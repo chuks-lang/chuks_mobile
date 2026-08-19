@@ -1,0 +1,153 @@
+// @chuks/ui state -- per-instance component state, keyed by structural identity.
+//
+// The reconciler calls hookEnter(path) before it runs each component, so a
+// component's useState() needs NO key: identity comes from the component's
+// position in the tree (like SwiftUI's @State / React's fiber). State persists in
+// `_cells` across renders and is reconnected by identity every render.
+//
+// App developers use `useState` / `useKeyedState`; the leading-underscore context
+// and hookEnter/hookSweep are framework-internal (core/ui.chuks drives them).
+
+var _path: string = ""              // identity of the component currently rendering
+var _slot: int = 0                  // index within a component (multiple useState per component)
+var _fxSlot: int = 0                // index within a component for useEffect calls
+var _cells: map[string]any = {}     // persistent state boxes, keyed by "path#slot" (or "key:...")
+var _seen: map[string]bool = {}     // cell keys touched this render, for hookSweep()
+
+// Effect bookkeeping (see useEffect below). Declared up top so hookBegin/hookSweep
+// can reference them (Chuks needs types/vars defined before use).
+class Effect { var depsKey: string; var cleanup: any; constructor() { this.depsKey = ""; this.cleanup = null } }
+class PendingFx { var key: string; var fn: any; var old: any; constructor() { this.key = ""; this.fn = null; this.old = null } }
+var _effects: map[string]Effect = {}    // identity -> { depsKey, cleanup }
+var _fxSeen: map[string]bool = {}       // effect keys touched this render
+var _pendingFx: []PendingFx = []        // effects to run after this render pass
+
+// Framework-internal: called before a component renders to set its identity.
+export function hookEnter(path: string): void { _path = path; _slot = 0; _fxSlot = 0 }
+
+// A handle to one state cell. Read with get() (cast to your type), write set(v).
+export class Cell {
+    var k: string
+    constructor(k: string) { this.k = k }
+    public get(): any { return _cells.getOr(this.k, null) }
+    public set(v: any): void { _cells[this.k] = v }
+}
+
+/**
+ * Declare a piece of local component state. No key needed -- identity comes from
+ * the component's position in the tree -- and it holds any type. Returns a Cell:
+ * read `cell.get()` (cast to your type), write `cell.set(v)`.
+ *
+ * ```chuks
+ * var count = useState(0)
+ * var n: int = count.get()
+ * Button({ onPress: function(): void { count.set(count.get() + 1) } }, string(n))
+ * ```
+ */
+export function useState(initial: any): Cell {
+    var k: string = _path + "#" + string(_slot)
+    _slot = _slot + 1
+    _seen[k] = true
+    if (!_cells.has(k)) { _cells[k] = initial }
+    return new Cell(k)
+}
+
+/**
+ * Explicit-key state for a hand-rolled loop of stateful items. Prefer `List`
+ * (its rows are already keyed) for dynamic collections; use this only when you
+ * build a fixed set of stateful children yourself and want stable identity.
+ *
+ * ```chuks
+ * var open = useKeyedState("row:" + string(id), false)
+ * ```
+ */
+export function useKeyedState(key: string, initial: any): Cell {
+    var k: string = "key:" + key
+    _seen[k] = true
+    if (!_cells.has(k)) { _cells[k] = initial }
+    return new Cell(k)
+}
+
+// Framework-internal: begin a render pass (clear the visited sets + effect queue).
+export function hookBegin(): void {
+    var e1: map[string]bool = {}; _seen = e1
+    var e2: map[string]bool = {}; _fxSeen = e2
+    var e3: []PendingFx = []; _pendingFx = e3
+}
+
+// Framework-internal: after a render, drop cells whose identity was not visited
+// (a component that unmounted), so a later remount at the same path starts fresh.
+// Also run cleanup for any effect whose component unmounted.
+export function hookSweep(): void {
+    var live: map[string]any = {}
+    var ks: []string = _cells.keys()
+    for (var i: int = 0; i < ks.length; i = i + 1) {
+        var key: string = ks[i]
+        if (_seen.getOr(key, false)) { live[key] = _cells[key] }
+    }
+    _cells = live
+    // effects: run cleanup for identities not visited this render, then drop them.
+    var liveFx: map[string]Effect = {}
+    var fks: []string = _effects.keys()
+    for (var j: int = 0; j < fks.length; j = j + 1) {
+        var fk: string = fks[j]
+        var ev: Effect? = _effects.get(fk)
+        if (ev != null) {
+            if (_fxSeen.getOr(fk, false)) { liveFx[fk] = ev }
+            else { if (ev.cleanup != null) { var c: any = ev.cleanup; c() } }
+        }
+    }
+    _effects = liveFx
+}
+
+// ---- Effects (useEffect): side effects that run after the render commits, on
+//      mount and whenever a dependency changes, with cleanup on re-run/unmount.
+
+function depsKeyOf(deps: []any): string {
+    var s: string = ""
+    for (var i: int = 0; i < deps.length; i = i + 1) { s = s + "|" + string(deps[i]) }
+    return s
+}
+
+/**
+ * Run a side effect after the component renders: on first mount, and again
+ * whenever any value in `deps` changes. `fn` returns an OPTIONAL cleanup (a
+ * function, or null) that runs before the next re-run and when the component
+ * unmounts. Pass `[]` for run-once-on-mount.
+ *
+ * ```chuks
+ * useEffect(function(): any {
+ *     var id = startTimer()
+ *     return function(): void { stopTimer(id) }   // cleanup on unmount
+ * }, [])
+ * ```
+ */
+export function useEffect(fn: any, deps: []any): void {
+    var key: string = _path + "!" + string(_fxSlot)
+    _fxSlot = _fxSlot + 1
+    _fxSeen[key] = true
+    var dk: string = depsKeyOf(deps)
+    var prev: Effect? = _effects.get(key)
+    if (prev == null || prev.depsKey != dk) {
+        var old: any = prev != null ? prev.cleanup : null
+        var e: Effect = new Effect(); e.depsKey = dk; e.cleanup = old
+        _effects[key] = e
+        var p: PendingFx = new PendingFx(); p.key = key; p.fn = fn; p.old = old
+        _pendingFx.push(p)
+    }
+}
+
+// Framework-internal: run queued effects after the render commits. Each pending
+// effect runs its previous cleanup (if deps changed), then fn(), storing the new
+// cleanup it returns.
+export function runEffects(): void {
+    for (var i: int = 0; i < _pendingFx.length; i = i + 1) {
+        var p: PendingFx = _pendingFx[i]
+        if (p.old != null) { var c: any = p.old; c() }
+        var f: any = p.fn
+        var cleanup: any = f()
+        var e: Effect? = _effects.get(p.key)
+        if (e != null) { e.cleanup = cleanup }
+    }
+    var empty: []PendingFx = []; _pendingFx = empty
+}

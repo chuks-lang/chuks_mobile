@@ -1,0 +1,153 @@
+// @chuks/ui -- the component kit. The chuks-mobile analogue of RN Paper /
+// Tamagui: higher-level, good-looking components composed from the primitives
+// and styled entirely through semantic theme tokens (see theme.chuks), so every
+// one of them reskins with setTheme("light") and stays consistent by default.
+//
+// API convention (RN/SwiftUI props model): every component takes a SINGLE props
+// `dataType`, so callers set only what they need by name (no positional nulls).
+// Required content is a plain field; optional config is a nullable field (`T?`,
+// `function?(...)`) that defaults to null when omitted. Every component accepts an
+// optional `extra` tw-class string that is appended last, so it wins:
+//   Button({ variant: "primary", label: "Save", extra: "grow rounded-full" })
+import { Node, Row, Column, Text, TextInput, Prop } from "./ui.chuks";
+import { tw } from "./tw.chuks";
+
+// Button: a tappable action. variant = "primary" | "secondary" | "ghost" | "danger"
+// (default "ghost"). onPress fires on tap.
+//   Button({ variant: "primary", label: "Save", onPress: function(): void { save() } })
+export dataType ButtonProps {
+    label: string,
+    variant: string?,               // "primary" | "secondary" | "ghost" | "danger"
+    onPress: function?(): void,
+    extra: string?,
+}
+export function Button(p: ButtonProps): Node {
+    const variant: string = p.variant ?? "ghost"
+    var bg: string = ""; var txt: string = "text-primary"          // ghost
+    if (variant == "primary") { bg = "bg-primary"; txt = "text-primaryText" }
+    else if (variant == "secondary") { bg = "bg-surface2 border border-border"; txt = "text-text" }
+    else if (variant == "danger") { bg = "bg-danger"; txt = "text-dangerText" }
+    var props: map[string]Prop = tw("items-center justify-center p-lg rounded-lg " + bg + " " + (p.extra ?? ""))
+    if (p.onPress != null) { props["onPress"] = p.onPress }
+    return Row(props, [ Text(tw("text-base font-bold " + txt), p.label) ])
+}
+
+// Card: an elevated surface. Its children stack vertically.
+//   Card({ children: [ Text(tw("text-lg font-bold text-text"), "Title") ] })
+export dataType CardProps {
+    children: []Node,
+    extra: string?,
+}
+export function Card(p: CardProps): Node {
+    return Column(tw("bg-surface border border-border rounded-xl p-lg gap-md shadow-sm " + (p.extra ?? "")), p.children)
+}
+
+// Input: a single-line field. onChange(string) fires on each edit.
+//   Input({ placeholder: "you@example.com", onChange: function(v: string): void { email.set(v) } })
+export dataType InputProps {
+    placeholder: string?,
+    onChange: function?(v: string): void,
+    extra: string?,
+}
+export function Input(p: InputProps): Node {
+    var props: map[string]Prop = tw("bg-surface2 border border-border rounded-lg h-11 p-md text-base text-text " + (p.extra ?? ""))
+    props["placeholder"] = p.placeholder ?? ""
+    if (p.onChange != null) { const h: any = p.onChange; props["onChange"] = h }
+    return TextInput(props)
+}
+
+// Badge: a small status pill. tone = "neutral" | "primary" | "success" | "warning"
+// | "danger" | "info" (default "neutral").
+//   Badge({ tone: "success", text: "Online" })
+export dataType BadgeProps {
+    text: string,
+    tone: string?,
+}
+export function Badge(p: BadgeProps): Node {
+    const tone: string = p.tone ?? "neutral"
+    var bg: string = "bg-surface2"; var col: string = "text-muted"
+    if (tone == "primary") { bg = "bg-primarySoft"; col = "text-primary" }
+    else if (tone == "success") { bg = "bg-successSoft"; col = "text-success" }
+    else if (tone == "warning") { bg = "bg-warningSoft"; col = "text-warning" }
+    else if (tone == "danger") { bg = "bg-dangerSoft"; col = "text-danger" }
+    else if (tone == "info") { bg = "bg-infoSoft"; col = "text-info" }
+    return Row(tw("rounded-full p-sm items-center " + bg), [
+        Text(tw("text-xs font-semibold " + col), p.text),
+    ])
+}
+
+// Chip: a selectable pill (filters, tags). `selected` defaults to false.
+//   Chip({ text: "All", selected: kind == 0, onPress: function(): void { set(0) } })
+export dataType ChipProps {
+    text: string,
+    selected: bool?,
+    onPress: function?(): void,
+}
+export function Chip(p: ChipProps): Node {
+    const selected: bool = p.selected ?? false
+    const cls: string = selected ? "bg-primary border border-primary" : "bg-surface2 border border-border"
+    const col: string = selected ? "text-primaryText" : "text-muted"
+    var props: map[string]Prop = tw("rounded-full p-sm items-center " + cls)
+    if (p.onPress != null) { props["onPress"] = p.onPress }
+    return Row(props, [ Text(tw("text-sm font-semibold " + col), p.text) ])
+}
+
+// Avatar: a circular initials badge (cross-platform; no SF Symbols).
+//   Avatar({ initials: "AL", extra: "w-16 h-16" })
+export dataType AvatarProps {
+    initials: string,
+    extra: string?,
+}
+export function Avatar(p: AvatarProps): Node {
+    return Row(tw("w-10 h-10 rounded-full bg-primarySoft items-center justify-center " + (p.extra ?? "")), [
+        Text(tw("text-sm font-bold text-primary"), p.initials),
+    ])
+}
+
+// Divider: a subtle horizontal rule. (No config — stays argument-free.)
+export function Divider(): Node { return Row(tw("h-1 bg-borderSoft"), []) }
+
+// SectionHeader: a small, quiet label above a group. (Single required arg.)
+export function SectionHeader(text: string): Node {
+    return Text(tw("text-xs font-bold text-subtle p-sm"), text)
+}
+
+// ListItem: a row with a title, optional subtitle + trailing text. Tappable when
+// onPress is passed.
+//   ListItem({ title: "Wi-Fi", subtitle: "Home", trailing: "On", onPress: open })
+export dataType ListItemProps {
+    title: string,
+    subtitle: string?,
+    trailing: string?,
+    onPress: function?(): void,
+}
+export function ListItem(p: ListItemProps): Node {
+    var props: map[string]Prop = tw("items-center gap-md p-md bg-surface rounded-lg")
+    if (p.onPress != null) { props["onPress"] = p.onPress }
+    var kids: []Node = [
+        Column(tw("grow gap-xs"), [
+            Text(tw("text-base font-semibold text-text"), p.title),
+            Text(tw("text-sm text-muted"), p.subtitle ?? ""),
+        ]),
+    ]
+    const trailing: string = p.trailing ?? ""
+    if (trailing != "") { kids.push(Text(tw("text-sm text-subtle"), trailing)) }
+    return Row(props, kids)
+}
+
+// Switch: a controlled on/off toggle (RN-style). The parent owns the state and
+// passes `on`; `onToggle` fires when tapped (the parent flips its own var). The
+// thumb slides via flex justify (start = off, end = on).
+//   Switch({ on: enabled, onToggle: function(): void { enabled = !enabled } })
+export dataType SwitchProps {
+    on: bool,
+    onToggle: function?(): void,
+}
+export function Switch(p: SwitchProps): Node {
+    const track: string = p.on ? "bg-primary justify-end" : "bg-surface2 justify-start"
+    var props: map[string]Prop = tw("w-13 h-8 rounded-full p-1 items-center " + track)
+    if (p.onToggle != null) { props["onPress"] = p.onToggle }
+    return Row(props, [
+        Row(tw("w-6 h-6 rounded-full bg-white"), []),
+    ])
+}

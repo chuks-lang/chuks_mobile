@@ -1,0 +1,729 @@
+// @chuks/ui -- the Chuks Mobile framework toolkit. Authored once; app developers
+// import this and write components in app/app.chuks, never editing this file.
+//
+// It provides: the flexbox Style model, the Node tree, declarative element
+// builders, the memoized Component base, and the Reconciler (which diffs trees
+// into the minimal CREATE/STYLE/TEXT/INSERT/REMOVE mutation stream the native
+// host applies). No module-global state -- the mutation buffer lives on a
+// Reconciler instance the app owns, so nothing crosses the import boundary as
+// shared mutable state.
+
+import { hookEnter, hookBegin, hookSweep, runEffects } from "./state.chuks";
+
+// ---- Style: a compact subset of the flexbox + visual model -----------------
+export class Style {
+    var dir: string     // "row" | "col"
+    var just: string    // start|center|end|between|around
+    var align: string   // start|center|end|stretch
+    var grow: int
+    var basis: int      // flex-basis; 0 = "fill available, ignore content size"
+    var w: int
+    var h: int
+    var pad: int
+    var gap: int
+    var bg: string      // hex, e.g. "1B1F2A"
+    var fg: string      // text color hex
+    var fs: int         // font size
+    var fw: string      // regular|semibold|bold
+    var ta: string      // text align: left|center|right
+    var img: string     // SF Symbol name for an Image node
+    var radius: int
+    var pos: string     // "abs" for absolute positioning
+    var top: int
+    var left: int
+    var right: int
+    var bw: int         // border width (px)
+    var bc: string      // border color hex
+    var shadow: int     // elevation: 1 small, 2 medium, 3 large
+    var opacity: int    // 0-100 (-1 = fully opaque)
+    var wrap: string    // "wrap" | "nowrap" (flex-wrap)
+    var font: string    // custom font family (e.g. an icon font); "" = system
+    var vid: string     // video filename for a Video node
+    constructor() {
+        this.dir = ""; this.just = ""; this.align = ""
+        this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
+        this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
+        this.pos = ""; this.top = -1; this.left = -1; this.right = -1
+        this.bw = -1; this.bc = ""; this.shadow = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
+    }
+    // Serialize the set fields into the host's compact "k=v;" style string. Only
+    // non-default fields are emitted, so unchanged styles diff to nothing.
+    public str(): string {
+        var s: string = ""
+        if (this.dir != "") { s = s + "d=" + this.dir + ";" }
+        if (this.just != "") { s = s + "j=" + this.just + ";" }
+        if (this.align != "") { s = s + "a=" + this.align + ";" }
+        if (this.grow >= 0) { s = s + "g=" + string(this.grow) + ";" }
+        if (this.basis >= 0) { s = s + "basis=" + string(this.basis) + ";" }
+        if (this.w >= 0) { s = s + "w=" + string(this.w) + ";" }
+        if (this.h >= 0) { s = s + "h=" + string(this.h) + ";" }
+        if (this.pad >= 0) { s = s + "p=" + string(this.pad) + ";" }
+        if (this.gap >= 0) { s = s + "gap=" + string(this.gap) + ";" }
+        if (this.bg != "") { s = s + "bg=" + this.bg + ";" }
+        if (this.fg != "") { s = s + "fg=" + this.fg + ";" }
+        if (this.fs >= 0) { s = s + "fs=" + string(this.fs) + ";" }
+        if (this.fw != "") { s = s + "fw=" + this.fw + ";" }
+        if (this.ta != "") { s = s + "ta=" + this.ta + ";" }
+        if (this.img != "") { s = s + "img=" + this.img + ";" }
+        if (this.radius >= 0) { s = s + "r=" + string(this.radius) + ";" }
+        if (this.pos != "") { s = s + "pos=" + this.pos + ";" }
+        if (this.top >= 0) { s = s + "top=" + string(this.top) + ";" }
+        if (this.left >= 0) { s = s + "left=" + string(this.left) + ";" }
+        if (this.right >= 0) { s = s + "right=" + string(this.right) + ";" }
+        if (this.bw >= 0) { s = s + "bw=" + string(this.bw) + ";" }
+        if (this.bc != "") { s = s + "bc=" + this.bc + ";" }
+        if (this.shadow >= 0) { s = s + "shadow=" + string(this.shadow) + ";" }
+        if (this.opacity >= 0) { s = s + "opacity=" + string(this.opacity) + ";" }
+        if (this.wrap != "") { s = s + "wrap=" + this.wrap + ";" }
+        if (this.font != "") { s = s + "font=" + this.font + ";" }
+        if (this.vid != "") { s = s + "vid=" + this.vid + ";" }
+        return s
+    }
+}
+
+// ---- Node: a view in the tree ----------------------------------------------
+export class Node {
+    var kind: string    // View | Text | Image | Button | Input | Scroll
+    var style: Style
+    var text: string
+    var action: string  // legacy string tag (still used by the search scaffold)
+    var onPress: any     // holds a Prop closure; kept `any` so both event
+    var onChange: any    // signatures fit one field (see the Prop union below)
+    var data: map[string]ListProp   // List config (count/key/item/rowHeight/gap)
+    var kids: []Node
+    var comp: any        // kind=="Comp": the component render fn () -> Node (lazy)
+    var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
+    var ckey: string     // kind=="Comp": explicit identity key (KeyedComp); "" = use path
+    constructor(kind: string, style: Style, text: string, kids: []Node) {
+        this.kind = kind; this.style = style; this.text = text
+        this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
+        this.comp = null; this.produced = null; this.ckey = ""
+    }
+    // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
+    // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
+    public key(k: string): Node { this.ckey = k; return this }
+    // Produce this node's rendered subtree. A host node is its own output; a
+    // Comp(fn) node runs its closure; a class Component subclass overrides this.
+    // The reconciler calls render() only for kind=="Comp" nodes.
+    public render(): Node { if (this.comp != null) { const f: any = this.comp; return f() } return this }
+}
+
+// ---- Node constructors (INTERNAL primitives; the named-prop builders below
+//      are the public API). Not exported, so they don't collide with the
+//      capitalized public builders when transpiled to Go. -------------------
+// Build a container node (native View). Holds children laid out by its Style.
+function mkView(style: Style, kids: []Node): Node { return new Node("View", style, "", kids) }
+// Build a text node (native Text/label). Self-sizes to its string.
+function mkText(style: Style, t: string): Node { return new Node("Text", style, t, []) }
+// Build an image node (native Image). Style.img names the SF Symbol / asset.
+function mkImage(style: Style): Node { return new Node("Image", style, "", []) }
+// Build a button node (native Button) with a text title.
+function mkButton(style: Style, t: string): Node { return new Node("Button", style, t, []) }
+// Build a text-input node (native Input). `placeholder` is the empty-state hint.
+function mkInput(style: Style, placeholder: string): Node { return new Node("Input", style, placeholder, []) }
+
+// ---- Prop value types ------------------------------------------------------
+// The value a prop can hold: a number, a string, a flag, or an event closure.
+// Using a union (not `any`) means the builders accept only these, so a stray
+// value like an object is a compile error. Chuks has no first-class function
+// type WITHOUT a signature, so the two event shapes are spelled out.
+export unionType Prop = int | string | bool | function(): void | function(v: string): void
+// A List's config values: sizes/counts (int) plus its two row callbacks. These
+// have List-specific signatures, so they get their own union, distinct from Prop.
+export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node
+
+// ---- Named-prop component builders (the JSX-like API) ----------------------
+// Compose with named props + children + closures:
+//   Row({ onPress: fn, gap: 12, bg: CARD }, [ Text({ weight: "bold" }, "hi") ])
+// Props are a map[string]Prop; missing keys fall through to defaults.
+
+// Read an int prop `k` from the props map, or return `def` if it is absent.
+function pInt(p: map[string]Prop, k: string, def: int): int { const v: Prop? = p.get(k); if (v != null) { return int(v) } return def }
+// Read a string prop `k` from the props map, or return `def` if it is absent.
+function pStr(p: map[string]Prop, k: string, def: string): string { const v: Prop? = p.get(k); if (v != null) { return string(v) } return def }
+// Read an int config value `k` from a List's ListProp map, or `def` if absent.
+function lpInt(d: map[string]ListProp, k: string, def: int): int { const v: ListProp? = d.get(k); if (v != null) { return int(v) } return def }
+// Copy the layout/visual props onto a Style. Each pInt/pStr defaults to the
+// Style's current value, so an absent prop leaves whatever the builder preset.
+function applyLayout(s: Style, p: map[string]Prop): void {
+    s.gap = pInt(p, "gap", s.gap)
+    s.pad = pInt(p, "pad", s.pad)
+    s.w = pInt(p, "w", s.w)
+    s.h = pInt(p, "h", s.h)
+    s.grow = pInt(p, "grow", s.grow)
+    s.basis = pInt(p, "basis", s.basis)
+    s.radius = pInt(p, "radius", s.radius)
+    s.align = pStr(p, "align", s.align)
+    s.just = pStr(p, "justify", s.just)
+    s.bg = pStr(p, "bg", s.bg)
+    s.fg = pStr(p, "color", s.fg)
+    s.fs = pInt(p, "size", s.fs)
+    s.fw = pStr(p, "weight", s.fw)
+    s.ta = pStr(p, "ta", s.ta)
+    const abs: Prop? = p.get("abs"); if (abs != null) { s.pos = "abs" }
+    s.top = pInt(p, "top", s.top)
+    s.left = pInt(p, "left", s.left)
+    s.right = pInt(p, "right", s.right)
+    s.dir = pStr(p, "dir", s.dir)               // flex-direction (Row/Column set this too)
+    s.bw = pInt(p, "border", s.bw)              // border width
+    s.bc = pStr(p, "borderColor", s.bc)         // border color hex
+    s.shadow = pInt(p, "shadow", s.shadow)      // elevation 1..3
+    s.opacity = pInt(p, "opacity", s.opacity)   // 0..100
+    s.wrap = pStr(p, "wrap", s.wrap)            // "wrap" | "nowrap"
+    s.font = pStr(p, "font", s.font)            // custom font family (icon fonts)
+}
+// Wire onPress / onChange closures from a props map onto a node. The Reconciler
+// registers them by node id and calls them when the native event fires.
+function applyEvents(n: Node, p: map[string]Prop): void {
+    const op: Prop? = p.get("onPress"); if (op != null) { n.onPress = op }
+    const oc: Prop? = p.get("onChange"); if (oc != null) { n.onChange = oc }
+}
+/**
+ * A horizontal row (flex-direction: row): lays its children left-to-right.
+ *
+ * Props: `gap`, `pad`, `align` ("start"|"center"|"end"|"stretch"),
+ * `justify` ("start"|"center"|"end"|"between"|"around"), `bg`, `radius`,
+ * `w`, `h`, `grow`, `onPress`.
+ *
+ * ```chuks
+ * Row({ align: "center", justify: "between", gap: 12 }, [
+ *     Text({ weight: "bold", size: 16 }, "Title"),
+ *     Button({ onPress: onOpen }, "Open"),
+ * ])
+ * ```
+ */
+export function Row(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style(); s.dir = "row"; applyLayout(s, p)
+    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+}
+/**
+ * A vertical column (flex-direction: col): lays its children top-to-bottom.
+ *
+ * Props: `gap`, `pad`, `align`, `justify`, `bg`, `radius`, `grow`, `onPress`.
+ *
+ * ```chuks
+ * Column({ gap: 6 }, [
+ *     Text({ weight: "semibold", size: 13 }, "Email"),
+ *     TextInput({ placeholder: "you@example.com" }),
+ * ])
+ * ```
+ */
+export function Column(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style(); s.dir = "col"; s.just = "center"; applyLayout(s, p)
+    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+}
+/**
+ * A run of text; `t` is the string to display. Text self-sizes to its content.
+ *
+ * Props: `size` (px), `weight` ("regular"|"semibold"|"bold"), `color` (hex),
+ * `ta` (text-align "left"|"center"|"right").
+ *
+ * ```chuks
+ * Text({ size: 30, weight: "bold", color: FG }, "Welcome back")
+ * ```
+ */
+export function Text(p: map[string]Prop, t: string): Node {
+    const s: Style = new Style(); applyLayout(s, p)
+    return mkText(s, t)
+}
+/**
+ * A circular icon backed by an SF Symbol.
+ *
+ * Props: `name` (SF Symbol id, e.g. "bolt.fill"), `size` (px; also the circle
+ * diameter), `bg` (circle fill hex), `color` (glyph hex, default white).
+ *
+ * ```chuks
+ * Icon({ name: "bolt.fill", size: 40, bg: ACCENT })
+ * ```
+ */
+/**
+ * A looping, muted video surface (native AVPlayer / ExoPlayer). `src` is a
+ * bundled video filename. Only mounted (visible) videos play, so a virtualized
+ * List keeps just the on-screen ones alive.
+ *
+ * ```chuks
+ * Video({ src: "sample.mp4", h: 320, radius: 12 })
+ * ```
+ */
+export function Video(p: map[string]Prop): Node {
+    const s: Style = new Style(); applyLayout(s, p)
+    s.vid = pStr(p, "src", "")
+    return new Node("Video", s, "", [])
+}
+export function Icon(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    const sz: int = pInt(p, "size", 24); s.w = sz; s.h = sz; s.radius = sz / 2
+    s.bg = pStr(p, "bg", "")
+    s.img = pStr(p, "name", ""); s.fg = pStr(p, "color", "FFFFFF")
+    return mkImage(s)
+}
+/**
+ * A tappable button showing title `t`. Pass `onPress` as a () -> void closure;
+ * the framework registers it by node id and calls it on tap.
+ *
+ * Props: `onPress`, `bg`, `color`, `h`, `w`, `radius`, `size`, `weight`.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { navReplace("home") },
+ *          bg: ACCENT, color: "FFFFFF", h: 52, radius: 12 }, "Log in")
+ * ```
+ */
+export function Button(p: map[string]Prop, t: string): Node {
+    const s: Style = new Style(); s.fw = "bold"; applyLayout(s, p)
+    const n: Node = mkButton(s, t); applyEvents(n, p); return n
+}
+/**
+ * A small rounded value badge (a compact tappable button). Defaults to 56x36.
+ *
+ * Props: `w`, `h`, `bg`, `color`, `onPress`.
+ *
+ * ```chuks
+ * Pill({ onPress: function(): void { self.inc() } }, string(this.value))
+ * ```
+ */
+export function Pill(p: map[string]Prop, t: string): Node {
+    const s: Style = new Style()
+    s.w = pInt(p, "w", 56); s.h = pInt(p, "h", 36); s.radius = 10
+    s.bg = pStr(p, "bg", "222A3A"); s.fg = pStr(p, "color", "5B8CFF"); s.fs = 16; s.fw = "bold"
+    applyLayout(s, p)
+    const n: Node = mkButton(s, t); applyEvents(n, p); return n
+}
+/**
+ * A single-line text field. Pass `onChange` as a (string) -> void closure that
+ * receives the current text on every edit. Renders as a light field by default.
+ *
+ * Props: `placeholder`, `onChange`, `bg` (default white "FFFFFF"), `color`, `h`.
+ *
+ * ```chuks
+ * TextInput({ placeholder: "Filter services",
+ *             onChange: function(v: string): void { self.setQuery(v) } })
+ * ```
+ */
+export function TextInput(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.h = pInt(p, "h", 44); s.bg = pStr(p, "bg", "FFFFFF"); s.radius = 10
+    s.fg = pStr(p, "color", "111318"); s.fs = 15; applyLayout(s, p)
+    const n: Node = mkInput(s, pStr(p, "placeholder", ""))
+    applyEvents(n, p); return n
+}
+/**
+ * A page's root column: its children fill the screen top-to-bottom. Every
+ * View.render() returns one of these as its outermost node.
+ *
+ * Props: `bg` (page background hex), `pad` (default 12), `gap` (default 10).
+ *
+ * ```chuks
+ * Screen({ bg: BG, pad: 24, gap: 18 }, [
+ *     Text({ weight: "bold", size: 30, color: FG }, "Welcome back"),
+ *     Field("Email", "you@example.com", onEmail),
+ *     Button({ onPress: onSubmit, bg: ACCENT, h: 52 }, "Log in"),
+ * ])
+ * ```
+ */
+export function Screen(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style(); s.dir = "col"; s.pad = pInt(p, "pad", 12); s.gap = pInt(p, "gap", 10)
+    s.bg = pStr(p, "bg", "")
+    return mkView(s, kids)
+}
+/**
+ * A virtualized list: only the on-screen rows are mounted, the rest recycled, so
+ * a list of thousands of rows stays smooth.
+ *
+ * Props:
+ *   - `count`     total number of rows
+ *   - `key`       (rank: int) -> string    stable identity for the row at `rank`
+ *   - `item`      (rank: int, top: int) -> Node    builds the row's node
+ *   - `rowHeight` row height in px
+ *   - `gap`       vertical gap between rows
+ *   - `pad`       top/bottom padding (optional)
+ *   - `buffer`    extra rows kept above/below the window (optional, default 3)
+ *
+ * Identity comes from `key()` (NOT the rank), so a row's views and state survive
+ * when a filter moves it to a different position.
+ *
+ * ```chuks
+ * List({ count: this.filtered.length,
+ *        key:  function(r: int): string { return string(self.filtered[r]) },
+ *        item: function(r: int, top: int): Node { return self.rowAt(r, top) },
+ *        rowHeight: 72, gap: 10, pad: 8 })
+ * ```
+ */
+export function List(p: map[string]ListProp): Node {
+    const s: Style = new Style(); s.grow = 1; s.basis = 0    // fills the remaining space
+    const n: Node = new Node("List", s, "", [])
+    n.data = p    // carries count, key, item, rowHeight, gap, pad
+    return n
+}
+
+/**
+ * Place a component LAZILY. `render` is a () -> Node closure the framework calls
+ * top-down, at the component's position, so the component knows its identity when
+ * it runs -- which is what makes `useState()` work with no key. Use `Comp` for any
+ * component that holds state; pure/controlled components may be called directly.
+ *
+ * ```chuks
+ * Column({ gap: 10 }, [ Comp(Counter), Comp(function(): Node { return Card(id) }) ])
+ * ```
+ */
+export function Comp(render: any): Node {
+    const n: Node = new Node("Comp", new Style(), "", [])
+    n.comp = render
+    return n
+}
+/**
+ * Like `Comp`, but with an explicit identity key for a hand-rolled loop of
+ * stateful children (prefer `List` for dynamic collections -- its rows are already
+ * keyed). The key makes a child's state follow the item, not the slot.
+ *
+ * ```chuks
+ * for (var i = 0; i < items.length; i = i + 1) {
+ *     kids.push(KeyedComp("item:" + string(items[i].id), rowFor(items[i])))
+ * }
+ * ```
+ */
+export function KeyedComp(key: string, render: any): Node {
+    const n: Node = new Node("Comp", new Style(), "", [])
+    n.comp = render; n.ckey = key
+    return n
+}
+
+/**
+ * A class-based component (the SwiftUI/React model). `new MyComponent(props)`
+ * builds a LAZY placeable node: its render() is NOT called until the framework
+ * reaches its position in the tree, so the component knows its identity when it
+ * runs (which is what makes useState() work with no key). Subclasses override
+ * render(); props are plain constructor arguments; .key(id) chains for lists.
+ *
+ * ```chuks
+ * class Counter extends Component {
+ *     var start: int
+ *     constructor(start: int) { super(); this.start = start }
+ *     override public render(): Node {
+ *         var c = useState(this.start)
+ *         var n: int = c.get()
+ *         return Button({ onPress: function(): void { c.set(c.get() + 1) } }, string(n))
+ *     }
+ * }
+ * // placed directly, no wrapper: Column({}, [ new Counter(0), new Counter(0).key("b") ])
+ * ```
+ */
+export class Component extends Node {
+    constructor() { super("Comp", new Style(), "", []) }
+    // Subclasses override this. The default is an empty view (so a Component that
+    // forgets to override renders nothing rather than looping on itself).
+    override public render(): Node { return mkView(new Style(), []) }
+}
+
+// ---- Reconciler: diffs trees into the minimal mutation stream --------------
+// The app owns one instance; the mutation buffer lives here, not as module state.
+export class Reconciler {
+    var lines: []string
+    var handlers: map[string]any    // node id -> onPress/onChange closure (events)
+    var vpTop: int                  // viewport (set by the host each scroll) for List windowing
+    var vpH: int
+    var rootPrev: Node?             // last rendered root, for diffing
+    var itemNodes: map[string]Node  // List item id -> last node (for reconcile prev)
+    var mounted: []string           // List item ids currently mounted
+    var listCount: int              // last content count (to re-emit content height only on change)
+    constructor() {
+        this.lines = []; this.handlers = {}
+        this.vpTop = 0; this.vpH = 0; this.rootPrev = null
+        this.itemNodes = {}; this.mounted = []; this.listCount = -1
+    }
+    // Start a new mutation batch (clears the buffer). Call once per frame.
+    public begin(): void { this.lines = [] }
+    // Append one mutation line ("C|id|kind", "S|id|style", "I|id|parent|idx", "R|id", ...).
+    public emit(s: string): void { this.lines.push(s) }
+    // Number of mutations buffered this frame.
+    public count(): int { return this.lines.length }
+    // Join the buffered mutations into the newline-delimited stream the host applies.
+    public drain(): string { return this.lines.join("\n") }
+    // Record the visible scroll window used by reconcileList to pick the mount range.
+    public setViewport(top: int, h: int): void { this.vpTop = top; this.vpH = h }
+    // Reconcile the whole app tree from the root; the app calls this after any
+    // state change and the memoization makes everything unchanged bail.
+    public renderRoot(next: Node): void {
+        this.reconcile(this.rootPrev, next, "app", "root", 0)
+        this.rootPrev = next
+    }
+
+    // Fire the closure bound to a node id. `fire` for onPress, `fireValue` for
+    // onChange (inputs). The closure lives on the Chuks side; only the tag (the
+    // node id) ever crosses the host boundary.
+    public fire(tag: string): void {
+        if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f() }
+    }
+    // Fire the onChange(value) closure bound to node `tag` (from an input).
+    public fireValue(tag: string, value: string): void {
+        if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value) }
+    }
+    // register a node's event closure (tag = the node id), and emit its T binding
+    bindEvents(n: Node, id: string): void {
+        if (n.onPress != null) { this.handlers[id] = n.onPress; this.emit("T|" + id + "|" + id) }
+        else if (n.onChange != null) { this.handlers[id] = n.onChange; this.emit("T|" + id + "|" + id) }
+        else if (n.action != "") { this.emit("T|" + id + "|" + n.action) }
+    }
+
+    // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
+    // event binding, recursing into children. Used for first mount and remounts.
+    public mountNode(n: Node, id: string, parent: string, index: int): void {
+        if (n.kind == "Comp") {
+            // set the component's identity, run it, then mount what it produced AT
+            // the Comp's own id (a component is transparent in the native tree).
+            // render() dispatches: a Comp(fn) node runs its closure, a class
+            // Component subclass runs its overridden render().
+            const path: string = n.ckey != "" ? "key:" + n.ckey : id
+            hookEnter(path)
+            const produced: Node = n.render()
+            n.produced = produced
+            this.mountNode(produced, id, parent, index)
+            return
+        }
+        if (n.kind == "List") { this.reconcileList(null, n, id, parent, index); return }
+        this.emit("C|" + id + "|" + n.kind)
+        const st: string = n.style.str()
+        if (st != "") { this.emit("S|" + id + "|" + st) }
+        if (n.text != "") { this.emit("P|" + id + "|" + n.text) }
+        this.bindEvents(n, id)
+        this.emit("I|" + id + "|" + parent + "|" + string(index))
+        for (var i: int = 0; i < n.kids.length; i = i + 1) {
+            this.mountNode(n.kids[i], id + "." + string(i), id, i)
+        }
+    }
+    public reconcile(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        if (prev == null) { this.mountNode(next, id, parent, index); return }
+        const p: Node = prev
+        if (p == next) { return }              // memoized + unchanged: whole subtree bails
+        // component at this position: run it (setting its identity) and diff what it
+        // produced against what it produced last render.
+        if (next.kind == "Comp") {
+            const path: string = next.ckey != "" ? "key:" + next.ckey : id
+            hookEnter(path)
+            const produced: Node = next.render()
+            next.produced = produced
+            var prevProduced: Node? = null
+            if (p.kind == "Comp") { prevProduced = p.produced } else { this.emit("R|" + id) }
+            this.reconcile(prevProduced, produced, id, parent, index)
+            return
+        }
+        // prev was a component here, next is a plain node: drop the old subtree, mount fresh.
+        if (p.kind == "Comp") { this.emit("R|" + id); this.mountNode(next, id, parent, index); return }
+        // kind changed at this position (e.g. a page swap): remove + remount.
+        if (p.kind != next.kind) {
+            this.emit("R|" + id)
+            this.mountNode(next, id, parent, index)
+            return
+        }
+        if (next.kind == "List") { this.reconcileList(prev, next, id, parent, index); return }
+        if (p.text != next.text) { this.emit("P|" + id + "|" + next.text) }
+        const ps: string = p.style.str()
+        const ns: string = next.style.str()
+        if (ps != ns) { this.emit("S|" + id + "|" + ns) }
+        // Event binding can CHANGE on update, not just on mount: a slot that was
+        // inert can gain an onPress when the screen swaps in place (e.g. a NavBar
+        // trailing button appearing as Home -> Profile reuses the same node id), or
+        // lose one. bindEvents (which emits T|) runs ONLY on mountNode, so re-emit
+        // the tag here whenever the binding target changes — otherwise the host keeps
+        // a stale (or empty) action and the tap never fires on ANY host.
+        const prevTag: string = (p.onPress != null || p.onChange != null) ? id : p.action
+        const nextTag: string = (next.onPress != null || next.onChange != null) ? id : next.action
+        if (prevTag != nextTag) { this.emit("T|" + id + "|" + nextTag) }
+        // the closure is recreated each render; rebind it (tag/id unchanged)
+        if (next.onPress != null) { this.handlers[id] = next.onPress }
+        else if (next.onChange != null) { this.handlers[id] = next.onChange }
+        for (var i: int = 0; i < next.kids.length; i = i + 1) {
+            const child: Node? = i < p.kids.length ? p.kids[i] : null
+            this.reconcile(child, next.kids[i], id + "." + string(i), id, i)
+        }
+        // remove old children the new tree no longer has
+        for (var i: int = next.kids.length; i < p.kids.length; i = i + 1) {
+            this.emit("R|" + id + "." + string(i))
+        }
+    }
+
+    // True if string slice `a` contains `x`. Small helper for the mount window.
+    containsStr(a: []string, x: string): bool {
+        for (var i: int = 0; i < a.length; i = i + 1) { if (a[i] == x) { return true } }
+        return false
+    }
+    // Virtualize a List node: mount the Scroll + content scaffold once, then mount
+    // only the window of items visible for the current viewport, recycling the
+    // rest. Item identity comes from key(rank), so a row survives when a filter
+    // moves it to a different rank (its id "c<key>" is stable, only its top moves).
+    reconcileList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        const d: map[string]ListProp = next.data
+        const count: int = lpInt(d, "count", 0)
+        const rowH: int = lpInt(d, "rowHeight", 0)
+        const gap: int = lpInt(d, "gap", 0)
+        const pad: int = lpInt(d, "pad", 0)
+        const stride: int = rowH + gap
+        const buffer: int = lpInt(d, "buffer", 3)
+        const keyFn: any = d.get("key")     // called as `any` (its signature is fixed by contract)
+        const itemFn: any = d.get("item")
+        const contentId: string = id + ".0"
+        const contentH: int = pad + count * stride + pad
+
+        if (prev == null) {
+            // fresh mount (first render, or remount after this List was torn down
+            // by a page swap): start from a clean window so stale item nodes from a
+            // previous mounting don't suppress the C mutations for the new views.
+            this.mounted = []
+            this.itemNodes = {}
+            const listS: Style = new Style(); listS.grow = 1; listS.basis = 0
+            this.emit("C|" + id + "|Scroll"); this.emit("S|" + id + "|" + listS.str())
+            this.emit("I|" + id + "|" + parent + "|" + string(index))
+            const cS: Style = new Style(); cS.h = contentH
+            this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
+            this.emit("I|" + contentId + "|" + id + "|0")
+            this.listCount = count
+        } else if (count != this.listCount) {
+            const cS: Style = new Style(); cS.h = contentH
+            this.emit("S|" + contentId + "|" + cS.str())
+            this.listCount = count
+        }
+
+        var r0: int = (this.vpTop - pad) / stride - buffer
+        if (r0 < 0) { r0 = 0 }
+        var r1: int = (this.vpTop + this.vpH - pad) / stride + buffer + 1
+        if (r1 > count) { r1 = count }
+        if (r1 < r0) { r1 = r0 }
+
+        // item ids live UNDER the content node (contentId + ".c" + key) so a page
+        // swap that removes the List (R|<listId>) also frees every item by prefix.
+        // identity is still the key, so a row survives a filter that moves its rank.
+        const desired: []string = []
+        for (var r: int = r0; r < r1; r = r + 1) { desired.push(contentId + ".c" + string(keyFn(r))) }
+
+        // recycle rows no longer in the window
+        for (var m: int = 0; m < this.mounted.length; m = m + 1) {
+            const iid: string = this.mounted[m]
+            if (!this.containsStr(desired, iid)) { this.emit("R|" + iid) }
+        }
+        // mount entering / diff staying (identity = key, position = rank)
+        for (var r: int = r0; r < r1; r = r + 1) {
+            const top: int = pad + r * stride
+            const node: Node = itemFn(r, top)
+            const iid: string = contentId + ".c" + string(keyFn(r))
+            const wasMounted: bool = this.containsStr(this.mounted, iid)
+            const pn: Node? = wasMounted ? this.itemNodes.get(iid) : null
+            this.reconcile(pn, node, iid, contentId, 0)
+            this.itemNodes[iid] = node
+        }
+        this.mounted = desired
+    }
+}
+
+// ---- App: the base a screen extends. The framework drives it; you override
+//      the hooks (setup/render/onTick/save/load). Your entry is one line:
+//        runApp(new MyScreen())
+//      -- the host contract below (mount/tick/dispatch/...) is generated here,
+//      never in app code. ----------------------------------------------------
+export class App {
+    var recon: Reconciler
+    constructor() { this.recon = new Reconciler() }
+    // ---- hooks you override ----
+    // One-time initialization with a size hint `n` (e.g. seed data). Optional.
+    public setup(_n: int): void { }
+    // Return the app's UI tree. Called on mount and after every event/tick.
+    public render(): Node { return mkView(new Style(), []) }
+    // Advance per-frame state before each re-render. Optional.
+    public onTick(): void { }
+    // Serialize state to a string for hot-reload preservation. Optional.
+    public saveState(): string { return "" }
+    // Restore state from a saveState() string after a hot reload. Optional.
+    public loadState(_data: string): void { }
+    // ---- framework-driven (the native host calls these; don't override) ----
+    // Render the tree and emit the initial mutation stream. Returns mutation count.
+    // hookBegin/hookSweep bracket every render so component state cells are seeded,
+    // reconnected by identity, and freed when a component leaves the tree.
+    public mount(): int { this.recon.begin(); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
+    public setViewport(top: int, h: int): int {
+        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+    }
+    // Advance one frame: onTick() then re-render. Returns the mutation count.
+    public tick(): int { this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
+    public dispatch(tag: string): int {
+        this.recon.begin(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+    }
+    // A native input change arrived for node `tag`: fire its onChange(value), then re-render.
+    public dispatchInput(tag: string, value: string): int {
+        this.recon.begin(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+    }
+    // Return the pending mutation stream as text and hand it to the host.
+    public drain(): string { return this.recon.drain() }
+}
+
+// ---- NavStack: named routing ----------------------------------------------
+// A screen is a function () -> Node (like RN's JSX component); there is no page
+// base class. A NavStack holds a map of named routes to those functions and a
+// page stack, renders the top screen, and switches via navigate()/back()/navReplace().
+
+var NAV: NavStack? = null    // the active NavStack (so pages can navigate from anywhere)
+
+export class NavStack extends App {
+    // Routes map a name to a screen: a function () -> Node. (Like RN, a screen is
+    // just a function that returns Node; there is no page base class to extend.)
+    var routes: map[string]any
+    var stack: []string           // route-name stack; last = visible page
+    constructor(routes: map[string]any, initial: string) {
+        super()
+        this.routes = routes
+        this.stack = [initial]
+        NAV = this
+    }
+    // Push a route name onto the stack (prefer the navigate() free function).
+    public push(name: string): void { this.stack.push(name) }
+    // Reset the stack to a single route (prefer the navReplace() free function).
+    public replace(name: string): void { this.stack = [name] }
+    // Pop the top route, if any remains below it (prefer the back() free function).
+    public popStack(): void {
+        if (this.stack.length > 1) {
+            const s: []string = []
+            for (var i: int = 0; i < this.stack.length - 1; i = i + 1) { s.push(this.stack[i]) }
+            this.stack = s
+        }
+    }
+    // The current screen function (top of the stack).
+    cur(): any { return this.routes[this.stack[this.stack.length - 1]] }
+    // Render the current screen LAZILY: wrap it in a Comp so the screen function
+    // runs inside the reconciler's top-down walk, with identity "app". This is what
+    // lets screens and their components use useState() with no key.
+    override render(): Node { const f: any = this.cur(); return Comp(f) }
+    override setup(_n: int): void { }
+}
+
+/**
+ * Push a page onto the navigation stack by its route name (the name you
+ * registered in createRoot). Back returns to the current page. Call from any
+ * event closure; the re-render after the event shows the new top page.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { navigate("settings") } }, "Settings")
+ * ```
+ */
+export function navigate(name: string): void { const nv: NavStack? = NAV; if (nv != null) { nv.push(name) } }
+/**
+ * Replace the whole stack with a single page, so Back cannot return to what came
+ * before. Use it for login -> home and logout -> login transitions.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { navReplace("home") } }, "Log in")
+ * ```
+ */
+export function navReplace(name: string): void { const nv: NavStack? = NAV; if (nv != null) { nv.replace(name) } }
+/**
+ * Pop the top page and return to the previous one. No-op at the root page.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { back() } }, "< Back")
+ * ```
+ */
+export function back(): void { const nv: NavStack? = NAV; if (nv != null) { nv.popStack() } }
+
+// NOTE: the native host contract (set_count/mount/tick/...) can't live here --
+// the transpiler tree-shakes exported functions that no Chuks code calls (the C
+// bridge calls them, which it can't see), and only the ENTRY module's exports
+// are emitted with their bare names for cgo. So app/_entry.chuks defines them as
+// thin forwarders to its App instance -- the one unavoidable bit of C-ABI glue.

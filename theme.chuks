@@ -1,0 +1,95 @@
+// @chuks/ui -- design tokens: the single source of truth for the look of an app.
+//
+// Components and tw() resolve *semantic* names (surface, primary, muted, danger,
+// ...) against the ACTIVE theme, so one setTheme("light") reskins everything.
+// This is the chuks-mobile analogue of a Tamagui / NativeWind theme config: you
+// design against roles, not raw hex, and light/dark come for free.
+//
+//   Column(tw("bg-surface p-lg rounded-lg gap-md"), [
+//       Text(tw("text-lg font-bold text-text"), "Title"),
+//       Text(tw("text-sm text-muted"), "Subtitle"),
+//   ])
+
+// ── Semantic color roles (hex, no leading #) ────────────────────────────────
+// Roles, not shades. Keep the two palettes parallel so a role means the same
+// thing in both modes (surface is always "the card behind content", etc.).
+const DARK: map[string]string = {
+    "bg": "0B1120",          // app background
+    "surface": "151C2E",     // cards / sheets
+    "surface2": "1E263B",    // insets, inputs, subtle fills
+    "elevated": "26304A",    // menus / popovers above surface
+    "text": "E8ECF4",        // primary text
+    "muted": "9AA5BC",       // secondary text
+    "subtle": "68738A",      // tertiary / placeholder
+    "inverse": "0B1120",     // text on a light/vivid fill
+    "primary": "6366F1",     // brand / accent (indigo)
+    "primaryText": "FFFFFF", // text/icon on `primary`
+    "primarySoft": "2B2F63", // tinted primary background (soft buttons, chips)
+    "accent": "22D3EE",      // secondary accent (cyan)
+    "border": "27314A",      // hairlines, outlines
+    "borderSoft": "1E263B",  // subtler dividers
+    "success": "34D399", "successText": "052E1B", "successSoft": "0C3626",
+    "warning": "FBBF24", "warningText": "3A2A05", "warningSoft": "3A2E0A",
+    "danger": "FB7185", "dangerText": "3B0A12", "dangerSoft": "3E1620",
+    "info": "60A5FA", "infoSoft": "13294B",
+    "overlay": "000000",     // scrim behind modals (used with opacity)
+}
+const LIGHT: map[string]string = {
+    "bg": "F6F7F9",
+    "surface": "FFFFFF",
+    "surface2": "F0F2F7",
+    "elevated": "FFFFFF",
+    "text": "0F1729",
+    "muted": "55617A",
+    "subtle": "8A93A6",
+    "inverse": "FFFFFF",
+    "primary": "5B5BF0",
+    "primaryText": "FFFFFF",
+    "primarySoft": "E7E7FC",
+    "accent": "0891B2",
+    "border": "E3E7F0",
+    "borderSoft": "EDF0F6",
+    "success": "16A34A", "successText": "FFFFFF", "successSoft": "DCFCE7",
+    "warning": "D97706", "warningText": "FFFFFF", "warningSoft": "FEF3C7",
+    "danger": "E11D48", "dangerText": "FFFFFF", "dangerSoft": "FFE4E6",
+    "info": "2563EB", "infoSoft": "DBEAFE",
+    "overlay": "0B1120",
+}
+
+// The supported appearances. A closed, type-safe set — setTheme(ThemeMode.Light)
+// only; an invalid mode is a compile error, not a silent no-op. (A `"light" |
+// "dark"` string-literal union would be nice, but Chuks types a bare "light"
+// literal as `string`, not as the literal, so it can't be compared/assigned to
+// the union; an enum is the idiomatic type-safe closed set.)
+export enum ThemeMode {
+    Light = "light",
+    Dark = "dark"
+}
+
+var THEME_MODE: ThemeMode = ThemeMode.Dark
+
+// Switch the whole app between dark and light. Re-render after calling.
+export function setTheme(mode: ThemeMode): void { THEME_MODE = mode }
+export function currentTheme(): ThemeMode { return THEME_MODE }
+export function toggleTheme(): void { THEME_MODE = THEME_MODE == ThemeMode.Light ? ThemeMode.Dark : ThemeMode.Light }
+
+// Resolve a semantic color role to hex against the active theme. Returns "" when
+// `name` is not a role, so callers can fall back (raw hex, Tailwind palette).
+export function tk(name: string): string {
+    const pal: map[string]string = THEME_MODE == ThemeMode.Light ? LIGHT : DARK
+    return pal.getOr(name, "")
+}
+
+// ── Scales ──────────────────────────────────────────────────────────────────
+// Named spacing (px). -1 when `name` is not a scale step.
+export function tkSpace(name: string): int {
+    if (name == "none") { return 0 }
+    if (name == "xs") { return 4 }
+    if (name == "sm") { return 8 }
+    if (name == "md") { return 12 }
+    if (name == "lg") { return 16 }
+    if (name == "xl") { return 24 }
+    if (name == "2xl") { return 32 }
+    if (name == "3xl") { return 48 }
+    return -1
+}

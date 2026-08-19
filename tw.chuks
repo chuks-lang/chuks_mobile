@@ -1,0 +1,135 @@
+// @chuks/ui -- tw(): a Tailwind-style utility-class adapter.
+//
+// Like NativeWind in React Native, this does NOT run CSS. It parses a class
+// string into the same prop map the builders already take, so you get the
+// Tailwind DX on top of the native Style model:
+//
+//   Row(tw("flex-row items-center justify-between gap-3 p-4 bg-slate-800 rounded-xl"), [
+//       Text(tw("text-lg font-bold text-slate-50"), "Title"),
+//       Button(tw("bg-blue-500 rounded-lg"), "Open"),
+//   ])
+//
+// Spacing follows Tailwind's 1 unit = 4px scale (p-4 = 16px). Colors come from
+// the palette below; an unknown color name is passed through as a raw hex, so
+// bg-1B2130 and bg-CARD (a theme constant's hex) both work.
+import { Prop } from "./ui.chuks";
+import { tk, tkSpace } from "./theme.chuks";
+
+// A curated slice of the Tailwind v3 palette (hex, no leading #).
+const PALETTE: map[string]string = {
+    "white": "FFFFFF", "black": "000000",
+    "slate-50": "F8FAFC", "slate-100": "F1F5F9", "slate-200": "E2E8F0", "slate-300": "CBD5E1",
+    "slate-400": "94A3B8", "slate-500": "64748B", "slate-600": "475569", "slate-700": "334155",
+    "slate-800": "1E293B", "slate-900": "0F172A", "slate-950": "020617",
+    "gray-400": "9CA3AF", "gray-500": "6B7280", "gray-600": "4B5563", "gray-700": "374151",
+    "gray-800": "1F2937", "gray-900": "111827", "gray-950": "030712",
+    "zinc-700": "3F3F46", "zinc-800": "27272A", "zinc-900": "18181B",
+    "blue-400": "60A5FA", "blue-500": "3B82F6", "blue-600": "2563EB", "blue-700": "1D4ED8",
+    "indigo-500": "6366F1", "indigo-600": "4F46E5",
+    "violet-500": "8B5CF6", "violet-600": "7C3AED",
+    "purple-500": "A855F7", "purple-600": "9333EA",
+    "red-400": "F87171", "red-500": "EF4444", "red-600": "DC2626", "red-700": "B91C1C",
+    "orange-500": "F97316", "orange-600": "EA580C",
+    "amber-400": "FBBF24", "amber-500": "F59E0B", "amber-600": "D97706",
+    "yellow-400": "FACC15", "yellow-500": "EAB308",
+    "green-400": "4ADE80", "green-500": "22C55E", "green-600": "16A34A",
+    "emerald-500": "10B981", "emerald-600": "059669",
+    "teal-500": "14B8A6", "teal-600": "0D9488", "cyan-500": "06B6D4",
+    "pink-500": "EC4899", "pink-600": "DB2777", "rose-500": "F43F5E",
+}
+
+// hex for a color name: a semantic theme role first (surface/primary/muted/...),
+// then the Tailwind palette, else the token itself (assumed a raw hex).
+function twColor(name: string): string {
+    const sem: string = tk(name)
+    if (sem != "") { return sem }
+    return PALETTE.getOr(name, name)
+}
+// px for a spacing token: a plain number on the 4px scale (p-4 = 16), or a named
+// step (p-md = 12). -1 when neither.
+function twSpaceVal(rest: string): int {
+    const n: int = twNum(rest)
+    if (n >= 0) { return n * 4 }
+    return tkSpace(rest)
+}
+// true if `t` begins with `p`.
+function twHas(t: string, p: string): bool { return t.length >= p.length && t.slice(0, p.length) == p }
+// the substring of `t` after prefix `p`.
+function twRest(t: string, p: string): string { return t.slice(p.length, t.length) }
+// parse `s` as a non-negative int, or -1 if it is not all digits.
+function twNum(s: string): int {
+    if (s.length == 0) { return -1 }
+    for (var i: int = 0; i < s.length; i = i + 1) {
+        const c: int = s.charCodeAt(i)
+        if (c < 48 || c > 57) { return -1 }
+    }
+    return int(s)
+}
+function twSize(k: string): int {
+    if (k == "xs") { return 11 } if (k == "sm") { return 13 } if (k == "base") { return 15 }
+    if (k == "lg") { return 18 } if (k == "xl") { return 22 } if (k == "2xl") { return 28 }
+    if (k == "3xl") { return 34 } if (k == "4xl") { return 40 }
+    return -1
+}
+
+// Parse a space-separated class string into a builder prop map.
+export function tw(classes: string): map[string]Prop {
+    var p: map[string]Prop = {}
+    const toks: []string = classes.split(" ")
+    for (var i: int = 0; i < toks.length; i = i + 1) {
+        const t: string = toks[i]
+        if (t == "") { continue }
+        // ---- flex / layout ----
+        if (t == "flex-row") { p["dir"] = "row" }
+        else if (t == "flex-col") { p["dir"] = "col" }
+        else if (t == "flex-wrap") { p["wrap"] = "wrap" }
+        else if (t == "flex-nowrap") { p["wrap"] = "nowrap" }
+        else if (t == "flex-1" || t == "grow") { p["grow"] = 1 }
+        else if (twHas(t, "items-")) { p["align"] = twRest(t, "items-") }
+        else if (twHas(t, "justify-")) { p["justify"] = twRest(t, "justify-") }
+        // ---- spacing / sizing (1 unit = 4px) ----
+        else if (twHas(t, "gap-")) { const v: int = twSpaceVal(twRest(t, "gap-")); if (v >= 0) { p["gap"] = v } }
+        else if (twHas(t, "p-")) { const v: int = twSpaceVal(twRest(t, "p-")); if (v >= 0) { p["pad"] = v } }
+        else if (twHas(t, "w-")) { const n: int = twNum(twRest(t, "w-")); if (n >= 0) { p["w"] = n * 4 } }
+        else if (twHas(t, "h-")) { const n: int = twNum(twRest(t, "h-")); if (n >= 0) { p["h"] = n * 4 } }
+        // ---- radius ----
+        else if (t == "rounded") { p["radius"] = 8 }
+        else if (t == "rounded-sm") { p["radius"] = 4 }
+        else if (t == "rounded-md") { p["radius"] = 8 }
+        else if (t == "rounded-lg") { p["radius"] = 12 }
+        else if (t == "rounded-xl") { p["radius"] = 16 }
+        else if (t == "rounded-2xl") { p["radius"] = 20 }
+        else if (t == "rounded-3xl") { p["radius"] = 24 }
+        else if (t == "rounded-full") { p["radius"] = 9999 }
+        // ---- border (width keywords before color) ----
+        else if (t == "border") { p["border"] = 1 }
+        else if (t == "border-0") { p["border"] = 0 }
+        else if (t == "border-2") { p["border"] = 2 }
+        else if (t == "border-4") { p["border"] = 4 }
+        else if (twHas(t, "border-")) { p["borderColor"] = twColor(twRest(t, "border-")) }
+        // ---- colors ----
+        else if (twHas(t, "bg-")) { p["bg"] = twColor(twRest(t, "bg-")) }
+        else if (twHas(t, "text-")) {
+            const rest: string = twRest(t, "text-")
+            const sz: int = twSize(rest)
+            if (sz >= 0) { p["size"] = sz }
+            else if (rest == "left" || rest == "center" || rest == "right") { p["ta"] = rest }
+            else { p["color"] = twColor(rest) }
+        }
+        // ---- typography ----
+        else if (t == "font-bold") { p["weight"] = "bold" }
+        else if (t == "font-semibold") { p["weight"] = "semibold" }
+        else if (t == "font-normal") { p["weight"] = "regular" }
+        // ---- effects ----
+        else if (twHas(t, "opacity-")) { const n: int = twNum(twRest(t, "opacity-")); if (n >= 0) { p["opacity"] = n } }
+        else if (t == "shadow" || t == "shadow-md") { p["shadow"] = 2 }
+        else if (t == "shadow-sm") { p["shadow"] = 1 }
+        else if (t == "shadow-lg" || t == "shadow-xl") { p["shadow"] = 3 }
+        // ---- position ----
+        else if (t == "absolute") { p["abs"] = true }
+        else if (twHas(t, "top-")) { const n: int = twNum(twRest(t, "top-")); if (n >= 0) { p["top"] = n * 4 } }
+        else if (twHas(t, "left-")) { const n: int = twNum(twRest(t, "left-")); if (n >= 0) { p["left"] = n * 4 } }
+        else if (twHas(t, "right-")) { const n: int = twNum(twRest(t, "right-")); if (n >= 0) { p["right"] = n * 4 } }
+    }
+    return p
+}
