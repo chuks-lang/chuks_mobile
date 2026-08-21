@@ -1,0 +1,56 @@
+// Chuks Mobile dev server (hot reload). Runs the SAME engine in the Chuks VM and
+// serves the mutation protocol over HTTP, so a thin host fetches frames without
+// the engine being AOT-linked into the app. Editing engine.chuks + restarting
+// this server reloads the logic with NO app rebuild/reinstall -- Fast Refresh.
+//
+// State preservation: the dev script snapshots /state before a restart into
+// STATE_FILE; on boot we restore it, so selection/values/filter/toolbar survive
+// the reload. (The host process stays alive, so scroll/focus persist for free.)
+import { createServer, Request, Response } from "std/http";
+import { fs } from "std/fs";
+import { set_count, mount, tick, setViewport, dispatch, dispatchInput, resolve, fail, drain, saveState, loadState } from "./entry.chuks";
+
+const STATE_FILE: string = "/tmp/chuks-mobile-state.txt"
+
+set_count(1000)
+if (fs.exists(STATE_FILE)) {
+    loadState(fs.readFile(STATE_FILE))
+    fs.remove(STATE_FILE)
+    print("dev server: restored preserved state")
+}
+
+var app = createServer({})
+
+app.post("/mount", function(req: Request, res: Response) { mount(); res.send(drain()) })
+app.post("/tick", function(req: Request, res: Response) { tick(); res.send(drain()) })
+app.post("/viewport", function(req: Request, res: Response) {
+    const p: []string = req.body.split(" ")   // "top height"
+    setViewport(int(p[0]), int(p[1]))
+    res.send(drain())
+})
+app.post("/event", function(req: Request, res: Response) { dispatch(req.body.trim()); res.send(drain()) })
+app.post("/input", function(req: Request, res: Response) {
+    const b: string = req.body                // "action\nvalue"
+    const nl: int = b.indexOf("\n")
+    if (nl >= 0) { dispatchInput(b.slice(0, nl), b.slice(nl + 1)) }
+    else { dispatchInput(b.trim(), "") }
+    res.send(drain())
+})
+app.post("/resolve", function(req: Request, res: Response) {   // "token\npayload" — async host->engine result (F3)
+    const b: string = req.body
+    const nl: int = b.indexOf("\n")
+    if (nl >= 0) { resolve(b.slice(0, nl), b.slice(nl + 1)) }
+    else { resolve(b.trim(), "") }
+    res.send(drain())
+})
+app.post("/fail", function(req: Request, res: Response) {   // "token\nmessage" — async capability failure (F3 error channel)
+    const b: string = req.body
+    const nl: int = b.indexOf("\n")
+    if (nl >= 0) { fail(b.slice(0, nl), b.slice(nl + 1)) }
+    else { fail(b.trim(), "") }
+    res.send(drain())
+})
+app.get("/state", function(req: Request, res: Response) { res.send(saveState()) })
+
+app.listen(7799, "127.0.0.1")   // loopback only: the sim/emulator reach it via localhost / 10.0.2.2, and it stays off the LAN (no macOS firewall prompt)
+print("chuks-mobile dev server on :7799")

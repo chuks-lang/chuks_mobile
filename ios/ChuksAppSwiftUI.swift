@@ -75,43 +75,82 @@ struct ChuksWeb: UIViewRepresentable {
     }
 }
 
+// DEV mode (built with -D DEV): the engine runs in the Chuks VM dev server started by
+// `chuks watch .chuks/devserver.chuks`, and the host fetches the mutation stream over
+// HTTP. Saving any .chuks file makes `chuks watch` restart the server; the host detects
+// the bounce (see Scene.startDevWatch) and remounts — hot reload with no app rebuild.
+// Out of DEV mode the engine is the AOT-linked library.
+#if DEV
+let DEV_MODE = true
+#else
+let DEV_MODE = false
+#endif
+
+// Synchronous request to the dev server. Returns nil on a network error (the server is
+// briefly down while `chuks watch` restarts it), else the response body (may be empty).
+func devHTTP(_ path: String, _ body: String, get: Bool = false) -> String? {
+    guard let url = URL(string: "http://localhost:7799\(path)") else { return nil }
+    var req = URLRequest(url: url, timeoutInterval: 2)
+    req.httpMethod = get ? "GET" : "POST"
+    if !get { req.httpBody = body.data(using: .utf8) }
+    let sem = DispatchSemaphore(value: 0)
+    var out: String? = nil
+    URLSession.shared.dataTask(with: req) { data, _, err in
+        if err == nil, let d = data { out = String(data: d, encoding: .utf8) ?? "" }
+        sem.signal()
+    }.resume()
+    _ = sem.wait(timeout: .now() + 2.5)
+    return out
+}
+
 // ================= engine bridge (identical C ABI to the UIKit host) =============
+// Each engine call has a DEV branch that talks to the VM dev server over HTTP instead
+// of the AOT-linked cgo library, so the two hosts share one control flow.
 enum Engine {
     static func drain() -> String {
         guard let c = chuks_drain() else { return "" }
         let s = String(cString: c); chuks_free_str(c); return s
     }
-    static func setup(_ n: Int32) { chuks_set_count(n) }
-    static func mount() -> String { _ = chuks_mount(); return drain() }
-    static func tick() -> String { _ = chuks_tick(); return drain() }
+    static func setup(_ n: Int32) { if DEV_MODE { return }; chuks_set_count(n) }   // dev server self-inits on boot
+    static func mount() -> String { if DEV_MODE { return devHTTP("/mount", "") ?? "" }; _ = chuks_mount(); return drain() }
+    static func tick() -> String { if DEV_MODE { return devHTTP("/tick", "") ?? "" }; _ = chuks_tick(); return drain() }
     static func dispatch(_ tag: String) -> String {
+        if DEV_MODE { return devHTTP("/event", tag) ?? "" }
         _ = tag.withCString { chuks_dispatch(UnsafeMutablePointer(mutating: $0)) }
         return drain()
     }
     static func input(_ tag: String, _ v: String) -> String {
+        if DEV_MODE { return devHTTP("/input", "\(tag)\n\(v)") ?? "" }
         _ = tag.withCString { a in v.withCString { b in
             chuks_dispatchInput(UnsafeMutablePointer(mutating: a), UnsafeMutablePointer(mutating: b)) } }
         return drain()
     }
     // Async host->engine bridge (F3): report a native capability result for `token`.
     static func resolve(_ token: String, _ payload: String) -> String {
+        if DEV_MODE { return devHTTP("/resolve", "\(token)\n\(payload)") ?? "" }
         _ = token.withCString { a in payload.withCString { b in
             chuks_resolve(UnsafeMutablePointer(mutating: a), UnsafeMutablePointer(mutating: b)) } }
         return drain()
     }
     // Report a capability FAILURE for `token` (error channel).
     static func fail(_ token: String, _ message: String) -> String {
+        if DEV_MODE { return devHTTP("/fail", "\(token)\n\(message)") ?? "" }
         _ = token.withCString { a in message.withCString { b in
             chuks_fail(UnsafeMutablePointer(mutating: a), UnsafeMutablePointer(mutating: b)) } }
         return drain()
     }
-    static func viewport(_ top: Int32, _ h: Int32) -> String { _ = chuks_setViewport(top, h); return drain() }
+    static func viewport(_ top: Int32, _ h: Int32) -> String {
+        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h)") ?? "" }
+        _ = chuks_setViewport(top, h); return drain()
+    }
     // Dark-mode sync: report the OS appearance (no render), and query whether the app
     // is still following it. setColorScheme updates the theme; the caller re-renders.
-    static func setColorScheme(_ dark: Bool) { chuks_setColorScheme(dark ? 1 : 0) }
-    static func colorSchemeFollows() -> Bool { return chuks_colorSchemeFollows() == 1 }
-    static func setInsets(_ t: Int32, _ r: Int32, _ b: Int32, _ l: Int32) { chuks_setInsets(t, r, b, l) }
+    // The dev server has no appearance/insets/platform endpoints, so these no-op in DEV.
+    static func setColorScheme(_ dark: Bool) { if DEV_MODE { return }; chuks_setColorScheme(dark ? 1 : 0) }
+    static func colorSchemeFollows() -> Bool { if DEV_MODE { return true }; return chuks_colorSchemeFollows() == 1 }
+    static func setInsets(_ t: Int32, _ r: Int32, _ b: Int32, _ l: Int32) { if DEV_MODE { return }; chuks_setInsets(t, r, b, l) }
     static func setPlatform() {
+        if DEV_MODE { return }
         let version = UIDevice.current.systemVersion, model = UIDevice.current.model
         let isPad: Int32 = UIDevice.current.userInterfaceIdiom == .pad ? 1 : 0
         "ios".withCString { o in version.withCString { v in model.withCString { m in
@@ -250,6 +289,30 @@ final class Scene: ObservableObject {
         if booted { return }; booted = true
         UNUserNotificationCenter.current().delegate = notifDelegate  // foreground banners
         Engine.setup(0); Engine.setPlatform(); Engine.setColorScheme(osDark); apply(Engine.mount()); syncFollow()
+        if DEV_MODE { startDevWatch() }
+    }
+
+    // DEV hot reload: `chuks watch` restarts the VM dev server (~1s) whenever a .chuks
+    // file is saved. We poll it off the main thread; when it comes back after a bounce,
+    // we clear the tree and remount from a fresh /mount, so the edit shows with no
+    // rebuild. (Engine state resets on reload; state preservation is a later refinement.)
+    private var devConnected = true
+    private func startDevWatch() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            while self != nil {
+                Thread.sleep(forTimeInterval: 0.4)
+                let up = devHTTP("/state", "", get: true) != nil
+                guard let self = self else { return }
+                if up && !self.devConnected {
+                    DispatchQueue.main.async {
+                        self.nodes.removeAll()
+                        self.apply(Engine.mount())
+                        self.syncFollow()
+                    }
+                }
+                self.devConnected = up
+            }
+        }
     }
     func dispatch(_ tag: String) { apply(Engine.dispatch(tag)); syncFollow() }
     func input(_ tag: String, _ v: String) { apply(Engine.input(tag, v)) }
