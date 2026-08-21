@@ -1,0 +1,16 @@
+{
+  "name": "__APP_NAME__",
+  "version": "0.1.0",
+  "entry": ".chuks/entry.chuks",
+  "iosEngine": "swiftui",
+  "dependencies": {
+    "@chuks/mobile": "^0.1.1"
+  },
+  "scripts": {
+    "ios": "FAST=1 bash chuks_packages/@chuks/mobile/ios/build.sh",
+    "ios:release": "bash chuks_packages/@chuks/mobile/ios/build.sh",
+    "android": "bash chuks_packages/@chuks/mobile/android/build.sh",
+    "dev": "chuks run chuks_packages/@chuks/mobile/core/devserver.chuks",
+    "typecheck": "chuks check .chuks/entry.chuks"
+  }
+}

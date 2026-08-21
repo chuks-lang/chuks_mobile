@@ -1,0 +1,28 @@
+// GENERATED entry (chuks new --template mobile). Do not edit — it bridges your
+// app root (app/app.chuks) to the @chuks/mobile native host C-ABI. The engine glue
+// comes from the installed package; your root comes from ./app.
+import { createRoot } from "../app/app.chuks";
+import { syncSystemTheme, followingSystem } from "pkg/@chuks/mobile/core/theme.chuks";
+import { setSafeInsets } from "pkg/@chuks/mobile/core/ui.chuks";
+import { setPlatformInfo } from "pkg/@chuks/mobile/core/platform.chuks";
+
+var APP = createRoot()
+
+export function set_count(n: int): void { APP.setup(n) }
+export function mount(): int { return APP.mount() }
+export function setViewport(top: int, height: int): int { return APP.setViewport(top, height) }
+export function tick(): int { return APP.tick() }
+export function dispatch(action: string): int { return APP.dispatch(action) }
+export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
+export function drain(): string { return APP.drain() }
+export function saveState(): string { return APP.saveState() }
+export function loadState(data: string): void { APP.loadState(data) }
+export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
+export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
+export function setPlatform(os: string, version: string, model: string, isTablet: int): void {
+    setPlatformInfo(os, version, model, isTablet == 1)
+}

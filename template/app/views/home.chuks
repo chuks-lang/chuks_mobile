@@ -1,0 +1,18 @@
+// The starter Home screen. Edit this file and rebuild to see changes.
+import { Node, Column, Text, Pressable, Comp } from "pkg/@chuks/mobile/core/ui.chuks";
+import { useState, Cell } from "pkg/@chuks/mobile/core/state.chuks";
+import { tk } from "pkg/@chuks/mobile/core/theme.chuks";
+
+function body(): Node {
+    var taps: Cell = useState(0)
+    return Column({ dir: "col", grow: 1, justify: "center", align: "center", gap: 16, pad: 24, bg: tk("bg") }, [
+        Text({ size: 28, weight: "bold", color: tk("text"), ta: "center" }, "Welcome to Chuks Mobile"),
+        Text({ size: 16, color: tk("muted"), ta: "center", w: 300 }, "Edit app/views/home.chuks and rebuild. Add screens in app/views/ and register them in app/app.chuks."),
+        Pressable({ onPress: function(): void { taps.set(int(taps.get()) + 1) },
+                    bg: tk("primary"), radius: 12, pad: 14, w: 240 }, [
+            Text({ size: 16, weight: "bold", color: "FFFFFF", ta: "center" }, "Tapped " + string(taps.get()) + " times"),
+        ]),
+    ])
+}
+
+export function Home(): Node { return Comp(body) }

@@ -1,0 +1,10 @@
+// Your app root. Register screens and pick the start route; each screen is a
+// () -> Node. Add screens under app/views/ and register them here.
+import { Node, NavStack } from "pkg/@chuks/mobile/core/ui.chuks";
+import { Home } from "./views/home.chuks";
+
+export function createRoot(): NavStack {
+    var routes: map[string]()=> Node = {}
+    routes["home"] = Home
+    return new NavStack(routes, "home")
+}

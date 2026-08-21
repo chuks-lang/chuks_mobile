@@ -1,0 +1,5 @@
+# Build outputs
+.chuks/ios-out/
+.chuks/android-out/
+# Installed Chuks packages (fetched via chuks install)
+chuks_packages/
