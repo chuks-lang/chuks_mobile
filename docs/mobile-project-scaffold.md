@@ -10,10 +10,11 @@ Design for how a developer creates and runs a Chuks Mobile app, and how the SDK
    generated runner shells that link the SDK engine. App authors get engine fixes by
    bumping the SDK version, not by re-scaffolding. (The audio / stale-apk incidents
    showed how often the host engine changes; that churn must not land on app authors.)
-2. **Creation: `chuks new <name> --template @chuks/mobile`.** The CLI is a thin launcher:
-   `--template <pkg>` FETCHES a template package from the registry (like `npx
-   react-native init` / `npx expo`) rather than embedding a mobile skeleton in the
-   `chuks` binary. Chuks Mobile grows on its own; the CLI must not chain to its releases.
+2. **Creation: `chuks new <name> --template mobile`.** `mobile` is the friendly template
+   name; the CLI resolves it to the `@chuks/mobile` package and FETCHES the template from
+   the registry (like `npx react-native init` / `npx expo`) rather than embedding a mobile
+   skeleton in the `chuks` binary. The name→package alias is a trivial stable mapping;
+   Chuks Mobile still grows on its own in the package, decoupled from CLI releases.
 3. **Dev loop rides the existing `chuks.json` scripts.** `chuks` already runs a project's
    `scripts` (that is how `chuks ios` / `chuks dev` work). The scaffold points `dev` /
    `run` / `build` at the installed `@chuks/mobile` tooling — so the mobile toolchain
@@ -103,12 +104,13 @@ Where things live:
 
 ### The one generic CLI capability to add
 
-`chuks new <name> --template @chuks/mobile`: teach `new` (main.go:234 / `createProject`
-main.go:1102) to accept `--template <pkg>` and, instead of writing the fixed inline
-skeleton, **fetch the template package from the registry** (reusing the existing
-`add` / `install` / `fetch` machinery) and scaffold from it, then install `@chuks/mobile`
-as a dependency. This is generic (any template package), not mobile-specific. The mobile
-template + all its growth stay in `@chuks/mobile`.
+`chuks new <name> --template mobile`: teach `new` (main.go:234 / `createProject`
+main.go:1102) to accept `--template <name>` and, instead of writing the fixed inline
+skeleton, resolve the template name to its package (`mobile → @chuks/mobile`), **fetch it
+from the registry** (reusing the existing `add` / `install` / `fetch` machinery), scaffold
+from it, and install `@chuks/mobile` as a dependency. The template machinery is generic
+(any friendly name → package); the mobile template + all its growth stay in
+`@chuks/mobile`.
 
 Optional later polish: a `chuks mobile <verb>` alias that forwards to the project scripts
 for discoverability — but it is sugar over `chuks <script>`, not the mechanism.
@@ -123,8 +125,8 @@ for discoverability — but it is sugar over `chuks <script>`, not the mechanism
 2. **Starter template (inside `@chuks/mobile`)** — the project tree (`app/` + `assets/` +
    `chuks.json` whose `scripts` delegate to the SDK tooling + generated runner shells).
    Grows in the package, never in the CLI.
-3. **One generic CLI capability** — `chuks new <name> --template <pkg>`: fetch a template
-   package from the registry (reuse `add`/`install`) and scaffold from it. Not
-   mobile-specific.
-4. **Verify** — `chuks new myapp --template @chuks/mobile` produces a project that builds
-   + runs on SwiftUI, UIKit, and Android.
+3. **One generic CLI capability** — `chuks new <name> --template mobile`: resolve the
+   friendly template name to its package, fetch it from the registry (reuse `add`/`install`)
+   and scaffold from it. The name→package resolution is generic, not mobile-specific.
+4. **Verify** — `chuks new myapp --template mobile` produces a project that builds + runs
+   on SwiftUI, UIKit, and Android.
