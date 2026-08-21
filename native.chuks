@@ -107,6 +107,61 @@ export class SecureStore {
     public static delete(key: string): void { emitNativeCommand("secure.delete", key, null) }
 }
 
+// ---- Local notifications (Tier B) -------------------------------------------
+// Post a local notification. Requires the "notifications" permission (see F2).
+// Both title and body are base64 on the wire (arbitrary text). Fires shortly
+// after the call and appears in the notification shade / as a banner.
+export class Notifications {
+    public static notify(title: string, body: string): void {
+        const b: Base64 = new Base64()
+        emitNativeCommand("notif.notify", b.encode(title) + "|" + b.encode(body), null)
+    }
+}
+
+// ---- Audio playback (Tier B) ------------------------------------------------
+// Play a bundled audio track (an asset filename, e.g. "sample.mp4") through the
+// OS media player. play() (re)loads + starts; pause/resume/stop control it; a
+// single track plays at a time. position() answers (async) with "posMs/durMs" —
+// the proof that playback actually advanced (and freezes while paused).
+export class Audio {
+    public static play(src: string): void { emitNativeCommand("audio.play", src, null) }
+    public static pause(): void { emitNativeCommand("audio.pause", "", null) }
+    public static resume(): void { emitNativeCommand("audio.resume", "", null) }
+    public static stop(): void { emitNativeCommand("audio.stop", "", null) }
+    public static position(onResult: (string)=> void): void { emitNativeCommand("audio.position", "", onResult) }
+}
+
+// ---- Text-to-speech (Tier B) ------------------------------------------------
+// Speak text aloud via the OS speech synthesizer. speak() replaces any current
+// utterance; stop() cancels it. text is base64 on the wire (arbitrary/multiline).
+// isSpeaking() answers (async) "1" while speaking, else "0" -- the proof that the
+// synthesizer engaged. On Android the engine + voice data must be present (it
+// usually is); if absent, isSpeaking stays "0".
+export class Tts {
+    public static speak(text: string): void { emitNativeCommand("tts.speak", new Base64().encode(text), null) }
+    public static stop(): void { emitNativeCommand("tts.stop", "", null) }
+    public static isSpeaking(onResult: (string)=> void): void { emitNativeCommand("tts.isSpeaking", "", onResult) }
+}
+
+// ---- Real streams (Tier B) --------------------------------------------------
+// Live OS state as F3 streams: each fires once immediately with the current value,
+// then again on every change, until the returned NativeSub is cancelled (which
+// unregisters the underlying OS observer -- teardown is verified via
+// Debug.activeStreams reading 0 after cancel, same as Pulse).
+export class Battery {
+    // onChange gets "level,charging", e.g. "87,1" (level 0..100, charging 1/0).
+    // Comma, not "|": "|" is the mutation-wire field delimiter and is unsafe in a payload.
+    public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("battery.watch", "", onChange, null) }
+}
+export class AppState {
+    // onChange gets "active" | "inactive" | "background".
+    public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("appstate.watch", "", onChange, null) }
+}
+export class Network {
+    // onChange gets "wifi" | "cellular" | "none" | "other".
+    public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("network.watch", "", onChange, null) }
+}
+
 // ---- Debug ------------------------------------------------------------------
 // activeStreams() answers (async) with the host's live native-subscription count —
 // the assertion that a stream's NATIVE side was actually released, not just that
