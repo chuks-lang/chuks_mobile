@@ -7,6 +7,7 @@
 // Fire-and-forget capabilities pass no callback (the token is "0"); async reads
 // pass a `(string) -> void` that receives the host's result payload.
 import { emitNativeCommand, emitNativeCommandE, emitNativeStream, NativeSub } from "./ui.chuks";
+import { Base64 } from "std/base64";
 
 // ---- Clipboard --------------------------------------------------------------
 // set() copies text; get() reads it (async — the OS pasteboard read is deferred).
@@ -70,6 +71,25 @@ export class Permission {
     public static request(kind: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("permission.request", kind, onResult, onError)
     }
+}
+
+// ---- File system (Tier B) ---------------------------------------------------
+// Read / write / list / delete files in the app's private document directory.
+// write()'s content is base64-encoded on the wire, because the command channel is
+// newline-delimited and file content is arbitrary/multiline; the host decodes it.
+// read() returns the content directly (the result channel is binary-safe). read of
+// a missing file goes to onError.
+export class FileSystem {
+    public static write(name: string, content: string): void {
+        emitNativeCommand("fs.write", name + "|" + new Base64().encode(content), null)
+    }
+    public static read(name: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("fs.read", name, onResult, onError)
+    }
+    public static list(onResult: (string)=> void): void {
+        emitNativeCommand("fs.list", "", onResult)
+    }
+    public static delete(name: string): void { emitNativeCommand("fs.delete", name, null) }
 }
 
 // ---- Debug ------------------------------------------------------------------
