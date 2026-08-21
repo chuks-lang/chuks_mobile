@@ -1129,13 +1129,14 @@ export class Reconciler {
     var cellRank: map[string]int    // recycling: cell id -> the row rank it currently shows (-1 = free)
     var poolSize: int               // recycling: how many pool cells have been created
     var pending: map[string]any     // async bridge: token -> result closure (survives frames, unlike handlers)
+    var streamTokens: map[string]bool // async bridge: token -> true if a STREAM (fires repeatedly; not dropped on fire)
     var tokenSeq: int               // async bridge: monotonic token counter
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
         this.cellRank = {}; this.poolSize = 0
-        this.pending = {}; this.tokenSeq = 0
+        this.pending = {}; this.streamTokens = {}; this.tokenSeq = 0
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1173,23 +1174,46 @@ export class Reconciler {
     // `args` is a raw string (JSON when structured). The callback survives across
     // frames (it lives in `pending`, which begin() does NOT clear) because the
     // host resolves it on a later runloop turn, not within this batch.
-    public command(cap: string, args: string, cb: any): void {
+    // `stream` = true registers a REPEATING token (fired on every host event until
+    // cancelled) rather than a one-shot. Returns the token so the caller can build a
+    // NativeSub handle to cancel it. A null `cb` is fire-and-forget (token "0").
+    public command(cap: string, args: string, cb: any, stream: bool): string {
         var tok: string = "0"
         if (cb != null) {
             this.tokenSeq = this.tokenSeq + 1
             tok = "k" + string(this.tokenSeq)
             this.pending[tok] = cb
+            if (stream) { this.streamTokens[tok] = true }
         }
         this.emit("X|" + tok + "|" + cap + "|" + args)
+        return tok
     }
-    // The host reports an async result for `token`. Fire the registered callback
-    // with `payload`, then drop it (one-shot). Unknown/late tokens are ignored.
+    // The host reports a result for `token`. Fire the registered callback. A one-shot
+    // token is dropped BEFORE firing (so it can't fire twice); a stream token stays
+    // registered for the next event. An unknown/late token (already cancelled or
+    // dropped) is ignored — this is the fire-after-cancel / fire-during-unmount race
+    // landing safely, mirroring Cell.set's has-guard.
     public fireToken(token: string, payload: string): void {
         if (this.pending.has(token)) {
             const f: any = this.pending[token]
-            this.pending.delete(token)
+            if (!this.streamTokens.getOr(token, false)) { this.pending.delete(token) }
             f(payload)
         }
+    }
+    // Chuks-initiated cancel (a NativeSub.cancel(), typically from a useEffect
+    // cleanup on unmount): drop the token locally AND tell the host to tear down the
+    // native op/subscription, so a stream stops draining battery and a one-shot
+    // aborts. Emits into the current drain, which the host applies.
+    public cancelStream(token: string): void {
+        if (this.pending.has(token)) { this.pending.delete(token) }
+        if (this.streamTokens.has(token)) { this.streamTokens.delete(token) }
+        this.emit("X|" + token + "|__cancel__|")
+    }
+    // Host-initiated death (the user dismissed the picker / the native op ended with
+    // no result): drop the token locally, no host command (the host already knows).
+    public dropToken(token: string): void {
+        if (this.pending.has(token)) { this.pending.delete(token) }
+        if (this.streamTokens.has(token)) { this.streamTokens.delete(token) }
     }
     // register a node's event closure (tag = the node id), and emit its T binding
     bindEvents(n: Node, id: string): void {
@@ -1495,20 +1519,48 @@ export class App {
     public resolve(token: string, payload: string): int {
         this.recon.begin(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
+    // The host reports that `token` is dead (user dismissed the picker, native op
+    // ended with no result). Drop it and re-render. Mirrors resolve, without a fire.
+    public cancelToken(token: string): int {
+        this.recon.begin(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+    }
     // Return the pending mutation stream as text and hand it to the host.
     public drain(): string { return this.recon.drain() }
+}
+
+// A handle to an outstanding native request (async one-shot or a stream). Hold it
+// to cancel: `sub.cancel()` drops the callback and tells the host to tear down the
+// native op/subscription. For streams, call cancel() in a useEffect cleanup so
+// hookSweep tears it down on unmount (no leaked native listener).
+export class NativeSub {
+    var token: string
+    constructor(token: string) { this.token = token }
+    public cancel(): void { const h: App? = HOST; if (h != null) { h.recon.cancelStream(this.token) } }
 }
 
 /**
  * Request a native capability from the host (the async host->engine bridge).
  * `cap` is the capability id (e.g. "clipboard.get"), `args` a raw string payload
  * (JSON when structured), and `cb` an optional `(string) -> void` fired with the
- * host's result. Capability wrappers in core/native.chuks call this; app code
- * uses those wrappers (Clipboard, Share, ...) rather than raw command ids.
+ * host's result. Returns a NativeSub you can cancel(). Capability wrappers in
+ * core/native.chuks call this; app code uses those (Clipboard, Share, ...).
  */
-export function emitNativeCommand(cap: string, args: string, cb: any): void {
+export function emitNativeCommand(cap: string, args: string, cb: any): NativeSub {
     const h: App? = HOST
-    if (h != null) { h.recon.command(cap, args, cb) }
+    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, false)) }
+    return new NativeSub("0")
+}
+
+/**
+ * Subscribe to a native STREAM (repeating events: battery, app state, location,
+ * sensors). `cb` fires on every event until you cancel the returned NativeSub.
+ * Start streams in a useEffect and cancel() in its cleanup so they tear down on
+ * unmount.
+ */
+export function emitNativeStream(cap: string, args: string, cb: any): NativeSub {
+    const h: App? = HOST
+    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, true)) }
+    return new NativeSub("0")
 }
 
 // ---- NavStack: named routing ----------------------------------------------

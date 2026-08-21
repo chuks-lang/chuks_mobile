@@ -22,6 +22,9 @@ export function dispatchInput(action: string, value: string): int { return APP.d
 // requested via an `X|token|...` command completes, passing the same token and a
 // result payload. Fires the registered Chuks callback and re-renders.
 export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+// The host reports a token died with no result (user dismissed a picker, a native
+// op ended). Drop the callback so it never fires and doesn't leak. (F3 teardown.)
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
 export function drain(): string { return APP.drain() }
 export function saveState(): string { return APP.saveState() }
 export function loadState(data: string): void { APP.loadState(data) }

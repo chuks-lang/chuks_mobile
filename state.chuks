@@ -30,7 +30,12 @@ export class Cell {
     var k: string
     constructor(k: string) { this.k = k }
     public get(): any { return _cells.getOr(this.k, null) }
-    public set(v: any): void { _cells[this.k] = v }
+    // Only update a cell that still exists. While the component is mounted useState
+    // seeds it, so set() works; after it unmounts hookSweep drops the cell, so set()
+    // is a no-op instead of resurrecting a dead cell. This makes a late async/stream
+    // callback firing into an unmounted component harmless (React's "setState on an
+    // unmounted component is a no-op") — the fire-after-unmount race lands here.
+    public set(v: any): void { if (_cells.has(this.k)) { _cells[this.k] = v } }
 }
 
 /**

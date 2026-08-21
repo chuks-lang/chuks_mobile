@@ -6,7 +6,7 @@
 //
 // Fire-and-forget capabilities pass no callback (the token is "0"); async reads
 // pass a `(string) -> void` that receives the host's result payload.
-import { emitNativeCommand } from "./ui.chuks";
+import { emitNativeCommand, emitNativeStream, NativeSub } from "./ui.chuks";
 
 // ---- Clipboard --------------------------------------------------------------
 // set() copies text; get() reads it (async — the OS pasteboard read is deferred).
@@ -46,4 +46,20 @@ export class Torch {
 export class Brightness {
     public static set(level: float): void { emitNativeCommand("brightness.set", string(level), null) }
     public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", on ? "1" : "0", null) }
+}
+
+// ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------
+// A minimal repeating stream used to exercise + prove the teardown path: start it
+// in a useEffect, cancel() the returned NativeSub in the cleanup, and on unmount
+// hookSweep tears down the native timer. `onTick` gets the tick count as a string.
+export class Pulse {
+    public static watch(onTick: (string)=> void): NativeSub { return emitNativeStream("pulse.watch", "", onTick) }
+}
+
+// ---- Debug ------------------------------------------------------------------
+// activeStreams() answers (async) with the host's live native-subscription count —
+// the assertion that a stream's NATIVE side was actually released, not just that
+// Chuks stopped receiving. Should read "0" after every stream is cancelled.
+export class Debug {
+    public static activeStreams(onResult: (string)=> void): void { emitNativeCommand("debug.activeStreams", "", onResult) }
 }
