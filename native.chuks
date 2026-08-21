@@ -56,6 +56,22 @@ export class Pulse {
     public static watch(onTick: (string)=> void): NativeSub { return emitNativeStream("pulse.watch", "", onTick, null) }
 }
 
+// ---- Permissions (F2) -------------------------------------------------------
+// One primitive every gated capability reuses. `kind` is one of: "camera",
+// "microphone", "location", "notifications", "photos". status() reads the current
+// grant WITHOUT prompting; request() shows the OS dialog (once) and reports the
+// outcome. Both answer via onResult with: "granted" | "denied" | "undetermined" |
+// "restricted" (Android reports only granted/denied). onError (request only) fires
+// for an unknown kind or a platform failure. Built entirely on the F3 bridge.
+export class Permission {
+    public static status(kind: string, onResult: (string)=> void): void {
+        emitNativeCommand("permission.status", kind, onResult)
+    }
+    public static request(kind: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("permission.request", kind, onResult, onError)
+    }
+}
+
 // ---- Debug ------------------------------------------------------------------
 // activeStreams() answers (async) with the host's live native-subscription count —
 // the assertion that a stream's NATIVE side was actually released, not just that
