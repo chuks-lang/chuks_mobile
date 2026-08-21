@@ -23,29 +23,28 @@ export CHUKS_NO_WARNINGS=1
 rm -rf "$OUT" ~/.chuks/cache/builds/*; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the .so is compiled inside the cache dir, so its -o must be absolute
 
-echo "1. chuks AOT -> Go  (compiles YOUR app through pkg/@chuks/mobile; generated Go stays in the cache)"
+echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )   # --c-archive emits the chuks_* C-ABI bridge
-BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated Go lives here, under ~/.chuks/cache
+BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated sources live here, under ~/.chuks/cache
 # Stage the JNI bridge + cgo link flags + Yoga (from the PACKAGE) next to the generated Go.
 cp "$PKGDIR/jni.cpp" "$PKGDIR/cgo_android.go" "$BD/"
 mkdir -p "$BD/yoga"; cp "$PKGDIR/yoga/libyoga.a" "$BD/yoga/"; cp -r "$SDKROOT/core/yoga/include" "$BD/yoga/"
 
-echo "2. engine + JNI + Yoga -> libapp.so (android arm64; only the .so lands in $OUT)"
+echo "2. Building the Android engine (arm64)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC" CXX="$CXX" \
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" . )
-file "$OUT/libapp.so" | cut -d, -f1-2
 
-echo "3. kotlinc -> jar  (Kotlin host from the package)"
+echo "3. Building the Android host"
 kotlinc "$PKGDIR/MainActivity.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" 2>&1 | grep -iE "error|warning: unable" | head || true
 
-echo "4. d8 -> dex"
+echo "4. Preparing app classes"
 "$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar"
 
-echo "5. aapt2 link -> base.apk  (manifest from the package)"
+echo "5. Linking resources"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$PKGDIR/AndroidManifest.xml" \
     --min-sdk-version 24 --target-sdk-version 34
 
-echo "6. package dex + .so (+ libc++_shared) + YOUR assets into the apk"
+echo "6. Bundling the app (+ your assets)"
 mkdir -p "$OUT/lib/arm64-v8a"; cp "$OUT/libapp.so" "$OUT/lib/arm64-v8a/"
 CXXSHARED="$BIN/../sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 cp "$CXXSHARED" "$OUT/lib/arm64-v8a/"
@@ -61,7 +60,7 @@ for f in $(find -L "$PROJDIR/assets" -name "*.mp4" -o -name "*.wav" -o -name "*.
 "$BT/apksigner" sign --ks "$HOME/.android/debug.keystore" \
     --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android "$OUT/chuks.apk"
 
-echo "7. install + launch"
+echo "7. Installing + launching"
 "$ADB" install -r "$OUT/chuks.apk"
 "$ADB" shell am force-stop "$PKG" || true
 "$ADB" shell am start -n "$PKG/.MainActivity"

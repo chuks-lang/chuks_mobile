@@ -29,11 +29,11 @@ TRIPLE="arm64-apple-ios15.0-simulator"
 YOGA="$PKGDIR/yoga"                       # iOS-sim arm64 libyoga.a (in the package)
 YOGA_INC="$SDKROOT/core/yoga/include"     # shared Yoga headers (in the package)
 
-echo "1. chuks AOT -> Go (compiles YOUR app through pkg/@chuks/mobile; generated Go stays in the cache)"
+echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )
-BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated Go lives here, under ~/.chuks/cache
+BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated sources live under ~/.chuks/cache
 
-echo "2. c-archive for iOS simulator (compiled in place in the cache; only artifacts land in $OUT)"
+echo "2. Building the iOS engine (arm64 simulator)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
     CC="$SIMCC -isysroot $SIMSDK -target $TRIPLE" CGO_CFLAGS="-isysroot $SIMSDK -target $TRIPLE" \
     go build -buildmode=c-archive -tags ios -o "$OUTABS/libapp.a" . )   # emits $OUT/libapp.a + $OUT/libapp.h
@@ -43,7 +43,7 @@ ENGINE="${IOS_ENGINE:-$(sed -n 's/.*"iosEngine"[^"]*"\([a-z]*\)".*/\1/p' "$PROJD
 [ -z "$ENGINE" ] && ENGINE="uikit"
 
 if [ "$ENGINE" = "swiftui" ]; then
-    echo "3. swiftc SwiftUI host (native layout; no Yoga) [iosEngine=swiftui]"
+    echo "3. Building the SwiftUI host"
     printf '#include "libapp.h"\n' > "$OUT/app_bridge.h"
     swiftc "$PKGDIR/ChuksAppSwiftUI.swift" -sdk "$SIMSDK" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" \
@@ -52,7 +52,7 @@ if [ "$ENGINE" = "swiftui" ]; then
         -framework SwiftUI -framework UIKit -framework Foundation -framework AVKit -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG \
         -o "$OUT/ChuksDashboard"
 else
-    echo "3. swiftc UIKit host (+ Yoga flexbox engine) [iosEngine=uikit]"
+    echo "3. Building the UIKit host"
     printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
     swiftc "$PKGDIR/ChuksApp.swift" -sdk "$SIMSDK" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
@@ -62,7 +62,7 @@ else
         -o "$OUT/ChuksDashboard"
 fi
 
-echo "4. assemble app (+ YOUR assets/fonts)"
+echo "4. Assembling the app (+ your assets)"
 mkdir -p "$APP"; cp "$OUT/ChuksDashboard" "$APP/ChuksDashboard"
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 FONT_PLIST=""
@@ -97,7 +97,7 @@ PLIST
 
 UDID="$(xcrun simctl list devices | awk -F'[()]' '/Booted/{print $2; exit}')"
 [ -z "$UDID" ] && { echo "no booted simulator"; exit 1; }
-echo "5. install + launch on $UDID"
+echo "5. Installing + launching"
 xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
 xcrun simctl install "$UDID" "$APP"
 xcrun simctl launch "$UDID" "$BID"

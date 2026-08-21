@@ -4,7 +4,7 @@
   "entry": ".chuks/entry.chuks",
   "iosEngine": "swiftui",
   "dependencies": {
-    "@chuks/mobile": "^0.1.2"
+    "@chuks/mobile": "^0.1.3"
   },
   "scripts": {
     "ios": "FAST=1 bash chuks_packages/@chuks/mobile/ios/build.sh",
