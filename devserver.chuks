@@ -8,7 +8,7 @@
 // the reload. (The host process stays alive, so scroll/focus persist for free.)
 import { createServer, Request, Response } from "std/http";
 import { fs } from "std/fs";
-import { set_count, mount, tick, setViewport, dispatch, dispatchInput, drain, saveState, loadState } from "./entry.chuks";
+import { set_count, mount, tick, setViewport, dispatch, dispatchInput, resolve, drain, saveState, loadState } from "./entry.chuks";
 
 const STATE_FILE: string = "/tmp/chuks-mobile-state.txt"
 
@@ -34,6 +34,13 @@ app.post("/input", function(req: Request, res: Response) {
     const nl: int = b.indexOf("\n")
     if (nl >= 0) { dispatchInput(b.slice(0, nl), b.slice(nl + 1)) }
     else { dispatchInput(b.trim(), "") }
+    res.send(drain())
+})
+app.post("/resolve", function(req: Request, res: Response) {   // "token\npayload" — async host->engine result (F3)
+    const b: string = req.body
+    const nl: int = b.indexOf("\n")
+    if (nl >= 0) { resolve(b.slice(0, nl), b.slice(nl + 1)) }
+    else { resolve(b.trim(), "") }
     res.send(drain())
 })
 app.get("/state", function(req: Request, res: Response) { res.send(saveState()) })

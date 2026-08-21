@@ -1,0 +1,49 @@
+// Native capabilities — part of @chuks/mobile. Each capability is a thin wrapper
+// over the async host->engine bridge (emitNativeCommand): it emits an
+// `X|token|capability|args` command that the native host (iOS/Android) executes,
+// and for async reads the host calls resolve(token, payload), which fires your
+// callback. Your app code uses these wrappers, never the raw command ids.
+//
+// Fire-and-forget capabilities pass no callback (the token is "0"); async reads
+// pass a `(string) -> void` that receives the host's result payload.
+import { emitNativeCommand } from "./ui.chuks";
+
+// ---- Clipboard --------------------------------------------------------------
+// set() copies text; get() reads it (async — the OS pasteboard read is deferred).
+export class Clipboard {
+    public static set(text: string): void { emitNativeCommand("clipboard.set", text, null) }
+    public static get(onResult: (string)=> void): void { emitNativeCommand("clipboard.get", "", onResult) }
+}
+
+// ---- Linking ----------------------------------------------------------------
+// Open a URL, tel:, mailto:, or app scheme in the OS. canOpen() answers async
+// with "1"/"0".
+export class Linking {
+    public static open(url: string): void { emitNativeCommand("linking.open", url, null) }
+    public static canOpen(url: string, onResult: (string)=> void): void { emitNativeCommand("linking.canOpen", url, onResult) }
+}
+
+// ---- Share ------------------------------------------------------------------
+// Present the OS share sheet with text and/or a URL.
+export class Share {
+    public static text(t: string): void { emitNativeCommand("share.text", t, null) }
+    public static url(u: string): void { emitNativeCommand("share.url", u, null) }
+}
+
+// ---- Haptics ----------------------------------------------------------------
+// style: "light" | "medium" | "heavy" | "success" | "warning" | "error" | "selection".
+export class Haptics {
+    public static impact(style: string): void { emitNativeCommand("haptics.impact", style, null) }
+}
+
+// ---- Torch / flashlight -----------------------------------------------------
+export class Torch {
+    public static set(on: bool): void { emitNativeCommand("torch.set", on ? "1" : "0", null) }
+}
+
+// ---- Screen brightness ------------------------------------------------------
+// level is 0.0..1.0. keepAwake() toggles the idle timer (keep the screen on).
+export class Brightness {
+    public static set(level: float): void { emitNativeCommand("brightness.set", string(level), null) }
+    public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", on ? "1" : "0", null) }
+}

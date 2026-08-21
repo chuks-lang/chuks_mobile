@@ -1128,11 +1128,14 @@ export class Reconciler {
     var listCount: int              // last content count (to re-emit content height only on change)
     var cellRank: map[string]int    // recycling: cell id -> the row rank it currently shows (-1 = free)
     var poolSize: int               // recycling: how many pool cells have been created
+    var pending: map[string]any     // async bridge: token -> result closure (survives frames, unlike handlers)
+    var tokenSeq: int               // async bridge: monotonic token counter
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
         this.cellRank = {}; this.poolSize = 0
+        this.pending = {}; this.tokenSeq = 0
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1160,6 +1163,33 @@ export class Reconciler {
     // Fire the onChange(value) closure bound to node `tag` (from an input).
     public fireValue(tag: string, value: string): void {
         if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value) }
+    }
+    // ---- async host->engine bridge (F3) --------------------------------------
+    // Request a native capability. If `cb` is non-null it is registered under a
+    // fresh token and the host calls back resolve(token, payload) when the async
+    // work completes; a null `cb` is fire-and-forget (token "0"). Emits the
+    // command into the SAME drain stream the host already applies, as an X op:
+    //   X|token|capability|args
+    // `args` is a raw string (JSON when structured). The callback survives across
+    // frames (it lives in `pending`, which begin() does NOT clear) because the
+    // host resolves it on a later runloop turn, not within this batch.
+    public command(cap: string, args: string, cb: any): void {
+        var tok: string = "0"
+        if (cb != null) {
+            this.tokenSeq = this.tokenSeq + 1
+            tok = "k" + string(this.tokenSeq)
+            this.pending[tok] = cb
+        }
+        this.emit("X|" + tok + "|" + cap + "|" + args)
+    }
+    // The host reports an async result for `token`. Fire the registered callback
+    // with `payload`, then drop it (one-shot). Unknown/late tokens are ignored.
+    public fireToken(token: string, payload: string): void {
+        if (this.pending.has(token)) {
+            const f: any = this.pending[token]
+            this.pending.delete(token)
+            f(payload)
+        }
     }
     // register a node's event closure (tag = the node id), and emit its T binding
     bindEvents(n: Node, id: string): void {
@@ -1422,9 +1452,13 @@ export class Reconciler {
 //        runApp(new MyScreen())
 //      -- the host contract below (mount/tick/dispatch/...) is generated here,
 //      never in app code. ----------------------------------------------------
+// The active App (set in its constructor), so a capability called from anywhere
+// can reach the reconciler to enqueue an async command. One app instance exists.
+var HOST: App? = null
+
 export class App {
     var recon: Reconciler
-    constructor() { this.recon = new Reconciler() }
+    constructor() { this.recon = new Reconciler(); HOST = this }
     // ---- hooks you override ----
     // One-time initialization with a size hint `n` (e.g. seed data). Optional.
     public setup(_n: int): void { }
@@ -1455,8 +1489,26 @@ export class App {
     public dispatchInput(tag: string, value: string): int {
         this.recon.begin(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
+    // A native async result arrived for `token` (F3): fire the registered callback
+    // with `payload`, then re-render. Mirrors dispatch, but keyed by an async token
+    // rather than a UI node id.
+    public resolve(token: string, payload: string): int {
+        this.recon.begin(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+    }
     // Return the pending mutation stream as text and hand it to the host.
     public drain(): string { return this.recon.drain() }
+}
+
+/**
+ * Request a native capability from the host (the async host->engine bridge).
+ * `cap` is the capability id (e.g. "clipboard.get"), `args` a raw string payload
+ * (JSON when structured), and `cb` an optional `(string) -> void` fired with the
+ * host's result. Capability wrappers in core/native.chuks call this; app code
+ * uses those wrappers (Clipboard, Share, ...) rather than raw command ids.
+ */
+export function emitNativeCommand(cap: string, args: string, cb: any): void {
+    const h: App? = HOST
+    if (h != null) { h.recon.command(cap, args, cb) }
 }
 
 // ---- NavStack: named routing ----------------------------------------------

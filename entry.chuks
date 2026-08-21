@@ -18,6 +18,10 @@ export function setViewport(top: int, height: int): int { return APP.setViewport
 export function tick(): int { return APP.tick() }
 export function dispatch(action: string): int { return APP.dispatch(action) }
 export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+// Async host->engine bridge (F3): the host calls this when a native capability
+// requested via an `X|token|...` command completes, passing the same token and a
+// result payload. Fires the registered Chuks callback and re-renders.
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
 export function drain(): string { return APP.drain() }
 export function saveState(): string { return APP.saveState() }
 export function loadState(data: string): void { APP.loadState(data) }
