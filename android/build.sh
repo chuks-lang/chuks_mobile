@@ -35,10 +35,19 @@ echo "2. Building the Android engine (arm64)"
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" . )
 
 echo "3. Building the Android host"
-kotlinc "$PKGDIR/MainActivity.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" 2>&1 | grep -iE "error|warning: unable" | head || true
+if ! kotlinc "$PKGDIR/MainActivity.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1; then
+    echo "  Build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1
+fi
 
 echo "4. Preparing app classes"
-"$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar"
+# The bundled dexer floods benign Kotlin-metadata warnings (its metadata parser is
+# older than the compiler that produced the stdlib); the output is still valid, and
+# it ran fine in every test. Capture it and only surface a genuine failure.
+if ! "$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar" > "$OUT/d8.log" 2>&1; then
+    echo "  Failed to prepare app classes:"
+    grep -viE "kotlin.?Metadata|Should never be called|ForkJoin|^[[:space:]]+at (com\.android|java\.base)|kotlinx-metadata|newer version of kotlin|rewriting of Kotlin" "$OUT/d8.log" | tail -20
+    exit 1
+fi
 
 echo "5. Linking resources"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$PKGDIR/AndroidManifest.xml" \
@@ -56,11 +65,14 @@ for f in $(find -L "$PROJDIR/assets" -name "*.mp4" -o -name "*.wav" -o -name "*.
 ( cd "$OUT" && zip -qj base.apk classes.dex && zip -q base.apk lib/arm64-v8a/libapp.so lib/arm64-v8a/libc++_shared.so \
     && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
     && for mv in assets/*.mp4 assets/*.wav assets/*.mp3 assets/*.m4a; do [ -e "$mv" ] && zip -0 -q base.apk "$mv" || true; done )   # -0: store media uncompressed so MediaPlayer.openFd hands back a seekable descriptor; || true so a non-matching glob doesn't trip set -e
-"$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/chuks.apk"
+"$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/chuks.apk" > "$OUT/zipalign.log" 2>&1 || { echo "  Alignment failed:"; cat "$OUT/zipalign.log"; exit 1; }
+# apksigner emits benign JVM restricted-method warnings on newer JDKs; hide unless it fails.
 "$BT/apksigner" sign --ks "$HOME/.android/debug.keystore" \
-    --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android "$OUT/chuks.apk"
+    --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android "$OUT/chuks.apk" > "$OUT/apksigner.log" 2>&1 \
+    || { echo "  Signing failed:"; cat "$OUT/apksigner.log"; exit 1; }
 
 echo "7. Installing + launching"
-"$ADB" install -r "$OUT/chuks.apk"
-"$ADB" shell am force-stop "$PKG" || true
-"$ADB" shell am start -n "$PKG/.MainActivity"
+"$ADB" install -r "$OUT/chuks.apk" > "$OUT/adb.log" 2>&1 || { echo "  Install failed:"; cat "$OUT/adb.log"; exit 1; }
+"$ADB" shell am force-stop "$PKG" > /dev/null 2>&1 || true
+"$ADB" shell am start -n "$PKG/.MainActivity" > /dev/null 2>&1
+echo "   Done."
