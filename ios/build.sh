@@ -1,33 +1,36 @@
 #!/usr/bin/env bash
-# The real Chuks Mobile demo: a memoized reconciler driving real UIViews via
-# minimal diffs, live on the iOS simulator. Cross-compiles the engine for the
-# iOS simulator, links a UIKit host, installs + launches on the booted sim.
+# iOS host build, provided by @chuks/mobile. Run from a Chuks project root
+# (`bash chuks_packages/@chuks/mobile/ios/build.sh`, or via the chuks.json "ios"
+# script). Reads the Swift host + Yoga from the installed package, AOT-compiles
+# YOUR app (chuks.json entry) through the package, links a native host, and
+# installs on the booted simulator. Engine: chuks.json "iosEngine" (swiftui|uikit).
 set -euo pipefail
-cd "$(dirname "$0")"
+PKGDIR="$(cd "$(dirname "$0")" && pwd)"       # chuks_packages/@chuks/mobile/ios (host source)
+SDKROOT="$(cd "$PKGDIR/.." && pwd)"           # chuks_packages/@chuks/mobile
+PROJDIR="$(pwd)"                              # consumer project root
+[ -f "$PROJDIR/chuks.json" ] || { echo "run from a Chuks project root (no chuks.json here)"; exit 1; }
+ENTRY="$(sed -n 's/.*"entry"[^"]*"\([^"]*\)".*/\1/p' "$PROJDIR/chuks.json" | head -1)"
+ENTRY="$PROJDIR/${ENTRY:-.chuks/entry.chuks}"
+[ -f "$ENTRY" ] || { echo "no entry module at $ENTRY"; exit 1; }
 
 export CHUKS_NO_WARNINGS=1
-OUT=".out"; APP="$OUT/ChuksDashboard.app"; BID="com.chuks.dashboard"
+OUT="$PROJDIR/.chuks/ios-out"; APP="$OUT/ChuksDashboard.app"; BID="com.chuks.dashboard"
 rm -rf "$OUT"; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the c-archive is compiled inside the cache dir, so its -o must be absolute
-# Cold build wipes the AOT cache for reproducibility; FAST=1 (the dev loop) keeps
-# it so the Go/stdlib recompile is incremental -- seconds instead of a cold pass.
-# FAST also drops swiftc optimization (-Onone), the biggest single cost (~2.1s -> ~0.7s).
+# Cold build wipes the AOT cache for reproducibility; FAST=1 (the dev loop) keeps it.
 [ "${FAST:-0}" = "1" ] || rm -rf ~/.chuks/cache/builds/*
 SWIFT_OPT="-O"; [ "${FAST:-0}" = "1" ] && SWIFT_OPT="-Onone"
-# DEV=1 builds the host in hot-reload mode: it fetches the mutation stream from
-# the Chuks VM dev server over HTTP instead of the AOT-linked engine.
 DEV_FLAG=""; [ "${DEV:-0}" = "1" ] && DEV_FLAG="-D DEV"
-# BENCHMARK=1 compiles the host's auto-scroll + per-frame fps harness (off in normal apps).
 BENCH_FLAG=""; [ "${BENCHMARK:-0}" = "1" ] && BENCH_FLAG="-D BENCHMARK"
 
 SIMSDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
 SIMCC="$(xcrun --sdk iphonesimulator --find clang)"
 TRIPLE="arm64-apple-ios15.0-simulator"
-YOGA="$(pwd)/yoga"                       # iOS-sim arm64 libyoga.a (platform-specific)
-YOGA_INC="$(cd ../core/yoga/include && pwd)"   # shared Yoga headers (in core/)
+YOGA="$PKGDIR/yoga"                       # iOS-sim arm64 libyoga.a (in the package)
+YOGA_INC="$SDKROOT/core/yoga/include"     # shared Yoga headers (in the package)
 
-echo "1. chuks AOT -> Go (--c-archive emits the chuks_* C-ABI bridge; generated Go stays in the cache, never in the project)"
-chuks build --c-archive ../core/entry.chuks -o "$OUT/e" >/dev/null
+echo "1. chuks AOT -> Go (compiles YOUR app through pkg/@chuks/mobile; generated Go stays in the cache)"
+( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )
 BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated Go lives here, under ~/.chuks/cache
 
 echo "2. c-archive for iOS simulator (compiled in place in the cache; only artifacts land in $OUT)"
@@ -35,16 +38,14 @@ echo "2. c-archive for iOS simulator (compiled in place in the cache; only artif
     CC="$SIMCC -isysroot $SIMSDK -target $TRIPLE" CGO_CFLAGS="-isysroot $SIMSDK -target $TRIPLE" \
     go build -buildmode=c-archive -tags ios -o "$OUTABS/libapp.a" . )   # emits $OUT/libapp.a + $OUT/libapp.h
 
-# Pick the iOS render engine: env IOS_ENGINE wins, else chuks.json "iosEngine",
-# else uikit. Both hosts consume the same C ABI + mutation stream; only rendering
-# differs. SwiftUI host needs no Yoga (SwiftUI does its own layout).
-ENGINE="${IOS_ENGINE:-$(sed -n 's/.*"iosEngine"[^"]*"\([a-z]*\)".*/\1/p' ../chuks.json | head -1)}"
+# Pick the iOS render engine: env IOS_ENGINE wins, else chuks.json "iosEngine", else uikit.
+ENGINE="${IOS_ENGINE:-$(sed -n 's/.*"iosEngine"[^"]*"\([a-z]*\)".*/\1/p' "$PROJDIR/chuks.json" | head -1)}"
 [ -z "$ENGINE" ] && ENGINE="uikit"
 
 if [ "$ENGINE" = "swiftui" ]; then
     echo "3. swiftc SwiftUI host (native layout; no Yoga) [iosEngine=swiftui]"
     printf '#include "libapp.h"\n' > "$OUT/app_bridge.h"
-    swiftc ChuksAppSwiftUI.swift -sdk "$SIMSDK" -target "$TRIPLE" \
+    swiftc "$PKGDIR/ChuksAppSwiftUI.swift" -sdk "$SIMSDK" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" \
         "$OUT/libapp.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
@@ -53,7 +54,7 @@ if [ "$ENGINE" = "swiftui" ]; then
 else
     echo "3. swiftc UIKit host (+ Yoga flexbox engine) [iosEngine=uikit]"
     printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
-    swiftc ChuksApp.swift -sdk "$SIMSDK" -target "$TRIPLE" \
+    swiftc "$PKGDIR/ChuksApp.swift" -sdk "$SIMSDK" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
         "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
@@ -61,16 +62,14 @@ else
         -o "$OUT/ChuksDashboard"
 fi
 
-echo "4. assemble app"
+echo "4. assemble app (+ YOUR assets/fonts)"
 mkdir -p "$APP"; cp "$OUT/ChuksDashboard" "$APP/ChuksDashboard"
-# Discover + bundle icon fonts from local assets/ and any installed package
-# (chuks_packages/**/assets/*.ttf), and register each in UIAppFonts.
+# -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 FONT_PLIST=""
-for f in $(find ../assets ../chuks_packages -name "*.ttf" 2>/dev/null); do
+for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do
     bn="$(basename "$f")"; cp "$f" "$APP/$bn"; FONT_PLIST="$FONT_PLIST<string>$bn</string>"
 done
-# bundle media assets (videos/images/audio) next to the executable
-for f in $(find ../assets -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" 2>/dev/null); do cp "$f" "$APP/$(basename "$f")"; done
+for f in $(find -L "$PROJDIR/assets" -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" 2>/dev/null); do cp "$f" "$APP/$(basename "$f")"; done
 cat > "$APP/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
