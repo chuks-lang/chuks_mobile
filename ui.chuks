@@ -1129,6 +1129,7 @@ export class Reconciler {
     var cellRank: map[string]int    // recycling: cell id -> the row rank it currently shows (-1 = free)
     var poolSize: int               // recycling: how many pool cells have been created
     var pending: map[string]any     // async bridge: token -> result closure (survives frames, unlike handlers)
+    var pendingErr: map[string]any  // async bridge: token -> OPTIONAL error closure (host reports a failure)
     var streamTokens: map[string]bool // async bridge: token -> true if a STREAM (fires repeatedly; not dropped on fire)
     var tokenSeq: int               // async bridge: monotonic token counter
     constructor() {
@@ -1136,7 +1137,7 @@ export class Reconciler {
         this.vpTop = 0; this.vpH = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
         this.cellRank = {}; this.poolSize = 0
-        this.pending = {}; this.streamTokens = {}; this.tokenSeq = 0
+        this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1177,16 +1178,27 @@ export class Reconciler {
     // `stream` = true registers a REPEATING token (fired on every host event until
     // cancelled) rather than a one-shot. Returns the token so the caller can build a
     // NativeSub handle to cancel it. A null `cb` is fire-and-forget (token "0").
-    public command(cap: string, args: string, cb: any, stream: bool): string {
+    // `onErr` (optional) is fired if the host reports a FAILURE for this request
+    // (permission denied at the OS level, hardware missing, native op errored) —
+    // distinct from a valid result. Failable capabilities pass it; simple ones null.
+    public command(cap: string, args: string, cb: any, onErr: any, stream: bool): string {
         var tok: string = "0"
         if (cb != null) {
             this.tokenSeq = this.tokenSeq + 1
             tok = "k" + string(this.tokenSeq)
             this.pending[tok] = cb
+            if (onErr != null) { this.pendingErr[tok] = onErr }
             if (stream) { this.streamTokens[tok] = true }
         }
         this.emit("X|" + tok + "|" + cap + "|" + args)
         return tok
+    }
+    // Drop a token from every registry (success/error/stream). Central so cancel,
+    // drop, one-shot success, and failure all forget the token the same way.
+    forgetToken(token: string): void {
+        if (this.pending.has(token)) { this.pending.delete(token) }
+        if (this.pendingErr.has(token)) { this.pendingErr.delete(token) }
+        if (this.streamTokens.has(token)) { this.streamTokens.delete(token) }
     }
     // The host reports a result for `token`. Fire the registered callback. A one-shot
     // token is dropped BEFORE firing (so it can't fire twice); a stream token stays
@@ -1196,8 +1208,18 @@ export class Reconciler {
     public fireToken(token: string, payload: string): void {
         if (this.pending.has(token)) {
             const f: any = this.pending[token]
-            if (!this.streamTokens.getOr(token, false)) { this.pending.delete(token) }
+            if (!this.streamTokens.getOr(token, false)) { this.forgetToken(token) }
             f(payload)
+        }
+    }
+    // The host reports a FAILURE for `token`. Fire the error callback (if any) and
+    // forget the token entirely — an error terminates the request (one-shot or
+    // stream). Same has-guard: a late/unknown failure is ignored.
+    public failToken(token: string, message: string): void {
+        if (this.pending.has(token)) {
+            const onErr: any = this.pendingErr.getOr(token, null)
+            this.forgetToken(token)
+            if (onErr != null) { onErr(message) }
         }
     }
     // Chuks-initiated cancel (a NativeSub.cancel(), typically from a useEffect
@@ -1205,16 +1227,12 @@ export class Reconciler {
     // native op/subscription, so a stream stops draining battery and a one-shot
     // aborts. Emits into the current drain, which the host applies.
     public cancelStream(token: string): void {
-        if (this.pending.has(token)) { this.pending.delete(token) }
-        if (this.streamTokens.has(token)) { this.streamTokens.delete(token) }
+        this.forgetToken(token)
         this.emit("X|" + token + "|__cancel__|")
     }
     // Host-initiated death (the user dismissed the picker / the native op ended with
     // no result): drop the token locally, no host command (the host already knows).
-    public dropToken(token: string): void {
-        if (this.pending.has(token)) { this.pending.delete(token) }
-        if (this.streamTokens.has(token)) { this.streamTokens.delete(token) }
-    }
+    public dropToken(token: string): void { this.forgetToken(token) }
     // register a node's event closure (tag = the node id), and emit its T binding
     bindEvents(n: Node, id: string): void {
         if (n.onPress != null) { this.handlers[id] = n.onPress; this.emit("T|" + id + "|" + id) }
@@ -1524,6 +1542,11 @@ export class App {
     public cancelToken(token: string): int {
         this.recon.begin(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
+    // The host reports a FAILURE for `token` (permission denied, hardware missing,
+    // native error). Fire the request's error callback and re-render.
+    public failToken(token: string, message: string): int {
+        this.recon.begin(); this.recon.failToken(token, message); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+    }
     // Return the pending mutation stream as text and hand it to the host.
     public drain(): string { return this.recon.drain() }
 }
@@ -1547,19 +1570,30 @@ export class NativeSub {
  */
 export function emitNativeCommand(cap: string, args: string, cb: any): NativeSub {
     const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, false)) }
+    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, null, false)) }
+    return new NativeSub("0")
+}
+
+/**
+ * Like emitNativeCommand, but for a capability that can FAIL: `onErr` (a
+ * `(string) -> void`) fires with the host's error message if the request fails
+ * (permission denied, hardware missing), instead of `cb`.
+ */
+export function emitNativeCommandE(cap: string, args: string, cb: any, onErr: any): NativeSub {
+    const h: App? = HOST
+    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, onErr, false)) }
     return new NativeSub("0")
 }
 
 /**
  * Subscribe to a native STREAM (repeating events: battery, app state, location,
  * sensors). `cb` fires on every event until you cancel the returned NativeSub.
- * Start streams in a useEffect and cancel() in its cleanup so they tear down on
- * unmount.
+ * `onErr` (optional) fires if the subscription fails. Start streams in a useEffect
+ * and cancel() in its cleanup so they tear down on unmount.
  */
-export function emitNativeStream(cap: string, args: string, cb: any): NativeSub {
+export function emitNativeStream(cap: string, args: string, cb: any, onErr: any): NativeSub {
     const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, true)) }
+    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, onErr, true)) }
     return new NativeSub("0")
 }
 

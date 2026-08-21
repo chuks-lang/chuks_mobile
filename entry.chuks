@@ -25,6 +25,9 @@ export function resolve(token: string, payload: string): int { return APP.resolv
 // The host reports a token died with no result (user dismissed a picker, a native
 // op ended). Drop the callback so it never fires and doesn't leak. (F3 teardown.)
 export function cancelToken(token: string): int { return APP.cancelToken(token) }
+// The host reports a capability FAILURE (permission denied, hardware missing, a
+// native error) for `token`. Fires the request's error callback. (F3 error channel.)
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
 export function drain(): string { return APP.drain() }
 export function saveState(): string { return APP.saveState() }
 export function loadState(data: string): void { APP.loadState(data) }

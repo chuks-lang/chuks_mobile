@@ -6,7 +6,7 @@
 //
 // Fire-and-forget capabilities pass no callback (the token is "0"); async reads
 // pass a `(string) -> void` that receives the host's result payload.
-import { emitNativeCommand, emitNativeStream, NativeSub } from "./ui.chuks";
+import { emitNativeCommand, emitNativeCommandE, emitNativeStream, NativeSub } from "./ui.chuks";
 
 // ---- Clipboard --------------------------------------------------------------
 // set() copies text; get() reads it (async — the OS pasteboard read is deferred).
@@ -53,13 +53,15 @@ export class Brightness {
 // in a useEffect, cancel() the returned NativeSub in the cleanup, and on unmount
 // hookSweep tears down the native timer. `onTick` gets the tick count as a string.
 export class Pulse {
-    public static watch(onTick: (string)=> void): NativeSub { return emitNativeStream("pulse.watch", "", onTick) }
+    public static watch(onTick: (string)=> void): NativeSub { return emitNativeStream("pulse.watch", "", onTick, null) }
 }
 
 // ---- Debug ------------------------------------------------------------------
 // activeStreams() answers (async) with the host's live native-subscription count —
 // the assertion that a stream's NATIVE side was actually released, not just that
 // Chuks stopped receiving. Should read "0" after every stream is cancelled.
+// fail() always resolves via the ERROR channel, to exercise onErr end-to-end.
 export class Debug {
     public static activeStreams(onResult: (string)=> void): void { emitNativeCommand("debug.activeStreams", "", onResult) }
+    public static fail(onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("debug.fail", "", onResult, onError) }
 }
