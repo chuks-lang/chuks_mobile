@@ -16,7 +16,7 @@ function step(icon: string, title: string, desc: string): Node {
                 ]),
                 Column({ dir: "col", gap: 3, grow: 1 }, [
                     Text({ size: 15, weight: "bold", color: tk("text") }, title),
-                    Text({ size: 13, color: tk("muted"), w: 236 }, desc),
+                    Text({ size: 13, color: tk("muted") }, desc),
                 ]),
             ])
         }
@@ -65,8 +65,8 @@ function step(icon: string, title: string, desc: string): Node {
                             // ── Next steps ──
                             Column({ dir: "col", gap: 10 }, [
                                 step("pencil", "Edit this screen", "app/views/home.chuks"),
-                                step("plus", "Add a screen", "Drop it in app/views/, register in app/app.chuks"),
-                                step("smartphone", "Reach the device", "Permissions, files, audio, notifications, streams"),
+                                step("plus", "Add a screen", "app/views/ + app/app.chuks"),
+                                step("smartphone", "Reach the device", "Permissions, files, audio, more"),
                             ]),
 
                             Text({ size: 13, color: tk("muted"), ta: "center", pad: 4 }, "iOS  ·  Android, one Chuks codebase"),
