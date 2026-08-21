@@ -1195,6 +1195,21 @@ export class Reconciler {
     }
     // Drop a token from every registry (success/error/stream). Central so cancel,
     // drop, one-shot success, and failure all forget the token the same way.
+    //
+    // ORPHAN-SWEEP EXTENSION POINT: a one-shot token whose host work never completes
+    // (a hung native call that never resolve()s or fail()s, while its component stays
+    // mounted) sits in `pending` forever. The unmount case is already handled
+    // (hookSweep -> NativeSub.cancel), so this is the narrow "component alive, native
+    // side silent" case. Adding a timeout audit is ADDITIVE, no restructuring:
+    //   1. a parallel `pendingMeta: map[string]int` (token -> creation stamp), set in
+    //      command() and cleared HERE (this is the single removal choke point, so it
+    //      stays in lockstep automatically);
+    //   2. a `sweepOrphans(nowMs)` method that walks pending.keys() and
+    //      failToken(token, "timeout") for anything past a cutoff;
+    //   3. a `sweepOrphans` C-ABI export the host drives (it owns the clock; the
+    //      framework has no built-in time source — token ids are monotonic, a coarse
+    //      age proxy). Age is the axis, not owner. Prefer a host-side per-capability
+    //      timeout (calls the existing fail()) for the common case; this is the net.
     forgetToken(token: string): void {
         if (this.pending.has(token)) { this.pending.delete(token) }
         if (this.pendingErr.has(token)) { this.pendingErr.delete(token) }
