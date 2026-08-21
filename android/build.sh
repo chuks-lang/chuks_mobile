@@ -61,10 +61,11 @@ cp "$CXXSHARED" "$OUT/lib/arm64-v8a/"
 mkdir -p "$OUT/assets"
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
-for f in $(find -L "$PROJDIR/assets" -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
+for f in $(find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.png" -o -name "*.jpg" \) 2>/dev/null); do cp "$f" "$OUT/assets/"; done
 ( cd "$OUT" && zip -qj base.apk classes.dex && zip -q base.apk lib/arm64-v8a/libapp.so lib/arm64-v8a/libc++_shared.so \
     && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
-    && for mv in assets/*.mp4 assets/*.wav assets/*.mp3 assets/*.m4a; do [ -e "$mv" ] && zip -0 -q base.apk "$mv" || true; done )   # -0: store media uncompressed so MediaPlayer.openFd hands back a seekable descriptor; || true so a non-matching glob doesn't trip set -e
+    && for im in assets/*.png assets/*.jpg; do [ -e "$im" ] && zip -q base.apk "$im" || true; done \
+    && for mv in assets/*.mp4 assets/*.wav assets/*.mp3 assets/*.m4a; do [ -e "$mv" ] && zip -0 -q base.apk "$mv" || true; done )   # -0 (media): seekable for MediaPlayer.openFd; images stay compressed   # -0: store media uncompressed so MediaPlayer.openFd hands back a seekable descriptor; || true so a non-matching glob doesn't trip set -e
 "$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/chuks.apk" > "$OUT/zipalign.log" 2>&1 || { echo "  Alignment failed:"; cat "$OUT/zipalign.log"; exit 1; }
 # apksigner emits benign JVM restricted-method warnings on newer JDKs; hide unless it fails.
 "$BT/apksigner" sign --ks "$HOME/.android/debug.keystore" \

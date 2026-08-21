@@ -1,18 +1,77 @@
-// The starter Home screen. Edit this file and rebuild to see changes.
-import { Node, Column, Text, Pressable, Comp } from "pkg/@chuks/mobile/core/ui.chuks";
+// The starter Home screen — your first impression of Chuks Mobile. Edit freely:
+// change the copy, restyle it, or replace it entirely. Colors come from theme
+// tokens (tk) so it adapts to light/dark, and icons come from @chuks/lucide via
+// utils/icons.chuks.
+import { Node, Column, Row, Text, Pressable, Image, Scroll, Comp } from "pkg/@chuks/mobile/core/ui.chuks";
 import { useState, Cell } from "pkg/@chuks/mobile/core/state.chuks";
 import { tk } from "pkg/@chuks/mobile/core/theme.chuks";
+import { lucide } from "../../utils/icons.chuks";
 
-function body(): Node {
-    var taps: Cell = useState(0)
-    return Column({ dir: "col", grow: 1, justify: "center", align: "center", gap: 16, pad: 24, bg: tk("bg") }, [
-        Text({ size: 28, weight: "bold", color: tk("text"), ta: "center" }, "Welcome to Chuks Mobile"),
-        Text({ size: 16, color: tk("muted"), ta: "center", w: 300 }, "Edit app/views/home.chuks and rebuild. Add screens in app/views/ and register them in app/app.chuks."),
-        Pressable({ onPress: function(): void { taps.set(int(taps.get()) + 1) },
-                    bg: tk("primary"), radius: 12, pad: 14, w: 240 }, [
-            Text({ size: 16, weight: "bold", color: "FFFFFF", ta: "center" }, "Tapped " + string(taps.get()) + " times"),
-        ]),
-    ])
-}
+// A "next step" row: an icon tile, a title, and a description.
+function step(icon: string, title: string, desc: string): Node {
+    return Row({ dir: "row", gap: 14, align: "center", bg: tk("surface"), radius: 16, pad: 16,
+            border: 1, borderColor: tk("border") }, [
+                Column({ w: 38, h: 38, radius: 12, bg: tk("primarySoft"), justify: "center", align: "center" }, [
+                    lucide(icon, 19, tk("primary")),
+                ]),
+                Column({ dir: "col", gap: 3, grow: 1 }, [
+                    Text({ size: 15, weight: "bold", color: tk("text") }, title),
+                    Text({ size: 13, color: tk("muted"), w: 236 }, desc),
+                ]),
+            ])
+        }
 
-export function Home(): Node { return Comp(body) }
+        // A round stepper button.
+        function stepper(label: string, fg: string, bg: string, onPress: ()=> void): Node {
+            return Pressable({ onPress: onPress, bg: bg, radius: 25, w: 50, h: 50, justify: "center", align: "center" }, [
+                Text({ size: 26, weight: "bold", color: fg }, label),
+            ])
+        }
+
+        function body(): Node {
+            var taps: Cell = useState(0)
+            return Scroll({ dir: "col", grow: 1, bg: tk("bg") }, [
+                Column({ dir: "col", pad: 14, gap: 18, align: "stretch" }, [
+
+                    // ── Hero ──
+                    Column({ dir: "col", gap: 12, align: "center", pad: 10 }, [
+                        Column({ w: 88, h: 88, radius: 24, bg: "FFFFFF", justify: "center", align: "center", shadow: 2 }, [
+                            Image({ src: "chuks-logo.png", w: 58, h: 58, resize: "contain" }),
+                        ]),
+                        Text({ size: 12, weight: "bold", color: tk("primary"), ta: "center" }, "CHUKS  MOBILE"),
+                        Text({ size: 31, weight: "bold", color: tk("text"), ta: "center" }, "Welcome aboard"),
+                        Text({ size: 16, color: tk("muted"), ta: "center", w: 300 },
+                            "You just built a native app written entirely in Chuks. One codebase, real iOS and Android."),
+                    ]),
+
+                    // ── Live card: a stepper proves the UI is reactive ──
+                    Column({ dir: "col", gap: 16, bg: tk("surface"), radius: 20, pad: 20,
+                            border: 1, borderColor: tk("border"), shadow: 1 }, [
+                                Row({ dir: "row", justify: "between", align: "center" }, [
+                                    Text({ size: 12, weight: "bold", color: tk("muted") }, "THIS SCREEN IS LIVE"),
+                                    Text({ size: 12, weight: "bold", color: tk("accent") }, "● reactive"),
+                                ]),
+                                Row({ dir: "row", justify: "center", align: "center", gap: 22 }, [
+                                    stepper("–", tk("primary"), tk("primarySoft"),
+                                        function(): void { const c: int = int(taps.get()); if (c > 0) { taps.set(c - 1) } }),
+                                    Text({ size: 40, weight: "bold", color: tk("text"), w: 96, ta: "center" }, string(taps.get())),
+                                    stepper("+", "FFFFFF", tk("primary"),
+                                        function(): void { taps.set(int(taps.get()) + 1) }),
+                                ]),
+                                Text({ size: 13, color: tk("muted"), ta: "center" },
+                                    "State just works, useState re-renders the view."),
+                            ]),
+
+                            // ── Next steps ──
+                            Column({ dir: "col", gap: 10 }, [
+                                step("pencil", "Edit this screen", "app/views/home.chuks"),
+                                step("plus", "Add a screen", "Drop it in app/views/, register in app/app.chuks"),
+                                step("smartphone", "Reach the device", "Permissions, files, audio, notifications, streams"),
+                            ]),
+
+                            Text({ size: 13, color: tk("muted"), ta: "center", pad: 4 }, "iOS  ·  Android, one Chuks codebase"),
+                        ]),
+                    ])
+                }
+
+                export function Home(): Node { return Comp(body) }

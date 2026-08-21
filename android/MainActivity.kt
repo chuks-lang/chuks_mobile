@@ -919,9 +919,13 @@ class MainActivity : Activity() {
             mp = MediaPlayer()
             videoAlive.add(mp)
             try {
-                val afd = assets.openFd(asset)
-                mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                afd.close()
+                if (asset.startsWith("http")) {
+                    mp.setDataSource(asset)                  // remote URL
+                } else {
+                    val afd = assets.openFd(asset)           // bundled asset
+                    mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                    afd.close()
+                }
             } catch (e: Exception) { videoAlive.remove(mp); mp.release(); return }
             mp.isLooping = true
             mp.setVolume(0f, 0f)
@@ -1025,6 +1029,10 @@ class MainActivity : Activity() {
         (views[id] as? android.webkit.WebView)?.let { it.loadUrl(t); return }   // WebView URL
         if (t.startsWith("http")) {                                           // remote image / background URL
             (bgImageViews[id] ?: views[id] as? ImageView)?.let { loadRemoteImage(t, it); return }
+        }
+        (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->            // bundled local asset (e.g. chuks-logo.png)
+            if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) } } catch (e: Exception) {}
+            return
         }
         when (val v = views[id]) {
             is Button -> v.text = t

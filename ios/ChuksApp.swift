@@ -832,6 +832,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if alertIds.contains(id) { alertData[id] = t.components(separatedBy: "\t"); return }   // Alert's tab-joined fields
         if let iv = bgImageViews[id], t.hasPrefix("http") { loadRemoteImage(t, into: iv); return }   // ImageBackground URL
         if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv); return }   // remote Image URL
+        if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
+            if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
+            return
+        }
+        if let iv = bgImageViews[id], !t.isEmpty {            // bundled ImageBackground asset
+            if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
+            return
+        }
         if let wv = views[id] as? WKWebView { if let u = URL(string: t) { wv.load(URLRequest(url: u)) }; return }   // WebView URL
         if let cv = views[id] as? CanvasView { cv.shapes = t; return }                // Canvas's "text" is the shape list
         if let mv = views[id] as? MKMapView {                                        // Map's "text" is "lat,lng,zoom"
@@ -863,11 +871,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let n = YGNodeNewWithConfig(config)
         switch kind {
         case "Text":
-            let l = UILabel(); l.font = .systemFont(ofSize: 14); v = l
+            let l = UILabel(); l.font = .systemFont(ofSize: 14); l.numberOfLines = 0; v = l   // 0 = wrap to as many lines as fit the measured (Yoga) width
             YGNodeSetContext(n, Unmanaged.passUnretained(l).toOpaque())
             YGNodeSetMeasureFunc(n, measureText)
         case "Image":
-            let iv = UIImageView(); iv.contentMode = .center; iv.tintColor = .white; iv.clipsToBounds = true; v = iv
+            let iv = UIImageView(); iv.contentMode = .scaleAspectFit; iv.clipsToBounds = true; v = iv
         case "ImageBackground":
             let box = UIView(); box.clipsToBounds = true
             let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
@@ -1104,7 +1112,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     var player: AVPlayer? = nil
                     if var idle = videoPool[val], !idle.isEmpty {
                         player = idle.removeLast(); videoPool[val] = idle       // reuse (no alloc)
-                    } else if let url = Bundle.main.url(forResource: val, withExtension: nil) {
+                    } else if let url = (val.hasPrefix("http") ? URL(string: val) : Bundle.main.url(forResource: val, withExtension: nil)) {
                         let item = AVPlayerItem(url: url)
                         let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
                         let obs = NotificationCenter.default.addObserver(

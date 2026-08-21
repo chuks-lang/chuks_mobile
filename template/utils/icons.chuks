@@ -1,0 +1,12 @@
+// Icons for your app, backed by the @chuks/lucide package (2,000+ icons as a
+// cross-platform icon font). This thin wrapper turns a name into a Text node drawn
+// in the icon font, so an icon colors and scales like text and renders identically
+// on iOS + Android. Browse names at https://lucide.dev.  Usage: lucide("bell", 22, tk("text"))
+import { Node, Text } from "pkg/@chuks/mobile/core/ui.chuks";
+import { LUCIDE_FONT, lucideChar } from "pkg/@chuks/lucide";
+
+export function lucide(name: string, size: int, color: string): Node {
+    const g: string = lucideChar(name)
+    if (g == "") { return Text({ size: size, color: color, ta: "center", w: size, h: size }, "?") }
+    return Text({ font: LUCIDE_FONT, size: size, color: color, ta: "center", w: size, h: size }, g)
+}

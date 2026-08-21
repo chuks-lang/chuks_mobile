@@ -29,8 +29,10 @@ final class LoopingPlayerView: UIView {
     private var looper: NSObjectProtocol?
     private var currentSrc = ""
     func configure(_ src: String) {
-        guard src != currentSrc, !src.isEmpty,
-              let url = Bundle.main.url(forResource: src, withExtension: nil) else { return }
+        guard src != currentSrc, !src.isEmpty else { return }
+        // http(s) URL -> remote; otherwise a bundled asset (e.g. clip.mp4).
+        let url: URL? = src.hasPrefix("http") ? URL(string: src) : Bundle.main.url(forResource: src, withExtension: nil)
+        guard let url = url else { return }
         teardown()
         currentSrc = src
         let item = AVPlayerItem(url: url)
@@ -1085,6 +1087,14 @@ struct NodeView: View {
             .frame(width: numOf(s["w"]), height: numOf(s["h"]))
             .clipped()
             .cornerRadius(numOf(s["r"]) ?? 0)
+        } else if !node.text.isEmpty,
+                  let url = Bundle.main.url(forResource: node.text, withExtension: nil),
+                  let ui = UIImage(contentsOfFile: url.path) {   // bundled local asset (e.g. chuks-logo.png)
+            let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
+            Image(uiImage: ui).resizable().aspectRatio(contentMode: mode)
+                .frame(width: numOf(s["w"]), height: numOf(s["h"]))
+                .clipped()
+                .cornerRadius(numOf(s["r"]) ?? 0)
         } else {                                             // local SF Symbol icon
             let tint = s["fg"].map { hexColor($0) } ?? Color.white
             let sym = s["img"] ?? ""
