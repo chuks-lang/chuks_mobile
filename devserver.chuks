@@ -8,7 +8,7 @@
 // the reload. (The host process stays alive, so scroll/focus persist for free.)
 import { createServer, Request, Response } from "std/http";
 import { fs } from "std/fs";
-import { set_count, mount, tick, setViewport, dispatch, dispatchInput, drain, saveState, loadState } from "../app/_entry.chuks";
+import { set_count, mount, tick, setViewport, dispatch, dispatchInput, drain, saveState, loadState } from "./entry.chuks";
 
 const STATE_FILE: string = "/tmp/chuks-mobile-state.txt"
 

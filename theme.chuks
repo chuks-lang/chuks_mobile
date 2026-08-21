@@ -67,11 +67,25 @@ export enum ThemeMode {
 }
 
 var THEME_MODE: ThemeMode = ThemeMode.Dark
+var userPicked: bool = false    // true once the user chooses a theme by hand; then OS sync stops
 
-// Switch the whole app between dark and light. Re-render after calling.
-export function setTheme(mode: ThemeMode): void { THEME_MODE = mode }
+// Switch the whole app between dark and light. Counts as a manual choice, so the
+// app stops following the OS appearance afterwards. Re-render after calling.
+export function setTheme(mode: ThemeMode): void { userPicked = true; THEME_MODE = mode }
 export function currentTheme(): ThemeMode { return THEME_MODE }
-export function toggleTheme(): void { THEME_MODE = THEME_MODE == ThemeMode.Light ? ThemeMode.Dark : ThemeMode.Light }
+export function toggleTheme(): void { userPicked = true; THEME_MODE = THEME_MODE == ThemeMode.Light ? ThemeMode.Dark : ThemeMode.Light }
+
+// The host reports the OS appearance (at launch and whenever it changes). We follow
+// it UNTIL the user picks a theme manually, after which their choice sticks. This is
+// the "system / light / dark" pattern: default = follow system.
+export function syncSystemTheme(dark: bool): void {
+    if (userPicked) { return }
+    THEME_MODE = dark ? ThemeMode.Dark : ThemeMode.Light
+}
+// Whether the app is still tracking the OS appearance (false once overridden). The
+// host uses this to decide whether to force the system chrome (status bar) or leave
+// it to the OS.
+export function followingSystem(): bool { return !userPicked }
 
 // Resolve a semantic color role to hex against the active theme. Returns "" when
 // `name` is not a role, so callers can fall back (raw hex, Tailwind palette).

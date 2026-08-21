@@ -39,12 +39,42 @@ export class Style {
     var wrap: string    // "wrap" | "nowrap" (flex-wrap)
     var font: string    // custom font family (e.g. an icon font); "" = system
     var vid: string     // video filename for a Video node
+    var swOn: int       // Switch on-state: 1 = on, 0 = off (-1 = not a Switch)
+    var press: int      // Pressable active opacity 0-100 while held (-1 = no press feedback)
+    var sec: int        // Input secure-entry (password): 1 = masked (-1 = normal)
+    var sbHide: int     // StatusBar hidden: 1 hide, 0 show (-1 = not a StatusBar)
+    var sbStyle: string // StatusBar content: "light" | "dark" | "" (auto, follows theme)
+    var mvis: int       // Modal visible: 1 shown, 0 hidden (-1 = not a Modal)
+    var mpos: string    // Modal content position: "center" | "bottom"
+    var slval: int      // Slider current value (-1 = not a Slider); min/max travel with it
+    var slmin: int      // Slider minimum (>= 0)
+    var slmax: int      // Slider maximum
+    var seli: int       // Select selected option index (-1 = not a Select)
+    var avis: int       // Alert visible: 1 shown, 0 hidden (-1 = not an Alert)
+    var resize: string  // Image resize mode: "cover" | "contain" | "center" ("" = default)
+    var prog: int       // Progress bar fill percent 0-100 (-1 = not a Progress)
+    var rfsh: int       // Scroll pull-to-refresh: -1 none, 0 idle, 1 refreshing
+    var dpmode: string  // DatePicker mode: "date" | "time" | "datetime" ("" = not a DatePicker)
+    var dpdisp: string  // DatePicker display: "" (compact field) | "inline" (always-open) | "wheels"
+    var tx: int         // transform translateX (px, default 0)
+    var ty: int         // transform translateY (px, default 0)
+    var rot: int        // transform rotation (degrees, default 0)
+    var scl: int        // transform scale as a percent (100 = 1.0)
+    var animMs: int     // transition duration in ms for opacity/transform changes (-1 = no animation)
+    var animEz: string  // transition easing: "" (ease) | "linear" | "spring"
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
         this.bw = -1; this.bc = ""; this.shadow = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
+        this.swOn = -1; this.press = -1; this.sec = -1
+        this.sbHide = -1; this.sbStyle = ""
+        this.mvis = -1; this.mpos = ""
+        this.slval = -1; this.slmin = 0; this.slmax = 100
+        this.seli = -1; this.avis = -1; this.resize = ""; this.prog = -1; this.rfsh = -1
+        this.dpmode = ""; this.dpdisp = ""
+        this.tx = 0; this.ty = 0; this.rot = 0; this.scl = 100; this.animMs = -1; this.animEz = ""
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -77,6 +107,31 @@ export class Style {
         if (this.wrap != "") { s = s + "wrap=" + this.wrap + ";" }
         if (this.font != "") { s = s + "font=" + this.font + ";" }
         if (this.vid != "") { s = s + "vid=" + this.vid + ";" }
+        if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
+        if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
+        if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
+        if (this.sbHide >= 0) { s = s + "sbh=" + string(this.sbHide) + ";" }
+        if (this.sbStyle != "") { s = s + "sbstyle=" + this.sbStyle + ";" }
+        if (this.mvis >= 0) { s = s + "mvis=" + string(this.mvis) + ";" }
+        if (this.mpos != "") { s = s + "mpos=" + this.mpos + ";" }
+        if (this.slval >= 0) {                       // a Slider: value + range travel together
+            s = s + "slv=" + string(this.slval) + ";"
+            s = s + "slmin=" + string(this.slmin) + ";"
+            s = s + "slmax=" + string(this.slmax) + ";"
+        }
+        if (this.seli >= 0) { s = s + "seli=" + string(this.seli) + ";" }
+        if (this.avis >= 0) { s = s + "avis=" + string(this.avis) + ";" }
+        if (this.resize != "") { s = s + "rmode=" + this.resize + ";" }
+        if (this.prog >= 0) { s = s + "prog=" + string(this.prog) + ";" }
+        if (this.rfsh >= 0) { s = s + "rfsh=" + string(this.rfsh) + ";" }
+        if (this.dpmode != "") { s = s + "dp=" + this.dpmode + ";" }
+        if (this.dpdisp != "") { s = s + "dpd=" + this.dpdisp + ";" }
+        if (this.tx != 0) { s = s + "tx=" + string(this.tx) + ";" }
+        if (this.ty != 0) { s = s + "ty=" + string(this.ty) + ";" }
+        if (this.rot != 0) { s = s + "rot=" + string(this.rot) + ";" }
+        if (this.scl != 100) { s = s + "sc=" + string(this.scl) + ";" }
+        if (this.animMs >= 0) { s = s + "anim=" + string(this.animMs) + ";" }
+        if (this.animEz != "") { s = s + "ez=" + this.animEz + ";" }
         return s
     }
 }
@@ -121,6 +176,39 @@ function mkImage(style: Style): Node { return new Node("Image", style, "", []) }
 function mkButton(style: Style, t: string): Node { return new Node("Button", style, t, []) }
 // Build a text-input node (native Input). `placeholder` is the empty-state hint.
 function mkInput(style: Style, placeholder: string): Node { return new Node("Input", style, placeholder, []) }
+// Build a multi-line text-area node. Like Input, its text field holds the placeholder.
+function mkTextArea(style: Style, placeholder: string): Node { return new Node("TextArea", style, placeholder, []) }
+// Build a switch node (native on/off toggle). Style.swOn carries the on-state.
+function mkSwitch(style: Style): Node { return new Node("Switch", style, "", []) }
+// Build a slider node (native value slider). Style.slval/slmin/slmax carry the range.
+function mkSlider(style: Style): Node { return new Node("Slider", style, "", []) }
+// Build a select node (native dropdown/menu). Options ride the text field (tab-joined,
+// so they survive the stream's |/newline split); Style.seli is the chosen index.
+function mkSelect(style: Style, joined: string): Node { return new Node("Select", style, joined, []) }
+// Build a date picker node (native date/time picker). The current value rides the
+// text channel as an ISO string; Style.dpmode carries the mode. `kind` is
+// "DatePicker" (compact field, tap-to-open) or "DatePickerInline" (always-open),
+// so each host can pick the right view type at creation.
+function mkDatePicker(kind: string, style: Style, value: string): Node { return new Node(kind, style, value, []) }
+// Build a menu button. The text channel is tab-joined: parts[0] is the trigger
+// label, the rest are the action items (must not contain tab / | / newline).
+function mkMenu(style: Style, joined: string): Node { return new Node("Menu", style, joined, []) }
+// Build a context-menu wrapper: long-press its children to open an action menu.
+// Items ride the text channel tab-joined (same rules as Menu).
+function mkContextMenu(style: Style, joined: string, kids: []Node): Node { return new Node("ContextMenu", style, joined, kids) }
+// Build a spinner node (native indeterminate activity indicator). w/h = size, fg = color.
+function mkSpinner(style: Style): Node { return new Node("Spinner", style, "", []) }
+// Build a determinate progress-bar node. Style.prog carries the fill percent (0-100).
+function mkProgress(style: Style): Node { return new Node("Progress", style, "", []) }
+// Build a status-bar directive node. Renders nothing (0x0); the host reads its
+// sbHide/sbStyle and applies them to the real OS status bar.
+function mkStatusBar(style: Style): Node { return new Node("StatusBar", style, "", []) }
+// Build a modal node. The host renders its children in an OVERLAY layer (scrim +
+// content) on top of everything when mvis=1; renders nothing inline.
+function mkModal(style: Style, kids: []Node): Node { return new Node("Modal", style, "", kids) }
+// Build an alert node: the host presents a NATIVE alert when avis=1. Title / message /
+// button labels ride the text field (tab-joined). Renders nothing inline.
+function mkAlert(style: Style, joined: string): Node { return new Node("Alert", style, joined, []) }
 
 // ---- Prop value types ------------------------------------------------------
 // The value a prop can hold: a number, a string, a flag, or an event closure.
@@ -128,9 +216,11 @@ function mkInput(style: Style, placeholder: string): Node { return new Node("Inp
 // value like an object is a compile error. Chuks has no first-class function
 // type WITHOUT a signature, so the two event shapes are spelled out.
 export unionType Prop = int | string | bool | function(): void | function(v: string): void
-// A List's config values: sizes/counts (int) plus its two row callbacks. These
-// have List-specific signatures, so they get their own union, distinct from Prop.
-export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node
+// A List's config values: sizes/counts (int) plus its row callbacks. These have
+// List-specific signatures, so they get their own union, distinct from Prop. The
+// last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
+// item(s,r,top)->Node; its header(s,top)->Node reuses (int,int)->Node above.
+export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node
 
 // ---- Named-prop component builders (the JSX-like API) ----------------------
 // Compose with named props + children + closures:
@@ -141,6 +231,24 @@ export unionType ListProp = int | function(r: int): string | function(r: int, to
 function pInt(p: map[string]Prop, k: string, def: int): int { const v: Prop? = p.get(k); if (v != null) { return int(v) } return def }
 // Read a string prop `k` from the props map, or return `def` if it is absent.
 function pStr(p: map[string]Prop, k: string, def: string): string { const v: Prop? = p.get(k); if (v != null) { return string(v) } return def }
+function pBool(p: map[string]Prop, k: string, def: bool): bool { const v: Prop? = p.get(k); if (v != null) { return v == true } return def }
+
+// ---- Safe-area insets --------------------------------------------------------
+// The device safe-area insets (notch/status bar, home indicator, rounded corners),
+// reported by each native host. Components pad by these to stay clear of system UI;
+// essential for edge-to-edge content (overlays / modals / full-bleed screens).
+var _safeTop: int = 0
+var _safeRight: int = 0
+var _safeBottom: int = 0
+var _safeLeft: int = 0
+// Called by the host (via the entry's setInsets) whenever the insets are known/change.
+export function setSafeInsets(t: int, r: int, b: int, l: int): void {
+    _safeTop = t; _safeRight = r; _safeBottom = b; _safeLeft = l
+}
+export function safeTop(): int { return _safeTop }
+export function safeRight(): int { return _safeRight }
+export function safeBottom(): int { return _safeBottom }
+export function safeLeft(): int { return _safeLeft }
 // Read an int config value `k` from a List's ListProp map, or `def` if absent.
 function lpInt(d: map[string]ListProp, k: string, def: int): int { const v: ListProp? = d.get(k); if (v != null) { return int(v) } return def }
 // Copy the layout/visual props onto a Style. Each pInt/pStr defaults to the
@@ -171,6 +279,13 @@ function applyLayout(s: Style, p: map[string]Prop): void {
     s.opacity = pInt(p, "opacity", s.opacity)   // 0..100
     s.wrap = pStr(p, "wrap", s.wrap)            // "wrap" | "nowrap"
     s.font = pStr(p, "font", s.font)            // custom font family (icon fonts)
+    // Animation: transform props (visual only, no layout) + a transition duration.
+    s.tx = pInt(p, "tx", s.tx)                  // translateX px
+    s.ty = pInt(p, "ty", s.ty)                  // translateY px
+    s.rot = pInt(p, "rotate", s.rot)            // rotation degrees
+    s.scl = pInt(p, "scale", s.scl)             // scale percent (100 = 1.0)
+    s.animMs = pInt(p, "anim", s.animMs)        // transition duration ms (-1 = none)
+    s.animEz = pStr(p, "easing", s.animEz)      // "" ease | "linear" | "spring"
 }
 // Wire onPress / onChange closures from a props map onto a node. The Reconciler
 // registers them by node id and calls them when the native event fires.
@@ -210,6 +325,20 @@ export function Row(p: map[string]Prop, kids: []Node): Node {
  */
 export function Column(p: map[string]Prop, kids: []Node): Node {
     const s: Style = new Style(); s.dir = "col"; s.just = "center"; applyLayout(s, p)
+    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+}
+/**
+ * A plain box (the base container). No default direction or alignment — just the
+ * layout/visual props you set (`w`, `h`, `bg`, `radius`, `grow`, `pad`, `gap`,
+ * `align`, `justify`, `border`, ...). Use it for spacers, fills, and simple surfaces;
+ * reach for `Column`/`Row` when you want a stacking direction by default.
+ *
+ * ```chuks
+ * View({ w: 44, h: 44, radius: 22, bg: tk("primary") }, [])
+ * ```
+ */
+export function View(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style(); applyLayout(s, p)
     const n: Node = mkView(s, kids); applyEvents(n, p); return n
 }
 /**
@@ -258,6 +387,63 @@ export function Icon(p: map[string]Prop): Node {
     return mkImage(s)
 }
 /**
+ * A remote (network) image loaded from a URL. The host fetches + caches the
+ * bytes asynchronously and shows them; give it a size (`w`/`h`) and optional
+ * `radius`. `resize`: "cover" (fill, crop — default), "contain" (fit), "center".
+ * (For a local SF Symbol icon use `Icon`/`name` instead.) The URL rides the text
+ * channel, so it may not contain a newline or "|".
+ *
+ * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color).
+ *
+ * ```chuks
+ * Image({ src: "https://picsum.photos/200", w: 96, h: 96, radius: 12 })
+ * ```
+ */
+export function Image(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.resize = pStr(p, "resize", "cover")
+    s.bg = pStr(p, "bg", "")
+    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
+    applyLayout(s, p)
+    return new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
+}
+/**
+ * A container whose BACKGROUND is a remote image, with `kids` rendered on top
+ * (like RN's ImageBackground). The host loads the URL and paints it behind the
+ * content; `resize` controls the fill mode.
+ *
+ * Props: `src` (URL), `resize`, plus layout (`pad`, `gap`, `w`, `h`, `radius`).
+ *
+ * ```chuks
+ * ImageBackground({ src: HERO_URL, pad: 24, radius: 16 }, [ Text(...), ... ])
+ * ```
+ */
+export function ImageBackground(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style()
+    s.resize = pStr(p, "resize", "cover")
+    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
+    applyLayout(s, p)
+    return new Node("ImageBackground", s, pStr(p, "src", ""), kids)   // URL in text; children on top
+}
+/**
+ * A native web view (WKWebView on iOS, android.webkit.WebView on Android) that
+ * loads a URL. Give it a size (`w`/`h`) or let it `grow` to fill, plus optional
+ * `radius`. The URL rides the text channel, so it may not contain a newline or
+ * "|" (fine for normal URLs). (Inline HTML can be added later via encoding.)
+ *
+ * Props: `url`, `w`, `h`, `grow`, `radius`, `bg`.
+ *
+ * ```chuks
+ * WebView({ url: "https://chuks.dev", grow: 1, radius: 12 })
+ * ```
+ */
+export function WebView(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
+    applyLayout(s, p)
+    return new Node("WebView", s, pStr(p, "url", ""), [])   // URL in the text channel
+}
+/**
  * A tappable button showing title `t`. Pass `onPress` as a () -> void closure;
  * the framework registers it by node id and calls it on tap.
  *
@@ -301,10 +487,496 @@ export function Pill(p: map[string]Prop, t: string): Node {
  */
 export function TextInput(p: map[string]Prop): Node {
     const s: Style = new Style()
-    s.h = pInt(p, "h", 44); s.bg = pStr(p, "bg", "FFFFFF"); s.radius = 10
+    const multi: bool = pBool(p, "multiline", false)   // a multi-line text area vs a single-line field
+    s.h = pInt(p, "h", multi ? 96 : 44); s.bg = pStr(p, "bg", "FFFFFF"); s.radius = 10
     s.fg = pStr(p, "color", "111318"); s.fs = 15; applyLayout(s, p)
-    const n: Node = mkInput(s, pStr(p, "placeholder", ""))
+    if (pBool(p, "secure", false)) { s.sec = 1 }    // password field: mask input
+    // multiline swaps the native widget (UITextView / TextEditor / multiline EditText)
+    const n: Node = multi ? mkTextArea(s, pStr(p, "placeholder", "")) : mkInput(s, pStr(p, "placeholder", ""))
     applyEvents(n, p); return n
+}
+/**
+ * A native on/off switch (UISwitch / SwiftUI Toggle / Android Switch/SwitchMaterial).
+ * Controlled, like RN's Switch: the parent owns `on` and passes it; `onPress` fires
+ * when the user flips it. The host reports the change (dispatch), the parent updates
+ * its own state in onPress, and the re-render syncs the control to that state — so
+ * the switch always reflects Chuks state, never drifts. `bg` is the on-tint (the
+ * track color when on); omit for the platform default.
+ *
+ * Props: `on` (bool), `onPress` (() -> void), `bg` (on-tint hex).
+ *
+ * ```chuks
+ * Toggle({ on: enabled, onPress: function(): void { enabled = !enabled }, bg: ACCENT })
+ * ```
+ */
+/**
+ * Insets its children clear of the device safe area (notch/status bar, home
+ * indicator). Composed from the host-reported insets, so it's cross-platform and
+ * needs no host code. Use it for EDGE-TO-EDGE content — a full-bleed screen, or an
+ * overlay/modal that spans the whole window. (Regular screens are already inset by
+ * the app root, so a SafeAreaView there is a no-op.)
+ *
+ * Props: `edges` ("top,bottom" default; "all" | "top" | "bottom" | any combination),
+ * plus any layout/style prop.
+ *
+ * ```chuks
+ * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
+ * ```
+ */
+export function SafeAreaView(p: map[string]Prop, kids: []Node): Node {
+    const edges: string = pStr(p, "edges", "top,bottom")
+    const all: bool = edges.contains("all")
+    var out: []Node = []
+    if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
+    for (var i: int = 0; i < kids.length; i = i + 1) { out.push(kids[i]) }
+    if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
+    const s: Style = new Style(); s.dir = "col"; applyLayout(s, p)
+    return mkView(s, out)
+}
+// A fixed-height empty row (a safe-area spacer).
+function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
+
+/**
+ * A vertical scroll container: children stack top-to-bottom and scroll when they
+ * overflow. Grows to fill its parent's main axis. For long UNIFORM lists prefer
+ * `List` (which virtualizes); use `Scroll` for a bounded set of mixed content.
+ *
+ *     Scroll({}, [ Text(...), Card(...), Button(...) ])
+ */
+export function Scroll(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style(); s.dir = "col"; s.grow = 1; s.basis = 0
+    applyLayout(s, p)
+    // Pull-to-refresh: `onRefresh` fires when the user pulls down at the top; the
+    // parent owns `refreshing` (set it false when the work is done to end the spinner).
+    const orf: Prop? = p.get("onRefresh")
+    if (orf != null) { s.rfsh = pBool(p, "refreshing", false) ? 1 : 0 }
+    const n: Node = new Node("Scroll", s, "", kids)
+    if (orf != null) { n.onPress = orf }
+    return n
+}
+/**
+ * A pressable surface: wraps content and gives instant press feedback (dims to
+ * `activeOpacity`% while held), firing `onPress` on release. The RN Pressable /
+ * TouchableOpacity. The dim is applied NATIVELY by each host on touch-down (no
+ * round-trip to Chuks), so it stays responsive. Put anything inside — a card, a
+ * row, an icon. Children stack vertically by default (`dir` overrides).
+ *
+ * Props: `onPress` (() -> void), `activeOpacity` (0-100, default 60), plus any
+ * layout/style prop (bg, radius, pad, gap, dir, align, justify, ...).
+ *
+ * ```chuks
+ * Pressable({ onPress: open, bg: CARD, radius: 12, pad: 16 }, [ Text(...) ])
+ * ```
+ */
+export function Pressable(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style(); s.dir = "col"
+    s.press = pInt(p, "activeOpacity", 60)
+    applyLayout(s, p)
+    const n: Node = mkView(s, kids)
+    applyEvents(n, p)
+    return n
+}
+/**
+ * An indeterminate activity spinner (UIActivityIndicatorView / SwiftUI ProgressView
+ * / Android ProgressBar). Display-only — it just spins to signal work in progress.
+ *
+ * Props: `size` (px diameter, default 24), `color` (hex; omit for the platform tint).
+ *
+ * ```chuks
+ * Spinner({ size: 28, color: ACCENT })
+ * ```
+ */
+export function Spinner(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    const sz: int = pInt(p, "size", 24)
+    s.fg = pStr(p, "color", s.fg)
+    applyLayout(s, p)
+    // `size` is the spinner DIAMETER (w/h), not a font size — set after applyLayout
+    // (which reads `size` as fs) so it wins and the spurious fs is cleared.
+    s.w = sz; s.h = sz; s.fs = -1
+    return mkSpinner(s)
+}
+/**
+ * A determinate progress bar (native UIProgressView / SwiftUI linear ProgressView /
+ * horizontal ProgressBar). Display-only; the parent owns `value`. For an
+ * indeterminate spinner use `Spinner`.
+ *
+ * Props: `value` (int), `max` (int, default 100), `color` (fill tint hex), `h` (thickness).
+ *
+ * ```chuks
+ * Progress({ value: pct.get(), max: 100, color: ACCENT })
+ * ```
+ */
+export function Progress(p: map[string]Prop): Node {
+    const val: int = pInt(p, "value", 0)
+    const mx: int = pInt(p, "max", 100)
+    var pct: int = mx > 0 ? (val * 100) / mx : 0
+    if (pct < 0) { pct = 0 }
+    if (pct > 100) { pct = 100 }
+    const s: Style = new Style()
+    s.fg = pStr(p, "color", "")     // fill tint
+    s.h = pInt(p, "h", 6)           // bar thickness
+    applyLayout(s, p)
+    s.prog = pct                    // set after applyLayout (which doesn't touch prog)
+    return mkProgress(s)
+}
+/**
+ * Controls the OS status bar (a host-global directive, like RN's StatusBar). Renders
+ * nothing — put it anywhere in a screen. `hidden` hides the bar (fullscreen media);
+ * `style` forces the content color: "light" (white text, for a dark header), "dark"
+ * (dark text), or omit to follow the app theme automatically.
+ *
+ * Props: `hidden` (bool, default false), `style` ("light" | "dark", default auto).
+ *
+ * ```chuks
+ * StatusBar({ hidden: isFullscreen })
+ * StatusBar({ style: "light" })
+ * ```
+ */
+export function StatusBar(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.sbHide = pBool(p, "hidden", false) ? 1 : 0
+    s.sbStyle = pStr(p, "style", "")
+    s.w = 0; s.h = 0
+    return mkStatusBar(s)
+}
+/**
+ * A modal overlay: `kids` render on top of everything, over a dimmed scrim, when
+ * `visible`. Tapping the scrim fires `onDismiss`. `position` centers the content
+ * ("center", a dialog) or pins it to the bottom ("bottom", a sheet). The host owns
+ * the overlay layer (z-top, full-screen, scrim), so it sits above the tab bar and
+ * spans the safe area. Wrap content in a Card for a dialog / sheet surface.
+ *
+ * Props: `visible` (bool), `onDismiss` (() -> void), `position` ("center" default |
+ * "bottom").
+ *
+ * ```chuks
+ * Modal({ visible: showSheet, onDismiss: close, position: "bottom" }, [
+ *     Card({ children: [ Text(...), Button({ ..., onPress: close }) ] }),
+ * ])
+ * ```
+ */
+export function Modal(p: map[string]Prop, kids: []Node): Node {
+    const vis: bool = pBool(p, "visible", false)
+    const s: Style = new Style()
+    s.mvis = vis ? 1 : 0
+    s.mpos = pStr(p, "position", "center")
+    // Hidden: emit the node but with NO children, so the content isn't mounted.
+    const n: Node = mkModal(s, vis ? kids : [])
+    const od: Prop? = p.get("onDismiss")     // scrim tap fires onDismiss (wired as onPress)
+    if (od != null) { n.onPress = od }
+    return n
+}
+/**
+ * A NATIVE alert / confirm dialog (UIAlertController / SwiftUI .alert / AlertDialog).
+ * Declarative like Modal: the parent owns `visible` and passes it; the host presents
+ * the OS alert when it flips true. `confirmText` is the primary button; a non-empty
+ * `cancelText` adds a second (cancel) button. `onConfirm` / `onCancel` fire on tap.
+ * Renders nothing inline.
+ *
+ * Props: `visible` (bool), `title`, `message`, `confirmText` ("OK"), `cancelText`
+ * ("" = single-button), `onConfirm` (() -> void), `onCancel` (() -> void).
+ *
+ * ```chuks
+ * Alert({ visible: confirming.get(), title: "Delete?", message: "This can't be undone.",
+ *         confirmText: "Delete", cancelText: "Cancel",
+ *         onConfirm: function(): void { doDelete(); confirming.set(false) },
+ *         onCancel:  function(): void { confirming.set(false) } })
+ * ```
+ */
+export function Alert(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.avis = pBool(p, "visible", false) ? 1 : 0
+    const title: string = pStr(p, "title", "")
+    const message: string = pStr(p, "message", "")
+    const confirm: string = pStr(p, "confirmText", "OK")
+    const cancel: string = pStr(p, "cancelText", "")     // "" = single-button alert
+    const joined: string = title + "\t" + message + "\t" + confirm + "\t" + cancel
+    const n: Node = mkAlert(s, joined)
+    // The host reports a button tap as "1" (confirm) or "0" (cancel); route to the callbacks.
+    // The closure body is a single call: locals declared inside a captured closure
+    // miscompile under AOT, so callOpt (a top-level helper) holds the const + call.
+    const oc: Prop? = p.get("onConfirm")
+    const ox: Prop? = p.get("onCancel")
+    n.onChange = function(v: string): void { if (v == "1") { callOpt(oc) } else { callOpt(ox) } }
+    return n
+}
+// Invoke an optional Prop closure (a () -> void callback), if present.
+function callOpt(cb: Prop?): void { if (cb != null) { const f: any = cb; f() } }
+export function Toggle(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.swOn = pBool(p, "on", false) ? 1 : 0
+    applyLayout(s, p)
+    const n: Node = mkSwitch(s)
+    applyEvents(n, p)
+    return n
+}
+/**
+ * A native value slider (UISlider / SwiftUI Slider / Android SeekBar). Controlled,
+ * like Switch: the parent owns `value` and passes it; `onChange` fires with the new
+ * value (as a string; parse with int()) as the user drags. Integer range, `min` >= 0.
+ *
+ * Props: `value` (int), `min` (int, default 0), `max` (int, default 100),
+ *        `onChange` ((string) -> void), `color` (active-track/thumb tint hex), `h`.
+ *
+ * ```chuks
+ * Slider({ value: vol.get(), min: 0, max: 100,
+ *          onChange: function(v: string): void { vol.set(int(v)) } })
+ * ```
+ */
+export function Slider(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.slmin = pInt(p, "min", 0)
+    s.slmax = pInt(p, "max", 100)
+    s.slval = pInt(p, "value", s.slmin)
+    if (s.slval < 0) { s.slval = 0 }            // keep the serialization sentinel valid
+    s.h = pInt(p, "h", 40)
+    s.fg = pStr(p, "color", "")                 // optional active-track / thumb tint
+    applyLayout(s, p)
+    const n: Node = mkSlider(s)
+    applyEvents(n, p)                           // onChange(v) fires on drag
+    return n
+}
+/**
+ * A native select / dropdown (UIButton pull-down menu / SwiftUI Menu / Android
+ * PopupMenu). Controlled, like Switch: the parent owns the selected index (`value`)
+ * and passes `options`; `onChange` fires with the newly-picked index (as a string,
+ * parse with int()). The field shows the current option's label.
+ *
+ * Props: `value` (int index), `onChange` ((string) -> void), `bg`, `color`, `h`.
+ * `options` is a separate arg (the Prop union has no list type).
+ *
+ * ```chuks
+ * Select({ value: sel.get(), onChange: function(v: string): void { sel.set(int(v)) } },
+ *        ["Low", "Medium", "High"])
+ * ```
+ */
+export function Select(p: map[string]Prop, options: []string): Node {
+    const s: Style = new Style()
+    s.seli = pInt(p, "value", 0)
+    if (s.seli < 0) { s.seli = 0 }
+    s.h = pInt(p, "h", 44)
+    s.bg = pStr(p, "bg", "FFFFFF")
+    s.fg = pStr(p, "color", "111318")
+    s.radius = pInt(p, "radius", 10)
+    applyLayout(s, p)
+    const n: Node = mkSelect(s, options.join("\t"))   // options in the text channel
+    applyEvents(n, p)                                 // onChange(index) fires on pick
+    return n
+}
+/**
+ * A native date / time picker (UIDatePicker .compact / SwiftUI DatePicker / Android
+ * DatePickerDialog + TimePickerDialog). Controlled, like Select: the parent owns the
+ * `value` (an ISO string) and passes it; `onChange` fires with the newly-picked value
+ * as an ISO string. The field shows the current value.
+ *
+ * Value format by `mode`: "date" -> "YYYY-MM-DD", "time" -> "HH:MM",
+ * "datetime" -> "YYYY-MM-DDTHH:MM". Empty `value` starts at "now".
+ *
+ * `display` sets how it presents: "" (compact field, tap opens a popover on iOS / a
+ * Material dialog on Android), "inline" (always-open graphical calendar on iOS), or
+ * "wheels" (the classic wheel on iOS). On Android every display opens the dialog.
+ *
+ * Props: `value` (ISO string), `mode` ("date" | "time" | "datetime", default "date"),
+ *        `display` ("" | "inline" | "wheels"), `onChange` ((string) -> void),
+ *        `bg`, `color`, `radius`, `h`.
+ *
+ * ```chuks
+ * DatePicker({ value: born.get(), mode: "date",
+ *              onChange: function(v: string): void { born.set(v) } })
+ * ```
+ */
+export function DatePicker(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.dpmode = pStr(p, "mode", "date")          // date | time | datetime
+    s.dpdisp = pStr(p, "display", "")           // "" compact field | "inline" always-open | "wheels"
+    // The compact field is a fixed-height row; inline/wheels size to their natural
+    // (tall) height, so only clamp height for the compact display.
+    if (s.dpdisp == "") { s.h = pInt(p, "h", 44) }
+    else if (p.get("h") != null) { s.h = pInt(p, "h", -1) }
+    s.bg = pStr(p, "bg", "FFFFFF")
+    s.fg = pStr(p, "color", "111318")
+    s.radius = pInt(p, "radius", 10)
+    applyLayout(s, p)
+    // Compact opens on tap (popover / dialog); inline & wheels are always-open, so
+    // each host builds a different view — carry that in the node kind.
+    const kind: string = (s.dpdisp == "") ? "DatePicker" : "DatePickerInline"
+    const n: Node = mkDatePicker(kind, s, pStr(p, "value", ""))   // ISO value in the text channel
+    applyEvents(n, p)                                       // onChange(iso) fires on pick
+    return n
+}
+/**
+ * A native menu button (UIButton pull-down / SwiftUI Menu / Android PopupMenu). Unlike
+ * Select there is no persistent selection: it shows a fixed `label` and its `items` are
+ * one-shot actions. `onChange` fires with the picked item's index (as a string; parse
+ * with int()). `items` is a separate arg (the Prop union has no list type).
+ *
+ * Props: `label` (trigger text), `onChange` ((string) -> void), `bg`, `color`, `h`, `radius`.
+ *
+ * ```chuks
+ * Menu({ label: "Options",
+ *        onChange: function(v: string): void { self.run(int(v)) } },
+ *      ["Share", "Rename", "Delete"])
+ * ```
+ */
+export function Menu(p: map[string]Prop, items: []string): Node {
+    const s: Style = new Style()
+    s.h = pInt(p, "h", 44)
+    s.bg = pStr(p, "bg", "FFFFFF")
+    s.fg = pStr(p, "color", "111318")
+    s.radius = pInt(p, "radius", 10)
+    applyLayout(s, p)
+    const label: string = pStr(p, "label", "Menu")
+    const n: Node = mkMenu(s, label + "\t" + items.join("\t"))   // parts[0]=label, rest=items
+    applyEvents(n, p)                                            // onChange(index) fires on pick
+    return n
+}
+/**
+ * A context menu: long-press the wrapped `kids` to open a native action menu
+ * (UIContextMenuInteraction / SwiftUI .contextMenu / Android long-press PopupMenu).
+ * `onChange` fires with the picked item's index (as a string). `items` is a separate
+ * arg before the children.
+ *
+ * ```chuks
+ * ContextMenu({ onChange: function(v: string): void { self.act(int(v)) } },
+ *             ["Copy", "Share", "Delete"],
+ *             [ Card({ children: [ Text(tw("text-text"), "Long-press me") ] }) ])
+ * ```
+ */
+export function ContextMenu(p: map[string]Prop, items: []string, kids: []Node): Node {
+    const s: Style = new Style()
+    applyLayout(s, p)
+    const n: Node = mkContextMenu(s, items.join("\t"), kids)     // items in the text channel
+    applyEvents(n, p)                                            // onChange(index) fires on pick
+    return n
+}
+/**
+ * A grid: lays `items` into `cols` equal-width columns with `gap` between cells and
+ * rows. Composed from Row/Column/View, so it works on every engine with no host code.
+ * Cells stretch to share the row width (align-items: stretch), so each item fills its
+ * cell; give items a height (or let them size to content). The last row is padded with
+ * empty cells so items stay aligned. For a long, scrolling grid, put it inside `Scroll`.
+ *
+ * Props: `cols` (default 2), `gap` (default 10), plus layout props (`pad`, `grow`, `bg`).
+ * `items` is a separate arg (the Prop union has no list type).
+ *
+ * ```chuks
+ * Grid({ cols: 3, gap: 10 }, [ tileA, tileB, tileC, tileD, tileE ])
+ * ```
+ */
+export function Grid(p: map[string]Prop, items: []Node): Node {
+    const cols: int = pInt(p, "cols", 2)
+    const gap: int = pInt(p, "gap", 10)
+    var rows: []Node = []
+    var i: int = 0
+    while (i < items.length) {
+        var cells: []Node = []
+        var c: int = 0
+        while (c < cols) {
+            const idx: int = i + c
+            if (idx < items.length) {
+                cells.push(View({ grow: 1 }, [items[idx]]))       // the cell; its child stretches to fill
+            } else {
+                cells.push(View({ grow: 1 }, []))                 // filler keeps the last row aligned
+            }
+            c = c + 1
+        }
+        rows.push(Row({ gap: gap }, cells))
+        i = i + cols
+    }
+    const s: Style = new Style(); s.dir = "col"; applyLayout(s, p); s.gap = gap
+    return mkView(s, rows)
+}
+/**
+ * A native map centered on a coordinate. iOS renders a real `MKMapView` (MapKit, no
+ * API key); Android renders an interactive OpenStreetMap in a web view (a native Google
+ * map needs the Maps SDK + an API key). Give it a size or let it `grow` to fill.
+ *
+ * Coordinates are strings (the Prop union has no float): `lat`, `lng`, and an integer
+ * `zoom` (higher = closer; ~1 world, ~13 city, ~17 street).
+ *
+ * ```chuks
+ * Map({ lat: "37.7749", lng: "-122.4194", zoom: "12", grow: 1 })
+ * ```
+ */
+export function Map(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    s.radius = pInt(p, "radius", 0)
+    applyLayout(s, p)
+    const lat: string = pStr(p, "lat", "37.7749")
+    const lng: string = pStr(p, "lng", "-122.4194")
+    const zoom: string = pStr(p, "zoom", "12")
+    return new Node("Map", s, lat + "," + lng + "," + zoom, [])   // "lat,lng,zoom" in the text channel
+}
+
+// ---- Canvas / SVG shapes ---------------------------------------------------
+// Each shape builder returns a compact descriptor string; Canvas joins them with ";"
+// into the node's text channel (fields comma-separated). A Path's `d` uses
+// space-separated SVG commands (M/L/Z) so it never contains a "," or ";".
+function si(p: map[string]Prop, k: string): string { return string(pInt(p, k, 0)) }
+
+/** A rectangle. Props: `x`, `y`, `w`, `h`, `fill`, `stroke`, `strokeWidth`, `radius`. */
+export function Rect(p: map[string]Prop): string {
+    return "rect," + si(p, "x") + "," + si(p, "y") + "," + si(p, "w") + "," + si(p, "h") + "," +
+        pStr(p, "fill", "") + "," + pStr(p, "stroke", "") + "," + si(p, "strokeWidth") + "," + si(p, "radius")
+}
+/** A circle. Props: `cx`, `cy`, `r`, `fill`, `stroke`, `strokeWidth`. */
+export function Circle(p: map[string]Prop): string {
+    return "circle," + si(p, "cx") + "," + si(p, "cy") + "," + si(p, "r") + "," +
+        pStr(p, "fill", "") + "," + pStr(p, "stroke", "") + "," + si(p, "strokeWidth")
+}
+/** A line. Props: `x1`, `y1`, `x2`, `y2`, `stroke`, `strokeWidth`. */
+export function Line(p: map[string]Prop): string {
+    return "line," + si(p, "x1") + "," + si(p, "y1") + "," + si(p, "x2") + "," + si(p, "y2") + "," +
+        pStr(p, "stroke", "") + "," + string(pInt(p, "strokeWidth", 1))
+}
+/** An SVG path (M / L / Z subset). Props: `d` (path data), `fill`, `stroke`, `strokeWidth`. */
+export function Path(p: map[string]Prop): string {
+    return "path," + pStr(p, "d", "") + "," + pStr(p, "fill", "") + "," +
+        pStr(p, "stroke", "") + "," + si(p, "strokeWidth")
+}
+/**
+ * A native drawing surface. Renders a list of vector shapes (Rect / Circle / Line /
+ * Path) with native drawing — Core Graphics on UIKit, SwiftUI `Canvas`, and
+ * `android.graphics` on Android. Shapes use pixel coordinates within the canvas; give
+ * it a size or let it `grow`. Colors are hex without a leading `#`.
+ *
+ * ```chuks
+ * Canvas({ w: 300, h: 180, bg: tk("surface"), radius: 12 }, [
+ *     Rect({ x: 16, y: 16, w: 80, h: 80, fill: "6366F1", radius: 10 }),
+ *     Circle({ cx: 210, cy: 56, r: 40, fill: "22C55E" }),
+ *     Line({ x1: 16, y1: 140, x2: 284, y2: 140, stroke: "EF4444", strokeWidth: 3 }),
+ *     Path({ d: "M150 96 L190 150 L110 150 Z", fill: "F97316" }),
+ * ])
+ * ```
+ */
+export function Canvas(p: map[string]Prop, shapes: []string): Node {
+    const s: Style = new Style()
+    s.bg = pStr(p, "bg", "")
+    s.radius = pInt(p, "radius", 0)
+    applyLayout(s, p)
+    return new Node("Canvas", s, shapes.join(";"), [])   // shapes joined in the text channel
+}
+/**
+ * Recognizes gestures beyond a tap on its children and reports them through one
+ * `onGesture(g)` callback. `g` is an encoded string the host dispatches: "swipe:left",
+ * "swipe:right", "swipe:up", "swipe:down", "doubletap", or "longpress". Native
+ * recognizers on each engine (UISwipe/UITap/UILongPress, SwiftUI gestures, Android
+ * GestureDetector), so each fires once — no per-frame round-trip.
+ *
+ * ```chuks
+ * Gesture({ onGesture: function(g: string): void {
+ *     if (g == "swipe:left") { next() }
+ *     if (g == "doubletap") { like() }
+ * } }, [ card ])
+ * ```
+ */
+export function Gesture(p: map[string]Prop, kids: []Node): Node {
+    const s: Style = new Style()
+    applyLayout(s, p)
+    const n: Node = new Node("Gesture", s, "", kids)
+    const og: Prop? = p.get("onGesture"); if (og != null) { n.onChange = og }   // fires via the value channel
+    return n
 }
 /**
  * A page's root column: its children fill the screen top-to-bottom. Every
@@ -352,6 +1024,35 @@ export function List(p: map[string]ListProp): Node {
     const s: Style = new Style(); s.grow = 1; s.basis = 0    // fills the remaining space
     const n: Node = new Node("List", s, "", [])
     n.data = p    // carries count, key, item, rowHeight, gap, pad
+    return n
+}
+/**
+ * A virtualized SECTIONED list: rows grouped under section headers, only the
+ * on-screen window mounted (same windowing as List). Uniform `rowHeight` +
+ * `headerHeight`; the header/rows are absolutely positioned at the `top` passed
+ * to their builders (use `abs: true, top`).
+ *
+ * Props:
+ *   - `sectionCount` number of sections
+ *   - `rows`         (s: int) -> int              rows in section `s`
+ *   - `header`       (s: int, top: int) -> Node   the section header at `top`
+ *   - `item`         (s: int, r: int, top: int) -> Node   a row at `top`
+ *   - `key`          (s: int, r: int) -> string   stable row identity
+ *   - `rowHeight`, `headerHeight`, `gap`, `pad`, `buffer` (optional)
+ *
+ * ```chuks
+ * SectionList({ sectionCount: groups.length,
+ *   rows:   function(s: int): int { return groups[s].items.length },
+ *   header: function(s: int, top: int): Node { return self.header(s, top) },
+ *   item:   function(s: int, r: int, top: int): Node { return self.row(s, r, top) },
+ *   key:    function(s: int, r: int): string { return string(s) + "-" + string(r) },
+ *   rowHeight: 56, headerHeight: 34, gap: 8, pad: 8 })
+ * ```
+ */
+export function SectionList(p: map[string]ListProp): Node {
+    const s: Style = new Style(); s.grow = 1; s.basis = 0
+    const n: Node = new Node("SectionList", s, "", [])
+    n.data = p
     return n
 }
 
@@ -422,13 +1123,16 @@ export class Reconciler {
     var vpTop: int                  // viewport (set by the host each scroll) for List windowing
     var vpH: int
     var rootPrev: Node?             // last rendered root, for diffing
-    var itemNodes: map[string]Node  // List item id -> last node (for reconcile prev)
-    var mounted: []string           // List item ids currently mounted
+    var itemNodes: map[string]Node  // List cell id -> last node it showed (for reconcile prev)
+    var mounted: []string           // List cell ids in use this frame
     var listCount: int              // last content count (to re-emit content height only on change)
+    var cellRank: map[string]int    // recycling: cell id -> the row rank it currently shows (-1 = free)
+    var poolSize: int               // recycling: how many pool cells have been created
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
+        this.cellRank = {}; this.poolSize = 0
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -480,6 +1184,7 @@ export class Reconciler {
             return
         }
         if (n.kind == "List") { this.reconcileList(null, n, id, parent, index); return }
+        if (n.kind == "SectionList") { this.reconcileSectionList(null, n, id, parent, index); return }
         this.emit("C|" + id + "|" + n.kind)
         const st: string = n.style.str()
         if (st != "") { this.emit("S|" + id + "|" + st) }
@@ -515,6 +1220,7 @@ export class Reconciler {
             return
         }
         if (next.kind == "List") { this.reconcileList(prev, next, id, parent, index); return }
+        if (next.kind == "SectionList") { this.reconcileSectionList(prev, next, id, parent, index); return }
         if (p.text != next.text) { this.emit("P|" + id + "|" + next.text) }
         const ps: string = p.style.str()
         const ns: string = next.style.str()
@@ -558,17 +1264,14 @@ export class Reconciler {
         const pad: int = lpInt(d, "pad", 0)
         const stride: int = rowH + gap
         const buffer: int = lpInt(d, "buffer", 3)
-        const keyFn: any = d.get("key")     // called as `any` (its signature is fixed by contract)
         const itemFn: any = d.get("item")
         const contentId: string = id + ".0"
         const contentH: int = pad + count * stride + pad
 
         if (prev == null) {
-            // fresh mount (first render, or remount after this List was torn down
-            // by a page swap): start from a clean window so stale item nodes from a
-            // previous mounting don't suppress the C mutations for the new views.
-            this.mounted = []
-            this.itemNodes = {}
+            // fresh mount (first render, or remount after a page swap tore this List
+            // down): start from a clean pool so stale cells can't suppress mounts.
+            this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
             const listS: Style = new Style(); listS.grow = 1; listS.basis = 0
             this.emit("C|" + id + "|Scroll"); this.emit("S|" + id + "|" + listS.str())
             this.emit("I|" + id + "|" + parent + "|" + string(index))
@@ -588,26 +1291,127 @@ export class Reconciler {
         if (r1 > count) { r1 = count }
         if (r1 < r0) { r1 = r0 }
 
-        // item ids live UNDER the content node (contentId + ".c" + key) so a page
-        // swap that removes the List (R|<listId>) also frees every item by prefix.
-        // identity is still the key, so a row survives a filter that moves its rank.
-        const desired: []string = []
-        for (var r: int = r0; r < r1; r = r + 1) { desired.push(contentId + ".c" + string(keyFn(r))) }
+        // ---- VIEW RECYCLING (the FlashList trick) --------------------------------
+        // A fixed POOL of cell views ("<content>.cell<i>"). On scroll we don't destroy
+        // the rows that leave and create the ones that enter — we REBIND a leaving
+        // cell to the entering row: reconcile() diffs its old node against the new
+        // one and emits only the changed text / position (S|/P|), reusing the native
+        // view. Result: during a fling, ~zero Create/Remove mutations — only cheap
+        // content updates — so the native side never churns view + Yoga-node allocs.
+        var freeCells: []string = []           // cells whose current rank fell out of the window
+        var rankCell: map[string]string = {}    // rank (as string) still on-screen -> the cell showing it
+        for (var i: int = 0; i < this.poolSize; i = i + 1) {
+            const cid: string = contentId + ".cell" + string(i)
+            const cr: int = this.cellRank.getOr(cid, -1)
+            if (cr >= r0 && cr < r1) { rankCell[string(cr)] = cid } else { freeCells.push(cid) }
+        }
 
-        // recycle rows no longer in the window
+        const newMounted: []string = []
+        var fi: int = 0                          // next free cell to hand out
+        for (var r: int = r0; r < r1; r = r + 1) {
+            var cid: string = ""
+            const kept: string? = rankCell.get(string(r))
+            if (kept != null) { cid = kept }                  // this row is already on a cell: reuse in place
+            else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }   // recycle a leaving cell
+            else { cid = contentId + ".cell" + string(this.poolSize); this.poolSize = this.poolSize + 1 }  // grow the pool
+            const top: int = pad + r * stride
+            const node: Node = itemFn(r, top)
+            const pn: Node? = this.itemNodes.get(cid)         // the node this cell last showed (null on first use)
+            this.reconcile(pn, node, cid, contentId, 0)       // diff -> minimal S|/P|, no C|/R| when recycling
+            this.itemNodes[cid] = node
+            this.cellRank[cid] = r
+            newMounted.push(cid)
+        }
+        // Leftover free cells (a shrinking window) stay mounted but off-screen at their
+        // stale top — reusable next frame. They keep their cellRank, so if that rank
+        // scrolls back in they're kept in place. No churn.
+        this.mounted = newMounted
+    }
+
+    // Like reconcileList but SECTIONED: sections each contribute a header (headerH)
+    // + rowsFn(s) rows (rowH+gap each). Cells are absolutely positioned at their
+    // running offset; only the on-screen window (± buffer) is mounted. Reuses the
+    // shared windowing state (mounted / itemNodes / listCount / vpTop / vpH).
+    reconcileSectionList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        const d: map[string]ListProp = next.data
+        const sectionCount: int = lpInt(d, "sectionCount", 0)
+        const rowH: int = lpInt(d, "rowHeight", 0)
+        const headerH: int = lpInt(d, "headerHeight", 0)
+        const gap: int = lpInt(d, "gap", 0)
+        const pad: int = lpInt(d, "pad", 0)
+        const stride: int = rowH + gap
+        const buffer: int = lpInt(d, "buffer", 3)
+        const rowsFn: any = d.get("rows")
+        const keyFn: any = d.get("key")
+        const headerFn: any = d.get("header")
+        const itemFn: any = d.get("item")
+        const contentId: string = id + ".0"
+
+        // total content height (uniform cells, so a single pass over sections)
+        var total: int = pad
+        for (var s0: int = 0; s0 < sectionCount; s0 = s0 + 1) {
+            const nr0: int = int(rowsFn(s0))
+            total = total + headerH + nr0 * stride
+        }
+        total = total + pad
+        const contentH: int = total
+
+        if (prev == null) {
+            this.mounted = []
+            this.itemNodes = {}
+            const listS: Style = new Style(); listS.grow = 1; listS.basis = 0
+            this.emit("C|" + id + "|Scroll"); this.emit("S|" + id + "|" + listS.str())
+            this.emit("I|" + id + "|" + parent + "|" + string(index))
+            const cS: Style = new Style(); cS.h = contentH
+            this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
+            this.emit("I|" + contentId + "|" + id + "|0")
+            this.listCount = contentH
+        } else if (contentH != this.listCount) {
+            const cS: Style = new Style(); cS.h = contentH
+            this.emit("S|" + contentId + "|" + cS.str())
+            this.listCount = contentH
+        }
+
+        const vpLo: int = this.vpTop - buffer * stride
+        const vpHi: int = this.vpTop + this.vpH + buffer * stride
+        const desired: []string = []
+
+        var off: int = pad
+        for (var s: int = 0; s < sectionCount; s = s + 1) {
+            const nr: int = int(rowsFn(s))
+            const secBottom: int = off + headerH + nr * stride
+            if (secBottom >= vpLo && off <= vpHi) {
+                const hid: string = contentId + ".h" + string(s)
+                desired.push(hid)
+                const hnode: Node = headerFn(s, off)
+                const hWas: bool = this.containsStr(this.mounted, hid)
+                const hpn: Node? = hWas ? this.itemNodes.get(hid) : null
+                this.reconcile(hpn, hnode, hid, contentId, 0)
+                this.itemNodes[hid] = hnode
+                const rowsTop: int = off + headerH
+                var r0: int = (vpLo - rowsTop) / stride
+                if (r0 < 0) { r0 = 0 }
+                var r1: int = (vpHi - rowsTop) / stride + 1
+                if (r1 > nr) { r1 = nr }
+                if (r1 < r0) { r1 = r0 }
+                for (var r: int = r0; r < r1; r = r + 1) {
+                    const rtop: int = rowsTop + r * stride
+                    const rid: string = contentId + ".c" + string(keyFn(s, r))
+                    desired.push(rid)
+                    const rnode: Node = itemFn(s, r, rtop)
+                    const rWas: bool = this.containsStr(this.mounted, rid)
+                    const rpn: Node? = rWas ? this.itemNodes.get(rid) : null
+                    this.reconcile(rpn, rnode, rid, contentId, 0)
+                    this.itemNodes[rid] = rnode
+                }
+            }
+            off = secBottom
+        }
+
+        // recycle cells that scrolled out of the window
         for (var m: int = 0; m < this.mounted.length; m = m + 1) {
             const iid: string = this.mounted[m]
             if (!this.containsStr(desired, iid)) { this.emit("R|" + iid) }
-        }
-        // mount entering / diff staying (identity = key, position = rank)
-        for (var r: int = r0; r < r1; r = r + 1) {
-            const top: int = pad + r * stride
-            const node: Node = itemFn(r, top)
-            const iid: string = contentId + ".c" + string(keyFn(r))
-            const wasMounted: bool = this.containsStr(this.mounted, iid)
-            const pn: Node? = wasMounted ? this.itemNodes.get(iid) : null
-            this.reconcile(pn, node, iid, contentId, 0)
-            this.itemNodes[iid] = node
         }
         this.mounted = desired
     }
@@ -665,9 +1469,9 @@ var NAV: NavStack? = null    // the active NavStack (so pages can navigate from 
 export class NavStack extends App {
     // Routes map a name to a screen: a function () -> Node. (Like RN, a screen is
     // just a function that returns Node; there is no page base class to extend.)
-    var routes: map[string]any
+    var routes: map[string]function(): Node   // route name -> screen function () -> Node
     var stack: []string           // route-name stack; last = visible page
-    constructor(routes: map[string]any, initial: string) {
+    constructor(routes: map[string]function(): Node, initial: string) {
         super()
         this.routes = routes
         this.stack = [initial]
@@ -725,5 +1529,5 @@ export function back(): void { const nv: NavStack? = NAV; if (nv != null) { nv.p
 // NOTE: the native host contract (set_count/mount/tick/...) can't live here --
 // the transpiler tree-shakes exported functions that no Chuks code calls (the C
 // bridge calls them, which it can't see), and only the ENTRY module's exports
-// are emitted with their bare names for cgo. So app/_entry.chuks defines them as
+// are emitted with their bare names for cgo. So core/entry.chuks defines them as
 // thin forwarders to its App instance -- the one unavoidable bit of C-ABI glue.

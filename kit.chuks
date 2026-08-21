@@ -9,8 +9,9 @@
 // `function?(...)`) that defaults to null when omitted. Every component accepts an
 // optional `extra` tw-class string that is appended last, so it wins:
 //   Button({ variant: "primary", label: "Save", extra: "grow rounded-full" })
-import { Node, Row, Column, Text, TextInput, Prop } from "./ui.chuks";
+import { Node, Row, Column, Text, TextInput, Toggle, Prop } from "./ui.chuks";
 import { tw } from "./tw.chuks";
+import { tk } from "./theme.chuks";
 
 // Button: a tappable action. variant = "primary" | "secondary" | "ghost" | "danger"
 // (default "ghost"). onPress fires on tap.
@@ -47,12 +48,20 @@ export function Card(p: CardProps): Node {
 export dataType InputProps {
     placeholder: string?,
     onChange: function?(v: string): void,
+    secure: bool?,                  // password field: mask the entered text
+    multiline: bool?,               // a taller multi-line text area
     extra: string?,
 }
 export function Input(p: InputProps): Node {
-    var props: map[string]Prop = tw("bg-surface2 border border-border rounded-lg h-11 p-md text-base text-text " + (p.extra ?? ""))
+    const ml: bool = p.multiline ?? false
+    const h: string = ml ? "h-24" : "h-11"      // multiline is taller
+    // multiline: the native field's own text inset handles padding, so no p-md (it would double up)
+    const pad: string = ml ? "" : "p-md "
+    var props: map[string]Prop = tw("bg-surface2 border border-border rounded-lg " + h + " " + pad + "text-base text-text " + (p.extra ?? ""))
     props["placeholder"] = p.placeholder ?? ""
-    if (p.onChange != null) { const h: any = p.onChange; props["onChange"] = h }
+    if (p.onChange != null) { const cb: any = p.onChange; props["onChange"] = cb }
+    if (p.secure ?? false) { props["secure"] = true }
+    if (ml) { props["multiline"] = true }
     return TextInput(props)
 }
 
@@ -144,10 +153,9 @@ export dataType SwitchProps {
     onToggle: function?(): void,
 }
 export function Switch(p: SwitchProps): Node {
-    const track: string = p.on ? "bg-primary justify-end" : "bg-surface2 justify-start"
-    var props: map[string]Prop = tw("w-13 h-8 rounded-full p-1 items-center " + track)
-    if (p.onToggle != null) { props["onPress"] = p.onToggle }
-    return Row(props, [
-        Row(tw("w-6 h-6 rounded-full bg-white"), []),
-    ])
+    // A real native switch (UISwitch / SwiftUI Toggle / Android Switch), tinted with
+    // the theme primary. Controlled: the parent owns `on`, onToggle fires on flip.
+    var props: map[string]Prop = { on: p.on, bg: tk("primary") }
+    if (p.onToggle != null) { const h: any = p.onToggle; props["onPress"] = h }
+    return Toggle(props)
 }

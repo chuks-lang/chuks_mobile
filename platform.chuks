@@ -1,0 +1,38 @@
+// Platform + device info. The host reports these once at launch (via the entry's
+// setPlatform), and the app reads them anywhere to branch on the running platform —
+// the Chuks analogue of RN's `Platform.OS`.
+//
+// ```chuks
+// if (getPlatform() == Platform.iOS) { ... }   // or: if (isIOS()) { ... }
+// ```
+
+// The two platforms Chuks Mobile runs on. String-backed so it serializes cleanly.
+export enum Platform {
+    iOS = "ios",
+    Android = "android"
+}
+
+var _os: Platform = Platform.iOS
+var _version: string = ""      // OS version, e.g. "17.4" / "14"
+var _model: string = ""        // device model, e.g. "iPhone" / "Pixel 7"
+var _isTablet: bool = false    // iPad / large-screen Android
+
+// Called by the host at launch (through the entry's setPlatform). Not for app code.
+export function setPlatformInfo(os: string, version: string, model: string, isTablet: bool): void {
+    _os = (os == "android") ? Platform.Android : Platform.iOS
+    _version = version
+    _model = model
+    _isTablet = isTablet
+}
+
+// The running platform. Compare against Platform.iOS / Platform.Android.
+export function getPlatform(): Platform { return _os }
+// Convenience predicates.
+export function isIOS(): bool { return _os == Platform.iOS }
+export function isAndroid(): bool { return _os == Platform.Android }
+// Device info reported by the host.
+export function osVersion(): string { return _version }
+export function deviceModel(): string { return _model }
+export function isTablet(): bool { return _isTablet }
+// Pick a value per platform in one expression: select(iosValue, androidValue).
+export function select(ios: string, android: string): string { return isIOS() ? ios : android }
