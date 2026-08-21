@@ -709,6 +709,7 @@ class MainActivity : Activity() {
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
+    private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
     private val iconFonts = HashMap<String, android.graphics.Typeface>()   // custom fonts by name, cached
     private fun iconFont(name: String): android.graphics.Typeface =
         iconFonts.getOrPut(name) { android.graphics.Typeface.createFromAsset(assets, "$name.ttf") }
@@ -720,7 +721,7 @@ class MainActivity : Activity() {
         // this id first. Node ids are reused when a screen swaps in place; without
         // this a previous bordered/filled element leaves its border/bg under the new
         // one (e.g. a stray outline around a row that later holds a Switch).
-        bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id)
+        bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id)
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
@@ -739,7 +740,7 @@ class MainActivity : Activity() {
                 "a" -> N.ySetF(n, 2, align(vl))
                 "g" -> N.ySetF(n, 3, f)
                 "basis" -> N.ySetF(n, 4, dpf(f))
-                "w" -> N.ySetF(n, 5, dpf(f))
+                "w" -> { N.ySetF(n, 5, dpf(f)); textWidthPx[id] = dpf(f) }   // record so Text wraps to this width
                 "h" -> { N.ySetF(n, 6, dpf(f))
                     // A ScrollView measures its child with UNSPECIFIED height, so a
                     // FrameLayout content sizes to its (windowed) children and ignores the
@@ -817,6 +818,9 @@ class MainActivity : Activity() {
             it.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, fsPx)
             if (customFont.isNotEmpty()) it.typeface = iconFont(customFont)
             else it.setTypeface(null, if (bold) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
+            // Size/font/width just changed; re-measure so wrapped height (and any
+            // fixed width) are correct regardless of style-vs-text op order.
+            if (it.text.isNotEmpty()) measureText(id, it)
         }
         if (v is SeekBar && slV >= 0) {              // Slider: SeekBar is 0-based, so offset by min
             sliderMin[id] = slMin
@@ -1108,10 +1112,19 @@ class MainActivity : Activity() {
     // eager text self-sizing (the Android analogue of Yoga's measure func)
     private fun measureText(id: String, tv: TextView) {
         val n = ynodes[id] ?: return
-        val unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        tv.measure(unspec, unspec)
-        N.ySetF(n, 5, tv.measuredWidth.toFloat())
-        N.ySetF(n, 6, tv.measuredHeight.toFloat())
+        val fixedW = textWidthPx[id]
+        val unspecH = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        if (fixedW != null) {
+            // Explicit width: measure CONSTRAINED so the text wraps, keep that width,
+            // and report the wrapped height. (Measuring UNSPECIFIED here would report the
+            // single-line width and clobber the width, so the text never wraps.)
+            tv.measure(View.MeasureSpec.makeMeasureSpec(fixedW.toInt(), View.MeasureSpec.EXACTLY), unspecH)
+            N.ySetF(n, 6, tv.measuredHeight.toFloat())
+        } else {
+            tv.measure(unspecH, unspecH)
+            N.ySetF(n, 5, tv.measuredWidth.toFloat())
+            N.ySetF(n, 6, tv.measuredHeight.toFloat())
+        }
     }
 
     // A vector drawing surface: parses the ";"-joined shape descriptors and draws them
