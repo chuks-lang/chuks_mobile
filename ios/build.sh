@@ -14,7 +14,14 @@ ENTRY="$PROJDIR/${ENTRY:-.chuks/entry.chuks}"
 [ -f "$ENTRY" ] || { echo "no entry module at $ENTRY"; exit 1; }
 
 export CHUKS_NO_WARNINGS=1
-OUT="$PROJDIR/.chuks/ios-out"; APP="$OUT/ChuksDashboard.app"; BID="com.chuks.dashboard"
+# App identity from chuks.json: name (bundle/executable), displayName (home-screen
+# label), bundleId (CFBundleIdentifier). Sensible fallbacks derive from name.
+pj() { sed -n "s/.*\"$1\"[^\"]*\"\([^\"]*\)\".*/\1/p" "$PROJDIR/chuks.json" | head -1; }
+NAME_RAW="$(pj name)"; NAME_RAW="${NAME_RAW:-chuksapp}"
+APPNAME="$(printf '%s' "$NAME_RAW" | tr -cd '[:alnum:]')"; APPNAME="${APPNAME:-ChuksApp}"
+DISPLAY="$(pj displayName)"; DISPLAY="${DISPLAY:-$NAME_RAW}"
+BID="$(pj bundleId)"; BID="${BID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')}"
+OUT="$PROJDIR/.chuks/ios-out"; APP="$OUT/$APPNAME.app"
 rm -rf "$OUT"; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the c-archive is compiled inside the cache dir, so its -o must be absolute
 # Cold build wipes the AOT cache for reproducibility; FAST=1 (the dev loop) keeps it.
@@ -50,7 +57,7 @@ if [ "$ENGINE" = "swiftui" ]; then
         "$OUT/libapp.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
         -framework SwiftUI -framework UIKit -framework Foundation -framework AVKit -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG \
-        -o "$OUT/ChuksDashboard"
+        -o "$OUT/$APPNAME"
 else
     echo "3. Building the UIKit host"
     printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
@@ -59,11 +66,11 @@ else
         "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
         -framework UIKit -framework Foundation -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG \
-        -o "$OUT/ChuksDashboard"
+        -o "$OUT/$APPNAME"
 fi
 
 echo "4. Assembling the app (+ your assets)"
-mkdir -p "$APP"; cp "$OUT/ChuksDashboard" "$APP/ChuksDashboard"
+mkdir -p "$APP"; cp "$OUT/$APPNAME" "$APP/$APPNAME"
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 FONT_PLIST=""
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do
@@ -75,9 +82,9 @@ cat > "$APP/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>$BID</string>
-  <key>CFBundleName</key><string>ChuksDashboard</string>
-  <key>CFBundleDisplayName</key><string>Chuks Dashboard</string>
-  <key>CFBundleExecutable</key><string>ChuksDashboard</string>
+  <key>CFBundleName</key><string>$APPNAME</string>
+  <key>CFBundleDisplayName</key><string>$DISPLAY</string>
+  <key>CFBundleExecutable</key><string>$APPNAME</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>

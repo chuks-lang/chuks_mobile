@@ -18,7 +18,15 @@ BT="$SDK/build-tools/35.0.0"; AJAR="$SDK/platforms/android-35/android.jar"
 BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 CC="$BIN/aarch64-linux-android24-clang"; CXX="$BIN/aarch64-linux-android24-clang++"
 ADB="$SDK/platform-tools/adb"
-PKG="com.chuks.app"; OUT="$PROJDIR/.chuks/android-out"
+# App identity from chuks.json: displayName (launcher label), bundleId (applicationId).
+# CODEPKG is the host's fixed Kotlin package; --rename-manifest-package keeps components
+# resolving to it while the app installs under APPID.
+pj() { sed -n "s/.*\"$1\"[^\"]*\"\([^\"]*\)\".*/\1/p" "$PROJDIR/chuks.json" | head -1; }
+NAME_RAW="$(pj name)"; NAME_RAW="${NAME_RAW:-chuksapp}"
+DISPLAY="$(pj displayName)"; DISPLAY="${DISPLAY:-$NAME_RAW}"
+CODEPKG="com.chuks.app"
+APPID="$(pj bundleId)"; APPID="${APPID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')}"
+PKG="$APPID"; OUT="$PROJDIR/.chuks/android-out"
 export CHUKS_NO_WARNINGS=1
 rm -rf "$OUT" ~/.chuks/cache/builds/*; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the .so is compiled inside the cache dir, so its -o must be absolute
@@ -50,7 +58,12 @@ if ! "$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar" > "$OUT/
 fi
 
 echo "5. Linking resources"
-"$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$PKGDIR/AndroidManifest.xml" \
+# Per-project manifest: override the launcher label; --rename-manifest-package sets the
+# applicationId while keeping CODEPKG for component (.MainActivity) resolution.
+cp "$PKGDIR/AndroidManifest.xml" "$OUT/AndroidManifest.xml"
+sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
+"$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
+    --rename-manifest-package "$APPID" \
     --min-sdk-version 24 --target-sdk-version 34
 
 echo "6. Bundling the app (+ your assets)"
@@ -75,5 +88,5 @@ for f in $(find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name 
 echo "7. Installing + launching"
 "$ADB" install -r "$OUT/chuks.apk" > "$OUT/adb.log" 2>&1 || { echo "  Install failed:"; cat "$OUT/adb.log"; exit 1; }
 "$ADB" shell am force-stop "$PKG" > /dev/null 2>&1 || true
-"$ADB" shell am start -n "$PKG/.MainActivity" > /dev/null 2>&1
+"$ADB" shell am start -n "$PKG/$CODEPKG.MainActivity" > /dev/null 2>&1
 echo "   Done."
