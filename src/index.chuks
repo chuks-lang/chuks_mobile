@@ -1,0 +1,14 @@
+// @chuks/mobile — the Chuks Mobile SDK entry (publish entry point).
+//
+// Chuks has no re-export, so import framework modules granularly:
+//   import { Node, Column, Row, Text, Pressable, Comp } from "pkg/@chuks/mobile/core/ui.chuks";
+//   import { useState, useEffect, Cell } from "pkg/@chuks/mobile/core/state.chuks";
+//   import { NavStack } from "pkg/@chuks/mobile/core/nav.chuks";
+//   import { tk, setTheme } from "pkg/@chuks/mobile/core/theme.chuks";
+//   import { Permission, FileSystem, SecureStore, Audio, Tts, Notifications,
+//            Battery, Network, AppState } from "pkg/@chuks/mobile/core/native.chuks";
+//
+// The native hosts (iOS SwiftUI/UIKit, Android) + build scripts ship in this
+// package under ios/ and android/; a project's build runs them from
+// chuks_packages/@chuks/mobile/.
+export const VERSION: string = "0.1.1"

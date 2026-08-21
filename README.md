@@ -1,66 +1,58 @@
-# Chuks Mobile
+# @chuks/mobile
 
-A mobile app written entirely in Chuks: the whole UI lives in `app/`, compiles to
-native, and drives real iOS/Android platform widgets through one shared engine.
+The Chuks Mobile SDK. Write your whole app in Chuks; it compiles to native and drives
+real iOS and Android widgets through one shared engine, with two iOS render engines
+(SwiftUI and UIKit) behind the same code.
 
-```
-app/      your app: pages (views/), components/, constants/, and app.chuks (routes)
-core/     the framework: ui.chuks (the toolkit), the VM dev server, shared Yoga headers
-ios/      the iOS/UIKit host + build/dev scripts
-android/  the Android host + build script
-```
+> **Requires Chuks v0.1.1 or newer.** The referenced-package build (a project consuming
+> `@chuks/mobile` from `chuks_packages/`) and the native host build scripts rely on
+> toolchain behavior available in Chuks v0.1.1+.
 
-You write Chuks in `app/`. You never edit `core/ui.chuks` or the hosts.
+## What's in the box
 
-## Running the app
+- **UI toolkit** — `core/ui.chuks` (Column, Row, Text, Pressable, List, …), `core/kit.chuks`
+- **State + effects** — `core/state.chuks` (`useState`, `useEffect`, keyed state)
+- **Navigation** — `core/nav.chuks` (`NavStack`)
+- **Theming** — `core/theme.chuks` (semantic tokens, light/dark), `core/tw.chuks`
+- **Platform info** — `core/platform.chuks` (`getPlatform`, `isIOS`, device info)
+- **Native capabilities** — `core/native.chuks`: permissions, file system, secure storage,
+  audio playback, text-to-speech, local notifications, and battery / network / app-state
+  streams, each working on all three engines
+- **Native hosts + build** — `ios/` (SwiftUI + UIKit), `android/` (JNI), and the build
+  scripts that compile your app through the package
 
-The commands live in `chuks.json` under `scripts` (they are documentation — run the
-shell command shown, `chuks` itself does not execute them). A booted simulator /
-emulator must already be running.
+## Using it
 
-### iOS — hot reload (recommended for development)
+Chuks has no re-export, so import framework modules granularly:
 
-```
-cd ios && ./dev.sh
-```
-
-One command: builds the DEV host once, starts the Chuks VM dev server on `:7799`,
-launches the app, then watches `app/app.chuks`. On every save it snapshots state,
-restarts the ~1s VM server, and the running app remounts with its state preserved
-(scroll position and keyboard focus survive too). No rebuild, no reinstall.
-
-Edited the Swift host itself? Re-run once with `FRESH=1 ./dev.sh` to rebuild it.
-
-### iOS — AOT build + launch
-
-```
-cd ios && FAST=1 ./build.sh     # fast dev build (keeps the AOT cache, ~seconds)
-cd ios && ./build.sh            # cold, optimized release build
+```chuks
+import { Node, Column, Text, Pressable, Comp } from "pkg/@chuks/mobile/core/ui.chuks";
+import { useState, useEffect, Cell }           from "pkg/@chuks/mobile/core/state.chuks";
+import { NavStack }                            from "pkg/@chuks/mobile/core/nav.chuks";
+import { tk }                                  from "pkg/@chuks/mobile/core/theme.chuks";
+import { Permission, FileSystem, SecureStore, Audio, Tts, Notifications,
+         Battery, Network, AppState }          from "pkg/@chuks/mobile/core/native.chuks";
 ```
 
-This compiles the engine into the app (no dev server), the true native binary.
+Your app root (`app/app.chuks`) exports `createRoot()`. A generated per-project entry
+(`.chuks/entry.chuks`) bridges it to the native host C-ABI — you don't write that file.
 
-### Android — AOT build + launch
+## Running
 
-```
-cd android && ./build.sh
-```
-
-The same `app/` engine, cross-compiled to an Android `.so` with a JNI + Kotlin host.
-
-### Other
+The package provides the host build scripts; run them from your project root (they read
+the native host out of `chuks_packages/@chuks/mobile/` and compile your app through the
+package):
 
 ```
-chuks check app/_entry.chuks              # typecheck the whole app
-chuks build app/_entry.chuks -o .out/e    # AOT-compile the engine only
-chuks run core/devserver.chuks            # start just the VM dev server on :7799
+bash chuks_packages/@chuks/mobile/ios/build.sh       # iOS simulator (iosEngine in chuks.json)
+bash chuks_packages/@chuks/mobile/android/build.sh   # Android device / emulator
 ```
 
-## How it fits together
+The streamlined path — `chuks new <name> --template mobile` to scaffold a project, then
+project `chuks.json` scripts to build — is being wired up in the CLI.
 
-`app/app.chuks` registers your pages (`View`s) in a `NavStack`. Each page's
-`render()` returns a UI tree built from the declarative builders in
-`core/ui.chuks` (`Screen`, `Row`, `Column`, `Text`, `Button`, `TextInput`,
-`List`, ...). The `Reconciler` diffs that tree into a minimal mutation stream the
-native host applies to real platform views. Hover any builder in your editor for
-its signature and an example.
+## Engines
+
+Your Chuks code is identical across all three. `iosEngine` in your project's `chuks.json`
+selects `swiftui` (native SwiftUI layout) or `uikit` (UIViews + Yoga flexbox); Android is
+a single JNI host.

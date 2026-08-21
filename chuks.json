@@ -1,17 +1,10 @@
 {
-  "name": "chuks-mobile",
+  "name": "@chuks/mobile",
   "version": "0.1.1",
-  "entry": "core/entry.chuks",
-  "iosEngine": "swiftui",
-  "_iosEngine_note": "uikit (UIViews + Yoga flexbox) or swiftui (native SwiftUI). The engine is the native render layer; your Chuks code is identical either way.",
-  "scripts": {
-    "dev": "cd ios && ./dev.sh",
-    "dev:fresh": "cd ios && FRESH=1 ./dev.sh",
-    "ios": "cd ios && FAST=1 ./build.sh",
-    "ios:release": "cd ios && ./build.sh",
-    "android": "cd android && ./build.sh",
-    "dev-server": "chuks run core/devserver.chuks",
-    "typecheck": "chuks check core/entry.chuks",
-    "check:aot": "chuks build core/entry.chuks -o /tmp/chuks-mobile-aot-check"
-  }
+  "description": "Chuks Mobile SDK: write your whole app in Chuks; it compiles to native and drives real iOS (SwiftUI + UIKit) and Android widgets through one engine. Ships the UI toolkit, navigation, theming, and native capabilities (permissions, file system, secure storage, audio, text-to-speech, local notifications, and battery / network / app-state streams).",
+  "entry": "src/index.chuks",
+  "repository": "https://github.com/chuks-lang/chuks_mobile",
+  "author": "Chuks Team",
+  "license": "MIT",
+  "keywords": ["mobile", "ios", "android", "swiftui", "uikit", "ui", "framework", "native", "cross-platform"]
 }
