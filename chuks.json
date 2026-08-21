@@ -1,0 +1,17 @@
+{
+  "name": "chuks-mobile",
+  "version": "0.1.1",
+  "entry": "core/entry.chuks",
+  "iosEngine": "swiftui",
+  "_iosEngine_note": "uikit (UIViews + Yoga flexbox) or swiftui (native SwiftUI). The engine is the native render layer; your Chuks code is identical either way.",
+  "scripts": {
+    "dev": "cd ios && ./dev.sh",
+    "dev:fresh": "cd ios && FRESH=1 ./dev.sh",
+    "ios": "cd ios && FAST=1 ./build.sh",
+    "ios:release": "cd ios && ./build.sh",
+    "android": "cd android && ./build.sh",
+    "dev-server": "chuks run core/devserver.chuks",
+    "typecheck": "chuks check core/entry.chuks",
+    "check:aot": "chuks build core/entry.chuks -o /tmp/chuks-mobile-aot-check"
+  }
+}
