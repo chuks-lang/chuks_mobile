@@ -92,6 +92,21 @@ export class FileSystem {
     public static delete(name: string): void { emitNativeCommand("fs.delete", name, null) }
 }
 
+// ---- Secure storage (Tier B) ------------------------------------------------
+// Encrypted key/value backed by the OS keystore (iOS Keychain, Android Keystore
+// AES-GCM) — for tokens, secrets, small sensitive values. Same content encoding
+// as FileSystem (the value is base64 on the wire); get() of a missing key ->
+// onError. Not for large blobs; use FileSystem for those.
+export class SecureStore {
+    public static set(key: string, value: string): void {
+        emitNativeCommand("secure.set", key + "|" + new Base64().encode(value), null)
+    }
+    public static get(key: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("secure.get", key, onResult, onError)
+    }
+    public static delete(key: string): void { emitNativeCommand("secure.delete", key, null) }
+}
+
 // ---- Debug ------------------------------------------------------------------
 // activeStreams() answers (async) with the host's live native-subscription count —
 // the assertion that a stream's NATIVE side was actually released, not just that
