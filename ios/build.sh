@@ -22,6 +22,15 @@ NAME_RAW="$(pj name)"; NAME_RAW="${NAME_RAW:-chuksapp}"
 APPNAME="$(printf '%s' "$NAME_RAW" | tr -cd '[:alnum:]')"; APPNAME="${APPNAME:-ChuksApp}"
 DISPLAY="$(pj displayName)"; DISPLAY="${DISPLAY:-$NAME_RAW}"
 BID="$(pj bundleId)"; BID="${BID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')}"
+# app.json (RN/Expo-style): the app's own identity + native config. Supersedes chuks.json
+# for name/displayName/bundleId, and is the SOLE source for version, URL schemes, and the
+# permission usage strings. Optional — every field falls back to a default.
+AJ() { python3 "$SDKROOT/appconfig.py" "$PROJDIR" "$1" 2>/dev/null; }
+_ajn="$(AJ name)";        [ -n "$_ajn" ] && { NAME_RAW="$_ajn"; APPNAME="$(printf '%s' "$_ajn" | tr -cd '[:alnum:]')"; }
+_ajd="$(AJ displayName)"; [ -n "$_ajd" ] && DISPLAY="$_ajd"
+_ajb="$(AJ ios-bundle)";  [ -n "$_ajb" ] && BID="$_ajb"
+APP_VERSION="$(AJ version)"; APP_VERSION="${APP_VERSION:-1.0}"
+APP_BUILD="$(AJ build)";     APP_BUILD="${APP_BUILD:-1}"
 # Chuks Preview: the generic runtime host (Expo Go for Chuks). Reuses this project's
 # entry only to supply the engine symbols (never called — Preview always talks to a dev
 # server), overrides the app identity, registers the chuks:// URL scheme, and compiles
@@ -114,14 +123,15 @@ if [ "${DEV:-0}" = "1" ] && [ "$PREVIEW" != "1" ]; then
     printf '%s' "$DEVHOST" > "$APP/chuks-dev.txt"
     echo "   hot reload: app will fetch from $DEVHOST"
 fi
-# Chuks Preview registers the chuks:// URL scheme (deep-link / scanner target).
-URLSCHEME_PLIST=""
+# Per-app plist keys: permission usage strings + URL schemes. A real build gets them from
+# app.json (via appconfig.py); Chuks Preview overrides with its scanner copy + chuks:// scheme.
 ICONNAME_PLIST=""
-CAMDESC="Demo: requesting camera permission (F2)."
 if [ "$PREVIEW" = "1" ]; then
-    URLSCHEME_PLIST='<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.chuks.preview</string><key>CFBundleURLSchemes</key><array><string>chuks</string></array></dict></array>'
-    CAMDESC="Scan a Chuks dev-server QR code to run your app."
+    IOS_PLIST_EXTRA='  <key>NSCameraUsageDescription</key><string>Scan a Chuks dev-server QR code to run your app.</string>
+  <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.chuks.preview</string><key>CFBundleURLSchemes</key><array><string>chuks</string></array></dict></array>'
     [ -f "$PKGDIR/preview-icon.png" ] && ICONNAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
+else
+    IOS_PLIST_EXTRA="$(AJ ios-plist)"
 fi
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 FONT_PLIST=""
@@ -138,26 +148,13 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>$DISPLAY</string>
   <key>CFBundleExecutable</key><string>$APPNAME</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>$APP_BUILD</string>
+  <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>MinimumOSVersion</key><string>15.0</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
   <key>NSLocalNetworkUsageDescription</key><string>Chuks dev-server hot reload.</string>
-  <key>NSCameraUsageDescription</key><string>$CAMDESC</string>
-  <key>NSMicrophoneUsageDescription</key><string>Demo: requesting microphone permission (F2).</string>
-  <key>NSLocationWhenInUseUsageDescription</key><string>Demo: requesting location permission (F2).</string>
-  <key>NSPhotoLibraryUsageDescription</key><string>Demo: requesting photo library permission (F2).</string>
-  <key>NSPhotoLibraryAddUsageDescription</key><string>Demo: saving an image to your photo library.</string>
-  <key>NSFaceIDUsageDescription</key><string>Demo: authenticating with Face ID.</string>
-  <key>NSContactsUsageDescription</key><string>Demo: reading your contacts.</string>
-  <key>NSCalendarsUsageDescription</key><string>Demo: reading and adding calendar events.</string>
-  <key>NSCalendarsFullAccessUsageDescription</key><string>Demo: reading and adding calendar events.</string>
-  <key>CFBundleURLTypes</key>
-  <array><dict>
-    <key>CFBundleURLName</key><string>com.chuks.chuksmobile</string>
-    <key>CFBundleURLSchemes</key><array><string>chuksdemo</string></array>
-  </dict></array>
+$IOS_PLIST_EXTRA
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
   <key>UISupportedInterfaceOrientations</key>
   <array>
@@ -166,7 +163,6 @@ cat > "$APP/Info.plist" <<PLIST
     <string>UIInterfaceOrientationLandscapeRight</string>
   </array>
   <key>UILaunchScreen</key><dict/>
-  $URLSCHEME_PLIST
   $ICONNAME_PLIST
   <key>UIAppFonts</key><array>$FONT_PLIST</array>
 </dict></plist>

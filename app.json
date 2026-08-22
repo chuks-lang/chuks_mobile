@@ -1,0 +1,24 @@
+{
+  "name": "Chuks",
+  "displayName": "Chuks",
+  "version": "1.0.0",
+  "buildNumber": 1,
+  "ios": {
+    "bundleId": "com.chuks.chuksmobile",
+    "schemes": ["chuksdemo"]
+  },
+  "android": {
+    "schemes": ["chuksdemo"]
+  },
+  "permissions": {
+    "camera": "Take and pick photos in the app.",
+    "microphone": "Record audio.",
+    "location": "Show your position on the map.",
+    "photos": "Pick photos from your library.",
+    "photosAdd": "Save photos to your library.",
+    "contacts": "Find people you know.",
+    "calendar": "Read and add calendar events.",
+    "faceId": "Unlock the app with Face ID.",
+    "notifications": "Send you notifications."
+  }
+}
