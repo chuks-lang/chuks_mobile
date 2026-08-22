@@ -51,6 +51,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         window = w
         return true
     }
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        chuksOrientationMask   // Orientation.lockTo() drives this
+    }
 }
 #endif
 
@@ -71,6 +74,28 @@ func hexColor(_ h: String) -> UIColor {
     Scanner(string: h).scanHexInt64(&v)
     return UIColor(red: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
                    blue: CGFloat(v & 0xff) / 255, alpha: 1)
+}
+
+// Orientation capability helpers: the current interface orientation as a string, and a
+// lock through the mask the AppDelegate reports to UIKit.
+var chuksOrientationMask: UIInterfaceOrientationMask = .all
+func currentOrientationString() -> String {
+    let io = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.interfaceOrientation
+    return (io?.isLandscape ?? false) ? "landscape" : "portrait"
+}
+func applyOrientationLock(_ mode: String) {
+    switch mode {
+    case "portrait":  chuksOrientationMask = .portrait
+    case "landscape": chuksOrientationMask = .landscape
+    default:          chuksOrientationMask = .all
+    }
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    if #available(iOS 16.0, *) {
+        scenes.forEach { $0.requestGeometryUpdate(.iOS(interfaceOrientations: chuksOrientationMask)) }
+        scenes.forEach { $0.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations() }
+    } else {
+        UIViewController.attemptRotationToDeviceOrientation()
+    }
 }
 
 // DEV mode (built with -D DEV): the engine runs in the Chuks VM dev server and
@@ -658,6 +683,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Live native subscriptions (stream token -> timer/observer), for teardown.
     var activeStreams: [String: Timer] = [:]
     var streamTeardown: [String: () -> Void] = [:]   // real OS streams: unregister closure, run on __cancel__
+    var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
@@ -773,6 +799,21 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "torch.set": setTorch(args == "1")
         case "brightness.set": if let v = Double(args) { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
+        case "orientation.watch":
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            orientationTokens.insert(token)
+            let emit: () -> Void = { [weak self] in self?.resolve(token, currentOrientationString()) }
+            let o = NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { _ in emit() }
+            streamTeardown[token] = { [weak self] in self?.orientationTokens.remove(token); NotificationCenter.default.removeObserver(o); UIDevice.current.endGeneratingDeviceOrientationNotifications() }
+            emit()
+        case "orientation.lock":
+            applyOrientationLock(args)
+            // A lock changes the interface orientation without a device-rotation notification,
+            // so re-emit the new value to the watchers once the geometry update settles.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self = self else { return }
+                self.orientationTokens.forEach { self.resolve($0, currentOrientationString()) }
+            }
         default: break
         }
     }

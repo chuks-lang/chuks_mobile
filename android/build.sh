@@ -11,6 +11,7 @@ PROJDIR="$(pwd)"                              # consumer project root
 [ -f "$PROJDIR/chuks.json" ] || { echo "run from a Chuks project root (no chuks.json here)"; exit 1; }
 ENTRY="$(sed -n 's/.*"entry"[^"]*"\([^"]*\)".*/\1/p' "$PROJDIR/chuks.json" | head -1)"
 ENTRY="$PROJDIR/${ENTRY:-.chuks/entry.chuks}"
+[ -n "${CHUKS_ENTRY:-}" ] && ENTRY="$PROJDIR/$CHUKS_ENTRY"   # build an arbitrary entry (docshots / examples)
 [ -f "$ENTRY" ] || { echo "no entry module at $ENTRY"; exit 1; }
 
 SDK="$HOME/Library/Android/sdk"; NDK="$SDK/ndk/27.1.12297006"

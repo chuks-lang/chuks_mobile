@@ -157,6 +157,10 @@ class MainActivity : Activity() {
     // android:configChanges="uiMode" in the manifest so we aren't recreated instead.
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        orientationTokens.toList().forEach { resolve(it, currentOrientation()) }   // rotation stream (works in dev too)
+        // Rotation changes the window size; onConfigurationChanged fires BEFORE the new
+        // measure, so re-layout after it (post) or the tree keeps the old width.
+        root.post { reportInsets(); if (pushViewport()) relayout() else relayout() }
         if (devMode) return   // dev server has no /colorScheme endpoint
         val dark = (newConfig.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
@@ -327,6 +331,9 @@ class MainActivity : Activity() {
     // run on __cancel__ so the receiver/callback is unregistered.
     private val streamTeardown = mutableMapOf<String, () -> Unit>()
     private val appStateTokens = mutableSetOf<String>()   // tokens watching foreground/background
+    private val orientationTokens = mutableSetOf<String>()   // tokens watching device orientation
+    private fun currentOrientation(): String =
+        if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait"
 
     // Execute a native capability requested via an `X|` command (F3). Fire-and-forget
     // commands (token "0") just perform the side effect; async reads call resolve().
@@ -475,6 +482,16 @@ class MainActivity : Activity() {
             "brightness.keepAwake" ->
                 if (args == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            "orientation.watch" -> {
+                orientationTokens.add(token)
+                streamTeardown[token] = { orientationTokens.remove(token) }
+                resolve(token, currentOrientation())
+            }
+            "orientation.lock" -> requestedOrientation = when (args) {
+                "portrait"  -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                else        -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
         }
     }
 

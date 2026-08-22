@@ -49,6 +49,16 @@ export class Brightness {
     public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", on ? "1" : "0", null) }
 }
 
+// ---- Orientation ------------------------------------------------------------
+// The device orientation, as a stream, plus a lock. watch() fires the current value
+// immediately ("portrait" | "landscape"), then on every rotation, until its NativeSub
+// is cancelled. lockTo(mode) pins the UI to "portrait" | "landscape", or "auto" to follow
+// the device again. (`lock` is a Chuks keyword, hence `lockTo`.)
+export class Orientation {
+    public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("orientation.watch", "", onChange, null) }
+    public static lockTo(mode: string): void { emitNativeCommand("orientation.lock", mode, null) }
+}
+
 // ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------
 // A minimal repeating stream used to exercise + prove the teardown path: start it
 // in a useEffect, cancel() the returned NativeSub in the cleanup, and on unmount

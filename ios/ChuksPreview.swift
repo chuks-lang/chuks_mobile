@@ -38,6 +38,7 @@ func parseDevServer(_ raw: String) -> String? {
 #if !CHUKS_PREVIEW_UIKIT
 @main
 struct ChuksPreviewApp: App {
+    @UIApplicationDelegateAdaptor(ChuksOrientationDelegate.self) var appDelegate   // orientation lock mask
     var body: some SwiftUI.Scene {
         WindowGroup { PreviewGate() }
     }
@@ -135,6 +136,9 @@ class ChuksPreviewAppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
         guard let host = parseDevServer(url.absoluteString) else { return false }
         connect(host); return true
+    }
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        chuksOrientationMask   // Orientation.lockTo() drives this
     }
     private func connect(_ host: String) {
         devServerHost = host

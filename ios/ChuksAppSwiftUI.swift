@@ -187,6 +187,35 @@ func hexColor(_ h: String) -> Color {
 }
 func numOf(_ s: String?) -> CGFloat? { guard let s = s, let f = Float(s) else { return nil }; return CGFloat(f) }
 
+// ─── Orientation (capability) ─────────────────────────────────────────────────
+// The app's current interface orientation, as "portrait"/"landscape", and a lock.
+// The lock reads through the global mask that the app delegate reports to UIKit.
+var chuksOrientationMask: UIInterfaceOrientationMask = .all
+func currentOrientationString() -> String {
+    let io = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.interfaceOrientation
+    return (io?.isLandscape ?? false) ? "landscape" : "portrait"
+}
+func applyOrientationLock(_ mode: String) {
+    switch mode {
+    case "portrait":  chuksOrientationMask = .portrait
+    case "landscape": chuksOrientationMask = .landscape
+    default:          chuksOrientationMask = .all
+    }
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    if #available(iOS 16.0, *) {
+        scenes.forEach { $0.requestGeometryUpdate(.iOS(interfaceOrientations: chuksOrientationMask)) }
+        scenes.forEach { $0.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations() }
+    } else {
+        UIViewController.attemptRotationToDeviceOrientation()
+    }
+}
+// SwiftUI has no AppDelegate by default; this adaptor lets UIKit read the lock mask.
+class ChuksOrientationDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        chuksOrientationMask
+    }
+}
+
 // Perceived lightness of a hex color (ITU-R BT.601 luma). Used to pick the status
 // bar / system chrome scheme from the app's live background, so the host chrome
 // follows setTheme() instead of being pinned dark.
@@ -388,6 +417,7 @@ final class Scene: ObservableObject {
     // Real OS streams (battery/app-state/network) keep an unregister closure here
     // instead of a Timer; __cancel__ runs it so the observer is torn down.
     var streamTeardown: [String: () -> Void] = [:]
+    var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
@@ -507,6 +537,21 @@ final class Scene: ObservableObject {
         case "torch.set": setTorch(args == "1")
         case "brightness.set": if let v = Double(args) { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
+        case "orientation.watch":
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            orientationTokens.insert(token)
+            let emit: () -> Void = { [weak self] in self?.resolve(token, currentOrientationString()) }
+            let o = NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { _ in emit() }
+            streamTeardown[token] = { [weak self] in self?.orientationTokens.remove(token); NotificationCenter.default.removeObserver(o); UIDevice.current.endGeneratingDeviceOrientationNotifications() }
+            emit()   // fire current value immediately
+        case "orientation.lock":
+            applyOrientationLock(args)
+            // A lock changes the interface orientation without a device-rotation notification,
+            // so re-emit the new value to the watchers once the geometry update settles.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self = self else { return }
+                self.orientationTokens.forEach { self.resolve($0, currentOrientationString()) }
+            }
         default: break
         }
     }
@@ -1488,6 +1533,7 @@ struct BottomSheetView: View {
 #if !CHUKS_PREVIEW
 @main
 struct ChuksMobileApp: App {
+    @UIApplicationDelegateAdaptor(ChuksOrientationDelegate.self) var appDelegate   // reports the orientation lock mask
     @StateObject var scene = Scene()
     var body: some SwiftUI.Scene {
         WindowGroup {

@@ -1,19 +1,38 @@
-// A tiny app served over the dev server to smoke-test the Chuks Preview host end to
-// end. Not shipped — lives beside the host build scripts for manual verification.
-import { NavStack, Node, View, Text, setSafeInsets } from "../core/ui.chuks";
-import { syncSystemTheme, followingSystem } from "../core/theme.chuks";
+// Smoke-test app for the Chuks Preview host, now exercising the Orientation capability:
+// Orientation.watch (live current value + rotation stream) and Orientation.lockTo. Served
+// over the dev server; connect Preview and rotate the device. Not shipped.
+import { NavStack, Node, Column, Text, Pressable, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
+import { useState, useEffect, Cell } from "../core/state.chuks";
+import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
+import { Orientation } from "../core/native.chuks";
 
-function screen(): Node {
-    return View({ "flex": "1", "bg": "0B1120", "justify": "center", "align": "center", "gap": "12" }, [
-        Text({ "color": "4F7DFF", "size": "34", "weight": "bold", "ta": "center" }, "Served by chuks dev"),
-        Text({ "color": "9AA4B2", "size": "16", "ta": "center" }, "Chuks Preview is live over HTTP"),
+function lockBtn(label: string, mode: string): Node {
+    return Pressable({ onPress: function(): void { Orientation.lockTo(mode) }, bg: tk("surface"), radius: 12, pad: 14, w: 260, align: "center",
+                       border: 1, borderColor: tk("border") }, [
+        Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, label),
+    ])
+}
+
+function screenBody(): Node {
+    var orient: Cell = useState("?")
+    useEffect(function(): any {
+        Orientation.lockTo("portrait")   // stable portrait for the doc capture (use "landscape" to regenerate the landscape docshots)
+        const s: NativeSub = Orientation.watch(function(v: string): void { orient.set(v) })
+        return function(): void { s.cancel() }
+    }, [])
+    return Column({ dir: "col", gap: 14, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        Text({ size: 44, weight: "bold", color: tk("primary"), ta: "center" }, string(orient.get())),
+        Text({ size: 15, color: tk("muted"), ta: "center" }, "Orientation.watch: rotate the device"),
+        lockBtn("Lock portrait", "portrait"),
+        lockBtn("Lock landscape", "landscape"),
+        lockBtn("Auto (unlock)", "auto"),
     ])
 }
 
 function createRoot(): NavStack {
     var routes: map[string]function(): Node = {}
-    routes["home"] = screen
+    routes["home"] = function(): Node { return Comp(screenBody) }
     return new NavStack(routes, "home")
 }
 

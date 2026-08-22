@@ -11,6 +11,7 @@ PROJDIR="$(pwd)"                              # consumer project root
 [ -f "$PROJDIR/chuks.json" ] || { echo "run from a Chuks project root (no chuks.json here)"; exit 1; }
 ENTRY="$(sed -n 's/.*"entry"[^"]*"\([^"]*\)".*/\1/p' "$PROJDIR/chuks.json" | head -1)"
 ENTRY="$PROJDIR/${ENTRY:-.chuks/entry.chuks}"
+[ -n "${CHUKS_ENTRY:-}" ] && ENTRY="$PROJDIR/$CHUKS_ENTRY"   # build an arbitrary entry (docshots / examples)
 [ -f "$ENTRY" ] || { echo "no entry module at $ENTRY"; exit 1; }
 
 export CHUKS_NO_WARNINGS=1
@@ -148,6 +149,12 @@ cat > "$APP/Info.plist" <<PLIST
   <key>NSLocationWhenInUseUsageDescription</key><string>Demo: requesting location permission (F2).</string>
   <key>NSPhotoLibraryUsageDescription</key><string>Demo: requesting photo library permission (F2).</string>
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
+  <key>UISupportedInterfaceOrientations</key>
+  <array>
+    <string>UIInterfaceOrientationPortrait</string>
+    <string>UIInterfaceOrientationLandscapeLeft</string>
+    <string>UIInterfaceOrientationLandscapeRight</string>
+  </array>
   <key>UILaunchScreen</key><dict/>
   $URLSCHEME_PLIST
   $ICONNAME_PLIST
