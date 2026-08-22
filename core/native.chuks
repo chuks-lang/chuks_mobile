@@ -17,11 +17,13 @@ export class Clipboard {
 }
 
 // ---- Linking ----------------------------------------------------------------
-// Open a URL, tel:, mailto:, or app scheme in the OS. canOpen() answers async
-// with "1"/"0".
+// Open a URL, tel:, mailto:, or app scheme in the OS. canOpen() answers async with a
+// bool (the host's "1"/"0" is converted, so callers never compare a magic string).
 export class Linking {
     public static open(url: string): void { emitNativeCommand("linking.open", url, null) }
-    public static canOpen(url: string, onResult: (string)=> void): void { emitNativeCommand("linking.canOpen", url, onResult) }
+    public static canOpen(url: string, onResult: (bool)=> void): void {
+        emitNativeCommand("linking.canOpen", url, function(s: string): void { onResult(s == "1") })
+    }
 }
 
 // ---- Share ------------------------------------------------------------------
@@ -192,13 +194,15 @@ export class Audio {
 // ---- Text-to-speech (Tier B) ------------------------------------------------
 // Speak text aloud via the OS speech synthesizer. speak() replaces any current
 // utterance; stop() cancels it. text is base64 on the wire (arbitrary/multiline).
-// isSpeaking() answers (async) "1" while speaking, else "0" -- the proof that the
-// synthesizer engaged. On Android the engine + voice data must be present (it
-// usually is); if absent, isSpeaking stays "0".
+// isSpeaking() answers (async) a bool -- true while speaking -- the proof that the
+// synthesizer engaged. On Android the engine + voice data must be present (it usually
+// is); if absent, isSpeaking stays false.
 export class Tts {
     public static speak(text: string): void { emitNativeCommand("tts.speak", new Base64().encode(text), null) }
     public static stop(): void { emitNativeCommand("tts.stop", "", null) }
-    public static isSpeaking(onResult: (string)=> void): void { emitNativeCommand("tts.isSpeaking", "", onResult) }
+    public static isSpeaking(onResult: (bool)=> void): void {
+        emitNativeCommand("tts.isSpeaking", "", function(s: string): void { onResult(s == "1") })
+    }
 }
 
 // ---- Real streams (Tier B) --------------------------------------------------
