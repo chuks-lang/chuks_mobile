@@ -72,10 +72,14 @@ CXXSHARED="$BIN/../sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 cp "$CXXSHARED" "$OUT/lib/arm64-v8a/"
 # Discover + bundle icon fonts + media from the PROJECT's assets/ and installed packages.
 mkdir -p "$OUT/assets"
+# DEV hot reload (DEV=1): point the app at the running dev server (chuks watch). The
+# emulator reaches the host loopback via 10.0.2.2; a real device needs the Mac's LAN IP.
+[ "${DEV:-0}" = "1" ] && printf '10.0.2.2:7799' > "$OUT/assets/chuks-dev.txt"
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
 for f in $(find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.png" -o -name "*.jpg" \) 2>/dev/null); do cp "$f" "$OUT/assets/"; done
 ( cd "$OUT" && zip -qj base.apk classes.dex && zip -q base.apk lib/arm64-v8a/libapp.so lib/arm64-v8a/libc++_shared.so \
+    && { [ -e assets/chuks-dev.txt ] && zip -q base.apk assets/chuks-dev.txt || true; } \
     && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
     && for im in assets/*.png assets/*.jpg; do [ -e "$im" ] && zip -q base.apk "$im" || true; done \
     && for mv in assets/*.mp4 assets/*.wav assets/*.mp3 assets/*.m4a; do [ -e "$mv" ] && zip -0 -q base.apk "$mv" || true; done )   # -0 (media): seekable for MediaPlayer.openFd; images stay compressed   # -0: store media uncompressed so MediaPlayer.openFd hands back a seekable descriptor; || true so a non-matching glob doesn't trip set -e

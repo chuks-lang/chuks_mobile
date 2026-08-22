@@ -136,6 +136,7 @@ class MainActivity : Activity() {
     private var lastInsets = intArrayOf(-1, -1, -1, -1)
     @Suppress("DEPRECATION")
     private fun reportInsets() {
+        if (devMode) return   // dev server has no /insets endpoint; uses default insets
         val wi = window.decorView.rootWindowInsets ?: return
         val t = (wi.systemWindowInsetTop / density).toInt()
         val r = (wi.systemWindowInsetRight / density).toInt()
@@ -156,6 +157,7 @@ class MainActivity : Activity() {
     // android:configChanges="uiMode" in the manifest so we aren't recreated instead.
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
+        if (devMode) return   // dev server has no /colorScheme endpoint
         val dark = (newConfig.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         N.setColorScheme(if (dark) 1 else 0)
@@ -169,26 +171,50 @@ class MainActivity : Activity() {
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
 
-        N.setup(1000)
-        val isTablet = if (resources.configuration.smallestScreenWidthDp >= 600) 1 else 0
-        N.setPlatform("android", android.os.Build.VERSION.RELEASE, android.os.Build.MODEL, isTablet)   // platform + device info
-        N.setColorScheme(if (osDark()) 1 else 0)   // open in the OS appearance
-        N.mount()
-        applyDrain()
+        // DEV hot reload: assets/chuks-dev.txt (written by a DEV=1 build) points at the
+        // running dev server. Present => fetch the UI over HTTP instead of the JNI engine.
+        try { assets.open("chuks-dev.txt").bufferedReader().use { devBase = "http://" + it.readText().trim() } } catch (e: Exception) {}
+
+        if (!devMode) {
+            N.setup(1000)
+            val isTablet = if (resources.configuration.smallestScreenWidthDp >= 600) 1 else 0
+            N.setPlatform("android", android.os.Build.VERSION.RELEASE, android.os.Build.MODEL, isTablet)   // platform + device info
+            N.setColorScheme(if (osDark()) 1 else 0)   // open in the OS appearance
+        }
+        hostMount()
 
         // first layout after the window is measured
         root.post { reportInsets(); relayout(); if (pushViewport()) relayout() }
         root.setOnApplyWindowInsetsListener { _, insets -> reportInsets(); insets }   // update on inset changes
 
-        // tick timer
-        val ticker = object : Runnable {
-            override fun run() {
-                frame++
-                N.tick(); applyDrain(); relayout()
-                handler.postDelayed(this, 400)
+        if (devMode) {
+            // Poll the dev server off the main thread; when it comes back after a chuks
+            // watch restart, remount so the edit shows with no rebuild.
+            Thread {
+                while (true) {
+                    try { Thread.sleep(400) } catch (e: InterruptedException) { return@Thread }
+                    val up = devReq("/state", "", get = true) != null
+                    if (up && !devConnected) {
+                        // Server came back after a chuks watch restart: recreate the Activity
+                        // for a clean remount (onCreate re-fetches the full tree), and stop this
+                        // poll — the new Activity starts its own.
+                        handler.post { recreate() }
+                        return@Thread
+                    }
+                    devConnected = up
+                }
+            }.apply { isDaemon = true; start() }
+        } else {
+            // tick timer
+            val ticker = object : Runnable {
+                override fun run() {
+                    frame++
+                    N.tick(); applyDrain(); relayout()
+                    handler.postDelayed(this, 400)
+                }
             }
+            handler.postDelayed(ticker, 400)
         }
-        handler.postDelayed(ticker, 400)
     }
 
     private fun dp(v: Int) = (v * density).toInt()
@@ -201,13 +227,15 @@ class MainActivity : Activity() {
         if (h <= 0) return false
         val topDp = (sc.scrollY / density).toInt()
         val hDp = (h / density).toInt()
+        if (devMode) { applyStream(devBlocking("/viewport", "$topDp $hDp")); return true }
         if (N.viewport(topDp, hDp) > 0) { applyDrain(); return true }
         return false
     }
 
     // ---- apply the mutation stream ----------------------------------------
-    private fun applyDrain() {
-        val stream = N.drain()
+    private fun applyDrain() { applyStream(N.drain()) }
+
+    private fun applyStream(stream: String) {
         if (stream.isEmpty()) return
         for (raw in stream.split("\n")) {
             val f = raw.split("|")
@@ -230,13 +258,61 @@ class MainActivity : Activity() {
         }
     }
 
+    // ================= DEV hot reload =======================================
+    // Built with DEV=1, android/build.sh drops assets/chuks-dev.txt holding
+    // "<host>:<port>" (e.g. 10.0.2.2:7799, the emulator's alias for the host loopback).
+    // The engine then runs in the Chuks VM dev server (chuks watch) and this host
+    // fetches the mutation stream over HTTP instead of the JNI-linked library, so saving
+    // a .chuks file hot-reloads the running app with no rebuild. Yoga layout stays JNI.
+    private var devBase = ""            // "http://10.0.2.2:7799"; empty => production (JNI)
+    private val devMode get() = devBase.isNotEmpty()
+    private var devConnected = true
+
+    // Synchronous HTTP to the dev server. MUST run off the main thread. Returns null on a
+    // network error (the server is briefly down while chuks watch restarts it).
+    private fun devReq(path: String, body: String, get: Boolean = false): String? {
+        return try {
+            val c = java.net.URL(devBase + path).openConnection() as java.net.HttpURLConnection
+            c.connectTimeout = 1500; c.readTimeout = 2000
+            c.requestMethod = if (get) "GET" else "POST"
+            if (!get) { c.doOutput = true; c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) } }
+            if (c.responseCode !in 200..299) { c.disconnect(); return null }
+            val s = c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            c.disconnect(); s
+        } catch (e: Exception) { null }
+    }
+
+    // Run a dev request on a worker thread and block briefly for the result. Called from
+    // the main thread at dispatch sites; requests are ~1ms while the server is up, and
+    // taps during the short restart window are rare.
+    private fun devBlocking(path: String, body: String): String {
+        var out = ""
+        val t = Thread { out = devReq(path, body) ?: "" }
+        t.start(); t.join(2500)
+        return out
+    }
+
+    // Engine calls: DEV routes to the dev server, production to the JNI library. Each
+    // returns the mutation stream (production folds the op and drain into one call).
+    private fun engMount() = if (devMode) devBlocking("/mount", "") else { N.mount(); N.drain() }
+    private fun engEvent(a: String) = if (devMode) devBlocking("/event", a) else { N.event(a); N.drain() }
+    private fun engInput(a: String, v: String) = if (devMode) devBlocking("/input", "$a\n$v") else { N.input(a, v); N.drain() }
+    private fun engResolve(t: String, p: String) = if (devMode) devBlocking("/resolve", "$t\n$p") else { N.resolve(t, p); N.drain() }
+    private fun engFail(t: String, m: String) = if (devMode) devBlocking("/fail", "$t\n$m") else { N.fail(t, m); N.drain() }
+
+    // Dispatch helpers used by every widget handler, so DEV vs production routing lives in
+    // one place. They apply the resulting stream and relayout on the main thread.
+    private fun hostMount() { applyStream(engMount()); relayout() }
+    private fun hostEvent(a: String) { applyStream(engEvent(a)); relayout() }
+    private fun hostInput(a: String, v: String) { applyStream(engInput(a, v)); relayout() }
+
     // Deliver a native capability result back to the engine and apply the re-render.
     private fun resolve(token: String, payload: String) {
-        N.resolve(token, payload); applyDrain(); relayout()
+        applyStream(engResolve(token, payload)); relayout()
     }
     // Report a capability failure back to the engine (fires the request's onErr).
     private fun fail(token: String, message: String) {
-        N.fail(token, message); applyDrain(); relayout()
+        applyStream(engFail(token, message)); relayout()
     }
 
     // Live native subscriptions (stream token -> repeating Runnable), for teardown.
@@ -586,7 +662,7 @@ class MainActivity : Activity() {
                     override fun beforeTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
                     override fun onTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {
                         val action = it.getTag(TAG) as? String ?: return
-                        N.input(action, it.text.toString()); applyDrain()
+                        applyStream(engInput(action, it.text.toString()))
                         listScroll?.scrollTo(0, 0); relayout()
                     } }) }
             "Alert" -> View(this).also { alertIds.add(id) }   // invisible placeholder; the OS dialog shows on avis=1
@@ -601,7 +677,7 @@ class MainActivity : Activity() {
                     override fun beforeTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
                     override fun onTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {
                         val action = it.getTag(TAG) as? String ?: return
-                        N.input(action, it.text.toString()); applyDrain(); relayout()   // keep scroll pos (no scrollTo)
+                        hostInput(action, it.text.toString())   // keep scroll pos (no scrollTo)
                     } }) }
             "Spinner" -> ProgressBar(this).also { it.isIndeterminate = true }   // circular indeterminate; Yoga sizes it via w/h
             "Progress" -> ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).also {
@@ -620,7 +696,7 @@ class MainActivity : Activity() {
                     val pm = PopupMenu(this, b)
                     opts.forEachIndexed { i, label -> pm.menu.add(0, i, i, label) }
                     pm.setOnMenuItemClickListener { mi ->
-                        (b.getTag(TAG) as? String)?.let { N.input(it, mi.itemId.toString()); applyDrain(); relayout() }
+                        (b.getTag(TAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }
                         true
                     }
                     pm.show()
@@ -634,7 +710,7 @@ class MainActivity : Activity() {
                     val pm = PopupMenu(this, b)
                     items.forEachIndexed { i, t -> pm.menu.add(0, i, i, t) }
                     pm.setOnMenuItemClickListener { mi ->
-                        (b.getTag(TAG) as? String)?.let { N.input(it, mi.itemId.toString()); applyDrain(); relayout() }; true
+                        (b.getTag(TAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }; true
                     }
                     pm.show()
                 }
@@ -646,7 +722,7 @@ class MainActivity : Activity() {
                     val pm = PopupMenu(this, c)
                     items.forEachIndexed { i, t -> pm.menu.add(0, i, i, t) }
                     pm.setOnMenuItemClickListener { mi ->
-                        (c.getTag(TAG) as? String)?.let { N.input(it, mi.itemId.toString()); applyDrain(); relayout() }; true
+                        (c.getTag(TAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }; true
                     }
                     pm.show(); true
                 }
@@ -657,7 +733,7 @@ class MainActivity : Activity() {
                         if (!fromUser) return                       // ignore programmatic setProgress (the controlled sync)
                         val action = sb.getTag(TAG) as? String ?: return
                         val min = sliderMin[id] ?: 0
-                        N.input(action, (progress + min).toString()); applyDrain(); relayout()
+                        hostInput(action, (progress + min).toString())
                     }
                     override fun onStartTrackingTouch(s: SeekBar) {}
                     override fun onStopTrackingTouch(s: SeekBar) {}
@@ -1043,7 +1119,7 @@ class MainActivity : Activity() {
 
     // A recognized gesture -> the engine (via the wrapper's action tag).
     private fun dispatchGesture(v: View, g: String) {
-        (v.getTag(TAG) as? String)?.let { N.input(it, g); applyDrain(); relayout() }
+        (v.getTag(TAG) as? String)?.let { hostInput(it, g) }
     }
 
     private fun selectLabel(id: String): String {
@@ -1099,7 +1175,7 @@ class MainActivity : Activity() {
         val cal = dateCalendar(id)
         val fire = { picked: Calendar ->
             val iso = isoOf(id, picked)
-            (b.getTag(TAG) as? String)?.let { N.input(it, iso); applyDrain(); relayout() }
+            (b.getTag(TAG) as? String)?.let { hostInput(it, iso) }
         }
         if (mode == "time") {
             TimePickerDialog(this, theme, { _, hh, mm ->
@@ -1253,7 +1329,7 @@ class MainActivity : Activity() {
 
     private fun fire(action: String) {
         if (action.isEmpty()) return
-        N.event(action); applyDrain(); relayout()
+        hostEvent(action)
     }
 
     // Present a native AlertDialog for an Alert node (title/message/buttons from alertData).
@@ -1279,7 +1355,7 @@ class MainActivity : Activity() {
     }
     private fun alertDispatch(id: String, v: String) {
         val action = alertActions[id] ?: return
-        N.input(action, v); applyDrain(); relayout()
+        hostInput(action, v)
     }
 
     // Manual pull-to-refresh (the platform SDK has no SwipeRefreshLayout). A spinner
