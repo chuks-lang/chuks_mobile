@@ -71,6 +71,9 @@ fi
 
 echo "4. Assembling the app (+ your assets)"
 mkdir -p "$APP"; cp "$OUT/$APPNAME" "$APP/$APPNAME"
+# DEV hot reload: the host reads the dev server address from this file. The simulator
+# reaches it at localhost; for a real device, pass IOS_DEV_HOST=<your Mac LAN IP>:7799.
+[ "${DEV:-0}" = "1" ] && printf '%s' "${IOS_DEV_HOST:-localhost:7799}" > "$APP/chuks-dev.txt"
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 FONT_PLIST=""
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do
