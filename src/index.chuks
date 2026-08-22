@@ -6,9 +6,10 @@
 //   import { NavStack } from "pkg/@chuks/mobile/core/nav.chuks";
 //   import { tk, setTheme } from "pkg/@chuks/mobile/core/theme.chuks";
 //   import { Permission, FileSystem, SecureStore, Audio, Tts, Notifications,
-//            Battery, Network, AppState } from "pkg/@chuks/mobile/core/native.chuks";
+//            Battery, Network, AppState, Orientation, Location, Motion, Biometrics,
+//            DeviceInfo, MediaPicker, Camera } from "pkg/@chuks/mobile/core/native.chuks";
 //
 // The native hosts (iOS SwiftUI/UIKit, Android) + build scripts ship in this
 // package under ios/ and android/; a project's build runs them from
 // chuks_packages/@chuks/mobile/.
-export const VERSION: string = "0.1.1"
+export const VERSION: string = "0.1.4"
