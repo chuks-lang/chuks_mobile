@@ -1,26 +1,42 @@
-// Smoke-test app for the Chuks Preview host, exercising the haptics catalog:
-// Haptics.vibrate(ms), Haptics.pattern(seq), and Haptics.impact(style). Served over the
-// dev server; tap a button and feel it (real device — the simulator has no haptics). Not shipped.
+// Smoke-test app for the Chuks Preview host, exercising Contacts.list (read the address
+// book) gated by the "contacts" permission. Served over the dev server. The iOS Simulator
+// ships sample contacts; the Android emulator starts empty. Not shipped.
 import { NavStack, Node, Column, Text, Pressable, Comp, setSafeInsets } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { Haptics } from "../core/native.chuks";
-
-function btn(label: string, onPress: () => void): Node {
-    return Pressable({ onPress: onPress, bg: tk("surface"), radius: 12, pad: 16, w: 280, align: "center",
-                       border: 1, borderColor: tk("border") }, [
-        Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, label),
-    ])
-}
+import { Contacts, Permission } from "../core/native.chuks";
 
 function screenBody(): Node {
-    return Column({ dir: "col", gap: 14, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        Text({ size: 15, color: tk("muted"), ta: "center" }, "Haptics catalog"),
-        btn("Buzz 300ms", function(): void { Haptics.vibrate(300) }),
-        btn("Pattern (buzz-buzz-buzzz)", function(): void { Haptics.pattern("0,100,80,100,80,300") }),
-        btn("Success impact", function(): void { Haptics.impact("success") }),
-        btn("Selection tick", function(): void { Haptics.impact("selection") }),
-    ])
+    var payload: Cell = useState("")
+    var status: Cell = useState("tap to load contacts")
+    const raw: string = string(payload.get())
+    const lines: []string = raw == "" ? [] : raw.split("\n")
+    var kids: []Node = [
+        Text({ size: 14, color: tk("muted"), ta: "center" }, "Contacts"),
+        Text({ size: 22, weight: "bold", color: tk("primary"), ta: "center", w: 330 }, string(status.get())),
+    ]
+    var i: int = 0
+    while (i < lines.length && i < 6) {
+        const f: []string = lines[i].split("\t")
+        const phone: string = f.length > 1 && f[1] != "" ? "  ·  " + f[1] : ""
+        kids.push(Text({ size: 15, color: tk("text"), ta: "center", w: 330 }, f[0] + phone))
+        i = i + 1
+    }
+    kids.push(Pressable({ onPress: function(): void {
+                    status.set("requesting...")
+                    Permission.request("contacts", function(s: string): void {
+                        if (s != "granted") { status.set("permission " + s); return }
+                        Contacts.list(function(p: string): void {
+                            const n: int = p == "" ? 0 : p.split("\n").length
+                            status.set(string(n) + " contacts")
+                            payload.set(p)
+                        }, function(e: string): void { status.set(e) })
+                    }, function(e: string): void { status.set(e) })
+                }, bg: tk("primary"), radius: 12, pad: 15, w: 280, align: "center" }, [
+        Text({ size: 16, weight: "bold", color: tk("primaryText"), ta: "center" }, "Load contacts"),
+    ]))
+    return Column({ dir: "col", gap: 10, grow: 1, justify: "center", align: "center", bg: tk("bg") }, kids)
 }
 
 function createRoot(): NavStack {

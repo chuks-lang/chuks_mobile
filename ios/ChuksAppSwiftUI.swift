@@ -19,6 +19,7 @@ import UserNotifications
 import CoreLocation
 import CoreMotion
 import CoreHaptics
+import Contacts
 import LocalAuthentication
 import Security
 import Network
@@ -263,6 +264,10 @@ func phAuthStr(_ s: PHAuthorizationStatus) -> String {
 }
 func clAuthStr(_ s: CLAuthorizationStatus) -> String {
     switch s { case .authorizedWhenInUse, .authorizedAlways: return "granted"; case .denied: return "denied"; case .restricted: return "restricted"; default: return "undetermined" }
+}
+func cnAuthStr(_ s: CNAuthorizationStatus) -> String {
+    if #available(iOS 18.0, *), s == .limited { return "granted" }
+    switch s { case .authorized: return "granted"; case .denied: return "denied"; case .restricted: return "restricted"; default: return "undetermined" }
 }
 func unAuthStr(_ s: UNAuthorizationStatus) -> String {
     switch s { case .authorized, .provisional, .ephemeral: return "granted"; case .denied: return "denied"; default: return "undetermined" }
@@ -619,6 +624,24 @@ final class Scene: ObservableObject {
             resolve(token, "\(v),\(bld)")
         case "deviceinfo.locale":
             resolve(token, "\(Locale.current.languageCode ?? ""),\(Locale.current.regionCode ?? "")")
+        case "contacts.list":
+            var contactsOK = CNContactStore.authorizationStatus(for: .contacts) == .authorized
+            if #available(iOS 18.0, *) { contactsOK = contactsOK || CNContactStore.authorizationStatus(for: .contacts) == .limited }
+            guard contactsOK else { fail(token, "contacts permission denied"); break }
+            let store = CNContactStore()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let keys = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactPhoneNumbersKey, CNContactEmailAddressesKey] as [CNKeyDescriptor]
+                var lines: [String] = []
+                do {
+                    try store.enumerateContacts(with: CNContactFetchRequest(keysToFetch: keys)) { c, _ in
+                        let name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
+                        let phones = c.phoneNumbers.map { $0.value.stringValue }.joined(separator: ";")
+                        let emails = c.emailAddresses.map { String($0.value) }.joined(separator: ";")
+                        lines.append("\(name)\t\(phones)\t\(emails)")
+                    }
+                    DispatchQueue.main.async { self.resolve(token, lines.joined(separator: "\n")) }
+                } catch { DispatchQueue.main.async { self.fail(token, "read failed") } }
+            }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
         case "mediapicker.image":
@@ -801,6 +824,7 @@ final class Scene: ObservableObject {
         case "microphone": resolve(token, avAuthStr(AVCaptureDevice.authorizationStatus(for: .audio)))
         case "photos": resolve(token, phAuthStr(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
         case "location": resolve(token, clAuthStr(CLLocationManager().authorizationStatus))
+        case "contacts": resolve(token, cnAuthStr(CNContactStore.authorizationStatus(for: .contacts)))
         case "notifications":
             UNUserNotificationCenter.current().getNotificationSettings { s in
                 DispatchQueue.main.async { self.resolve(token, unAuthStr(s.authorizationStatus)) }
@@ -819,6 +843,7 @@ final class Scene: ObservableObject {
                 DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") }
             }
         case "location": locPerm.request { s in self.resolve(token, s) }
+        case "contacts": CNContactStore().requestAccess(for: .contacts) { g, _ in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } }
         default: fail(token, "unknown permission: \(kind)")
         }
     }

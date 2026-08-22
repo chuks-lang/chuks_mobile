@@ -115,6 +115,17 @@ export class Camera {
     }
 }
 
+// ---- Contacts ---------------------------------------------------------------
+// Read the device address book. list() answers with one contact per line, each line
+// three TAB-separated fields: name, phones, emails (multiple phones/emails joined by
+// ";"). Needs the "contacts" permission — request it via Permission.request("contacts")
+// first; a denial (or a read failure) goes to onError. Read-only for now.
+export class Contacts {
+    public static list(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("contacts.list", "", onResult, onError)
+    }
+}
+
 // ---- Device info ------------------------------------------------------------
 // screen() reads the CURRENT screen size — a live read, not a launch-time constant,
 // since it changes on rotation, split-screen, and foldables. The payload is

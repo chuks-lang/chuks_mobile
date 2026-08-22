@@ -450,6 +450,35 @@ class MainActivity : Activity() {
                 val loc = resources.configuration.locales[0]
                 resolve(token, "${loc.language},${loc.country}")
             }
+            "contacts.list" -> {
+                if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) { fail(token, "contacts permission denied"); return }
+                try {
+                    // id -> [name, phones, emails]; merge phone + email rows by contact id
+                    val map = LinkedHashMap<String, Array<Any>>()
+                    fun entry(id: String, name: String) = map.getOrPut(id) { arrayOf(name, linkedSetOf<String>(), linkedSetOf<String>()) }
+                    contentResolver.query(android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                        arrayOf(android.provider.ContactsContract.CommonDataKinds.Phone.CONTACT_ID, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY, android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER),
+                        null, null, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY)?.use { c ->
+                        while (c.moveToNext()) {
+                            val id = c.getString(0) ?: continue
+                            @Suppress("UNCHECKED_CAST") (entry(id, c.getString(1) ?: "")[1] as LinkedHashSet<String>).add(c.getString(2) ?: "")
+                        }
+                    }
+                    contentResolver.query(android.provider.ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+                        arrayOf(android.provider.ContactsContract.CommonDataKinds.Email.CONTACT_ID, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY, android.provider.ContactsContract.CommonDataKinds.Email.ADDRESS),
+                        null, null, null)?.use { c ->
+                        while (c.moveToNext()) {
+                            val id = c.getString(0) ?: continue
+                            @Suppress("UNCHECKED_CAST") (entry(id, c.getString(1) ?: "")[2] as LinkedHashSet<String>).add(c.getString(2) ?: "")
+                        }
+                    }
+                    val out = map.values.joinToString("\n") { r ->
+                        @Suppress("UNCHECKED_CAST")
+                        "${r[0]}\t${(r[1] as Set<String>).joinToString(";")}\t${(r[2] as Set<String>).joinToString(";")}"
+                    }
+                    resolve(token, out)
+                } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            }
             "linking.opensettings" -> {
                 try {
                     startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -623,6 +652,7 @@ class MainActivity : Activity() {
         "camera" -> Manifest.permission.CAMERA
         "microphone" -> Manifest.permission.RECORD_AUDIO
         "location" -> Manifest.permission.ACCESS_FINE_LOCATION
+        "contacts" -> Manifest.permission.READ_CONTACTS
         "notifications" -> Manifest.permission.POST_NOTIFICATIONS   // runtime perm on API 33+
         "photos" -> Manifest.permission.READ_MEDIA_IMAGES           // API 33+
         else -> null

@@ -150,6 +150,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>NSPhotoLibraryUsageDescription</key><string>Demo: requesting photo library permission (F2).</string>
   <key>NSPhotoLibraryAddUsageDescription</key><string>Demo: saving an image to your photo library.</string>
   <key>NSFaceIDUsageDescription</key><string>Demo: authenticating with Face ID.</string>
+  <key>NSContactsUsageDescription</key><string>Demo: reading your contacts.</string>
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
   <key>UISupportedInterfaceOrientations</key>
   <array>
