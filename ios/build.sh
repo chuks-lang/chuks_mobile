@@ -44,7 +44,8 @@ else
     TRIPLE="arm64-apple-ios15.0-simulator"
     PLATLABEL="arm64 simulator"
 fi
-YOGA="$PKGDIR/yoga"                       # iOS-sim arm64 libyoga.a (in the package)
+# Yoga (UIKit host only): the simulator and device archives are separate arm64 builds.
+YOGA="$PKGDIR/yoga"; [ "$IOS_TARGET" = "device" ] && YOGA="$PKGDIR/yoga-device"
 YOGA_INC="$SDKROOT/core/yoga/include"     # shared Yoga headers (in the package)
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
@@ -59,12 +60,6 @@ echo "2. Building the iOS engine ($PLATLABEL)"
 # Pick the iOS render engine: env IOS_ENGINE wins, else chuks.json "iosEngine", else uikit.
 ENGINE="${IOS_ENGINE:-$(sed -n 's/.*"iosEngine"[^"]*"\([a-z]*\)".*/\1/p' "$PROJDIR/chuks.json" | head -1)}"
 [ -z "$ENGINE" ] && ENGINE="uikit"
-# The UIKit host needs a device-built libyoga.a; only the simulator one ships today, so a
-# physical-device build uses the SwiftUI host (SwiftUI does its own layout, no Yoga).
-if [ "$IOS_TARGET" = "device" ] && [ "$ENGINE" != "swiftui" ]; then
-    echo "   device builds use the SwiftUI host (UIKit needs a device Yoga build); overriding iosEngine=swiftui"
-    ENGINE="swiftui"
-fi
 
 if [ "$ENGINE" = "swiftui" ]; then
     echo "3. Building the SwiftUI host"
