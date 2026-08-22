@@ -216,9 +216,26 @@ func applyOrientationLock(_ mode: String) {
     }
 }
 // SwiftUI has no AppDelegate by default; this adaptor lets UIKit read the lock mask.
+// Bridges deep-link URLs from the app delegate to the active Scene — .onOpenURL is
+// unreliable under a UIApplicationDelegateAdaptor, so the delegate is the source of truth.
+final class ChuksURLBridge {
+    static let shared = ChuksURLBridge()
+    weak var scene: Scene?
+    private var pending: String?
+    func deliver(_ u: String) { if let s = scene { s.receiveURL(u) } else { pending = u } }
+    func attach(_ s: Scene) { scene = s; if let p = pending { pending = nil; s.receiveURL(p) } }
+}
+
 class ChuksOrientationDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         chuksOrientationMask
+    }
+    func application(_ app: UIApplication, didFinishLaunchingWithOptions o: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        if let url = o?[.url] as? URL { ChuksURLBridge.shared.deliver(url.absoluteString) }   // launched by a deep link
+        return true
+    }
+    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        ChuksURLBridge.shared.deliver(url.absoluteString); return true   // subsequent deep link
     }
 }
 
@@ -428,6 +445,7 @@ final class Scene: ObservableObject {
     private var booted = false
     func boot(osDark: Bool) {
         if booted { return }; booted = true
+        ChuksURLBridge.shared.attach(self)   // receive deep links (incl. a launch URL delivered before boot)
         UNUserNotificationCenter.current().delegate = notifDelegate  // foreground banners
         Engine.setup(0); Engine.setPlatform(); Engine.setColorScheme(osDark); apply(Engine.mount()); syncFollow()
         if DEV_MODE { startDevWatch() }
@@ -517,6 +535,10 @@ final class Scene: ObservableObject {
     // instead of a Timer; __cancel__ runs it so the observer is torn down.
     var streamTeardown: [String: () -> Void] = [:]
     var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
+    var urlTokens = Set<String>()           // linking.onurl subscribers
+    var lastURL: String? = nil              // the deep link that opened the app (delivered to late subscribers)
+    // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
+    func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
     var locFixes: [String: LocFix] = [:]    // live Location managers, keyed by token (once + watch)
     let motion = CMMotionManager()          // one shared motion manager; sensors fan out to token sets
     var accelTokens = Set<String>()
@@ -674,6 +696,10 @@ final class Scene: ObservableObject {
             catch { fail(token, "save failed: \(error.localizedDescription)") }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
+        case "linking.onurl":
+            urlTokens.insert(token)
+            streamTeardown[token] = { [weak self] in self?.urlTokens.remove(token) }
+            if let u = lastURL { resolve(token, u) }   // deliver the launch URL to a late subscriber
         case "mediapicker.image":
             let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
                                          cancel: { [weak self] m in self?.mediaCoord = nil; self?.fail(token, m) })
@@ -1828,6 +1854,7 @@ struct ChuksMobileApp: App {
     var body: some SwiftUI.Scene {
         WindowGroup {
             RootView(scene: scene)
+                .onOpenURL { scene.receiveURL($0.absoluteString) }
         }
     }
 }

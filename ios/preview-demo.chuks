@@ -1,50 +1,23 @@
-// Smoke-test app for the Chuks Preview host, exercising Calendar.createEvent + Calendar.upcoming
-// gated by the "calendar" permission. Served over the dev server. Not shipped.
-import { NavStack, Node, Column, Text, Pressable, Comp, setSafeInsets } from "../core/ui.chuks";
-import { useState, Cell } from "../core/state.chuks";
+// Smoke-test app for the Chuks Preview host, exercising Linking.onURL (inbound deep links).
+// Served over the dev server. Open  chuksdemo://something  to route a URL into the app
+// (iOS: xcrun simctl openurl; Android: adb am start -a VIEW -d chuksdemo://...). Not shipped.
+import { NavStack, Node, Column, Text, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
+import { useState, useEffect, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { Calendar, Permission } from "../core/native.chuks";
+import { Linking } from "../core/native.chuks";
 
 function screenBody(): Node {
-    var payload: Cell = useState("")
-    var status: Cell = useState("create an event, then load")
-    const raw: string = string(payload.get())
-    const lines: []string = raw == "" ? [] : raw.split("\n")
-    var kids: []Node = [
-        Text({ size: 14, color: tk("muted"), ta: "center" }, "Calendar"),
-        Text({ size: 22, weight: "bold", color: tk("primary"), ta: "center", w: 330 }, string(status.get())),
-    ]
-    var i: int = 0
-    while (i < lines.length && i < 6) {
-        const f: []string = lines[i].split("\t")
-        kids.push(Text({ size: 15, color: tk("text"), ta: "center", w: 330 }, f[0]))
-        i = i + 1
-    }
-    kids.push(Pressable({ onPress: function(): void {
-                    status.set("requesting...")
-                    Permission.request("calendar", function(s: string): void {
-                        if (s != "granted") { status.set("permission " + s); return }
-                        Calendar.createEvent("Chuks standup", 60, 30,
-                            function(_: string): void { status.set("created event") },
-                            function(e: string): void { status.set(e) })
-                    }, function(e: string): void { status.set(e) })
-                }, bg: tk("primary"), radius: 12, pad: 14, w: 280, align: "center" }, [
-        Text({ size: 16, weight: "bold", color: tk("primaryText"), ta: "center" }, "Create event (+1h)"),
-    ]))
-    kids.push(Pressable({ onPress: function(): void {
-                    Permission.request("calendar", function(s: string): void {
-                        if (s != "granted") { status.set("permission " + s); return }
-                        Calendar.upcoming(7, function(p: string): void {
-                            const n: int = p == "" ? 0 : p.split("\n").length
-                            status.set(string(n) + " upcoming events")
-                            payload.set(p)
-                        }, function(e: string): void { status.set(e) })
-                    }, function(e: string): void { status.set(e) })
-                }, bg: tk("surface"), radius: 12, pad: 14, w: 280, align: "center", border: 1, borderColor: tk("border") }, [
-        Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, "Load upcoming (7 days)"),
-    ]))
-    return Column({ dir: "col", gap: 10, grow: 1, justify: "center", align: "center", bg: tk("bg") }, kids)
+    var url: Cell = useState("waiting for a deep link...")
+    useEffect(function(): any {
+        const s: NativeSub = Linking.onURL(function(u: string): void { url.set(u) })
+        return function(): void { s.cancel() }
+    }, [])
+    return Column({ dir: "col", gap: 16, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        Text({ size: 14, color: tk("muted"), ta: "center" }, "Linking.onURL"),
+        Text({ size: 22, weight: "bold", color: tk("primary"), ta: "center", w: 330 }, string(url.get())),
+        Text({ size: 14, color: tk("muted"), ta: "center", w: 330 }, "open  chuksdemo://hello  to route a URL here"),
+    ])
 }
 
 function createRoot(): NavStack {

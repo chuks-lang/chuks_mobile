@@ -27,6 +27,13 @@ export class Linking {
     // Open this app's own page in the OS Settings (e.g. to let the user flip a permission
     // they previously denied). Fire-and-forget.
     public static openSettings(): void { emitNativeCommand("linking.opensettings", "", null) }
+    // Subscribe to inbound deep links — URLs that open the app (a custom scheme like
+    // "chuksdemo://path", or a universal/app link once its domain is configured). Fires
+    // with the launch URL if the app was opened by one, then on every subsequent open,
+    // until the NativeSub is cancelled. Register it in a useEffect and cancel on unmount.
+    public static onURL(onURL: (string)=> void): NativeSub {
+        return emitNativeStream("linking.onurl", "", onURL, null)
+    }
 }
 
 // ---- Share ------------------------------------------------------------------

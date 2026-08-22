@@ -52,13 +52,19 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     func application(_ a: UIApplication, didFinishLaunchingWithOptions o: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         let w = UIWindow(frame: UIScreen.main.bounds)
-        w.rootViewController = CardsVC()
+        let vc = CardsVC()
+        if let url = o?[.url] as? URL { vc.lastURL = url.absoluteString }   // deep link that launched the app
+        w.rootViewController = vc
         w.makeKeyAndVisible()
         window = w
         return true
     }
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         chuksOrientationMask   // Orientation.lockTo() drives this
+    }
+    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        (window?.rootViewController as? CardsVC)?.receiveURL(url.absoluteString)   // subsequent deep link
+        return true
     }
 }
 #endif
@@ -786,6 +792,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var gyroTokens = Set<String>()
     var magTokens = Set<String>()
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
+    var urlTokens = Set<String>()             // linking.onurl subscribers
+    var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
+    // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
+    func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
@@ -934,6 +944,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             catch { fail(token, "save failed: \(error.localizedDescription)") }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
+        case "linking.onurl":
+            urlTokens.insert(token)
+            streamTeardown[token] = { [weak self] in self?.urlTokens.remove(token) }
+            if let u = lastURL { resolve(token, u) }   // deliver the launch URL to a late subscriber
         case "mediapicker.image":
             let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
                                          cancel: { [weak self] m in self?.mediaCoord = nil; self?.fail(token, m) })

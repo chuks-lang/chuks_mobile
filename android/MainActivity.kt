@@ -185,6 +185,7 @@ class MainActivity : Activity() {
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
+        intent?.data?.let { lastUrl = it.toString() }   // deep link that launched the app
 
         // DEV hot reload: assets/chuks-dev.txt (written by a DEV=1 build) points at the
         // running dev server. Present => fetch the UI over HTTP instead of the JNI engine.
@@ -517,6 +518,11 @@ class MainActivity : Activity() {
                     resolve(token, uri.lastPathSegment ?: "ok")
                 } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
             }
+            "linking.onurl" -> {
+                urlTokens.add(token)
+                streamTeardown[token] = { urlTokens.remove(token) }
+                lastUrl?.let { resolve(token, it) }   // deliver the launch URL to a late subscriber
+            }
             "linking.opensettings" -> {
                 try {
                     startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -702,6 +708,17 @@ class MainActivity : Activity() {
         val token = pendingPerms.remove(code) ?: return
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         resolve(token, if (granted) "granted" else "denied")
+    }
+
+    // Deep links (F3): the URL that launched (or re-opened) the app, delivered to any
+    // linking.onurl subscribers. lastUrl is held so a subscriber that registers after launch
+    // still gets it.
+    private var lastUrl: String? = null
+    private val urlTokens = mutableSetOf<String>()
+    override fun onNewIntent(newIntent: Intent) {
+        super.onNewIntent(newIntent)
+        setIntent(newIntent)
+        newIntent.data?.toString()?.let { url -> lastUrl = url; runOnUiThread { urlTokens.forEach { resolve(it, url) } } }
     }
 
     // Media picker + camera (F3): each launch holds (engine token, camera output uri | null)

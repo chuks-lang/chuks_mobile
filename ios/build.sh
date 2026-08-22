@@ -153,6 +153,11 @@ cat > "$APP/Info.plist" <<PLIST
   <key>NSContactsUsageDescription</key><string>Demo: reading your contacts.</string>
   <key>NSCalendarsUsageDescription</key><string>Demo: reading and adding calendar events.</string>
   <key>NSCalendarsFullAccessUsageDescription</key><string>Demo: reading and adding calendar events.</string>
+  <key>CFBundleURLTypes</key>
+  <array><dict>
+    <key>CFBundleURLName</key><string>com.chuks.chuksmobile</string>
+    <key>CFBundleURLSchemes</key><array><string>chuksdemo</string></array>
+  </dict></array>
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
   <key>UISupportedInterfaceOrientations</key>
   <array>
