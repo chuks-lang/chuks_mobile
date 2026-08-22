@@ -634,6 +634,14 @@ final class Scene: ObservableObject {
             mediaCoord = coord
             let pk = UIImagePickerController(); pk.sourceType = .camera; pk.delegate = coord
             chuksTopVC()?.present(pk, animated: true)
+        case "mediapicker.save":
+            let path = args.hasPrefix("file://") ? String(args.dropFirst(7)) : args
+            guard let img = UIImage(contentsOfFile: path) else { fail(token, "no such image"); break }
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+                guard status == .authorized || status == .limited else { DispatchQueue.main.async { self?.fail(token, "photos permission denied") }; return }
+                PHPhotoLibrary.shared().performChanges({ PHAssetChangeRequest.creationRequestForAsset(from: img) },
+                    completionHandler: { ok, err in DispatchQueue.main.async { ok ? self?.resolve(token, "ok") : self?.fail(token, err?.localizedDescription ?? "save failed") } })
+            }
         case "biometrics.available":
             resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
         case "biometrics.authenticate":

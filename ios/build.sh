@@ -148,6 +148,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>NSMicrophoneUsageDescription</key><string>Demo: requesting microphone permission (F2).</string>
   <key>NSLocationWhenInUseUsageDescription</key><string>Demo: requesting location permission (F2).</string>
   <key>NSPhotoLibraryUsageDescription</key><string>Demo: requesting photo library permission (F2).</string>
+  <key>NSPhotoLibraryAddUsageDescription</key><string>Demo: saving an image to your photo library.</string>
   <key>NSFaceIDUsageDescription</key><string>Demo: authenticating with Face ID.</string>
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
   <key>UISupportedInterfaceOrientations</key>

@@ -45,6 +45,7 @@ export class Style {
     var sbHide: int     // StatusBar hidden: 1 hide, 0 show (-1 = not a StatusBar)
     var sbStyle: string // StatusBar content: "light" | "dark" | "" (auto, follows theme)
     var sbColor: string // StatusBar background color (hex, e.g. "222A3A"); "" = default
+    var sbNavColor: string // Android nav-bar background color (hex); "" = default (iOS has no nav bar)
     var mvis: int       // Modal visible: 1 shown, 0 hidden (-1 = not a Modal)
     var mpos: string    // Modal content position: "center" | "bottom"
     var slval: int      // Slider current value (-1 = not a Slider); min/max travel with it
@@ -70,7 +71,7 @@ export class Style {
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
         this.bw = -1; this.bc = ""; this.shadow = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
         this.swOn = -1; this.press = -1; this.sec = -1
-        this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""
+        this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
         this.slval = -1; this.slmin = 0; this.slmax = 100
         this.seli = -1; this.avis = -1; this.resize = ""; this.prog = -1; this.rfsh = -1
@@ -114,6 +115,7 @@ export class Style {
         if (this.sbHide >= 0) { s = s + "sbh=" + string(this.sbHide) + ";" }
         if (this.sbStyle != "") { s = s + "sbstyle=" + this.sbStyle + ";" }
         if (this.sbColor != "") { s = s + "sbcolor=" + this.sbColor + ";" }
+        if (this.sbNavColor != "") { s = s + "sbnavcolor=" + this.sbNavColor + ";" }
         if (this.mvis >= 0) { s = s + "mvis=" + string(this.mvis) + ";" }
         if (this.mpos != "") { s = s + "mpos=" + this.mpos + ";" }
         if (this.slval >= 0) {                       // a Slider: value + range travel together
@@ -643,6 +645,7 @@ export function StatusBar(p: map[string]Prop): Node {
     s.sbHide = pBool(p, "hidden", false) ? 1 : 0
     s.sbStyle = pStr(p, "style", "")
     s.sbColor = pStr(p, "color", "")
+    s.sbNavColor = pStr(p, "navColor", "")
     s.w = 0; s.h = 0
     return mkStatusBar(s)
 }

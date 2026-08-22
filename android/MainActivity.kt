@@ -135,6 +135,11 @@ class MainActivity : Activity() {
         if (hex.isEmpty()) return
         try { window.statusBarColor = android.graphics.Color.parseColor(if (hex.startsWith("#")) hex else "#$hex") } catch (e: Exception) {}
     }
+    // Nav-bar background color (Android only; iOS has no on-screen nav bar).
+    private fun setNavBarColor(hex: String) {
+        if (hex.isEmpty()) return
+        try { window.navigationBarColor = android.graphics.Color.parseColor(if (hex.startsWith("#")) hex else "#$hex") } catch (e: Exception) {}
+    }
 
     // Report the system-bar (safe-area) insets to the engine, in dp (Chuks lengths are
     // dp on Android). Re-render if they changed so inset-using components update.
@@ -473,6 +478,22 @@ class MainActivity : Activity() {
                 }
                 try { startActivityForResult(intent, code) }
                 catch (e: Exception) { pendingMedia.remove(code); fail(token, "no camera app") }
+            }
+            "mediapicker.save" -> {
+                val path = if (args.startsWith("file://")) args.substring(7) else args
+                val f = java.io.File(path)
+                if (!f.exists()) { fail(token, "no such image"); return }
+                try {
+                    val values = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "chuks-${mediaSeq++}.jpg")
+                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                        if (android.os.Build.VERSION.SDK_INT >= 29) put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures")
+                    }
+                    val uri = contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    if (uri == null) { fail(token, "cannot save"); return }
+                    contentResolver.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
+                    resolve(token, "ok")
+                } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
             }
             "biometrics.available" -> {
                 if (android.os.Build.VERSION.SDK_INT < 29) { resolve(token, "0"); return }
@@ -1065,6 +1086,7 @@ class MainActivity : Activity() {
                 "sbh" -> setStatusBarHidden(vl == "1")   // StatusBar: hide/show
                 "sbstyle" -> setStatusBarStyle(vl)       // StatusBar: light/dark icons
                 "sbcolor" -> setStatusBarColor(vl)       // StatusBar: background color
+                "sbnavcolor" -> setNavBarColor(vl)       // StatusBar: Android nav-bar color
                 "mvis" -> {                              // Modal visible: show/hide the overlay
                     val vis = (vl == "1")
                     v.visibility = if (vis) View.VISIBLE else View.GONE

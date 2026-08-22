@@ -1,38 +1,41 @@
-// Smoke-test app for the Chuks Preview host, exercising three 0.1.5 helpers:
-// DeviceInfo.appVersion, DeviceInfo.locale, and Linking.openSettings. Served over the
-// dev server. Not shipped.
-import { NavStack, Node, Column, Text, Pressable, Comp, setSafeInsets } from "../core/ui.chuks";
-import { useState, useEffect, Cell } from "../core/state.chuks";
+// Smoke-test app for the Chuks Preview host, exercising 0.1.5 helpers: StatusBar color +
+// navColor (Android nav bar), and MediaPicker.saveImage (save a picked photo to the gallery).
+// Served over the dev server. Not shipped.
+import { NavStack, Node, Column, Row, Text, Pressable, Image, StatusBar, Comp, setSafeInsets } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { DeviceInfo, Linking } from "../core/native.chuks";
+import { MediaPicker } from "../core/native.chuks";
 
-function pair(v: string, sep: string): string {
-    const p: []string = v.split(",")
-    if (p.length < 2) { return v }
-    return p[0] + sep + p[1]
-}
-
-function row(label: string, v: Cell): Node {
-    return Column({ dir: "col", gap: 4, align: "center" }, [
-        Text({ size: 13, color: tk("muted"), ta: "center" }, label),
-        Text({ size: 24, weight: "bold", color: tk("primary"), ta: "center", w: 320 }, string(v.get())),
+function btn(label: string, onPress: () => void): Node {
+    return Pressable({ onPress: onPress, bg: tk("surface"), radius: 12, pad: 14, grow: 1, align: "center",
+                       border: 1, borderColor: tk("border") }, [
+        Text({ size: 15, weight: "bold", color: tk("text"), ta: "center" }, label),
     ])
 }
 
 function screenBody(): Node {
-    var ver: Cell = useState("...")
-    var loc: Cell = useState("...")
-    useEffect(function(): any {
-        DeviceInfo.appVersion(function(v: string): void { ver.set("v" + pair(v, "  build ")) })
-        DeviceInfo.locale(function(l: string): void { loc.set(pair(l, "-")) })
-        return function(): void {}
-    }, [])
-    return Column({ dir: "col", gap: 22, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        row("App version", ver),
-        row("Locale", loc),
-        Pressable({ onPress: function(): void { Linking.openSettings() }, bg: tk("primary"), radius: 12, pad: 16, w: 260, align: "center" }, [
-            Text({ size: 17, weight: "bold", color: tk("primaryText"), ta: "center" }, "Open settings"),
+    var uri: Cell = useState("")
+    var status: Cell = useState("pick an image, then save it")
+    return Column({ dir: "col", gap: 18, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        StatusBar({ style: "light", color: tk("primary"), navColor: tk("primary") }),
+        string(uri.get()) != ""
+            ? Image({ src: string(uri.get()), w: 220, h: 220, radius: 18, resize: "cover" })
+            : Column({ dir: "col", w: 220, h: 220, radius: 18, bg: tk("surface"), justify: "center", align: "center",
+                       border: 1, borderColor: tk("border") }, [ Text({ size: 14, color: tk("muted") }, "no image") ]),
+        Text({ size: 15, color: tk("muted"), ta: "center", w: 300 }, string(status.get())),
+        Row({ dir: "row", gap: 12, w: 300 }, [
+            btn("Pick", function(): void {
+                MediaPicker.pickImage(function(u: string): void { uri.set(u); status.set("picked") },
+                                      function(e: string): void { status.set(e) })
+            }),
+            btn("Save to gallery", function(): void {
+                if (string(uri.get()) == "") { status.set("pick an image first"); return }
+                status.set("saving...")
+                MediaPicker.saveImage(string(uri.get()),
+                    function(): void { status.set("saved to gallery") },
+                    function(e: string): void { status.set(e) })
+            }),
         ]),
     ])
 }

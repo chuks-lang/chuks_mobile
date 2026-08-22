@@ -95,6 +95,12 @@ export class MediaPicker {
     public static pickImage(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("mediapicker.image", "", onResult, onError)
     }
+    // Save a "file://<path>" image (e.g. one from pickImage/takePhoto, or a downloaded file)
+    // back to the OS photo gallery. onOk fires when written; onError on failure or a denied
+    // add-photos permission (iOS). Android needs no permission on API 29+.
+    public static saveImage(fileUri: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("mediapicker.save", fileUri, function(_: string): void { onOk() }, onError)
+    }
 }
 export class Camera {
     public static takePhoto(onResult: (string)=> void, onError: (string)=> void): void {
