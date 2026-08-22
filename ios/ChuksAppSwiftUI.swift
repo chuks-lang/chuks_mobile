@@ -992,7 +992,11 @@ struct BoxStyle: ViewModifier {
     // bg / radius / border / shadow / opacity — applied after sizing.
     func decor(_ input: AnyView) -> AnyView {
         var v = input
-        if let bg = s["bg"] { let r = numOf(s["r"]) ?? 0; v = AnyView(v.background(RoundedRectangle(cornerRadius: r).fill(hexColor(bg)))) }
+        if s["glass"] == "1" {   // Liquid Glass: iOS 26 glassEffect, ultraThinMaterial fallback below
+            let r = numOf(s["r"]) ?? 0
+            if #available(iOS 26.0, *) { v = AnyView(v.glassEffect(.regular, in: RoundedRectangle(cornerRadius: r))) }
+            else { v = AnyView(v.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: r))) }
+        } else if let bg = s["bg"] { let r = numOf(s["r"]) ?? 0; v = AnyView(v.background(RoundedRectangle(cornerRadius: r).fill(hexColor(bg)))) }
         if let r = numOf(s["r"]) { v = AnyView(v.clipShape(RoundedRectangle(cornerRadius: r))) }
         if let bw = numOf(s["bw"]), let bc = s["bc"] { let r = numOf(s["r"]) ?? 0; v = AnyView(v.overlay(RoundedRectangle(cornerRadius: r).stroke(hexColor(bc), lineWidth: bw))) }
         if let lvl = numOf(s["shadow"]) { let radius: CGFloat = lvl >= 3 ? 20 : (lvl == 2 ? 8 : 3); v = AnyView(v.shadow(color: Color.black.opacity(0.18), radius: radius, x: 0, y: lvl >= 3 ? 8 : 3)) }

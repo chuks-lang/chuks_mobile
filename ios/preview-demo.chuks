@@ -1,51 +1,27 @@
-// Smoke-test app for the Chuks Preview host, exercising the microphone recorder:
-// Recorder.start / Recorder.levels (a live VU meter) / Recorder.stop, then Audio.play
-// on the recorded file:// path. Served over the dev server. Not shipped.
-import { NavStack, Node, Column, Row, Text, Pressable, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
-import { useState, Cell } from "../core/state.chuks";
-import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
+// Smoke-test app for the Chuks Preview host, exercising the Liquid Glass material:
+// glass: true on any container. On iOS 26 it is the real .glassEffect / UIGlassEffect; on
+// older iOS an ultraThinMaterial blur; on Android a translucent frosted panel. A colorful
+// photo sits behind so the material has something to refract. Served over the dev server.
+import { NavStack, Node, Column, Row, Text, ImageBackground, Comp, setSafeInsets } from "../core/ui.chuks";
+import { syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { Recorder, Audio, Permission } from "../core/native.chuks";
 
-var levelSub: NativeSub? = null
-
-function btn(label: string, primary: bool, onPress: () => void): Node {
-    return Pressable({ onPress: onPress, bg: primary ? tk("primary") : tk("surface"), radius: 12, pad: 15, grow: 1, align: "center",
-                       border: primary ? 0 : 1, borderColor: tk("border") }, [
-        Text({ size: 16, weight: "bold", color: primary ? tk("primaryText") : tk("text"), ta: "center" }, label),
-    ])
+function tab(label: string): Node {
+    return Column({ dir: "col", align: "center", gap: 3 }, [ Text({ size: 14, weight: "bold", color: "FFFFFF", ta: "center" }, label) ])
 }
 
 function screenBody(): Node {
-    var recording: Cell = useState(false)
-    var meterW: Cell = useState(0)
-    var path: Cell = useState("")
-    var status: Cell = useState("tap Record to start")
-    return Column({ dir: "col", gap: 20, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        Text({ size: 15, color: tk("muted"), ta: "center" }, "Microphone recorder"),
-        // VU meter: a track with a filled bar whose width follows the input level
-        Column({ dir: "col", w: 240, h: 24, radius: 12, bg: tk("surface"), border: 1, borderColor: tk("border"), justify: "center" }, [
-            Column({ dir: "col", w: int(meterW.get()), h: 24, radius: 12, bg: tk("primary") }, []),
+    return ImageBackground({ src: "https://picsum.photos/id/1025/800/1500", grow: 1, dir: "col",
+                             justify: "center", align: "center", gap: 26, pad: 24 }, [
+        // a floating glass card
+        Column({ glass: true, radius: 26, pad: 26, w: 300, align: "center", gap: 10,
+                 border: 1, borderColor: "AAFFFFFF" }, [
+            Text({ size: 26, weight: "bold", color: "FFFFFF", ta: "center" }, "Liquid Glass"),
+            Text({ size: 15, color: "FFFFFF", ta: "center", w: 250 }, "glass: true on any container"),
         ]),
-        Text({ size: 15, color: tk("muted"), ta: "center", w: 300 }, string(status.get())),
-        Row({ dir: "row", gap: 12, w: 300 }, [
-            bool(recording.get())
-                ? btn("Stop", false, function(): void {
-                        if (levelSub != null) { levelSub.cancel(); levelSub = null }
-                        Recorder.stop(function(p: string): void { path.set(p); recording.set(false); meterW.set(0); status.set("recorded, tap Play") },
-                                      function(e: string): void { status.set(e); recording.set(false); meterW.set(0) })
-                    })
-                : btn("Record", true, function(): void {
-                        Permission.request("microphone", function(s: string): void {
-                            if (s != "granted") { status.set("microphone " + s); return }
-                            Recorder.start(function(e: string): void { status.set(e) })
-                            levelSub = Recorder.levels(function(v: string): void { meterW.set(int(float(v) * 240)) })
-                            recording.set(true); status.set("recording...")
-                        }, function(e: string): void { status.set(e) })
-                    }),
-            btn("Play", false, function(): void {
-                if (string(path.get()) != "") { Audio.play(string(path.get())) } else { status.set("record something first") }
-            }),
+        // a glass tab bar
+        Row({ glass: true, radius: 30, pad: 16, gap: 30, align: "center", border: 1, borderColor: "AAFFFFFF" }, [
+            tab("Home"), tab("Search"), tab("Profile"),
         ]),
     ])
 }

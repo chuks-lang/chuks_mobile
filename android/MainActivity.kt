@@ -1134,6 +1134,7 @@ class MainActivity : Activity() {
     // pending visual state per view (bg color + radius) -> a GradientDrawable
     private val bgColor = HashMap<String, Int>()
     private val bgRadius = HashMap<String, Float>()
+    private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a translucent frosted panel
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
@@ -1197,6 +1198,7 @@ class MainActivity : Activity() {
                 "anim" -> animMs = f.toInt()
                 "ez" -> animEz = vl
                 "shadow" -> v.elevation = dpf(if (f >= 3f) 12f else if (f == 2f) 6f else 3f)
+                "glass" -> if (vl == "1") glassIds.add(id) else glassIds.remove(id)
                 "wrap" -> N.ySetF(n, 13, if (vl == "wrap") 1f else 0f)
                 "fs" -> fsPx = dpf(f)
                 "fw" -> bold = (vl == "bold" || vl == "semibold")
@@ -1276,12 +1278,13 @@ class MainActivity : Activity() {
             }
         }
         // bg + radius + border -> GradientDrawable (a large radius clamps to a pill)
-        if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id)) {
+        if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id)) {
             val gd = GradientDrawable()
-            gd.setColor(bgColor[id] ?: Color.TRANSPARENT)
+            gd.setColor(if (glassIds.contains(id)) Color.argb(56, 255, 255, 255) else (bgColor[id] ?: Color.TRANSPARENT))   // frosted translucent
             gd.cornerRadius = bgRadius[id] ?: 0f
             val bw = borderW[id]
             if (bw != null && bw > 0f) gd.setStroke(bw.toInt(), borderC[id] ?: Color.parseColor("#334155"))
+            else if (glassIds.contains(id)) gd.setStroke(dpf(1f).toInt(), Color.argb(40, 255, 255, 255))   // subtle glass rim
             v.background = gd
         } else if (v !is Switch && !modalIds.contains(id)) {
             v.background = null   // the new style has no bg/border: clear a stale drawable on a reused view

@@ -415,6 +415,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var textAreaPlaceholders: [UITextView: UILabel] = [:]                // multiline field -> placeholder label
     static var imageCache: [String: UIImage] = [:]                       // URL -> decoded image (shared)
     var bgImageViews: [String: UIImageView] = [:]                        // ImageBackground id -> its backing image view
+    var glassViews: [String: UIVisualEffectView] = [:]                   // id -> Liquid Glass backing view
     var refreshActions: [UIRefreshControl: String] = [:]                 // pull-to-refresh control -> onRefresh action
     var alertIds: Set<String> = []                                       // Alert node ids (native alerts)
     var alertData: [String: [String]] = [:]                              // id -> [title, message, confirm, cancel]
@@ -1515,6 +1516,19 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         // path degenerate and the view stops drawing.
                         if f >= 9999 { pillIds.insert(id) }
                         else { pillIds.remove(id); v.layer.cornerRadius = CGFloat(f) }
+            case "glass":   // Liquid Glass: a UIGlassEffect view behind the content (blur fallback)
+                if val == "1" {
+                    if glassViews[id] == nil {
+                        let eff: UIVisualEffect
+                        if #available(iOS 26.0, *) { eff = UIGlassEffect() } else { eff = UIBlurEffect(style: .systemUltraThinMaterial) }
+                        let gv = UIVisualEffectView(effect: eff)
+                        gv.isUserInteractionEnabled = false
+                        gv.frame = v.bounds; gv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                        gv.clipsToBounds = true; gv.layer.cornerRadius = v.layer.cornerRadius
+                        v.insertSubview(gv, at: 0); v.backgroundColor = .clear
+                        glassViews[id] = gv
+                    }
+                } else { glassViews[id]?.removeFromSuperview(); glassViews[id] = nil }
             case "pos": if val == "abs" { YGNodeStyleSetPositionType(n, YGPositionType.absolute) }
             case "top":   YGNodeStyleSetPosition(n, YGEdge.top, f)
             case "left":  YGNodeStyleSetPosition(n, YGEdge.left, f)
@@ -1921,6 +1935,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 else { vv.bounds = CGRect(origin: .zero, size: fr.size); vv.center = CGPoint(x: fr.midX, y: fr.midY) }
             }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
+            if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
         }
         // place the whole Chuks app in the safe area, below the diagnostics header
         views["app"]?.frame = CGRect(x: insets.left, y: topY, width: CGFloat(W), height: CGFloat(H))

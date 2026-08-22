@@ -35,6 +35,7 @@ export class Style {
     var bw: int         // border width (px)
     var bc: string      // border color hex
     var shadow: int     // elevation: 1 small, 2 medium, 3 large
+    var glass: int      // Liquid Glass material: 1 = on (iOS 26 glassEffect; blur fallback elsewhere)
     var opacity: int    // 0-100 (-1 = fully opaque)
     var wrap: string    // "wrap" | "nowrap" (flex-wrap)
     var font: string    // custom font family (e.g. an icon font); "" = system
@@ -69,7 +70,7 @@ export class Style {
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
-        this.bw = -1; this.bc = ""; this.shadow = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
+        this.bw = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
         this.swOn = -1; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
@@ -105,6 +106,7 @@ export class Style {
         if (this.bw >= 0) { s = s + "bw=" + string(this.bw) + ";" }
         if (this.bc != "") { s = s + "bc=" + this.bc + ";" }
         if (this.shadow >= 0) { s = s + "shadow=" + string(this.shadow) + ";" }
+        if (this.glass >= 0) { s = s + "glass=" + string(this.glass) + ";" }
         if (this.opacity >= 0) { s = s + "opacity=" + string(this.opacity) + ";" }
         if (this.wrap != "") { s = s + "wrap=" + this.wrap + ";" }
         if (this.font != "") { s = s + "font=" + this.font + ";" }
@@ -280,6 +282,7 @@ function applyLayout(s: Style, p: map[string]Prop): void {
     s.bw = pInt(p, "border", s.bw)              // border width
     s.bc = pStr(p, "borderColor", s.bc)         // border color hex
     s.shadow = pInt(p, "shadow", s.shadow)      // elevation 1..3
+    if (p.get("glass") != null) { s.glass = pBool(p, "glass", false) ? 1 : -1 }   // Liquid Glass material
     s.opacity = pInt(p, "opacity", s.opacity)   // 0..100
     s.wrap = pStr(p, "wrap", s.wrap)            // "wrap" | "nowrap"
     s.font = pStr(p, "font", s.font)            // custom font family (icon fonts)
