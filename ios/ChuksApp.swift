@@ -508,6 +508,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let ins = view.safeAreaInsets                  // report safe insets to the engine on change
+        if let bar = sbColorView {                     // keep the status-bar fill covering the top inset
+            bar.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: ins.top)
+            view.bringSubviewToFront(bar)
+        }
         if ins != lastInsets {
             lastInsets = ins
             eInsets(ins)
@@ -676,6 +680,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     private var statusBarStyle: UIStatusBarStyle = .lightContent   // theme-derived (auto)
     private var sbStyleOverride: UIStatusBarStyle? = nil           // explicit StatusBar style
     private var sbHiddenOverride = false                           // explicit StatusBar hidden
+    private var sbColorView: UIView?                               // StatusBar background fill (top safe area)
     override var preferredStatusBarStyle: UIStatusBarStyle { sbStyleOverride ?? statusBarStyle }
     override var prefersStatusBarHidden: Bool { sbHiddenOverride }
 
@@ -833,6 +838,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 self?.magTokens.remove(token)
                 if self?.magTokens.isEmpty == true { self?.motion.stopMagnetometerUpdates() }
             }
+        case "deviceinfo.screen":
+            let b = UIScreen.main.bounds
+            resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")
         case "biometrics.available":
             resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
         case "biometrics.authenticate":
@@ -1224,6 +1232,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "sbstyle":
                 sbStyleOverride = (val == "light") ? .lightContent : (val == "dark" ? .darkContent : nil)
                 setNeedsStatusBarAppearanceUpdate()
+            case "sbcolor":
+                if val.isEmpty { sbColorView?.removeFromSuperview(); sbColorView = nil }
+                else {
+                    let bar = sbColorView ?? { let x = UIView(); x.isUserInteractionEnabled = false; view.addSubview(x); sbColorView = x; return x }()
+                    bar.backgroundColor = hexColor(val); view.setNeedsLayout()
+                }
             case "mvis":
                 let vis = (val == "1")
                 v.isHidden = !vis

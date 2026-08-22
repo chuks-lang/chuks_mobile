@@ -130,6 +130,11 @@ class MainActivity : Activity() {
             else    -> d.systemUiVisibility
         }
     }
+    // StatusBar background color: the OS status-bar fill (hex, with or without a leading #).
+    private fun setStatusBarColor(hex: String) {
+        if (hex.isEmpty()) return
+        try { window.statusBarColor = android.graphics.Color.parseColor(if (hex.startsWith("#")) hex else "#$hex") } catch (e: Exception) {}
+    }
 
     // Report the system-bar (safe-area) insets to the engine, in dp (Chuks lengths are
     // dp on Android). Re-render if they changed so inset-using components update.
@@ -424,6 +429,12 @@ class MainActivity : Activity() {
             "motion.accel" -> startSensor(token, android.hardware.Sensor.TYPE_ACCELEROMETER)
             "motion.gyro" -> startSensor(token, android.hardware.Sensor.TYPE_GYROSCOPE)
             "motion.mag" -> startSensor(token, android.hardware.Sensor.TYPE_MAGNETIC_FIELD)
+            "deviceinfo.screen" -> {
+                val dm = resources.displayMetrics
+                val wdp = (dm.widthPixels / dm.density).toInt()
+                val hdp = (dm.heightPixels / dm.density).toInt()
+                resolve(token, "$wdp,$hdp,${dm.density}")
+            }
             "biometrics.available" -> {
                 if (android.os.Build.VERSION.SDK_INT < 29) { resolve(token, "0"); return }
                 val bm = getSystemService(android.hardware.biometrics.BiometricManager::class.java)
@@ -996,6 +1007,7 @@ class MainActivity : Activity() {
                 }
                 "sbh" -> setStatusBarHidden(vl == "1")   // StatusBar: hide/show
                 "sbstyle" -> setStatusBarStyle(vl)       // StatusBar: light/dark icons
+                "sbcolor" -> setStatusBarColor(vl)       // StatusBar: background color
                 "mvis" -> {                              // Modal visible: show/hide the overlay
                     val vis = (vl == "1")
                     v.visibility = if (vis) View.VISIBLE else View.GONE

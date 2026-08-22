@@ -80,6 +80,17 @@ export class Location {
     }
 }
 
+// ---- Device info ------------------------------------------------------------
+// screen() reads the CURRENT screen size — a live read, not a launch-time constant,
+// since it changes on rotation, split-screen, and foldables. The payload is
+// "width,height,scale": width/height in logical points (iOS) / density-independent
+// pixels (Android), and scale the pixel ratio (e.g. "3" on a 3x iPhone, "2.75" on a
+// Pixel). For the device's static identity (os / version / model / isTablet) use the
+// sync getters in core/platform.chuks instead.
+export class DeviceInfo {
+    public static screen(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.screen", "", onResult) }
+}
+
 // ---- Biometrics -------------------------------------------------------------
 // Face ID / Touch ID (iOS, LAContext) and fingerprint / face (Android, the framework
 // BiometricPrompt, API 28+). available() answers "1" if the device has enrolled

@@ -1,35 +1,27 @@
-// Smoke-test app for the Chuks Preview host, exercising the Biometrics capability:
-// Biometrics.available reports whether the device has enrolled biometrics, and
-// Biometrics.authenticate shows the Face ID / Touch ID / fingerprint prompt. Served
-// over the dev server; connect Preview and tap Authenticate. Not shipped.
-import { NavStack, Node, Column, Text, Pressable, Comp, setSafeInsets } from "../core/ui.chuks";
+// Smoke-test app for the Chuks Preview host, exercising DeviceInfo + StatusBar color:
+// the StatusBar node tints the OS status bar (indigo, light icons), and
+// DeviceInfo.screen reads the live screen size. Served over the dev server. Not shipped.
+import { NavStack, Node, Column, Text, StatusBar, Comp, setSafeInsets } from "../core/ui.chuks";
 import { useState, useEffect, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
-import { setPlatformInfo } from "../core/platform.chuks";
-import { Biometrics } from "../core/native.chuks";
+import { setPlatformInfo, deviceModel, osVersion } from "../core/platform.chuks";
+import { DeviceInfo } from "../core/native.chuks";
 
 function screenBody(): Node {
-    var avail: Cell = useState("checking...")
-    var status: Cell = useState("")
-    var ok: Cell = useState(false)
+    var screen: Cell = useState("measuring...")
     useEffect(function(): any {
-        Biometrics.available(function(v: bool): void { avail.set(v ? "enrolled" : "not enrolled") })
+        DeviceInfo.screen(function(v: string): void {
+            const p: []string = v.split(",")
+            if (p.length >= 3) { screen.set(p[0] + " x " + p[1] + "  @" + p[2] + "x") }
+        })
         return function(): void {}
     }, [])
-    return Column({ dir: "col", gap: 16, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        Text({ size: 15, color: tk("muted"), ta: "center" }, "Biometrics"),
-        Text({ size: 16, color: tk("muted"), ta: "center" }, string(avail.get())),
-        Pressable({ onPress: function(): void {
-                        status.set("waiting...")
-                        Biometrics.authenticate("Unlock the demo",
-                            function(): void { ok.set(true); status.set("authenticated") },
-                            function(e: string): void { ok.set(false); status.set(e) })
-                    }, bg: tk("primary"), radius: 12, pad: 16, w: 260, align: "center" }, [
-            Text({ size: 17, weight: "bold", color: tk("primaryText"), ta: "center" }, "Authenticate"),
-        ]),
-        string(status.get()) != ""
-            ? Text({ size: 20, weight: "bold", color: bool(ok.get()) ? tk("primary") : tk("danger"), ta: "center", w: 300 }, string(status.get()))
-            : Text({ size: 0 }, ""),
+    return Column({ dir: "col", gap: 14, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        StatusBar({ style: "light", color: tk("primary") }),
+        Text({ size: 15, color: tk("muted"), ta: "center" }, "DeviceInfo.screen"),
+        Text({ size: 30, weight: "bold", color: tk("primary"), ta: "center", w: 320 }, string(screen.get())),
+        Text({ size: 16, color: tk("muted"), ta: "center", w: 320 }, deviceModel() + "  .  iOS/Android " + osVersion()),
+        Text({ size: 13, color: tk("muted"), ta: "center", w: 320 }, "the status bar above is StatusBar({ color })"),
     ])
 }
 

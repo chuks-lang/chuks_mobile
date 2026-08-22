@@ -369,6 +369,7 @@ final class Scene: ObservableObject {
     // ("light" | "dark" | "" = follow theme).
     @Published var sbHidden = false
     @Published var sbStyle = ""
+    @Published var sbColor = ""   // status-bar background color (hex); "" = none
 
     private var booted = false
     func boot(osDark: Bool) {
@@ -570,6 +571,9 @@ final class Scene: ObservableObject {
                 self?.magTokens.remove(token)
                 if self?.magTokens.isEmpty == true { self?.motion.stopMagnetometerUpdates() }
             }
+        case "deviceinfo.screen":
+            let b = UIScreen.main.bounds
+            resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")
         case "biometrics.available":
             resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
         case "biometrics.authenticate":
@@ -739,6 +743,7 @@ final class Scene: ObservableObject {
     private func applyStatusBar(_ style: [String: String]) {
         let h = style["sbh"] == "1"; if h != sbHidden { sbHidden = h }
         let st = style["sbstyle"] ?? ""; if st != sbStyle { sbStyle = st }
+        let c = style["sbcolor"] ?? ""; if c != sbColor { sbColor = c }
     }
 
     private func removeSubtree(_ id: String) {
@@ -752,7 +757,7 @@ final class Scene: ObservableObject {
                 if filtered.count != kids.count { nodes[k]!.children = filtered }
             }
         }
-        if hadStatusBar { if sbHidden { sbHidden = false }; if !sbStyle.isEmpty { sbStyle = "" } }
+        if hadStatusBar { if sbHidden { sbHidden = false }; if !sbStyle.isEmpty { sbStyle = "" }; if !sbColor.isEmpty { sbColor = "" } }
     }
 }
 
@@ -1517,6 +1522,12 @@ struct RootView: View {
                     NodeView(scene: scene, id: "app")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .ignoresSafeArea(.keyboard, edges: .bottom)
+                }
+                if !scene.sbColor.isEmpty {   // StatusBar color: fill the top safe area
+                    hexColor(scene.sbColor)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: geo.safeAreaInsets.top)
+                        .ignoresSafeArea(edges: .top)
                 }
                 modalOverlay   // a visible Modal renders here, above everything
             }

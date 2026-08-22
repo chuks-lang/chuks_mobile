@@ -44,6 +44,7 @@ export class Style {
     var sec: int        // Input secure-entry (password): 1 = masked (-1 = normal)
     var sbHide: int     // StatusBar hidden: 1 hide, 0 show (-1 = not a StatusBar)
     var sbStyle: string // StatusBar content: "light" | "dark" | "" (auto, follows theme)
+    var sbColor: string // StatusBar background color (hex, e.g. "222A3A"); "" = default
     var mvis: int       // Modal visible: 1 shown, 0 hidden (-1 = not a Modal)
     var mpos: string    // Modal content position: "center" | "bottom"
     var slval: int      // Slider current value (-1 = not a Slider); min/max travel with it
@@ -69,7 +70,7 @@ export class Style {
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
         this.bw = -1; this.bc = ""; this.shadow = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
         this.swOn = -1; this.press = -1; this.sec = -1
-        this.sbHide = -1; this.sbStyle = ""
+        this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""
         this.mvis = -1; this.mpos = ""
         this.slval = -1; this.slmin = 0; this.slmax = 100
         this.seli = -1; this.avis = -1; this.resize = ""; this.prog = -1; this.rfsh = -1
@@ -112,6 +113,7 @@ export class Style {
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
         if (this.sbHide >= 0) { s = s + "sbh=" + string(this.sbHide) + ";" }
         if (this.sbStyle != "") { s = s + "sbstyle=" + this.sbStyle + ";" }
+        if (this.sbColor != "") { s = s + "sbcolor=" + this.sbColor + ";" }
         if (this.mvis >= 0) { s = s + "mvis=" + string(this.mvis) + ";" }
         if (this.mpos != "") { s = s + "mpos=" + this.mpos + ";" }
         if (this.slval >= 0) {                       // a Slider: value + range travel together
@@ -624,19 +626,23 @@ export function Progress(p: map[string]Prop): Node {
  * Controls the OS status bar (a host-global directive, like RN's StatusBar). Renders
  * nothing — put it anywhere in a screen. `hidden` hides the bar (fullscreen media);
  * `style` forces the content color: "light" (white text, for a dark header), "dark"
- * (dark text), or omit to follow the app theme automatically.
+ * (dark text), or omit to follow the app theme automatically. `color` sets the bar's
+ * background (a hex string, e.g. tk("primary")); on iOS it fills the top safe area,
+ * on Android it sets the OS status-bar color.
  *
- * Props: `hidden` (bool, default false), `style` ("light" | "dark", default auto).
+ * Props: `hidden` (bool, default false), `style` ("light" | "dark", default auto),
+ * `color` (hex, default none).
  *
  * ```chuks
  * StatusBar({ hidden: isFullscreen })
- * StatusBar({ style: "light" })
+ * StatusBar({ style: "light", color: tk("primary") })
  * ```
  */
 export function StatusBar(p: map[string]Prop): Node {
     const s: Style = new Style()
     s.sbHide = pBool(p, "hidden", false) ? 1 : 0
     s.sbStyle = pStr(p, "style", "")
+    s.sbColor = pStr(p, "color", "")
     s.w = 0; s.h = 0
     return mkStatusBar(s)
 }
