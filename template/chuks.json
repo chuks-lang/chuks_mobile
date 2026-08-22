@@ -13,7 +13,7 @@
     "ios": "FAST=1 bash chuks_packages/@chuks/mobile/ios/build.sh",
     "ios:release": "bash chuks_packages/@chuks/mobile/ios/build.sh",
     "android": "bash chuks_packages/@chuks/mobile/android/build.sh",
-    "dev": "chuks watch .chuks/devserver.chuks",
+    "dev": "rm -f .chuks/dev-state.txt; chuks watch .chuks/devserver.chuks",
     "dev:ios": "DEV=1 FAST=1 bash chuks_packages/@chuks/mobile/ios/build.sh",
     "dev:android": "DEV=1 bash chuks_packages/@chuks/mobile/android/build.sh",
     "typecheck": "chuks check .chuks/entry.chuks"

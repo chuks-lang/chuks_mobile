@@ -8,11 +8,29 @@
 // App developers use `useState` / `useKeyedState`; the leading-underscore context
 // and hookEnter/hookSweep are framework-internal (core/ui.chuks drives them).
 
+import { json } from "std/json";
+
 var _path: string = ""              // identity of the component currently rendering
 var _slot: int = 0                  // index within a component (multiple useState per component)
 var _fxSlot: int = 0                // index within a component for useEffect calls
 var _cells: map[string]any = {}     // persistent state boxes, keyed by "path#slot" (or "key:...")
 var _seen: map[string]bool = {}     // cell keys touched this render, for hookSweep()
+
+// ---- state serialization (hot-reload preservation) -------------------------
+// Serialize every useState/useKeyedState cell to JSON so the dev server can carry
+// state across a `chuks watch` restart. Cells keyed by structural identity, so as
+// long as the component tree keeps the same shape the values reconnect on reload.
+export function serializeCells(): string { return json.stringify(_cells) }
+
+// Restore cells from serializeCells() output BEFORE the first render, so useState
+// finds the preserved value instead of re-seeding its initial. Keys absent from the
+// snapshot (new components after a structural edit) fall back to their initial.
+export function restoreCells(data: string): void {
+    if (data == "") { return }
+    const parsed: map[string]any = json.parse(data)
+    const ks: []string = parsed.keys()
+    for (var i: int = 0; i < ks.length; i = i + 1) { _cells[ks[i]] = parsed[ks[i]] }
+}
 
 // Effect bookkeeping (see useEffect below). Declared up top so hookBegin/hookSweep
 // can reference them (Chuks needs types/vars defined before use).

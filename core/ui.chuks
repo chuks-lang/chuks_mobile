@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, runEffects } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells } from "./state.chuks";
 
 // ---- Style: a compact subset of the flexbox + visual model -----------------
 export class Style {
@@ -1532,10 +1532,13 @@ export class App {
     public render(): Node { return mkView(new Style(), []) }
     // Advance per-frame state before each re-render. Optional.
     public onTick(): void { }
-    // Serialize state to a string for hot-reload preservation. Optional.
-    public saveState(): string { return "" }
-    // Restore state from a saveState() string after a hot reload. Optional.
-    public loadState(_data: string): void { }
+    // Serialize state for hot-reload preservation. Defaults to snapshotting every
+    // useState cell, so state survives a reload with no per-app code. Override to
+    // customize (e.g. drop transient state or serialize non-JSON values yourself).
+    public saveState(): string { return serializeCells() }
+    // Restore state from a saveState() string after a hot reload. Defaults to
+    // restoring the useState cells captured by saveState().
+    public loadState(data: string): void { restoreCells(data) }
     // ---- framework-driven (the native host calls these; don't override) ----
     // Render the tree and emit the initial mutation stream. Returns mutation count.
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
