@@ -8,7 +8,7 @@
 // the reload. (The host process stays alive, so scroll/focus persist for free.)
 import { createServer, Request, Response } from "std/http";
 import { fs } from "std/fs";
-import { set_count, mount, tick, setViewport, dispatch, dispatchInput, resolve, fail, drain, saveState, loadState } from "./entry.chuks";
+import { set_count, mount, remount, tick, setViewport, dispatch, dispatchInput, resolve, fail, drain, saveState, loadState } from "./entry.chuks";
 
 const STATE_FILE: string = "/tmp/chuks-mobile-state.txt"
 
@@ -21,7 +21,9 @@ if (fs.exists(STATE_FILE)) {
 
 var app = createServer({})
 
-app.post("/mount", function(req: Request, res: Response) { mount(); res.send(drain()) })
+// remount() (not mount()) so every host that connects or relaunches gets the FULL tree,
+// not an empty diff — mount()'s output is one-shot against the reconciler's committed state.
+app.post("/mount", function(req: Request, res: Response) { remount(); res.send(drain()) })
 app.post("/tick", function(req: Request, res: Response) { tick(); res.send(drain()) })
 app.post("/viewport", function(req: Request, res: Response) {
     const p: []string = req.body.split(" ")   // "top height"

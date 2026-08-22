@@ -1141,6 +1141,15 @@ export class Reconciler {
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
+    // Drop the committed-tree baseline so the next renderRoot re-emits the WHOLE tree as
+    // creates (not a diff). The dev server uses this so a freshly connected or relaunched
+    // host, which has no views yet, receives the full tree. Component state is untouched
+    // (it lives in the hook cells, not here), so a reconnecting host keeps current state.
+    public forgetCommitted(): void {
+        this.rootPrev = null
+        this.itemNodes = {}; this.mounted = []; this.listCount = -1
+        this.cellRank = {}; this.poolSize = 0
+    }
     // Append one mutation line ("C|id|kind", "S|id|style", "I|id|parent|idx", "R|id", ...).
     public emit(s: string): void { this.lines.push(s) }
     // Number of mutations buffered this frame.
@@ -1532,6 +1541,10 @@ export class App {
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
     // reconnected by identity, and freed when a component leaves the tree.
     public mount(): int { this.recon.begin(); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    // Full re-mount: re-emit the entire current tree (state preserved). The dev server
+    // calls this on every /mount so any host that connects or relaunches gets a complete
+    // tree, not an empty diff against a tree it never received. Not called in production.
+    public remount(): int { this.recon.forgetCommitted(); return this.mount() }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
     public setViewport(top: int, h: int): int {
         this.recon.begin(); hookBegin(); this.recon.setViewport(top, h); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
