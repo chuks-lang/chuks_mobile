@@ -23,3 +23,6 @@
 
 # NOTE: ios/yoga/*.a, ios/yoga-device/*.a, android/yoga/*.a are prebuilt Yoga
 # static libs — build INPUTS, kept on purpose so the repo builds out of the box.
+
+# Internal design docs / roadmaps — kept local, out of the repo.
+docs/
