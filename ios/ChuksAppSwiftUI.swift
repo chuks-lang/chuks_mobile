@@ -17,6 +17,7 @@ import Photos
 import UserNotifications
 import CoreLocation
 import CoreMotion
+import LocalAuthentication
 import Security
 import Network
 
@@ -568,6 +569,17 @@ final class Scene: ObservableObject {
             streamTeardown[token] = { [weak self] in
                 self?.magTokens.remove(token)
                 if self?.magTokens.isEmpty == true { self?.motion.stopMagnetometerUpdates() }
+            }
+        case "biometrics.available":
+            resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
+        case "biometrics.authenticate":
+            let ctx = LAContext()
+            var perr: NSError?
+            if !ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &perr) {
+                fail(token, perr?.localizedDescription ?? "biometrics unavailable"); break
+            }
+            ctx.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: args.isEmpty ? "Authenticate" : args) { [weak self] ok, e in
+                DispatchQueue.main.async { ok ? self?.resolve(token, "success") : self?.fail(token, e?.localizedDescription ?? "authentication failed") }
             }
         case "debug.activeStreams": resolve(token, String(activeStreams.count + streamTeardown.count))
         case "debug.fail": fail(token, "simulated native failure")

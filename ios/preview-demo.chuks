@@ -1,45 +1,35 @@
-// Smoke-test app for the Chuks Preview host, exercising the Motion capability:
-// Motion.accelerometer streams live "x,y,z" as the device tilts. Served over the dev
-// server; connect Preview and tilt the phone (Android emulator: set virtual sensors).
-// The iOS Simulator has no motion hardware, so it correctly reports "unavailable".
-// Not shipped.
-import { NavStack, Node, Column, Row, Text, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
+// Smoke-test app for the Chuks Preview host, exercising the Biometrics capability:
+// Biometrics.available reports whether the device has enrolled biometrics, and
+// Biometrics.authenticate shows the Face ID / Touch ID / fingerprint prompt. Served
+// over the dev server; connect Preview and tap Authenticate. Not shipped.
+import { NavStack, Node, Column, Text, Pressable, Comp, setSafeInsets } from "../core/ui.chuks";
 import { useState, useEffect, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { Motion } from "../core/native.chuks";
-
-// Trim a raw axis value ("0.019226") to a short, steady-width label.
-function short(v: string): string {
-    if (v.length <= 5) { return v }
-    return v.slice(0, 5)
-}
-
-function axis(label: string, v: Cell): Node {
-    return Row({ dir: "row", gap: 14, w: 220, justify: "between", align: "center" }, [
-        Text({ size: 20, weight: "bold", color: tk("muted") }, label),
-        Text({ size: 26, weight: "bold", color: tk("primary") }, string(v.get())),
-    ])
-}
+import { Biometrics } from "../core/native.chuks";
 
 function screenBody(): Node {
-    var ax: Cell = useState("0")
-    var ay: Cell = useState("0")
-    var az: Cell = useState("0")
-    var err: Cell = useState("")
+    var avail: Cell = useState("checking...")
+    var status: Cell = useState("")
+    var ok: Cell = useState(false)
     useEffect(function(): any {
-        const s: NativeSub = Motion.accelerometer(function(v: string): void {
-            err.set("")
-            const p: []string = v.split(",")
-            if (p.length >= 3) { ax.set(short(p[0])); ay.set(short(p[1])); az.set(short(p[2])) }
-        }, function(e: string): void { err.set(e) })
-        return function(): void { s.cancel() }
+        Biometrics.available(function(v: string): void { avail.set(v == "1" ? "enrolled" : "not enrolled") })
+        return function(): void {}
     }, [])
     return Column({ dir: "col", gap: 16, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        Text({ size: 15, color: tk("muted"), ta: "center" }, "Motion.accelerometer"),
-        string(err.get()) != ""
-            ? Text({ size: 18, color: tk("danger"), ta: "center", w: 300 }, string(err.get()))
-            : Column({ dir: "col", gap: 10, align: "center" }, [ axis("x", ax), axis("y", ay), axis("z", az) ]),
+        Text({ size: 15, color: tk("muted"), ta: "center" }, "Biometrics"),
+        Text({ size: 16, color: tk("muted"), ta: "center" }, string(avail.get())),
+        Pressable({ onPress: function(): void {
+                        status.set("waiting...")
+                        Biometrics.authenticate("Unlock the demo",
+                            function(_: string): void { ok.set(true); status.set("authenticated") },
+                            function(e: string): void { ok.set(false); status.set(e) })
+                    }, bg: tk("primary"), radius: 12, pad: 16, w: 260, align: "center" }, [
+            Text({ size: 17, weight: "bold", color: tk("primaryText"), ta: "center" }, "Authenticate"),
+        ]),
+        string(status.get()) != ""
+            ? Text({ size: 20, weight: "bold", color: bool(ok.get()) ? tk("primary") : tk("danger"), ta: "center", w: 300 }, string(status.get()))
+            : Text({ size: 0 }, ""),
     ])
 }
 

@@ -424,6 +424,13 @@ class MainActivity : Activity() {
             "motion.accel" -> startSensor(token, android.hardware.Sensor.TYPE_ACCELEROMETER)
             "motion.gyro" -> startSensor(token, android.hardware.Sensor.TYPE_GYROSCOPE)
             "motion.mag" -> startSensor(token, android.hardware.Sensor.TYPE_MAGNETIC_FIELD)
+            "biometrics.available" -> {
+                if (android.os.Build.VERSION.SDK_INT < 29) { resolve(token, "0"); return }
+                val bm = getSystemService(android.hardware.biometrics.BiometricManager::class.java)
+                val ok = bm != null && bm.canAuthenticate() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS
+                resolve(token, if (ok) "1" else "0")
+            }
+            "biometrics.authenticate" -> authenticateBiometric(token, args)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
             "debug.fail" -> fail(token, "simulated native failure")
             "permission.status" -> {
@@ -581,6 +588,28 @@ class MainActivity : Activity() {
         }
         sm.registerListener(listener, sensor, 50_000)   // 50ms sampling ≈ 20Hz
         streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // Biometrics (F3): the framework BiometricPrompt (API 28+, no androidx dependency).
+    // onAuthenticationSucceeded -> "success"; a cancel/lockout/error -> fail(); a single
+    // non-match (onAuthenticationFailed) leaves the prompt open for a retry.
+    private fun authenticateBiometric(token: String, reason: String) {
+        if (android.os.Build.VERSION.SDK_INT < 28) { fail(token, "biometrics unavailable"); return }
+        val prompt = android.hardware.biometrics.BiometricPrompt.Builder(this)
+            .setTitle("Authenticate")
+            .setSubtitle(if (reason.isEmpty()) "Confirm your identity" else reason)
+            .setNegativeButton("Cancel", mainExecutor, android.content.DialogInterface.OnClickListener { _, _ -> })
+            .build()
+        prompt.authenticate(android.os.CancellationSignal(), mainExecutor,
+            object : android.hardware.biometrics.BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: android.hardware.biometrics.BiometricPrompt.AuthenticationResult) {
+                    runOnUiThread { resolve(token, "success") }
+                }
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    runOnUiThread { fail(token, errString.toString()) }
+                }
+                override fun onAuthenticationFailed() {}   // one non-match; prompt stays open
+            })
     }
 
     // Secure storage (Tier B): values are AES-GCM encrypted with an AndroidKeyStore
