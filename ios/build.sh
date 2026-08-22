@@ -25,7 +25,7 @@ BID="$(pj bundleId)"; BID="${BID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:up
 # app.json (RN/Expo-style): the app's own identity + native config. Supersedes chuks.json
 # for name/displayName/bundleId, and is the SOLE source for version, URL schemes, and the
 # permission usage strings. Optional — every field falls back to a default.
-AJ() { python3 "$SDKROOT/appconfig.py" "$PROJDIR" "$1" 2>/dev/null; }
+AJ() { chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" "$1" 2>/dev/null; }
 _ajn="$(AJ name)";        [ -n "$_ajn" ] && { NAME_RAW="$_ajn"; APPNAME="$(printf '%s' "$_ajn" | tr -cd '[:alnum:]')"; }
 _ajd="$(AJ displayName)"; [ -n "$_ajd" ] && DISPLAY="$_ajd"
 _ajb="$(AJ ios-bundle)";  [ -n "$_ajb" ] && BID="$_ajb"
@@ -124,7 +124,7 @@ if [ "${DEV:-0}" = "1" ] && [ "$PREVIEW" != "1" ]; then
     echo "   hot reload: app will fetch from $DEVHOST"
 fi
 # Per-app plist keys: permission usage strings + URL schemes. A real build gets them from
-# app.json (via appconfig.py); Chuks Preview overrides with its scanner copy + chuks:// scheme.
+# app.json (via appconfig.chuks); Chuks Preview overrides with its scanner copy + chuks:// scheme.
 ICONNAME_PLIST=""
 if [ "$PREVIEW" = "1" ]; then
     IOS_PLIST_EXTRA='  <key>NSCameraUsageDescription</key><string>Scan a Chuks dev-server QR code to run your app.</string>

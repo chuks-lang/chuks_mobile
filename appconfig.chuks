@@ -1,0 +1,171 @@
+// Reads a Chuks app's app.json and emits (or injects) the per-platform native config the
+// build scripts need: version, URL schemes, permission strings / uses-permission entries.
+// The Chuks replacement for the old appconfig.py — the mobile toolchain stays 100% Chuks.
+//
+//   chuks run appconfig.chuks <projdir> <field> [arg]
+//     <field> = version | build | name | displayName | ios-bundle | ios-plist
+//               | android-perms | android-schemes            (print the value)
+//             | patch-manifest <manifest-path>               (fill the manifest in place)
+//
+// app.json (in the project root) is the app's identity + native config, like RN/Expo's
+// app.json; chuks.json stays the package/tooling manifest. Every field is optional and
+// falls back to a default, so a project without app.json still builds.
+import { fs } from "std/fs";
+import { json } from "std/json";
+import { os } from "std/os";
+
+// A FIXED kind order (not the parsed map's order, which isn't stable) so the generated
+// plist / manifest is deterministic across builds.
+const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications"]
+
+// permission kind -> iOS Info.plist usage-description key(s)
+function iosKeysFor(kind: string): []string {
+    if (kind == "camera") { return ["NSCameraUsageDescription"] }
+    if (kind == "microphone") { return ["NSMicrophoneUsageDescription"] }
+    if (kind == "location") { return ["NSLocationWhenInUseUsageDescription"] }
+    if (kind == "photos") { return ["NSPhotoLibraryUsageDescription"] }
+    if (kind == "photosAdd") { return ["NSPhotoLibraryAddUsageDescription"] }
+    if (kind == "contacts") { return ["NSContactsUsageDescription"] }
+    if (kind == "calendar") { return ["NSCalendarsUsageDescription", "NSCalendarsFullAccessUsageDescription"] }
+    if (kind == "faceId") { return ["NSFaceIDUsageDescription"] }
+    var empty: []string = []          // notifications need no iOS plist string
+    return empty
+}
+// permission kind -> Android manifest uses-permission name(s)
+function androidPermsFor(kind: string): []string {
+    if (kind == "camera") { return ["CAMERA"] }
+    if (kind == "microphone") { return ["RECORD_AUDIO"] }
+    if (kind == "location") { return ["ACCESS_FINE_LOCATION"] }
+    if (kind == "photos") { return ["READ_MEDIA_IMAGES"] }
+    if (kind == "contacts") { return ["READ_CONTACTS"] }
+    if (kind == "calendar") { return ["READ_CALENDAR", "WRITE_CALENDAR"] }
+    if (kind == "faceId") { return ["USE_BIOMETRIC"] }
+    if (kind == "notifications") { return ["POST_NOTIFICATIONS"] }
+    var empty: []string = []          // photosAdd (MediaStore) needs no permission on API 29+
+    return empty
+}
+
+function xmlEscape(s: string): string {
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+}
+
+function contains(arr: []string, v: string): bool {
+    var i: int = 0
+    while (i < arr.length) { if (arr[i] == v) { return true } i = i + 1 }
+    return false
+}
+
+// A JSON value's string form, or a default when it is missing (null).
+function strOr(v: any, dflt: string): string {
+    if (v == null) { return dflt }
+    return string(v)
+}
+
+// Read app.json's "schemes" array (as strings) from an ios/android sub-object.
+function schemesOf(node: any): []string {
+    var out: []string = []
+    if (node == null) { return out }
+    const arr: any = node["schemes"]
+    if (arr == null) { return out }
+    const items: []any = arr
+    var i: int = 0
+    while (i < items.length) { out.push(string(items[i])) i = i + 1 }
+    return out
+}
+
+// The iOS Info.plist fragment: NS*UsageDescription strings + a CFBundleURLTypes block.
+function iosPlistStr(perms: any, ios: any): string {
+    var out: string = ""
+    var i: int = 0
+    while (i < KINDS.length) {
+        const kind: string = KINDS[i]
+        if (perms[kind] != null) {
+            const reason: string = xmlEscape(string(perms[kind]))
+            const keys: []string = iosKeysFor(kind)
+            var j: int = 0
+            while (j < keys.length) {
+                out = out + "  <key>" + keys[j] + "</key><string>" + reason + "</string>\n"
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    const schemes: []string = schemesOf(ios)
+    if (schemes.length > 0) {
+        var items: string = ""
+        var k: int = 0
+        while (k < schemes.length) { items = items + "<string>" + xmlEscape(schemes[k]) + "</string>" k = k + 1 }
+        out = out + "  <key>CFBundleURLTypes</key>\n  <array><dict><key>CFBundleURLSchemes</key><array>" + items + "</array></dict></array>\n"
+    }
+    return out
+}
+
+// The Android <uses-permission> block (base entries + whatever the permissions map implies).
+function androidPermsStr(perms: any): string {
+    var names: []string = ["INTERNET", "ACCESS_NETWORK_STATE", "VIBRATE", "FLASHLIGHT"]
+    var i: int = 0
+    while (i < KINDS.length) {
+        if (perms[KINDS[i]] != null) {
+            const ps: []string = androidPermsFor(KINDS[i])
+            var j: int = 0
+            while (j < ps.length) { if (!contains(names, ps[j])) { names.push(ps[j]) } j = j + 1 }
+        }
+        i = i + 1
+    }
+    var out: string = ""
+    var k: int = 0
+    while (k < names.length) { out = out + "    <uses-permission android:name=\"android.permission." + names[k] + "\" />\n" k = k + 1 }
+    return out
+}
+
+// The deep-link <data android:scheme> lines for a VIEW intent-filter.
+function androidSchemesStr(android: any): string {
+    const schemes: []string = schemesOf(android)
+    var out: string = ""
+    var i: int = 0
+    while (i < schemes.length) { out = out + "                <data android:scheme=\"" + xmlEscape(schemes[i]) + "\" />\n" i = i + 1 }
+    return out
+}
+
+// Fill an AndroidManifest.xml in place: the CHUKS_PERMISSIONS / CHUKS_SCHEMES markers and
+// the __VERSION_CODE__ / __VERSION_NAME__ placeholders.
+function patchManifest(mfPath: string, cfg: any, perms: any, android: any): void {
+    var m: string = fs.readFile(mfPath)
+    m = m.replace("<!--CHUKS_PERMISSIONS-->", trimEnd(androidPermsStr(perms)))
+    m = m.replace("<!--CHUKS_SCHEMES-->", trimEnd(androidSchemesStr(android)))
+    m = m.replace("__VERSION_CODE__", strOr(cfg["buildNumber"], "1"))
+    m = m.replace("__VERSION_NAME__", strOr(cfg["version"], "1.0"))
+    fs.writeFile(mfPath, m)
+}
+function trimEnd(s: string): string {
+    if (s.length > 0 && s.slice(s.length - 1) == "\n") { return s.slice(0, s.length - 1) }
+    return s
+}
+
+function main(): void {
+    const a: []string = os.args()
+    if (a.length < 5) { return }            // chuks run <script> <projdir> <field> [arg]
+    const projdir: string = a[3]
+    const field: string = a[4]
+
+    var cfg: any = {}
+    const path: string = projdir + "/app.json"
+    if (fs.exists(path)) { cfg = json.parse(fs.readFile(path)) }
+
+    var ios: any = cfg["ios"]
+    var android: any = cfg["android"]
+    var perms: any = cfg["permissions"]
+    if (perms == null) { perms = {} }
+
+    if (field == "version") { println(strOr(cfg["version"], "1.0")) }
+    else if (field == "build") { println(strOr(cfg["buildNumber"], "1")) }
+    else if (field == "name") { println(strOr(cfg["name"], "")) }
+    else if (field == "displayName") { println(strOr(cfg["displayName"], strOr(cfg["name"], ""))) }
+    else if (field == "ios-bundle") { println(ios == null ? "" : strOr(ios["bundleId"], "")) }
+    else if (field == "ios-plist") { print(iosPlistStr(perms, ios)) }
+    else if (field == "android-perms") { print(androidPermsStr(perms)) }
+    else if (field == "android-schemes") { print(androidSchemesStr(android)) }
+    else if (field == "patch-manifest") { patchManifest(a[5], cfg, perms, android) }
+}
+
+main()

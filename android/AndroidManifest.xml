@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.chuks.app"
-    android:versionCode="1" android:versionName="1.0">
+    android:versionCode="__VERSION_CODE__" android:versionName="__VERSION_NAME__">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
-    <!--CHUKS_PERMISSIONS--><!-- build.sh fills these from app.json's permissions -->
+    <!--CHUKS_PERMISSIONS-->
     <application
         android:label="Chuks"
         android:hasCode="true"
@@ -20,7 +20,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <!--CHUKS_SCHEMES--><!-- build.sh fills <data android:scheme> from app.json's schemes -->
+                <!--CHUKS_SCHEMES-->
             </intent-filter>
         </activity>
     </application>

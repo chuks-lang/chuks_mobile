@@ -29,12 +29,10 @@ CODEPKG="com.chuks.app"
 APPID="$(pj bundleId)"; APPID="${APPID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')}"
 # app.json (RN/Expo-style) supersedes chuks.json for name/displayName and is the source of
 # version, deep-link schemes, and which permissions the manifest declares. Optional.
-AJ() { python3 "$SDKROOT/appconfig.py" "$PROJDIR" "$1" 2>/dev/null; }
+AJ() { chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" "$1" 2>/dev/null; }
 _ajn="$(AJ name)";        [ -n "$_ajn" ] && NAME_RAW="$_ajn"
 _ajd="$(AJ displayName)"; [ -n "$_ajd" ] && DISPLAY="$_ajd"
 _ajbid="$(AJ ios-bundle)"; [ -n "$_ajbid" ] && APPID="$_ajbid"   # single app id across platforms
-AJ_VER="$(AJ version)";   AJ_VER="${AJ_VER:-1.0}"
-AJ_BUILD="$(AJ build)";   AJ_BUILD="${AJ_BUILD:-1}"
 # Chuks Preview: the generic runtime host. ConnectActivity is the launcher; a package-local
 # stub supplies the engine symbols (never called — Preview always talks to a dev server).
 PREVIEW="${PREVIEW:-0}"
@@ -97,19 +95,8 @@ if [ "$PREVIEW" = "1" ]; then
 else
     cp "$PKGDIR/AndroidManifest.xml" "$OUT/AndroidManifest.xml"
     sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
-    # app.json -> permissions block, deep-link <data> schemes, and versionCode/versionName
-    AJ android-perms   > "$OUT/_perms.xml"
-    AJ android-schemes > "$OUT/_schemes.xml"
-    python3 - "$OUT/AndroidManifest.xml" "$OUT/_perms.xml" "$OUT/_schemes.xml" "$AJ_VER" "$AJ_BUILD" <<'PY'
-import sys, re
-mf, pf, sf, ver, build = sys.argv[1:6]
-m = open(mf).read()
-m = m.replace("<!--CHUKS_PERMISSIONS-->", open(pf).read().rstrip("\n"))
-m = m.replace("<!--CHUKS_SCHEMES-->", open(sf).read().rstrip("\n"))
-m = re.sub(r'android:versionCode="[^"]*"', 'android:versionCode="%s"' % build, m)
-m = re.sub(r'android:versionName="[^"]*"', 'android:versionName="%s"' % ver, m)
-open(mf, "w").write(m)
-PY
+    # app.json -> fill the manifest's permission block, deep-link schemes, and version
+    chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" patch-manifest "$OUT/AndroidManifest.xml" 2>/dev/null
 fi
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
     $RESZIP --rename-manifest-package "$APPID" \
