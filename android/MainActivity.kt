@@ -435,6 +435,22 @@ class MainActivity : Activity() {
                 val hdp = (dm.heightPixels / dm.density).toInt()
                 resolve(token, "$wdp,$hdp,${dm.density}")
             }
+            "deviceinfo.appversion" -> {
+                val pi = packageManager.getPackageInfo(packageName, 0)
+                @Suppress("DEPRECATION")
+                val code = if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode else pi.versionCode.toLong()
+                resolve(token, "${pi.versionName ?: ""},$code")
+            }
+            "deviceinfo.locale" -> {
+                val loc = resources.configuration.locales[0]
+                resolve(token, "${loc.language},${loc.country}")
+            }
+            "linking.opensettings" -> {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        android.net.Uri.parse("package:$packageName")).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                } catch (e: Exception) {}
+            }
             "mediapicker.image" -> {
                 val code = ++mediaSeq
                 pendingMedia[code] = Pair(token, null)

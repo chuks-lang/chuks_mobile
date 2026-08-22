@@ -612,6 +612,14 @@ final class Scene: ObservableObject {
         case "deviceinfo.screen":
             let b = UIScreen.main.bounds
             resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")
+        case "deviceinfo.appversion":
+            let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+            let bld = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+            resolve(token, "\(v),\(bld)")
+        case "deviceinfo.locale":
+            resolve(token, "\(Locale.current.languageCode ?? ""),\(Locale.current.regionCode ?? "")")
+        case "linking.opensettings":
+            if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
         case "mediapicker.image":
             let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
                                          cancel: { [weak self] m in self?.mediaCoord = nil; self?.fail(token, m) })

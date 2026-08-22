@@ -24,6 +24,9 @@ export class Linking {
     public static canOpen(url: string, onResult: (bool)=> void): void {
         emitNativeCommand("linking.canOpen", url, function(s: string): void { onResult(s == "1") })
     }
+    // Open this app's own page in the OS Settings (e.g. to let the user flip a permission
+    // they previously denied). Fire-and-forget.
+    public static openSettings(): void { emitNativeCommand("linking.opensettings", "", null) }
 }
 
 // ---- Share ------------------------------------------------------------------
@@ -108,6 +111,10 @@ export class Camera {
 // sync getters in core/platform.chuks instead.
 export class DeviceInfo {
     public static screen(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.screen", "", onResult) }
+    // The app's own version + build, as "version,build" (e.g. "0.1.5,42").
+    public static appVersion(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appversion", "", onResult) }
+    // The device language + region, as "language,region" (e.g. "en,US").
+    public static locale(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.locale", "", onResult) }
 }
 
 // ---- Biometrics -------------------------------------------------------------
