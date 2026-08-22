@@ -59,6 +59,25 @@ export class Orientation {
     public static lockTo(mode: string): void { emitNativeCommand("orientation.lock", mode, null) }
 }
 
+// ---- Location / GPS ---------------------------------------------------------
+// The device position, from CoreLocation (iOS) / LocationManager (Android). once()
+// reads a single fix; watch() streams fixes as the device moves — the first as soon
+// as one is available, then on each update, until its NativeSub is cancelled. Both
+// payloads are comma-separated (comma, not "|", which is the mutation-wire delimiter):
+//   "lat,lng,accuracy,altitude,speed,heading"
+// all floats; accuracy is in metres, speed in m/s, heading in degrees (a negative
+// value means that field is unavailable on this fix). Needs the "location" permission
+// — request it via Permission.request("location", ...) first; onError fires if the
+// permission is denied or no location provider is available.
+export class Location {
+    public static once(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("location.once", "", onResult, onError)
+    }
+    public static watch(onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
+        return emitNativeStream("location.watch", "", onUpdate, onError)
+    }
+}
+
 // ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------
 // A minimal repeating stream used to exercise + prove the teardown path: start it
 // in a useEffect, cancel() the returned NativeSub in the cleanup, and on unmount

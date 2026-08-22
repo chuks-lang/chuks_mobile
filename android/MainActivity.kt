@@ -384,6 +384,43 @@ class MainActivity : Activity() {
                 streamTeardown[token] = { try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) {} }
                 emitNetwork(token, cm)
             }
+            "location.once" -> {
+                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+                val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+                val provider = bestLocationProvider(lm)
+                if (provider == null) { fail(token, "location unavailable"); return }
+                try {
+                    val last = lm.getLastKnownLocation(provider)
+                    if (last != null) { resolve(token, locFixStr(last)) }
+                    else {
+                        // No cached fix: take one live update, then release the listener.
+                        val listener = object : android.location.LocationListener {
+                            override fun onLocationChanged(l: android.location.Location) { resolve(token, locFixStr(l)); lm.removeUpdates(this) }
+                            override fun onProviderDisabled(p: String) {}
+                            override fun onProviderEnabled(p: String) {}
+                            @Deprecated("kept for older API levels") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
+                        }
+                        lm.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
+                    }
+                } catch (e: SecurityException) { fail(token, "location permission denied") }
+            }
+            "location.watch" -> {
+                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+                val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+                val provider = bestLocationProvider(lm)
+                if (provider == null) { fail(token, "location unavailable"); return }
+                val listener = object : android.location.LocationListener {
+                    override fun onLocationChanged(l: android.location.Location) { resolve(token, locFixStr(l)) }
+                    override fun onProviderDisabled(p: String) {}
+                    override fun onProviderEnabled(p: String) {}
+                    @Deprecated("kept for older API levels") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
+                }
+                try {
+                    lm.getLastKnownLocation(provider)?.let { resolve(token, locFixStr(it)) }   // immediate value
+                    lm.requestLocationUpdates(provider, 1000L, 0f, listener, Looper.getMainLooper())
+                    streamTeardown[token] = { try { lm.removeUpdates(listener) } catch (e: Exception) {} }
+                } catch (e: SecurityException) { fail(token, "location permission denied") }
+            }
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
             "debug.fail" -> fail(token, "simulated native failure")
             "permission.status" -> {
@@ -513,6 +550,20 @@ class MainActivity : Activity() {
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         resolve(token, if (granted) "granted" else "denied")
     }
+
+    // Location (F3): fine or coarse grant is enough to read a fix; pick GPS, else the
+    // network provider (LocationManager, not fused — fused needs Google Play services).
+    private fun hasLocationPerm(): Boolean =
+        checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+        checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    private fun bestLocationProvider(lm: android.location.LocationManager): String? = when {
+        lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) -> android.location.LocationManager.GPS_PROVIDER
+        lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER) -> android.location.LocationManager.NETWORK_PROVIDER
+        else -> null
+    }
+    // "lat,lng,accuracy,altitude,speed,heading" — matches the iOS payload shape.
+    private fun locFixStr(l: android.location.Location): String =
+        "${l.latitude},${l.longitude},${l.accuracy},${l.altitude},${l.speed},${l.bearing}"
 
     // Secure storage (Tier B): values are AES-GCM encrypted with an AndroidKeyStore
     // key (never leaves the secure hardware) and the ciphertext kept in a private

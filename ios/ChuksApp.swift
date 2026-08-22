@@ -228,6 +228,48 @@ final class LocPerm: NSObject, CLLocationManagerDelegate {
     }
 }
 
+// Streams CLLocation fixes to a callback: once==true delivers a single fix then stops,
+// once==false keeps updating until stop(). If authorization is still undetermined it
+// prompts and begins as soon as the grant arrives; a denial goes to onErr.
+final class LocFix: NSObject, CLLocationManagerDelegate {
+    private let mgr = CLLocationManager()
+    private let once: Bool
+    private let onFix: (String) -> Void
+    private let onErr: (String) -> Void
+    private var pending = false   // waiting on the authorization decision to begin
+    init(once: Bool, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
+        self.once = once; self.onFix = onFix; self.onErr = onErr
+        super.init(); mgr.delegate = self; mgr.desiredAccuracy = kCLLocationAccuracyBest
+    }
+    func start() {
+        switch mgr.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways: begin()
+        case .denied, .restricted: onErr("location permission denied")
+        default: pending = true; mgr.requestWhenInUseAuthorization()
+        }
+    }
+    func stop() { mgr.stopUpdatingLocation() }
+    private func begin() { if once { mgr.requestLocation() } else { mgr.startUpdatingLocation() } }
+    func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+        guard pending else { return }
+        switch m.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways: pending = false; begin()
+        case .denied, .restricted: pending = false; onErr("location permission denied")
+        default: break   // still undetermined
+        }
+    }
+    func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {
+        guard let l = locs.last else { return }
+        let c = l.coordinate
+        onFix("\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course)")
+        if once { m.stopUpdatingLocation() }
+    }
+    func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
+        if (e as? CLError)?.code == .locationUnknown { return }  // transient: no fix yet, keep waiting
+        onErr(e.localizedDescription)
+    }
+}
+
 // Secure storage (Tier B): Keychain-backed key/value.
 func keychainSet(_ key: String, _ value: String) {
     let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key]
@@ -684,6 +726,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var activeStreams: [String: Timer] = [:]
     var streamTeardown: [String: () -> Void] = [:]   // real OS streams: unregister closure, run on __cancel__
     var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
+    var locFixes: [String: LocFix] = [:]    // live Location managers, keyed by token (once + watch)
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
@@ -730,6 +773,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
             mon.start(queue: DispatchQueue.global(qos: .utility))
             streamTeardown[token] = { mon.cancel() }
+        case "location.once":
+            let fix = LocFix(once: true,
+                onFix: { [weak self] s in self?.resolve(token, s); self?.locFixes[token] = nil },
+                onErr: { [weak self] m in self?.fail(token, m); self?.locFixes[token] = nil })
+            locFixes[token] = fix; fix.start()
+        case "location.watch":
+            let fix = LocFix(once: false,
+                onFix: { [weak self] s in self?.resolve(token, s) },
+                onErr: { [weak self] m in self?.fail(token, m) })
+            locFixes[token] = fix
+            streamTeardown[token] = { [weak self] in self?.locFixes[token]?.stop(); self?.locFixes[token] = nil }
+            fix.start()
         case "debug.activeStreams": resolve(token, String(activeStreams.count + streamTeardown.count))
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)

@@ -1,32 +1,45 @@
-// Smoke-test app for the Chuks Preview host, now exercising the Orientation capability:
-// Orientation.watch (live current value + rotation stream) and Orientation.lockTo. Served
-// over the dev server; connect Preview and rotate the device. Not shipped.
+// Smoke-test app for the Chuks Preview host, exercising the Location capability:
+// Location.watch (a live GPS stream) and Location.once (a single fix), gated behind
+// the "location" permission. Served over the dev server; connect Preview and move the
+// device (or set a simulated location). Not shipped.
 import { NavStack, Node, Column, Text, Pressable, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
 import { useState, useEffect, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { Orientation } from "../core/native.chuks";
+import { Location, Permission } from "../core/native.chuks";
 
-function lockBtn(label: string, mode: string): Node {
-    return Pressable({ onPress: function(): void { Orientation.lockTo(mode) }, bg: tk("surface"), radius: 12, pad: 14, w: 260, align: "center",
-                       border: 1, borderColor: tk("border") }, [
-        Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, label),
-    ])
+// Format one "lat,lng,accuracy,..." fix into two lines of readable coordinates.
+function fmtCoord(fix: string): string {
+    const p: []string = fix.split(",")
+    if (p.length < 3) { return fix }
+    return "lat " + p[0] + "\nlng " + p[1] + "\n±" + p[2] + " m"
 }
 
 function screenBody(): Node {
-    var orient: Cell = useState("?")
+    var coord: Cell = useState("locating...")
+    var err: Cell = useState("")
     useEffect(function(): any {
-        Orientation.lockTo("portrait")   // stable portrait for the doc capture (use "landscape" to regenerate the landscape docshots)
-        const s: NativeSub = Orientation.watch(function(v: string): void { orient.set(v) })
-        return function(): void { s.cancel() }
+        var sub: NativeSub? = null
+        // Ask for location first; only start the stream once it is granted.
+        Permission.request("location", function(status: string): void {
+            if (status != "granted") { err.set("permission " + status); return }
+            sub = Location.watch(
+                function(fix: string): void { err.set(""); coord.set(fmtCoord(fix)) },
+                function(e: string): void { err.set(e) })
+        }, function(e: string): void { err.set(e) })
+        return function(): void { if (sub != null) { sub.cancel() } }
     }, [])
-    return Column({ dir: "col", gap: 14, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        Text({ size: 44, weight: "bold", color: tk("primary"), ta: "center" }, string(orient.get())),
-        Text({ size: 15, color: tk("muted"), ta: "center" }, "Orientation.watch: rotate the device"),
-        lockBtn("Lock portrait", "portrait"),
-        lockBtn("Lock landscape", "landscape"),
-        lockBtn("Auto (unlock)", "auto"),
+    return Column({ dir: "col", gap: 16, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        Text({ size: 15, color: tk("muted"), ta: "center" }, "Location.watch"),
+        Text({ size: 26, weight: "bold", color: tk("primary"), ta: "center", w: 300 }, string(coord.get())),
+        string(err.get()) != "" ? Text({ size: 14, color: tk("danger"), ta: "center", w: 300 }, string(err.get())) : Text({ size: 0 }, ""),
+        Pressable({ onPress: function(): void {
+                        coord.set("reading...")
+                        Location.once(function(fix: string): void { coord.set(fmtCoord(fix)) },
+                                      function(e: string): void { err.set(e) })
+                    }, bg: tk("surface"), radius: 12, pad: 14, w: 260, align: "center", border: 1, borderColor: tk("border") }, [
+            Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, "Read once"),
+        ]),
     ])
 }
 
