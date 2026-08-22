@@ -86,10 +86,21 @@ let DEV_MODE = true
 let DEV_MODE = false
 #endif
 
+// The dev server host: a DEV=1 build may bundle chuks-dev.txt with the machine's LAN
+// IP (for a real device on the same Wi-Fi); the simulator falls back to localhost.
+let devServerHost: String = {
+    if let u = Bundle.main.url(forResource: "chuks-dev", withExtension: "txt"),
+       let s = try? String(contentsOf: u, encoding: .utf8) {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { return t }
+    }
+    return "localhost:7799"
+}()
+
 // Synchronous request to the dev server. Returns nil on a network error (the server is
 // briefly down while `chuks watch` restarts it), else the response body (may be empty).
 func devHTTP(_ path: String, _ body: String, get: Bool = false) -> String? {
-    guard let url = URL(string: "http://localhost:7799\(path)") else { return nil }
+    guard let url = URL(string: "http://\(devServerHost)\(path)") else { return nil }
     var req = URLRequest(url: url, timeoutInterval: 2)
     req.httpMethod = get ? "GET" : "POST"
     if !get { req.httpBody = body.data(using: .utf8) }

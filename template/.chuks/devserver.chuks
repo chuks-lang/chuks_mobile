@@ -57,5 +57,8 @@ app.post("/fail", function(req: Request, res: Response) {   // "token\nmessage" 
 })
 app.get("/state", function(req: Request, res: Response) { res.send(saveState()) })
 
-app.listen(7799, "127.0.0.1")   // loopback only: the sim/emulator reach it via localhost / 10.0.2.2, and it stays off the LAN (no macOS firewall prompt)
-print("chuks-mobile dev server on :7799")
+// Bind on all interfaces so a real phone on the same Wi-Fi can reach it (sim via
+// localhost, Android emulator via 10.0.2.2, real device via the machine's LAN IP).
+// macOS may show a one-time firewall prompt the first time.
+app.listen(7799, "0.0.0.0")
+print("chuks-mobile dev server on :7799 (sim: localhost | emulator: 10.0.2.2 | device: your LAN IP)")

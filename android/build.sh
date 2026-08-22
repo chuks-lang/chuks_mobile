@@ -72,9 +72,18 @@ CXXSHARED="$BIN/../sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 cp "$CXXSHARED" "$OUT/lib/arm64-v8a/"
 # Discover + bundle icon fonts + media from the PROJECT's assets/ and installed packages.
 mkdir -p "$OUT/assets"
-# DEV hot reload (DEV=1): point the app at the running dev server (chuks watch). The
-# emulator reaches the host loopback via 10.0.2.2; a real device needs the Mac's LAN IP.
-[ "${DEV:-0}" = "1" ] && printf '10.0.2.2:7799' > "$OUT/assets/chuks-dev.txt"
+# DEV hot reload (DEV=1): point the app at the running dev server (chuks watch). An
+# emulator reaches the host loopback via 10.0.2.2; a real device reaches the Mac over
+# Wi-Fi at its LAN IP (needs the dev server bound to 0.0.0.0, which it is).
+if [ "${DEV:-0}" = "1" ]; then
+    DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
+    case "$DEV_ID" in
+        emulator-*) DEV_HOST="10.0.2.2" ;;
+        *)          DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)" ;;
+    esac
+    printf '%s:7799' "$DEV_HOST" > "$OUT/assets/chuks-dev.txt"
+    echo "   hot reload: app will fetch from $DEV_HOST:7799"
+fi
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
 for f in $(find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.png" -o -name "*.jpg" \) 2>/dev/null); do cp "$f" "$OUT/assets/"; done
