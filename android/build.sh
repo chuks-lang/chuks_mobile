@@ -26,6 +26,14 @@ NAME_RAW="$(pj name)"; NAME_RAW="${NAME_RAW:-chuksapp}"
 DISPLAY="$(pj displayName)"; DISPLAY="${DISPLAY:-$NAME_RAW}"
 CODEPKG="com.chuks.app"
 APPID="$(pj bundleId)"; APPID="${APPID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')}"
+# Chuks Preview: the generic runtime host. ConnectActivity is the launcher; a package-local
+# stub supplies the engine symbols (never called — Preview always talks to a dev server).
+PREVIEW="${PREVIEW:-0}"
+LAUNCH_ACTIVITY="MainActivity"
+if [ "$PREVIEW" = "1" ]; then
+    DISPLAY="Chuks Preview"; APPID="com.chuks.preview"; LAUNCH_ACTIVITY="ConnectActivity"
+    ENTRY="$SDKROOT/ios/preview-stub.chuks"
+fi
 PKG="$APPID"; OUT="$PROJDIR/.chuks/android-out"
 export CHUKS_NO_WARNINGS=1
 rm -rf "$OUT" ~/.chuks/cache/builds/*; mkdir -p "$OUT"
@@ -42,8 +50,13 @@ echo "2. Building the Android engine (arm64)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC" CXX="$CXX" \
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" . )
 
-echo "3. Building the Android host"
-if ! kotlinc "$PKGDIR/MainActivity.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1; then
+echo "3. Building the Android host${PREVIEW:+ (Chuks Preview)}"
+KT_SRC="$PKGDIR/MainActivity.kt"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
+if [ "$PREVIEW" = "1" ]; then
+    KT_SRC="$KT_SRC $PKGDIR/ConnectActivity.kt $PKGDIR/ScannerActivity.kt"   # + in-app QR scanner
+    [ -f "$ZXING" ] && KT_CP="$AJAR:$ZXING"
+fi
+if ! kotlinc $KT_SRC -cp "$KT_CP" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1; then
     echo "  Build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1
 fi
 
@@ -51,7 +64,8 @@ echo "4. Preparing app classes"
 # The bundled dexer floods benign Kotlin-metadata warnings (its metadata parser is
 # older than the compiler that produced the stdlib); the output is still valid, and
 # it ran fine in every test. Capture it and only surface a genuine failure.
-if ! "$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar" > "$OUT/d8.log" 2>&1; then
+D8_EXTRA=""; [ "$PREVIEW" = "1" ] && [ -f "$ZXING" ] && D8_EXTRA="$ZXING"   # dex the ZXing scanner lib
+if ! "$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar" $D8_EXTRA > "$OUT/d8.log" 2>&1; then
     echo "  Failed to prepare app classes:"
     grep -viE "kotlin.?Metadata|Should never be called|ForkJoin|^[[:space:]]+at (com\.android|java\.base)|kotlinx-metadata|newer version of kotlin|rewriting of Kotlin" "$OUT/d8.log" | tail -20
     exit 1
@@ -60,10 +74,23 @@ fi
 echo "5. Linking resources"
 # Per-project manifest: override the launcher label; --rename-manifest-package sets the
 # applicationId while keeping CODEPKG for component (.MainActivity) resolution.
-cp "$PKGDIR/AndroidManifest.xml" "$OUT/AndroidManifest.xml"
-sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
+RESZIP=""
+if [ "$PREVIEW" = "1" ]; then
+    cp "$PKGDIR/AndroidManifest-preview.xml" "$OUT/AndroidManifest.xml"
+    # Launcher icon: the Chuks logo rendered at each density into res/mipmap-*.
+    if [ -f "$PKGDIR/preview-icon.png" ]; then
+        for d in "mdpi 48" "hdpi 72" "xhdpi 96" "xxhdpi 144" "xxxhdpi 192"; do
+            set -- $d; mkdir -p "$OUT/res/mipmap-$1"
+            sips -z "$2" "$2" "$PKGDIR/preview-icon.png" --out "$OUT/res/mipmap-$1/ic_launcher.png" >/dev/null 2>&1
+        done
+        "$BT/aapt2" compile --dir "$OUT/res" -o "$OUT/res.zip" >/dev/null 2>&1 && RESZIP="$OUT/res.zip"
+    fi
+else
+    cp "$PKGDIR/AndroidManifest.xml" "$OUT/AndroidManifest.xml"
+    sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
+fi
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
-    --rename-manifest-package "$APPID" \
+    $RESZIP --rename-manifest-package "$APPID" \
     --min-sdk-version 24 --target-sdk-version 34
 
 echo "6. Bundling the app (+ your assets)"
@@ -72,6 +99,8 @@ CXXSHARED="$BIN/../sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 cp "$CXXSHARED" "$OUT/lib/arm64-v8a/"
 # Discover + bundle icon fonts + media from the PROJECT's assets/ and installed packages.
 mkdir -p "$OUT/assets"
+# Chuks Preview: the transparent logo shown on the connect screen.
+[ "$PREVIEW" = "1" ] && [ -f "$PKGDIR/preview-logo.png" ] && cp "$PKGDIR/preview-logo.png" "$OUT/assets/ChuksLogo.png"
 # DEV hot reload (DEV=1): point the app at the running dev server (chuks watch). An
 # emulator reaches the host loopback via 10.0.2.2; a real device reaches the Mac over
 # Wi-Fi at its LAN IP (needs the dev server bound to 0.0.0.0, which it is).
@@ -104,5 +133,5 @@ for f in $(find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name 
 echo "7. Installing + launching"
 "$ADB" install -r "$OUT/chuks.apk" > "$OUT/adb.log" 2>&1 || { echo "  Install failed:"; cat "$OUT/adb.log"; exit 1; }
 "$ADB" shell am force-stop "$PKG" > /dev/null 2>&1 || true
-"$ADB" shell am start -n "$PKG/$CODEPKG.MainActivity" > /dev/null 2>&1
+"$ADB" shell am start -n "$PKG/$CODEPKG.$LAUNCH_ACTIVITY" > /dev/null 2>&1
 echo "   Done."

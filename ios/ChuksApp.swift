@@ -38,6 +38,9 @@ final class VideoView: UIView {
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }
 
+// The normal per-app UIKit host. The Chuks Preview build (-D CHUKS_PREVIEW) supplies its
+// own @main in ChuksPreview.swift, gating CardsVC behind a connect/scan screen.
+#if !CHUKS_PREVIEW
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
@@ -49,6 +52,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         return true
     }
 }
+#endif
 
 // Yoga measure callback: text nodes self-size by measuring their label's text.
 let measureText: YGMeasureFunc = { node, width, widthMode, _, _ in
@@ -90,14 +94,16 @@ let BENCHMARK_MODE = false
 // restarting during a reload), otherwise the mutation stream (possibly empty).
 // Dev server host: a DEV=1 build may bundle chuks-dev.txt (the machine's LAN IP for a
 // real device); the simulator falls back to localhost.
-let devServerHost: String = {
+// Mutable so the Chuks Preview host can point it at a scanned/entered server at runtime.
+func defaultDevServerHost() -> String {
     if let u = Bundle.main.url(forResource: "chuks-dev", withExtension: "txt"),
        let s = try? String(contentsOf: u, encoding: .utf8) {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if !t.isEmpty { return t }
     }
     return "localhost:7799"
-}()
+}
+var devServerHost: String = defaultDevServerHost()
 
 func devHTTP(_ path: String, _ body: String, get: Bool = false) -> String? {
     guard let url = URL(string: "http://\(devServerHost)\(path)") else { return nil }

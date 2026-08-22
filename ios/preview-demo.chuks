@@ -1,0 +1,40 @@
+// A tiny app served over the dev server to smoke-test the Chuks Preview host end to
+// end. Not shipped — lives beside the host build scripts for manual verification.
+import { NavStack, Node, View, Text, setSafeInsets } from "../core/ui.chuks";
+import { syncSystemTheme, followingSystem } from "../core/theme.chuks";
+import { setPlatformInfo } from "../core/platform.chuks";
+
+function screen(): Node {
+    return View({ "flex": "1", "bg": "0B1120", "justify": "center", "align": "center", "gap": "12" }, [
+        Text({ "color": "4F7DFF", "size": "34", "weight": "bold", "ta": "center" }, "Served by chuks dev"),
+        Text({ "color": "9AA4B2", "size": "16", "ta": "center" }, "Chuks Preview is live over HTTP"),
+    ])
+}
+
+function createRoot(): NavStack {
+    var routes: map[string]function(): Node = {}
+    routes["home"] = screen
+    return new NavStack(routes, "home")
+}
+
+var APP = createRoot()
+
+export function set_count(n: int): void { APP.setup(n) }
+export function mount(): int { return APP.mount() }
+export function remount(): int { return APP.remount() }
+export function setViewport(top: int, height: int): int { return APP.setViewport(top, height) }
+export function tick(): int { return APP.tick() }
+export function dispatch(action: string): int { return APP.dispatch(action) }
+export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
+export function drain(): string { return APP.drain() }
+export function saveState(): string { return APP.saveState() }
+export function loadState(data: string): void { APP.loadState(data) }
+export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
+export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
+export function setPlatform(os: string, version: string, model: string, isTablet: int): void {
+    setPlatformInfo(os, version, model, isTablet == 1)
+}

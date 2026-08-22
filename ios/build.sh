@@ -21,6 +21,18 @@ NAME_RAW="$(pj name)"; NAME_RAW="${NAME_RAW:-chuksapp}"
 APPNAME="$(printf '%s' "$NAME_RAW" | tr -cd '[:alnum:]')"; APPNAME="${APPNAME:-ChuksApp}"
 DISPLAY="$(pj displayName)"; DISPLAY="${DISPLAY:-$NAME_RAW}"
 BID="$(pj bundleId)"; BID="${BID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')}"
+# Chuks Preview: the generic runtime host (Expo Go for Chuks). Reuses this project's
+# entry only to supply the engine symbols (never called — Preview always talks to a dev
+# server), overrides the app identity, registers the chuks:// URL scheme, and compiles
+# the Preview Swift host (ChuksPreview.swift) with its connect/scan screen.
+PREVIEW="${PREVIEW:-0}"
+if [ "$PREVIEW" = "1" ]; then
+    DEV=1; IOS_ENGINE="${IOS_ENGINE:-swiftui}"   # swiftui by default; IOS_ENGINE=uikit for the UIKit renderer
+    APPNAME="ChuksPreview"; DISPLAY="Chuks Preview"; BID="com.chuks.preview"
+    # Preview links no app of its own; a tiny package-local stub supplies the engine
+    # symbols (never called in DEV). This decouples the build from the consumer app.
+    ENTRY="$PKGDIR/preview-stub.chuks"
+fi
 OUT="$PROJDIR/.chuks/ios-out"; APP="$OUT/$APPNAME.app"
 rm -rf "$OUT"; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the c-archive is compiled inside the cache dir, so its -o must be absolute
@@ -62,22 +74,29 @@ ENGINE="${IOS_ENGINE:-$(sed -n 's/.*"iosEngine"[^"]*"\([a-z]*\)".*/\1/p' "$PROJD
 [ -z "$ENGINE" ] && ENGINE="uikit"
 
 if [ "$ENGINE" = "swiftui" ]; then
-    echo "3. Building the SwiftUI host"
+    echo "3. Building the SwiftUI host${PREVIEW:+ (Chuks Preview)}"
     printf '#include "libapp.h"\n' > "$OUT/app_bridge.h"
-    swiftc "$PKGDIR/ChuksAppSwiftUI.swift" -sdk "$SDKPATH" -target "$TRIPLE" \
+    # Preview adds its connect/scan entry and the CHUKS_PREVIEW flag (drops the per-app @main).
+    PREVIEW_SRC=""; PREVIEW_FLAG=""
+    [ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW"; }
+    swiftc "$PKGDIR/ChuksAppSwiftUI.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" \
         "$OUT/libapp.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
-        -framework SwiftUI -framework UIKit -framework Foundation -framework AVKit -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG \
+        -framework SwiftUI -framework UIKit -framework Foundation -framework AVKit -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
         -o "$OUT/$APPNAME"
 else
-    echo "3. Building the UIKit host"
+    echo "3. Building the UIKit host${PREVIEW:+ (Chuks Preview)}"
     printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
-    swiftc "$PKGDIR/ChuksApp.swift" -sdk "$SDKPATH" -target "$TRIPLE" \
+    # Preview adds its connect/scan entry; CHUKS_PREVIEW_UIKIT selects the UIKit render gate
+    # (drops the per-app @main, hands the connect screen off to CardsVC). SwiftUI needs SwiftUI framework.
+    PREVIEW_SRC=""; PREVIEW_FLAG=""; PREVIEW_FW=""
+    [ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT"; PREVIEW_FW="-framework SwiftUI -framework AVKit"; }
+    swiftc "$PKGDIR/ChuksApp.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
         "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
-        -framework UIKit -framework Foundation -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG \
+        -framework UIKit -framework Foundation $PREVIEW_FW -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
         -o "$OUT/$APPNAME"
 fi
 
@@ -86,12 +105,22 @@ mkdir -p "$APP"; cp "$OUT/$APPNAME" "$APP/$APPNAME"
 # DEV hot reload: the host reads the dev server address from this file. The simulator
 # reaches it at localhost; a real device reaches the Mac over Wi-Fi at its LAN IP (auto-
 # detected, overridable with IOS_DEV_HOST).
-if [ "${DEV:-0}" = "1" ]; then
+# Preview picks its server at runtime (scan/enter), so it bundles no fixed host.
+if [ "${DEV:-0}" = "1" ] && [ "$PREVIEW" != "1" ]; then
     if [ -n "${IOS_DEV_HOST:-}" ]; then DEVHOST="$IOS_DEV_HOST"
     elif [ "$IOS_TARGET" = "device" ]; then DEVHOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo localhost):7799"
     else DEVHOST="localhost:7799"; fi
     printf '%s' "$DEVHOST" > "$APP/chuks-dev.txt"
     echo "   hot reload: app will fetch from $DEVHOST"
+fi
+# Chuks Preview registers the chuks:// URL scheme (deep-link / scanner target).
+URLSCHEME_PLIST=""
+ICONNAME_PLIST=""
+CAMDESC="Demo: requesting camera permission (F2)."
+if [ "$PREVIEW" = "1" ]; then
+    URLSCHEME_PLIST='<key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.chuks.preview</string><key>CFBundleURLSchemes</key><array><string>chuks</string></array></dict></array>'
+    CAMDESC="Scan a Chuks dev-server QR code to run your app."
+    [ -f "$PKGDIR/preview-icon.png" ] && ICONNAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
 fi
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 FONT_PLIST=""
@@ -114,15 +143,41 @@ cat > "$APP/Info.plist" <<PLIST
   <key>MinimumOSVersion</key><string>15.0</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
   <key>NSLocalNetworkUsageDescription</key><string>Chuks dev-server hot reload.</string>
-  <key>NSCameraUsageDescription</key><string>Demo: requesting camera permission (F2).</string>
+  <key>NSCameraUsageDescription</key><string>$CAMDESC</string>
   <key>NSMicrophoneUsageDescription</key><string>Demo: requesting microphone permission (F2).</string>
   <key>NSLocationWhenInUseUsageDescription</key><string>Demo: requesting location permission (F2).</string>
   <key>NSPhotoLibraryUsageDescription</key><string>Demo: requesting photo library permission (F2).</string>
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
   <key>UILaunchScreen</key><dict/>
+  $URLSCHEME_PLIST
+  $ICONNAME_PLIST
   <key>UIAppFonts</key><array>$FONT_PLIST</array>
 </dict></plist>
 PLIST
+
+# Chuks Preview home-screen icon: compile the packaged 1024 logo into an asset catalog
+# (Assets.car) with actool. Info.plist already points at it via CFBundleIconName=AppIcon.
+if [ "$PREVIEW" = "1" ] && [ -f "$PKGDIR/preview-icon.png" ]; then
+    [ -f "$PKGDIR/preview-logo.png" ] && cp "$PKGDIR/preview-logo.png" "$APP/ChuksLogo.png"   # transparent logo for the connect screen
+    ICONSET="$OUT/Assets.xcassets/AppIcon.appiconset"
+    mkdir -p "$ICONSET"
+    cp "$PKGDIR/preview-icon.png" "$ICONSET/icon.png"
+    printf '{"info":{"author":"xcode","version":1}}' > "$OUT/Assets.xcassets/Contents.json"
+    printf '{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$ICONSET/Contents.json"
+    ACT_PLAT=iphonesimulator; [ "$IOS_TARGET" = "device" ] && ACT_PLAT=iphoneos
+    actool "$OUT/Assets.xcassets" --compile "$APP" --app-icon AppIcon \
+        --output-partial-info-plist "$OUT/icon.plist" \
+        --platform "$ACT_PLAT" --minimum-deployment-target 15.0 --target-device iphone >/dev/null 2>&1
+    # actool emits the runtime icon PNGs + Assets.car into the bundle AND a partial plist
+    # holding the CFBundleIcons dict (CFBundleIconFiles) that SpringBoard needs to find
+    # them. Merge that into Info.plist — without it the app shows the default placeholder.
+    if [ -f "$OUT/icon.plist" ] && ls "$APP"/AppIcon*.png >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Merge $OUT/icon.plist" "$APP/Info.plist" >/dev/null 2>&1
+        echo "   home-screen icon compiled (Assets.car + CFBundleIcons)"
+    else
+        echo "   (icon compile skipped)"
+    fi
+fi
 
 if [ "$IOS_TARGET" = "device" ]; then
     echo "5. Signing for your device"

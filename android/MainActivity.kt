@@ -174,6 +174,11 @@ class MainActivity : Activity() {
         // DEV hot reload: assets/chuks-dev.txt (written by a DEV=1 build) points at the
         // running dev server. Present => fetch the UI over HTTP instead of the JNI engine.
         try { assets.open("chuks-dev.txt").bufferedReader().use { devBase = "http://" + it.readText().trim() } } catch (e: Exception) {}
+        // Chuks Preview: a server chosen at runtime on the connect screen wins over any
+        // bundled one, so one generic host can point at any `chuks dev`.
+        getSharedPreferences("chuks.preview", MODE_PRIVATE).getString("host", "")?.let {
+            if (it.isNotEmpty()) devBase = "http://$it"
+        }
 
         if (!devMode) {
             N.setup(1000)
