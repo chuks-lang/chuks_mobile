@@ -21,6 +21,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.provider.CalendarContract
 import android.hardware.camera2.CameraManager
 import android.view.WindowManager
 import android.graphics.Color
@@ -479,6 +480,43 @@ class MainActivity : Activity() {
                     resolve(token, out)
                 } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
             }
+            "calendar.upcoming" -> {
+                if (checkSelfPermission(Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
+                try {
+                    val days = args.toLongOrNull() ?: 7L
+                    val now = System.currentTimeMillis()
+                    val sb = StringBuilder()
+                    contentResolver.query(CalendarContract.Events.CONTENT_URI, arrayOf(CalendarContract.Events.TITLE, CalendarContract.Events.DTSTART, CalendarContract.Events.DTEND),
+                        "${CalendarContract.Events.DTSTART} >= ? AND ${CalendarContract.Events.DTSTART} <= ?", arrayOf(now.toString(), (now + days * 86400000L).toString()),
+                        "${CalendarContract.Events.DTSTART} ASC")?.use { c ->
+                        while (c.moveToNext()) sb.append(c.getString(0) ?: "").append('\t').append(c.getLong(1)).append('\t').append(c.getLong(2)).append('\n')
+                    }
+                    resolve(token, sb.toString().trimEnd('\n'))
+                } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            }
+            "calendar.create" -> {
+                if (checkSelfPermission(Manifest.permission.WRITE_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
+                try {
+                    val parts = args.split("|")
+                    if (parts.size < 3) { fail(token, "bad args"); return }
+                    val startMin = parts[1].toLongOrNull() ?: 0L; val durMin = parts[2].toLongOrNull() ?: 0L
+                    var calId = -1L
+                    contentResolver.query(CalendarContract.Calendars.CONTENT_URI, arrayOf(CalendarContract.Calendars._ID),
+                        "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ?", arrayOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR.toString()), null)?.use { c ->
+                        if (c.moveToFirst()) calId = c.getLong(0)
+                    }
+                    if (calId < 0) { fail(token, "no writable calendar"); return }
+                    val now = System.currentTimeMillis()
+                    val values = android.content.ContentValues().apply {
+                        put(CalendarContract.Events.CALENDAR_ID, calId); put(CalendarContract.Events.TITLE, parts[0])
+                        put(CalendarContract.Events.DTSTART, now + startMin * 60000L); put(CalendarContract.Events.DTEND, now + (startMin + durMin) * 60000L)
+                        put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
+                    }
+                    val uri = contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
+                    if (uri == null) { fail(token, "insert failed"); return }
+                    resolve(token, uri.lastPathSegment ?: "ok")
+                } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+            }
             "linking.opensettings" -> {
                 try {
                     startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
@@ -545,7 +583,8 @@ class MainActivity : Activity() {
                 else {
                     val code = ++permSeq
                     pendingPerms[code] = token       // resolved in onRequestPermissionsResult
-                    requestPermissions(arrayOf(p), code)
+                    // calendar needs both read + write; the rest are a single permission
+                    requestPermissions(if (args == "calendar") arrayOf(p, Manifest.permission.WRITE_CALENDAR) else arrayOf(p), code)
                 }
             }
             "fs.write" -> {
@@ -653,6 +692,7 @@ class MainActivity : Activity() {
         "microphone" -> Manifest.permission.RECORD_AUDIO
         "location" -> Manifest.permission.ACCESS_FINE_LOCATION
         "contacts" -> Manifest.permission.READ_CONTACTS
+        "calendar" -> Manifest.permission.READ_CALENDAR
         "notifications" -> Manifest.permission.POST_NOTIFICATIONS   // runtime perm on API 33+
         "photos" -> Manifest.permission.READ_MEDIA_IMAGES           // API 33+
         else -> null

@@ -115,6 +115,22 @@ export class Camera {
     }
 }
 
+// ---- Calendar ---------------------------------------------------------------
+// Read upcoming events and create new ones. Needs the "calendar" permission (request it
+// via Permission.request("calendar") first). upcoming() answers one event per line, each
+// three TAB-separated fields: title, startMs, endMs (Unix epoch ms). createEvent() adds an
+// event `startInMin` minutes from now lasting `durationMin` minutes, into the device's
+// default calendar; onOk fires with the created id. Denied permission / no writable
+// calendar goes to onError.
+export class Calendar {
+    public static upcoming(days: int, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("calendar.upcoming", string(days), onResult, onError)
+    }
+    public static createEvent(title: string, startInMin: int, durationMin: int, onOk: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("calendar.create", title + "|" + string(startInMin) + "|" + string(durationMin), onOk, onError)
+    }
+}
+
 // ---- Contacts ---------------------------------------------------------------
 // Read the device address book. list() answers with one contact per line, each line
 // three TAB-separated fields: name, phones, emails (multiple phones/emails joined by

@@ -151,6 +151,8 @@ cat > "$APP/Info.plist" <<PLIST
   <key>NSPhotoLibraryAddUsageDescription</key><string>Demo: saving an image to your photo library.</string>
   <key>NSFaceIDUsageDescription</key><string>Demo: authenticating with Face ID.</string>
   <key>NSContactsUsageDescription</key><string>Demo: reading your contacts.</string>
+  <key>NSCalendarsUsageDescription</key><string>Demo: reading and adding calendar events.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key><string>Demo: reading and adding calendar events.</string>
   <key>UIDeviceFamily</key><array><integer>1</integer></array>
   <key>UISupportedInterfaceOrientations</key>
   <array>

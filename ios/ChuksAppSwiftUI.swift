@@ -20,6 +20,7 @@ import CoreLocation
 import CoreMotion
 import CoreHaptics
 import Contacts
+import EventKit
 import LocalAuthentication
 import Security
 import Network
@@ -268,6 +269,16 @@ func clAuthStr(_ s: CLAuthorizationStatus) -> String {
 func cnAuthStr(_ s: CNAuthorizationStatus) -> String {
     if #available(iOS 18.0, *), s == .limited { return "granted" }
     switch s { case .authorized: return "granted"; case .denied: return "denied"; case .restricted: return "restricted"; default: return "undetermined" }
+}
+func ekAuthStr(_ s: EKAuthorizationStatus) -> String {
+    switch s {
+    case .authorized: return "granted"
+    case .denied: return "denied"
+    case .restricted: return "restricted"
+    default:
+        if #available(iOS 17.0, *) { if s == .fullAccess || s == .writeOnly { return "granted" } }
+        return "undetermined"
+    }
 }
 func unAuthStr(_ s: UNAuthorizationStatus) -> String {
     switch s { case .authorized, .provisional, .ephemeral: return "granted"; case .denied: return "denied"; default: return "undetermined" }
@@ -642,6 +653,25 @@ final class Scene: ObservableObject {
                     DispatchQueue.main.async { self.resolve(token, lines.joined(separator: "\n")) }
                 } catch { DispatchQueue.main.async { self.fail(token, "read failed") } }
             }
+        case "calendar.upcoming":
+            let days = Double(args) ?? 7
+            let store = EKEventStore()
+            let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
+            let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map {
+                "\($0.title ?? "")\t\(Int($0.startDate.timeIntervalSince1970 * 1000))\t\(Int($0.endDate.timeIntervalSince1970 * 1000))"
+            }
+            resolve(token, lines.joined(separator: "\n"))
+        case "calendar.create":
+            let parts = args.split(separator: "|", maxSplits: 2).map(String.init)
+            guard parts.count == 3, let startMin = Double(parts[1]), let durMin = Double(parts[2]) else { fail(token, "bad args"); break }
+            let store = EKEventStore()
+            guard let cal = store.defaultCalendarForNewEvents else { fail(token, "no writable calendar"); break }
+            let ev = EKEvent(eventStore: store)
+            ev.title = parts[0]; ev.calendar = cal
+            ev.startDate = Date(timeIntervalSinceNow: startMin * 60)
+            ev.endDate = Date(timeIntervalSinceNow: startMin * 60 + durMin * 60)
+            do { try store.save(ev, span: .thisEvent); resolve(token, ev.eventIdentifier ?? "ok") }
+            catch { fail(token, "save failed: \(error.localizedDescription)") }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
         case "mediapicker.image":
@@ -825,6 +855,7 @@ final class Scene: ObservableObject {
         case "photos": resolve(token, phAuthStr(PHPhotoLibrary.authorizationStatus(for: .readWrite)))
         case "location": resolve(token, clAuthStr(CLLocationManager().authorizationStatus))
         case "contacts": resolve(token, cnAuthStr(CNContactStore.authorizationStatus(for: .contacts)))
+        case "calendar": resolve(token, ekAuthStr(EKEventStore.authorizationStatus(for: .event)))
         case "notifications":
             UNUserNotificationCenter.current().getNotificationSettings { s in
                 DispatchQueue.main.async { self.resolve(token, unAuthStr(s.authorizationStatus)) }
@@ -844,6 +875,10 @@ final class Scene: ObservableObject {
             }
         case "location": locPerm.request { s in self.resolve(token, s) }
         case "contacts": CNContactStore().requestAccess(for: .contacts) { g, _ in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } }
+        case "calendar":
+            let ek = EKEventStore()
+            if #available(iOS 17.0, *) { ek.requestFullAccessToEvents { g, _ in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } } }
+            else { ek.requestAccess(to: .event) { g, _ in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } } }
         default: fail(token, "unknown permission: \(kind)")
         }
     }
