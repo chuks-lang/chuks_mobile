@@ -1,42 +1,25 @@
-// Smoke-test app for the Chuks Preview host, exercising 0.1.5 helpers: StatusBar color +
-// navColor (Android nav bar), and MediaPicker.saveImage (save a picked photo to the gallery).
-// Served over the dev server. Not shipped.
-import { NavStack, Node, Column, Row, Text, Pressable, Image, StatusBar, Comp, setSafeInsets } from "../core/ui.chuks";
-import { useState, Cell } from "../core/state.chuks";
+// Smoke-test app for the Chuks Preview host, exercising the haptics catalog:
+// Haptics.vibrate(ms), Haptics.pattern(seq), and Haptics.impact(style). Served over the
+// dev server; tap a button and feel it (real device — the simulator has no haptics). Not shipped.
+import { NavStack, Node, Column, Text, Pressable, Comp, setSafeInsets } from "../core/ui.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { MediaPicker } from "../core/native.chuks";
+import { Haptics } from "../core/native.chuks";
 
 function btn(label: string, onPress: () => void): Node {
-    return Pressable({ onPress: onPress, bg: tk("surface"), radius: 12, pad: 14, grow: 1, align: "center",
+    return Pressable({ onPress: onPress, bg: tk("surface"), radius: 12, pad: 16, w: 280, align: "center",
                        border: 1, borderColor: tk("border") }, [
-        Text({ size: 15, weight: "bold", color: tk("text"), ta: "center" }, label),
+        Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, label),
     ])
 }
 
 function screenBody(): Node {
-    var uri: Cell = useState("")
-    var status: Cell = useState("pick an image, then save it")
-    return Column({ dir: "col", gap: 18, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        StatusBar({ style: "light", color: tk("primary"), navColor: tk("primary") }),
-        string(uri.get()) != ""
-            ? Image({ src: string(uri.get()), w: 220, h: 220, radius: 18, resize: "cover" })
-            : Column({ dir: "col", w: 220, h: 220, radius: 18, bg: tk("surface"), justify: "center", align: "center",
-                       border: 1, borderColor: tk("border") }, [ Text({ size: 14, color: tk("muted") }, "no image") ]),
-        Text({ size: 15, color: tk("muted"), ta: "center", w: 300 }, string(status.get())),
-        Row({ dir: "row", gap: 12, w: 300 }, [
-            btn("Pick", function(): void {
-                MediaPicker.pickImage(function(u: string): void { uri.set(u); status.set("picked") },
-                                      function(e: string): void { status.set(e) })
-            }),
-            btn("Save to gallery", function(): void {
-                if (string(uri.get()) == "") { status.set("pick an image first"); return }
-                status.set("saving...")
-                MediaPicker.saveImage(string(uri.get()),
-                    function(): void { status.set("saved to gallery") },
-                    function(e: string): void { status.set(e) })
-            }),
-        ]),
+    return Column({ dir: "col", gap: 14, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        Text({ size: 15, color: tk("muted"), ta: "center" }, "Haptics catalog"),
+        btn("Buzz 300ms", function(): void { Haptics.vibrate(300) }),
+        btn("Pattern (buzz-buzz-buzzz)", function(): void { Haptics.pattern("0,100,80,100,80,300") }),
+        btn("Success impact", function(): void { Haptics.impact("success") }),
+        btn("Selection tick", function(): void { Haptics.impact("selection") }),
     ])
 }
 

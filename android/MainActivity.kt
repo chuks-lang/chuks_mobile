@@ -593,6 +593,8 @@ class MainActivity : Activity() {
                 startActivity(Intent.createChooser(i, null))
             }
             "haptics.impact" -> fireHaptic(args)
+            "haptics.vibrate" -> hapticVibrate(args.toLongOrNull() ?: 0L)
+            "haptics.pattern" -> hapticPattern(args)
             "torch.set" -> setTorch(args == "1")
             "brightness.set" -> args.toFloatOrNull()?.let {
                 val lp = window.attributes; lp.screenBrightness = it.coerceIn(0f, 1f); window.attributes = lp
@@ -812,6 +814,21 @@ class MainActivity : Activity() {
         val ms = when (style) { "light", "selection" -> 10L; "heavy", "error" -> 40L; else -> 20L }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
         else @Suppress("DEPRECATION") v.vibrate(ms)
+    }
+    // A single buzz of `ms`.
+    private fun hapticVibrate(ms: Long) {
+        val v = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) v.vibrate(VibrationEffect.createOneShot(ms.coerceAtLeast(1), VibrationEffect.DEFAULT_AMPLITUDE))
+        else @Suppress("DEPRECATION") v.vibrate(ms)
+    }
+    // A wait,buzz,wait,buzz sequence (ms) — matches VibrationEffect.createWaveform's
+    // off-first timing, so the Chuks and iOS semantics line up.
+    private fun hapticPattern(csv: String) {
+        val timings = csv.split(",").mapNotNull { it.trim().toLongOrNull() }.toLongArray()
+        if (timings.isEmpty()) return
+        val v = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) v.vibrate(VibrationEffect.createWaveform(timings, -1))
+        else @Suppress("DEPRECATION") v.vibrate(timings, -1)
     }
 
     private fun setTorch(on: Boolean) {

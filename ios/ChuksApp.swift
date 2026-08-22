@@ -18,6 +18,7 @@ import PhotosUI
 import UserNotifications
 import CoreLocation
 import CoreMotion
+import CoreHaptics
 import LocalAuthentication
 import Security
 import Network
@@ -979,6 +980,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "share.text": presentShare([args])
         case "share.url": presentShare([URL(string: args) ?? args])
         case "haptics.impact": fireHaptic(args)
+        case "haptics.vibrate": hapticBuzz(Int(args) ?? 0)
+        case "haptics.pattern": hapticPattern(args)
         case "torch.set": setTorch(args == "1")
         case "brightness.set": if let v = Double(args) { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
@@ -1012,6 +1015,33 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "selection": UISelectionFeedbackGenerator().selectionChanged()
         default: UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         }
+    }
+
+    private var hapticEngine: CHHapticEngine?
+    // A single buzz of `ms` (via a continuous CoreHaptics segment).
+    private func hapticBuzz(_ ms: Int) { hapticPlay([(0.0, Double(max(1, ms)) / 1000.0)]) }
+    // A custom wait,buzz,wait,buzz sequence in ms (even index = wait, odd = buzz).
+    private func hapticPattern(_ csv: String) {
+        let vals = csv.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        var segs: [(Double, Double)] = []; var t = 0.0
+        for (i, v) in vals.enumerated() { if i % 2 == 1 { segs.append((t, v / 1000.0)) }; t += v / 1000.0 }
+        hapticPlay(segs)
+    }
+    // Play continuous haptic segments [(startSec, durSec)]; fall back to a medium impact
+    // where CoreHaptics is unsupported (older devices, the Simulator).
+    private func hapticPlay(_ segs: [(Double, Double)]) {
+        guard !segs.isEmpty, CHHapticEngine.capabilitiesForHardware().supportsHaptics else { fireHaptic("medium"); return }
+        let events = segs.map { seg in
+            CHHapticEvent(eventType: .hapticContinuous,
+                          parameters: [CHHapticEventParameter(parameterID: .hapticIntensity, value: 1.0),
+                                       CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.5)],
+                          relativeTime: seg.0, duration: seg.1)
+        }
+        do {
+            if hapticEngine == nil { hapticEngine = try CHHapticEngine(); try hapticEngine?.start() }
+            let player = try hapticEngine?.makePlayer(with: CHHapticPattern(events: events, parameters: []))
+            try player?.start(atTime: 0)
+        } catch { fireHaptic("medium") }
     }
 
     private func setTorch(_ on: Bool) {

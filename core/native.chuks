@@ -37,9 +37,16 @@ export class Share {
 }
 
 // ---- Haptics ----------------------------------------------------------------
-// style: "light" | "medium" | "heavy" | "success" | "warning" | "error" | "selection".
+// impact() plays a canned feedback: "light" | "medium" | "heavy" | "success" |
+// "warning" | "error" | "selection". vibrate(ms) is a single buzz of a given length.
+// pattern() plays a custom on/off sequence: comma-separated ms durations that alternate
+// wait,buzz,wait,buzz,... (starting with a wait), e.g. "0,120,80,120" = buzz, pause 80ms,
+// buzz. Android drives the Vibrator (VibrationEffect); iOS drives CoreHaptics on a device
+// that supports it (older/haptics-less devices fall back to a medium impact).
 export class Haptics {
     public static impact(style: string): void { emitNativeCommand("haptics.impact", style, null) }
+    public static vibrate(ms: int): void { emitNativeCommand("haptics.vibrate", string(ms), null) }
+    public static pattern(msSequence: string): void { emitNativeCommand("haptics.pattern", msSequence, null) }
 }
 
 // ---- Torch / flashlight -----------------------------------------------------
