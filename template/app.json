@@ -1,0 +1,14 @@
+{
+  "name": "__APP_NAME__",
+  "displayName": "__APP_NAME__",
+  "version": "1.0.0",
+  "buildNumber": 1,
+  "ios": {
+    "bundleId": "__BUNDLE_ID__",
+    "schemes": []
+  },
+  "android": {
+    "schemes": []
+  },
+  "permissions": {}
+}
