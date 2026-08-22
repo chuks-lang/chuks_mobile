@@ -13,7 +13,7 @@ function screenBody(): Node {
     var status: Cell = useState("")
     var ok: Cell = useState(false)
     useEffect(function(): any {
-        Biometrics.available(function(v: string): void { avail.set(v == "1" ? "enrolled" : "not enrolled") })
+        Biometrics.available(function(v: bool): void { avail.set(v ? "enrolled" : "not enrolled") })
         return function(): void {}
     }, [])
     return Column({ dir: "col", gap: 16, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
@@ -22,7 +22,7 @@ function screenBody(): Node {
         Pressable({ onPress: function(): void {
                         status.set("waiting...")
                         Biometrics.authenticate("Unlock the demo",
-                            function(_: string): void { ok.set(true); status.set("authenticated") },
+                            function(): void { ok.set(true); status.set("authenticated") },
                             function(e: string): void { ok.set(false); status.set(e) })
                     }, bg: tk("primary"), radius: 12, pad: 16, w: 260, align: "center" }, [
             Text({ size: 17, weight: "bold", color: tk("primaryText"), ta: "center" }, "Authenticate"),

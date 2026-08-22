@@ -81,14 +81,17 @@ export class Location {
 // ---- Biometrics -------------------------------------------------------------
 // Face ID / Touch ID (iOS, LAContext) and fingerprint / face (Android, the framework
 // BiometricPrompt, API 28+). available() answers "1" if the device has enrolled
-// biometrics that can be used right now, else "0". authenticate(reason, onOk, onError)
-// shows the OS prompt: onOk fires with "success" once the user is verified; onError
-// fires with a message if they cancel, fail, or biometrics are unavailable. `reason` is
-// the prompt subtitle (iOS shows it under the Face ID sheet; Android as the subtitle).
+// biometrics that can be used right now (the host's "1"/"0" is converted to a real bool
+// so callers never compare a magic string). authenticate(reason, onOk, onError) shows the
+// OS prompt: onOk fires once the user is verified; onError fires with a message if they
+// cancel, fail, or biometrics are unavailable. `reason` is the prompt subtitle (iOS shows
+// it under the Face ID sheet; Android as the subtitle).
 export class Biometrics {
-    public static available(onResult: (string)=> void): void { emitNativeCommand("biometrics.available", "", onResult) }
-    public static authenticate(reason: string, onOk: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("biometrics.authenticate", reason, onOk, onError)
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("biometrics.available", "", function(s: string): void { onResult(s == "1") })
+    }
+    public static authenticate(reason: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("biometrics.authenticate", reason, function(_: string): void { onOk() }, onError)
     }
 }
 
