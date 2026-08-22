@@ -78,8 +78,11 @@ mkdir -p "$OUT/assets"
 if [ "${DEV:-0}" = "1" ]; then
     DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
     case "$DEV_ID" in
-        emulator-*) DEV_HOST="10.0.2.2" ;;
-        *)          DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)" ;;
+        emulator-*) DEV_HOST="10.0.2.2" ;;   # emulator's alias for the host loopback
+        *) # Real device: tunnel its localhost to the Mac over the adb (USB) link — no Wi-Fi,
+           # LAN IP, or firewall needed. Fall back to the Mac's LAN IP if the tunnel fails.
+           if "$ADB" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then DEV_HOST="localhost"
+           else DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)"; fi ;;
     esac
     printf '%s:7799' "$DEV_HOST" > "$OUT/assets/chuks-dev.txt"
     echo "   hot reload: app will fetch from $DEV_HOST:7799"
