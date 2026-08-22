@@ -36,6 +36,10 @@ fi
 # 2. start the VM dev server + (re)launch the app
 start_server; wait_up
 echo "▸ dev server up on :$PORT"
+
+# Scan-to-run QR for a phone running Chuks Preview (rendered by @chuks/qr, which
+# self-detects the LAN IP). Prints once per session; no-op if the package is absent.
+chuks run "../core/qrprint.chuks" 2>/dev/null || true
 xcrun simctl launch "$UDID" "$BID" >/dev/null 2>&1
 echo "▸ app launched (DEV mode, fetching over HTTP)"
 echo "▸ edit $ENGINE and save — the app hot-reloads with state preserved. Ctrl-C to stop."

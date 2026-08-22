@@ -6,15 +6,16 @@
   "entry": ".chuks/entry.chuks",
   "iosEngine": "swiftui",
   "dependencies": {
-    "@chuks/mobile": "^0.1.3",
-    "@chuks/lucide": "^1.0.0"
+    "@chuks/mobile": "^0.1.4",
+    "@chuks/lucide": "^1.0.0",
+    "@chuks/qr": "^0.1.0"
   },
   "scripts": {
     "ios": "FAST=1 bash chuks_packages/@chuks/mobile/ios/build.sh",
     "ios:release": "bash chuks_packages/@chuks/mobile/ios/build.sh",
     "ios:device": "IOS_TARGET=device bash chuks_packages/@chuks/mobile/ios/build.sh",
     "android": "bash chuks_packages/@chuks/mobile/android/build.sh",
-    "dev": "rm -f .chuks/dev-state.txt; chuks watch .chuks/devserver.chuks",
+    "dev": "rm -f .chuks/dev-state.txt; chuks run .chuks/qrprint.chuks; chuks watch .chuks/devserver.chuks",
     "dev:ios": "DEV=1 FAST=1 bash chuks_packages/@chuks/mobile/ios/build.sh",
     "dev:ios:device": "DEV=1 FAST=1 IOS_TARGET=device bash chuks_packages/@chuks/mobile/ios/build.sh",
     "dev:android": "DEV=1 bash chuks_packages/@chuks/mobile/android/build.sh",
