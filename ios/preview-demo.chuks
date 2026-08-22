@@ -1,45 +1,45 @@
-// Smoke-test app for the Chuks Preview host, exercising the Location capability:
-// Location.watch (a live GPS stream) and Location.once (a single fix), gated behind
-// the "location" permission. Served over the dev server; connect Preview and move the
-// device (or set a simulated location). Not shipped.
-import { NavStack, Node, Column, Text, Pressable, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
+// Smoke-test app for the Chuks Preview host, exercising the Motion capability:
+// Motion.accelerometer streams live "x,y,z" as the device tilts. Served over the dev
+// server; connect Preview and tilt the phone (Android emulator: set virtual sensors).
+// The iOS Simulator has no motion hardware, so it correctly reports "unavailable".
+// Not shipped.
+import { NavStack, Node, Column, Row, Text, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
 import { useState, useEffect, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { Location, Permission } from "../core/native.chuks";
+import { Motion } from "../core/native.chuks";
 
-// Format one "lat,lng,accuracy,..." fix into two lines of readable coordinates.
-function fmtCoord(fix: string): string {
-    const p: []string = fix.split(",")
-    if (p.length < 3) { return fix }
-    return "lat " + p[0] + "\nlng " + p[1] + "\n±" + p[2] + " m"
+// Trim a raw axis value ("0.019226") to a short, steady-width label.
+function short(v: string): string {
+    if (v.length <= 5) { return v }
+    return v.slice(0, 5)
+}
+
+function axis(label: string, v: Cell): Node {
+    return Row({ dir: "row", gap: 14, w: 220, justify: "between", align: "center" }, [
+        Text({ size: 20, weight: "bold", color: tk("muted") }, label),
+        Text({ size: 26, weight: "bold", color: tk("primary") }, string(v.get())),
+    ])
 }
 
 function screenBody(): Node {
-    var coord: Cell = useState("locating...")
+    var ax: Cell = useState("0")
+    var ay: Cell = useState("0")
+    var az: Cell = useState("0")
     var err: Cell = useState("")
     useEffect(function(): any {
-        var sub: NativeSub? = null
-        // Ask for location first; only start the stream once it is granted.
-        Permission.request("location", function(status: string): void {
-            if (status != "granted") { err.set("permission " + status); return }
-            sub = Location.watch(
-                function(fix: string): void { err.set(""); coord.set(fmtCoord(fix)) },
-                function(e: string): void { err.set(e) })
+        const s: NativeSub = Motion.accelerometer(function(v: string): void {
+            err.set("")
+            const p: []string = v.split(",")
+            if (p.length >= 3) { ax.set(short(p[0])); ay.set(short(p[1])); az.set(short(p[2])) }
         }, function(e: string): void { err.set(e) })
-        return function(): void { if (sub != null) { sub.cancel() } }
+        return function(): void { s.cancel() }
     }, [])
     return Column({ dir: "col", gap: 16, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        Text({ size: 15, color: tk("muted"), ta: "center" }, "Location.watch"),
-        Text({ size: 26, weight: "bold", color: tk("primary"), ta: "center", w: 300 }, string(coord.get())),
-        string(err.get()) != "" ? Text({ size: 14, color: tk("danger"), ta: "center", w: 300 }, string(err.get())) : Text({ size: 0 }, ""),
-        Pressable({ onPress: function(): void {
-                        coord.set("reading...")
-                        Location.once(function(fix: string): void { coord.set(fmtCoord(fix)) },
-                                      function(e: string): void { err.set(e) })
-                    }, bg: tk("surface"), radius: 12, pad: 14, w: 260, align: "center", border: 1, borderColor: tk("border") }, [
-            Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, "Read once"),
-        ]),
+        Text({ size: 15, color: tk("muted"), ta: "center" }, "Motion.accelerometer"),
+        string(err.get()) != ""
+            ? Text({ size: 18, color: tk("danger"), ta: "center", w: 300 }, string(err.get()))
+            : Column({ dir: "col", gap: 10, align: "center" }, [ axis("x", ax), axis("y", ay), axis("z", az) ]),
     ])
 }
 

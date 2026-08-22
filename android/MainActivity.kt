@@ -421,6 +421,9 @@ class MainActivity : Activity() {
                     streamTeardown[token] = { try { lm.removeUpdates(listener) } catch (e: Exception) {} }
                 } catch (e: SecurityException) { fail(token, "location permission denied") }
             }
+            "motion.accel" -> startSensor(token, android.hardware.Sensor.TYPE_ACCELEROMETER)
+            "motion.gyro" -> startSensor(token, android.hardware.Sensor.TYPE_GYROSCOPE)
+            "motion.mag" -> startSensor(token, android.hardware.Sensor.TYPE_MAGNETIC_FIELD)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
             "debug.fail" -> fail(token, "simulated native failure")
             "permission.status" -> {
@@ -564,6 +567,21 @@ class MainActivity : Activity() {
     // "lat,lng,accuracy,altitude,speed,heading" — matches the iOS payload shape.
     private fun locFixStr(l: android.location.Location): String =
         "${l.latitude},${l.longitude},${l.accuracy},${l.altitude},${l.speed},${l.bearing}"
+
+    // Motion (F3): stream a sensor's first three axes as "x,y,z" at ~20Hz until cancelled.
+    private fun startSensor(token: String, type: Int) {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(type)
+        if (sensor == null) { fail(token, "sensor unavailable"); return }
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                resolve(token, "${e.values[0]},${e.values[1]},${e.values[2]}")
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, 50_000)   // 50ms sampling ≈ 20Hz
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
 
     // Secure storage (Tier B): values are AES-GCM encrypted with an AndroidKeyStore
     // key (never leaves the secure hardware) and the ciphertext kept in a private

@@ -16,6 +16,7 @@ import WebKit
 import Photos
 import UserNotifications
 import CoreLocation
+import CoreMotion
 import Security
 import Network
 
@@ -461,6 +462,10 @@ final class Scene: ObservableObject {
     var streamTeardown: [String: () -> Void] = [:]
     var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
     var locFixes: [String: LocFix] = [:]    // live Location managers, keyed by token (once + watch)
+    let motion = CMMotionManager()          // one shared motion manager; sensors fan out to token sets
+    var accelTokens = Set<String>()
+    var gyroTokens = Set<String>()
+    var magTokens = Set<String>()
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
@@ -522,6 +527,48 @@ final class Scene: ObservableObject {
             locFixes[token] = fix
             streamTeardown[token] = { [weak self] in self?.locFixes[token]?.stop(); self?.locFixes[token] = nil }
             fix.start()
+        case "motion.accel":
+            if !motion.isAccelerometerAvailable { fail(token, "accelerometer unavailable"); break }
+            accelTokens.insert(token)
+            if !motion.isAccelerometerActive {
+                motion.accelerometerUpdateInterval = 1.0 / 20.0
+                motion.startAccelerometerUpdates(to: .main) { [weak self] data, _ in
+                    guard let self = self, let a = data?.acceleration else { return }
+                    let s = "\(a.x),\(a.y),\(a.z)"; for t in self.accelTokens { self.resolve(t, s) }
+                }
+            }
+            streamTeardown[token] = { [weak self] in
+                self?.accelTokens.remove(token)
+                if self?.accelTokens.isEmpty == true { self?.motion.stopAccelerometerUpdates() }
+            }
+        case "motion.gyro":
+            if !motion.isGyroAvailable { fail(token, "gyroscope unavailable"); break }
+            gyroTokens.insert(token)
+            if !motion.isGyroActive {
+                motion.gyroUpdateInterval = 1.0 / 20.0
+                motion.startGyroUpdates(to: .main) { [weak self] data, _ in
+                    guard let self = self, let r = data?.rotationRate else { return }
+                    let s = "\(r.x),\(r.y),\(r.z)"; for t in self.gyroTokens { self.resolve(t, s) }
+                }
+            }
+            streamTeardown[token] = { [weak self] in
+                self?.gyroTokens.remove(token)
+                if self?.gyroTokens.isEmpty == true { self?.motion.stopGyroUpdates() }
+            }
+        case "motion.mag":
+            if !motion.isMagnetometerAvailable { fail(token, "magnetometer unavailable"); break }
+            magTokens.insert(token)
+            if !motion.isMagnetometerActive {
+                motion.magnetometerUpdateInterval = 1.0 / 20.0
+                motion.startMagnetometerUpdates(to: .main) { [weak self] data, _ in
+                    guard let self = self, let f = data?.magneticField else { return }
+                    let s = "\(f.x),\(f.y),\(f.z)"; for t in self.magTokens { self.resolve(t, s) }
+                }
+            }
+            streamTeardown[token] = { [weak self] in
+                self?.magTokens.remove(token)
+                if self?.magTokens.isEmpty == true { self?.motion.stopMagnetometerUpdates() }
+            }
         case "debug.activeStreams": resolve(token, String(activeStreams.count + streamTeardown.count))
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)

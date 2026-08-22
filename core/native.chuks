@@ -78,6 +78,18 @@ export class Location {
     }
 }
 
+// ---- Motion sensors ---------------------------------------------------------
+// Device-motion streams from CoreMotion (iOS) / SensorManager (Android). Each fires
+// "x,y,z" (comma-separated floats, comma not "|") continuously (~20Hz) until its
+// NativeSub is cancelled. accelerometer is in g and includes gravity, gyroscope in
+// rad/s, magnetometer in microtesla. onError fires if the sensor is absent — e.g. the
+// iOS Simulator has no motion hardware, so accelerometer reports "unavailable" there.
+export class Motion {
+    public static accelerometer(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.accel", "", onData, onError) }
+    public static gyroscope(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.gyro", "", onData, onError) }
+    public static magnetometer(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.mag", "", onData, onError) }
+}
+
 // ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------
 // A minimal repeating stream used to exercise + prove the teardown path: start it
 // in a useEffect, cancel() the returned NativeSub in the cleanup, and on unmount
