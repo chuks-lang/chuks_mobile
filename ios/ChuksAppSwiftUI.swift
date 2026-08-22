@@ -14,6 +14,7 @@ import Foundation
 import AVFoundation
 import WebKit
 import Photos
+import PhotosUI
 import UserNotifications
 import CoreLocation
 import CoreMotion
@@ -327,6 +328,42 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     }
 }
 
+// Media picker + camera: copy the chosen/captured UIImage into the app's Documents and
+// return its path, so the "file://<path>" can feed an Image node.
+func chuksSaveImage(_ img: UIImage) -> String? {
+    guard let data = img.jpegData(compressionQuality: 0.9) else { return nil }
+    let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("picked-\(UUID().uuidString).jpg")
+    do { try data.write(to: url); return url.path } catch { return nil }
+}
+// The frontmost view controller to present the picker/camera from (the host is SwiftUI).
+func chuksTopVC() -> UIViewController? {
+    let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
+    var top = windows.first { $0.isKeyWindow }?.rootViewController
+    while let p = top?.presentedViewController { top = p }
+    return top
+}
+// Delegate for PHPicker (library) and UIImagePickerController (camera). Held by the host
+// for the lifetime of the presentation; `done` gets a "file://" path, `cancel` a message.
+final class MediaCoordinator: NSObject, PHPickerViewControllerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+    private let done: (String) -> Void
+    private let cancel: (String) -> Void
+    init(done: @escaping (String) -> Void, cancel: @escaping (String) -> Void) { self.done = done; self.cancel = cancel }
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        guard let prov = results.first?.itemProvider, prov.canLoadObject(ofClass: UIImage.self) else { cancel("canceled"); return }
+        prov.loadObject(ofClass: UIImage.self) { obj, _ in
+            let path = (obj as? UIImage).flatMap { chuksSaveImage($0) }
+            DispatchQueue.main.async { if let p = path { self.done("file://" + p) } else { self.cancel("no image") } }
+        }
+    }
+    func imagePickerController(_ p: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+        p.dismiss(animated: true)
+        if let path = (info[.originalImage] as? UIImage).flatMap({ chuksSaveImage($0) }) { done("file://" + path) } else { cancel("no image") }
+    }
+    func imagePickerControllerDidCancel(_ p: UIImagePickerController) { p.dismiss(animated: true); cancel("canceled") }
+}
+
 // Secure storage (Tier B): Keychain-backed key/value.
 func keychainSet(_ key: String, _ value: String) {
     let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key]
@@ -468,6 +505,7 @@ final class Scene: ObservableObject {
     var accelTokens = Set<String>()
     var gyroTokens = Set<String>()
     var magTokens = Set<String>()
+    var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
@@ -574,6 +612,20 @@ final class Scene: ObservableObject {
         case "deviceinfo.screen":
             let b = UIScreen.main.bounds
             resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")
+        case "mediapicker.image":
+            let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
+                                         cancel: { [weak self] m in self?.mediaCoord = nil; self?.fail(token, m) })
+            mediaCoord = coord
+            var cfg = PHPickerConfiguration(); cfg.filter = .images; cfg.selectionLimit = 1
+            let pk = PHPickerViewController(configuration: cfg); pk.delegate = coord
+            chuksTopVC()?.present(pk, animated: true)
+        case "camera.photo":
+            if !UIImagePickerController.isSourceTypeAvailable(.camera) { fail(token, "camera unavailable"); break }
+            let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
+                                         cancel: { [weak self] m in self?.mediaCoord = nil; self?.fail(token, m) })
+            mediaCoord = coord
+            let pk = UIImagePickerController(); pk.sourceType = .camera; pk.delegate = coord
+            chuksTopVC()?.present(pk, animated: true)
         case "biometrics.available":
             resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
         case "biometrics.authenticate":
@@ -1327,6 +1379,13 @@ struct NodeView: View {
             .frame(width: numOf(s["w"]), height: numOf(s["h"]))
             .clipped()
             .cornerRadius(numOf(s["r"]) ?? 0)
+        } else if node.text.hasPrefix("file://"),
+                  let ui = UIImage(contentsOfFile: String(node.text.dropFirst(7))) {   // picked/captured local file
+            let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
+            Image(uiImage: ui).resizable().aspectRatio(contentMode: mode)
+                .frame(width: numOf(s["w"]), height: numOf(s["h"]))
+                .clipped()
+                .cornerRadius(numOf(s["r"]) ?? 0)
         } else if !node.text.isEmpty,
                   let url = Bundle.main.url(forResource: node.text, withExtension: nil),
                   let ui = UIImage(contentsOfFile: url.path) {   // bundled local asset (e.g. chuks-logo.png)

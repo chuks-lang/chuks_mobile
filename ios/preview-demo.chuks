@@ -1,27 +1,40 @@
-// Smoke-test app for the Chuks Preview host, exercising DeviceInfo + StatusBar color:
-// the StatusBar node tints the OS status bar (indigo, light icons), and
-// DeviceInfo.screen reads the live screen size. Served over the dev server. Not shipped.
-import { NavStack, Node, Column, Text, StatusBar, Comp, setSafeInsets } from "../core/ui.chuks";
-import { useState, useEffect, Cell } from "../core/state.chuks";
+// Smoke-test app for the Chuks Preview host, exercising the media picker + camera:
+// MediaPicker.pickImage opens the photo library, Camera.takePhoto opens the OS camera,
+// and the returned "file://" path is shown in an Image. Served over the dev server. Not
+// shipped. (The iOS Simulator has no camera; Take photo reports "camera unavailable".)
+import { NavStack, Node, Column, Row, Text, Pressable, Image, Comp, setSafeInsets } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
-import { setPlatformInfo, deviceModel, osVersion } from "../core/platform.chuks";
-import { DeviceInfo } from "../core/native.chuks";
+import { setPlatformInfo } from "../core/platform.chuks";
+import { MediaPicker, Camera, Permission } from "../core/native.chuks";
+
+function btn(label: string, onPress: () => void): Node {
+    return Pressable({ onPress: onPress, bg: tk("surface"), radius: 12, pad: 14, grow: 1, align: "center",
+                       border: 1, borderColor: tk("border") }, [
+        Text({ size: 16, weight: "bold", color: tk("text"), ta: "center" }, label),
+    ])
+}
 
 function screenBody(): Node {
-    var screen: Cell = useState("measuring...")
-    useEffect(function(): any {
-        DeviceInfo.screen(function(v: string): void {
-            const p: []string = v.split(",")
-            if (p.length >= 3) { screen.set(p[0] + " x " + p[1] + "  @" + p[2] + "x") }
-        })
-        return function(): void {}
-    }, [])
-    return Column({ dir: "col", gap: 14, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        StatusBar({ style: "light", color: tk("primary") }),
-        Text({ size: 15, color: tk("muted"), ta: "center" }, "DeviceInfo.screen"),
-        Text({ size: 30, weight: "bold", color: tk("primary"), ta: "center", w: 320 }, string(screen.get())),
-        Text({ size: 16, color: tk("muted"), ta: "center", w: 320 }, deviceModel() + "  .  iOS/Android " + osVersion()),
-        Text({ size: 13, color: tk("muted"), ta: "center", w: 320 }, "the status bar above is StatusBar({ color })"),
+    var uri: Cell = useState("")
+    var status: Cell = useState("pick or shoot a photo")
+    const onOk: (string) => void = function(u: string): void { uri.set(u); status.set("loaded") }
+    const onErr: (string) => void = function(e: string): void { status.set(e) }
+    return Column({ dir: "col", gap: 18, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        string(uri.get()) != ""
+            ? Image({ src: string(uri.get()), w: 240, h: 240, radius: 18, resize: "cover" })
+            : Column({ dir: "col", w: 240, h: 240, radius: 18, bg: tk("surface"), justify: "center", align: "center",
+                       border: 1, borderColor: tk("border") }, [ Text({ size: 14, color: tk("muted") }, "no image yet") ]),
+        Text({ size: 15, color: tk("muted"), ta: "center", w: 300 }, string(status.get())),
+        Row({ dir: "row", gap: 12, w: 300 }, [
+            btn("Library", function(): void { status.set("opening..."); MediaPicker.pickImage(onOk, onErr) }),
+            btn("Camera", function(): void {
+                status.set("opening...")
+                Permission.request("camera",
+                    function(s: string): void { if (s == "granted") { Camera.takePhoto(onOk, onErr) } else { status.set("camera " + s) } },
+                    onErr)
+            }),
+        ]),
     ])
 }
 

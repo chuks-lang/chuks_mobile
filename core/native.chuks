@@ -80,6 +80,25 @@ export class Location {
     }
 }
 
+// ---- Media picker + camera --------------------------------------------------
+// pickImage() opens the OS photo library; takePhoto() opens the OS camera. Both
+// present the system UI and, on success, copy the chosen/captured image into the
+// app's private storage and answer (via onResult) with a "file://<path>" string you
+// can hand straight to an Image — see the Image component's file:// support. onError
+// fires if the user cancels, no image comes back, or the camera is unavailable.
+// takePhoto needs the "camera" permission (request it via Permission.request first);
+// pickImage needs no permission on either platform (the OS picker is the consent).
+export class MediaPicker {
+    public static pickImage(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("mediapicker.image", "", onResult, onError)
+    }
+}
+export class Camera {
+    public static takePhoto(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("camera.photo", "", onResult, onError)
+    }
+}
+
 // ---- Device info ------------------------------------------------------------
 // screen() reads the CURRENT screen size — a live read, not a launch-time constant,
 // since it changes on rotation, split-screen, and foldables. The payload is

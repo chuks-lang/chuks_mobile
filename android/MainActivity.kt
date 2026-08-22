@@ -435,6 +435,29 @@ class MainActivity : Activity() {
                 val hdp = (dm.heightPixels / dm.density).toInt()
                 resolve(token, "$wdp,$hdp,${dm.density}")
             }
+            "mediapicker.image" -> {
+                val code = ++mediaSeq
+                pendingMedia[code] = Pair(token, null)
+                val intent = Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*"; addCategory(Intent.CATEGORY_OPENABLE) }
+                try { startActivityForResult(Intent.createChooser(intent, "Pick image"), code) }
+                catch (e: Exception) { pendingMedia.remove(code); fail(token, "no picker available") }
+            }
+            "camera.photo" -> {
+                val code = ++mediaSeq
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "chuks-$code.jpg")
+                    put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                }
+                val outUri = contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                if (outUri == null) { fail(token, "cannot create output"); return }
+                pendingMedia[code] = Pair(token, outUri)
+                val intent = Intent(android.provider.MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                    putExtra(android.provider.MediaStore.EXTRA_OUTPUT, outUri)
+                    addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                try { startActivityForResult(intent, code) }
+                catch (e: Exception) { pendingMedia.remove(code); fail(token, "no camera app") }
+            }
             "biometrics.available" -> {
                 if (android.os.Build.VERSION.SDK_INT < 29) { resolve(token, "0"); return }
                 val bm = getSystemService(android.hardware.biometrics.BiometricManager::class.java)
@@ -570,6 +593,24 @@ class MainActivity : Activity() {
         val token = pendingPerms.remove(code) ?: return
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
         resolve(token, if (granted) "granted" else "denied")
+    }
+
+    // Media picker + camera (F3): each launch holds (engine token, camera output uri | null)
+    // under its request code; the result is copied into app files and answered as "file://".
+    private var mediaSeq = 9000
+    private val pendingMedia = mutableMapOf<Int, Pair<String, android.net.Uri?>>()
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val entry = pendingMedia.remove(requestCode) ?: return
+        val (token, outUri) = entry
+        if (resultCode != RESULT_OK) { fail(token, "canceled"); return }
+        val src = outUri ?: data?.data
+        if (src == null) { fail(token, "no image"); return }
+        try {
+            val dest = java.io.File(filesDir, "picked-$requestCode.jpg")
+            contentResolver.openInputStream(src)?.use { input -> dest.outputStream().use { input.copyTo(it) } }
+            resolve(token, "file://" + dest.absolutePath)
+        } catch (e: Exception) { fail(token, "copy failed: ${e.message}") }
     }
 
     // Location (F3): fine or coarse grant is enough to read a fix; pick GPS, else the
@@ -1237,6 +1278,12 @@ class MainActivity : Activity() {
         (views[id] as? android.webkit.WebView)?.let { it.loadUrl(t); return }   // WebView URL
         if (t.startsWith("http")) {                                           // remote image / background URL
             (bgImageViews[id] ?: views[id] as? ImageView)?.let { loadRemoteImage(t, it); return }
+        }
+        if (t.startsWith("file://")) {                                        // picked/captured local file
+            (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->
+                try { iv.setImageBitmap(android.graphics.BitmapFactory.decodeFile(t.substring(7))) } catch (e: Exception) {}
+                return
+            }
         }
         (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->            // bundled local asset (e.g. chuks-logo.png)
             if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) } } catch (e: Exception) {}
