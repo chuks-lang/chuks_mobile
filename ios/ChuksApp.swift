@@ -797,6 +797,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
     func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
+    var audioRecorder: AVAudioRecorder? = nil   // mic recording (Tier C)
+    var recURL: URL? = nil
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
     // Execute a native capability requested via an `X|` command (F3). Same UIKit
@@ -1017,7 +1019,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 identifier: UUID().uuidString, content: content,
                 trigger: UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)))
         case "audio.play":
-            if let url = Bundle.main.url(forResource: args, withExtension: nil) {
+            let src: URL? = args.hasPrefix("file://") ? URL(fileURLWithPath: String(args.dropFirst(7)))   // a recording / downloaded file
+                                                      : Bundle.main.url(forResource: args, withExtension: nil)   // a bundled asset
+            if let url = src {
                 try? AVAudioSession.sharedInstance().setCategory(.playback)
                 try? AVAudioSession.sharedInstance().setActive(true)
                 audioPlayer?.pause()                 // stop any previous track: no overlapping players
@@ -1030,6 +1034,31 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let cur = audioPlayer.map { CMTimeGetSeconds($0.currentTime()) } ?? 0
             let dur = audioPlayer?.currentItem?.duration.seconds ?? 0
             resolve(token, "\(cur.isFinite ? Int(cur*1000) : 0)/\(dur.isFinite ? Int(dur*1000) : 0)")
+        case "recorder.start":
+            guard AVAudioSession.sharedInstance().recordPermission == .granted else { fail(token, "microphone permission denied"); break }
+            let url = appDir().appendingPathComponent("rec-\(UUID().uuidString).m4a")
+            let settings: [String: Any] = [AVFormatIDKey: Int(kAudioFormatMPEG4AAC), AVSampleRateKey: 44100,
+                                           AVNumberOfChannelsKey: 1, AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue]
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default)
+                try AVAudioSession.sharedInstance().setActive(true)
+                let r = try AVAudioRecorder(url: url, settings: settings)
+                r.isMeteringEnabled = true; r.record()
+                audioRecorder = r; recURL = url
+            } catch { fail(token, "record failed: \(error.localizedDescription)") }
+        case "recorder.stop":
+            guard let r = audioRecorder, let url = recURL else { fail(token, "not recording"); break }
+            r.stop(); audioRecorder = nil
+            try? AVAudioSession.sharedInstance().setActive(false)
+            resolve(token, "file://" + url.path)
+        case "recorder.levels":
+            let t = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+                guard let r = self?.audioRecorder else { return }
+                r.updateMeters()
+                let lin = pow(10, r.averagePower(forChannel: 0) / 20)   // dB (-160..0) -> linear 0..1
+                self?.resolve(token, String(format: "%.3f", max(0, min(1, lin))))
+            }
+            activeStreams[token] = t
         case "tts.speak":
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)

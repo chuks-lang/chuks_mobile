@@ -627,8 +627,12 @@ class MainActivity : Activity() {
                 audioMp?.release(); audioMp = null
                 val mp = MediaPlayer()
                 try {
-                    val afd = assets.openFd(args)
-                    mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length); afd.close()
+                    if (args.startsWith("file://")) {
+                        mp.setDataSource(args.substring(7))   // a recording / downloaded file
+                    } else {
+                        val afd = assets.openFd(args)         // a bundled asset
+                        mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length); afd.close()
+                    }
                     mp.setAudioAttributes(
                         android.media.AudioAttributes.Builder()
                             .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
@@ -644,6 +648,39 @@ class MainActivity : Activity() {
             "audio.position" -> {
                 val mp = audioMp
                 resolve(token, "${mp?.currentPosition ?: 0}/${mp?.duration ?: 0}")
+            }
+            "recorder.start" -> {
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) { fail(token, "microphone permission denied"); return }
+                try {
+                    val f = java.io.File(filesDir, "rec-${System.nanoTime()}.m4a")
+                    @Suppress("DEPRECATION")
+                    val mr = if (android.os.Build.VERSION.SDK_INT >= 31) android.media.MediaRecorder(this) else android.media.MediaRecorder()
+                    mr.setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
+                    mr.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
+                    mr.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
+                    mr.setOutputFile(f.absolutePath)
+                    mr.prepare(); mr.start()
+                    mediaRecorder = mr; recPath = f.absolutePath
+                } catch (e: Exception) { fail(token, "record failed: ${e.message}") }
+            }
+            "recorder.stop" -> {
+                val mr = mediaRecorder ?: run { fail(token, "not recording"); return }
+                try { mr.stop() } catch (e: Exception) {}
+                mr.release(); mediaRecorder = null
+                resolve(token, "file://" + (recPath ?: ""))
+            }
+            "recorder.levels" -> {
+                val r = object : Runnable {
+                    override fun run() {
+                        mediaRecorder?.let {
+                            val amp = try { it.maxAmplitude } catch (e: Exception) { 0 }
+                            resolve(token, String.format("%.3f", (amp.toDouble() / 32767.0).coerceIn(0.0, 1.0)))
+                        }
+                        if (activeStreams.containsKey(token)) streamHandler.postDelayed(this, 80)
+                    }
+                }
+                activeStreams[token] = r
+                streamHandler.postDelayed(r, 80)
             }
             "tts.speak" -> {
                 val text = decodeB64(args)
@@ -823,6 +860,8 @@ class MainActivity : Activity() {
 
     private var notifId = 1
     private var audioMp: MediaPlayer? = null   // single-track audio playback (Tier B)
+    private var mediaRecorder: android.media.MediaRecorder? = null   // mic recording (Tier C)
+    private var recPath: String? = null
 
     // Text-to-speech (Tier B). The engine inits asynchronously; a speak() that
     // arrives before onInit is stashed in pendingSpeak and flushed once ready.

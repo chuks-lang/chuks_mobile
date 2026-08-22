@@ -1,22 +1,52 @@
-// Smoke-test app for the Chuks Preview host, exercising Linking.onURL (inbound deep links).
-// Served over the dev server. Open  chuksdemo://something  to route a URL into the app
-// (iOS: xcrun simctl openurl; Android: adb am start -a VIEW -d chuksdemo://...). Not shipped.
-import { NavStack, Node, Column, Text, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
-import { useState, useEffect, Cell } from "../core/state.chuks";
+// Smoke-test app for the Chuks Preview host, exercising the microphone recorder:
+// Recorder.start / Recorder.levels (a live VU meter) / Recorder.stop, then Audio.play
+// on the recorded file:// path. Served over the dev server. Not shipped.
+import { NavStack, Node, Column, Row, Text, Pressable, Comp, NativeSub, setSafeInsets } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
 import { syncSystemTheme, followingSystem, tk } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { Linking } from "../core/native.chuks";
+import { Recorder, Audio, Permission } from "../core/native.chuks";
+
+var levelSub: NativeSub? = null
+
+function btn(label: string, primary: bool, onPress: () => void): Node {
+    return Pressable({ onPress: onPress, bg: primary ? tk("primary") : tk("surface"), radius: 12, pad: 15, grow: 1, align: "center",
+                       border: primary ? 0 : 1, borderColor: tk("border") }, [
+        Text({ size: 16, weight: "bold", color: primary ? tk("primaryText") : tk("text"), ta: "center" }, label),
+    ])
+}
 
 function screenBody(): Node {
-    var url: Cell = useState("waiting for a deep link...")
-    useEffect(function(): any {
-        const s: NativeSub = Linking.onURL(function(u: string): void { url.set(u) })
-        return function(): void { s.cancel() }
-    }, [])
-    return Column({ dir: "col", gap: 16, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
-        Text({ size: 14, color: tk("muted"), ta: "center" }, "Linking.onURL"),
-        Text({ size: 22, weight: "bold", color: tk("primary"), ta: "center", w: 330 }, string(url.get())),
-        Text({ size: 14, color: tk("muted"), ta: "center", w: 330 }, "open  chuksdemo://hello  to route a URL here"),
+    var recording: Cell = useState(false)
+    var meterW: Cell = useState(0)
+    var path: Cell = useState("")
+    var status: Cell = useState("tap Record to start")
+    return Column({ dir: "col", gap: 20, grow: 1, justify: "center", align: "center", bg: tk("bg") }, [
+        Text({ size: 15, color: tk("muted"), ta: "center" }, "Microphone recorder"),
+        // VU meter: a track with a filled bar whose width follows the input level
+        Column({ dir: "col", w: 240, h: 24, radius: 12, bg: tk("surface"), border: 1, borderColor: tk("border"), justify: "center" }, [
+            Column({ dir: "col", w: int(meterW.get()), h: 24, radius: 12, bg: tk("primary") }, []),
+        ]),
+        Text({ size: 15, color: tk("muted"), ta: "center", w: 300 }, string(status.get())),
+        Row({ dir: "row", gap: 12, w: 300 }, [
+            bool(recording.get())
+                ? btn("Stop", false, function(): void {
+                        if (levelSub != null) { levelSub.cancel(); levelSub = null }
+                        Recorder.stop(function(p: string): void { path.set(p); recording.set(false); meterW.set(0); status.set("recorded, tap Play") },
+                                      function(e: string): void { status.set(e); recording.set(false); meterW.set(0) })
+                    })
+                : btn("Record", true, function(): void {
+                        Permission.request("microphone", function(s: string): void {
+                            if (s != "granted") { status.set("microphone " + s); return }
+                            Recorder.start(function(e: string): void { status.set(e) })
+                            levelSub = Recorder.levels(function(v: string): void { meterW.set(int(float(v) * 240)) })
+                            recording.set(true); status.set("recording...")
+                        }, function(e: string): void { status.set(e) })
+                    }),
+            btn("Play", false, function(): void {
+                if (string(path.get()) != "") { Audio.play(string(path.get())) } else { status.set("record something first") }
+            }),
+        ]),
     ])
 }
 

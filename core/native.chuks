@@ -275,6 +275,25 @@ export class Audio {
     public static position(onResult: (string)=> void): void { emitNativeCommand("audio.position", "", onResult) }
 }
 
+// ---- Microphone recording (Tier C) ------------------------------------------
+// Record audio from the mic to a file, with a live input-level stream for a VU meter.
+// start() begins recording (needs the "microphone" permission — request it via
+// Permission.request first; onError fires if it is denied or recording fails). stop()
+// finishes and answers (onResult) with a "file://<path>" to the recorded m4a, which you
+// can hand straight to Audio.play. levels() streams the current input level as "0".."1"
+// (normalized) while recording, ~12x/second, until its NativeSub is cancelled.
+export class Recorder {
+    public static start(onError: (string)=> void): void {
+        emitNativeCommandE("recorder.start", "", null, onError)
+    }
+    public static stop(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("recorder.stop", "", onResult, onError)
+    }
+    public static levels(onLevel: (string)=> void): NativeSub {
+        return emitNativeStream("recorder.levels", "", onLevel, null)
+    }
+}
+
 // ---- Text-to-speech (Tier B) ------------------------------------------------
 // Speak text aloud via the OS speech synthesizer. speak() replaces any current
 // utterance; stop() cancels it. text is base64 on the wire (arbitrary/multiline).
