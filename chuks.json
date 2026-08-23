@@ -1,6 +1,6 @@
 {
   "name": "@chuks/mobile",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Chuks Mobile SDK: write your whole app in Chuks; it compiles to native and drives real iOS (SwiftUI + UIKit) and Android widgets through one engine. Ships the UI toolkit, navigation, theming, and native capabilities (permissions, file system, secure storage, audio, text-to-speech, local notifications, and battery / network / app-state streams).",
   "entry": "src/index.chuks",
   "repository": "https://github.com/chuks-lang/chuks_mobile",
