@@ -24,6 +24,191 @@ import EventKit
 import LocalAuthentication
 import Security
 import Network
+import CoreBluetooth
+import CoreNFC
+
+// ===== Bluetooth LE (CoreBluetooth) + NFC (CoreNFC): shared by both iOS hosts =====
+// Decoupled from the host via onResolve/onFail closures (set to the host's resolve/fail).
+// CoreBluetooth is driven on the main queue, so callbacks fire on main.
+func bleHexToData(_ hex: String) -> Data {
+    var d = Data(); var i = hex.startIndex
+    while i < hex.endIndex {
+        let j = hex.index(i, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+        if let b = UInt8(hex[i..<j], radix: 16) { d.append(b) }
+        i = j
+    }
+    return d
+}
+func bleDataToHex(_ d: Data) -> String { d.map { String(format: "%02x", $0) }.joined() }
+
+final class BleManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    var onResolve: ((String, String) -> Void)?
+    var onFail: ((String, String) -> Void)?
+    private var central: CBCentralManager!
+    var scanToken: String?
+    var stateToken: String?
+    private var peripherals: [String: CBPeripheral] = [:]
+    private var chars: [String: CBCharacteristic] = [:]          // "id|service|char" -> characteristic
+    private var connectOk: [String: (String) -> Void] = [:]
+    private var connectErr: [String: (String) -> Void] = [:]
+    private var readOk: [String: (String) -> Void] = [:]
+    private var readErr: [String: (String) -> Void] = [:]
+    private var writeOk: [String: (String) -> Void] = [:]
+    private var writeErr: [String: (String) -> Void] = [:]
+    private var notifyTokens: [String: String] = [:]            // "id|s|c" -> stream token
+
+    override init() { super.init(); central = CBCentralManager(delegate: self, queue: .main) }
+
+    private func key(_ id: String, _ s: String, _ c: String) -> String { "\(id)|\(s.lowercased())|\(c.lowercased())" }
+
+    func centralManagerDidUpdateState(_ c: CBCentralManager) {
+        emitState()
+        if c.state == .poweredOn, scanToken != nil { central.scanForPeripherals(withServices: nil, options: nil) }
+    }
+    func emitState() {
+        guard let t = stateToken else { return }
+        let s: String
+        switch central.state {
+        case .poweredOn: s = "on"
+        case .poweredOff: s = "off"
+        case .unauthorized: s = "unauthorized"
+        case .unsupported: s = "unsupported"
+        default: s = "off"
+        }
+        onResolve?(t, s)
+    }
+    func startScan(_ token: String) {
+        scanToken = token
+        if central.state == .poweredOn { central.scanForPeripherals(withServices: nil, options: nil) }
+    }
+    func stopScan() { central.stopScan(); scanToken = nil }
+    func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        let id = p.identifier.uuidString
+        peripherals[id] = p
+        let name = p.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
+        if let t = scanToken { onResolve?(t, "\(id)\t\(name)\t\(RSSI.intValue)") }
+    }
+    func connect(_ id: String, ok: @escaping (String) -> Void, err: @escaping (String) -> Void) {
+        guard let p = peripherals[id] else { err("unknown device (scan first)"); return }
+        connectOk[id] = ok; connectErr[id] = err; p.delegate = self; central.connect(p, options: nil)
+    }
+    func disconnect(_ id: String) { if let p = peripherals[id] { central.cancelPeripheralConnection(p) } }
+    func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) { p.discoverServices(nil) }
+    func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
+        let id = p.identifier.uuidString
+        connectErr[id]?(error?.localizedDescription ?? "connect failed")
+        connectOk[id] = nil; connectErr[id] = nil
+    }
+    func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
+        if let e = error { connectErr[p.identifier.uuidString]?(e.localizedDescription); return }
+        let svcs = p.services ?? []
+        if svcs.isEmpty { finishConnect(p.identifier.uuidString) }
+        for s in svcs { p.discoverCharacteristics(nil, for: s) }
+    }
+    func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        let id = p.identifier.uuidString
+        for ch in service.characteristics ?? [] { chars[key(id, service.uuid.uuidString, ch.uuid.uuidString)] = ch }
+        finishConnect(id)
+    }
+    private func finishConnect(_ id: String) {
+        guard let ok = connectOk[id] else { return }
+        ok("connected"); connectOk[id] = nil; connectErr[id] = nil
+    }
+    func read(_ id: String, _ s: String, _ c: String, ok: @escaping (String) -> Void, err: @escaping (String) -> Void) {
+        guard let p = peripherals[id], let ch = chars[key(id, s, c)] else { err("characteristic not found"); return }
+        readOk[key(id, s, c)] = ok; readErr[key(id, s, c)] = err; p.readValue(for: ch)
+    }
+    func write(_ id: String, _ s: String, _ c: String, _ hex: String, ok: @escaping (String) -> Void, err: @escaping (String) -> Void) {
+        guard let p = peripherals[id], let ch = chars[key(id, s, c)] else { err("characteristic not found"); return }
+        writeOk[key(id, s, c)] = ok; writeErr[key(id, s, c)] = err
+        p.writeValue(bleHexToData(hex), for: ch, type: .withResponse)
+    }
+    func subscribe(_ id: String, _ s: String, _ c: String, token: String, err: @escaping (String) -> Void) {
+        guard let p = peripherals[id], let ch = chars[key(id, s, c)] else { err("characteristic not found"); return }
+        notifyTokens[key(id, s, c)] = token; p.setNotifyValue(true, for: ch)
+    }
+    func unsubscribe(_ token: String) {
+        for (k, t) in notifyTokens where t == token {
+            notifyTokens[k] = nil
+            let parts = k.split(separator: "|").map(String.init)
+            if parts.count == 3, let p = peripherals[parts[0]], let ch = chars[k] { p.setNotifyValue(false, for: ch) }
+        }
+    }
+    private func keyFor(_ ch: CBCharacteristic) -> String? { chars.first(where: { $0.value === ch })?.key }
+    func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
+        guard let k = keyFor(ch) else { return }
+        if let e = error { readErr[k]?(e.localizedDescription); readErr[k] = nil; readOk[k] = nil; return }
+        let hex = ch.value.map { bleDataToHex($0) } ?? ""
+        if let ok = readOk[k] { ok(hex); readOk[k] = nil; readErr[k] = nil }
+        if let t = notifyTokens[k] { onResolve?(t, hex) }
+    }
+    func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) {
+        guard let k = keyFor(ch) else { return }
+        if let e = error { writeErr[k]?(e.localizedDescription) } else { writeOk[k]?("ok") }
+        writeOk[k] = nil; writeErr[k] = nil
+    }
+}
+
+// NFC (CoreNFC, NDEF). Needs NFCReaderUsageDescription + the CoreNFC reader entitlement in the
+// app's provisioning profile; without the entitlement, begin() fails / readingAvailable is false.
+final class NfcReader: NSObject, NFCNDEFReaderSessionDelegate {
+    var onResolve: ((String, String) -> Void)?
+    var onFail: ((String, String) -> Void)?
+    private var session: NFCNDEFReaderSession?
+    private var token = ""
+    private var writeText: String?
+    private var didComplete = false
+
+    func read(_ token: String) { begin(token, write: nil) }
+    func write(_ text: String, _ token: String) { begin(token, write: text) }
+    var available: Bool { NFCNDEFReaderSession.readingAvailable }
+
+    private func begin(_ token: String, write: String?) {
+        guard NFCNDEFReaderSession.readingAvailable else { onFail?(token, "NFC not available"); return }
+        self.token = token; self.writeText = write; self.didComplete = false
+        session = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
+        session?.alertMessage = write == nil ? "Hold your iPhone near a tag." : "Hold your iPhone near a tag to write."
+        session?.begin()
+    }
+    func readerSession(_ s: NFCNDEFReaderSession, didDetectNDEFs messages: [NFCNDEFMessage]) { /* using didDetect(tags:) */ }
+    func readerSession(_ s: NFCNDEFReaderSession, didDetect tags: [NFCNDEFTag]) {
+        guard let tag = tags.first else { return }
+        s.connect(to: tag) { [weak self] err in
+            guard let self = self else { return }
+            if let e = err { self.finish(nil, e.localizedDescription, s); return }
+            if let text = self.writeText {
+                guard let pl = NFCNDEFPayload.wellKnownTypeTextPayload(string: text, locale: Locale(identifier: "en")) else {
+                    self.finish(nil, "encode failed", s); return
+                }
+                tag.writeNDEF(NFCNDEFMessage(records: [pl])) { werr in
+                    if let we = werr { self.finish(nil, we.localizedDescription, s) } else { self.finish("ok", nil, s) }
+                }
+            } else {
+                tag.readNDEF { msg, rerr in
+                    if let re = rerr { self.finish(nil, re.localizedDescription, s); return }
+                    let text = msg?.records.compactMap { self.textFrom($0) }.first ?? ""
+                    self.finish(text, nil, s)
+                }
+            }
+        }
+    }
+    private func textFrom(_ r: NFCNDEFPayload) -> String? {
+        let (str, _) = r.wellKnownTypeTextPayload()
+        if let str = str { return str }
+        return String(data: r.payload, encoding: .utf8)
+    }
+    private func finish(_ ok: String?, _ err: String?, _ s: NFCNDEFReaderSession) {
+        if didComplete { return }
+        didComplete = true
+        if let ok = ok { onResolve?(token, ok); s.alertMessage = "Done"; s.invalidate() }
+        else { onFail?(token, err ?? "failed"); s.invalidate(errorMessage: err ?? "failed") }
+    }
+    func readerSession(_ s: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
+        if didComplete { return }
+        didComplete = true
+        onFail?(token, error.localizedDescription)
+    }
+}
 
 // A muted, looping video surface backed by an AVPlayerLayer (no controls), driven
 // by its SwiftUI frame — matches the UIKit host's VideoView. `src` is a bundled
@@ -78,6 +263,103 @@ struct ChuksWeb: UIViewRepresentable {
     func updateUIView(_ w: WKWebView, context: Context) {
         guard let u = URL(string: url), w.url?.absoluteString != url else { return }
         w.load(URLRequest(url: u))
+    }
+}
+
+// A UIView whose backing layer IS the camera preview layer, so it always tracks the
+// view's frame (matches the Video surface). The session is owned by CameraController.
+final class CameraPreviewUIView: UIView {
+    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+    weak var controller: CameraController?
+    weak var scene: Scene?
+    func attach(_ session: AVCaptureSession) {
+        previewLayer.session = session
+        previewLayer.videoGravity = .resizeAspectFill
+    }
+}
+
+// Owns the AVCaptureSession, the lens input, and the photo output for the live camera
+// preview. One controller is retained by the Scene while a CameraView is on screen, so
+// camera.capturePreview can snap a still from the running session. Session work runs off
+// the main thread; the preview layer is driven by the on-screen CameraPreviewUIView.
+final class CameraController: NSObject, AVCapturePhotoCaptureDelegate {
+    let session = AVCaptureSession()
+    private let photoOut = AVCapturePhotoOutput()
+    let previewView = CameraPreviewUIView()
+    private var facing = ""
+    private let q = DispatchQueue(label: "chuks.camera.session")
+    private var onCapOk: ((String) -> Void)?
+    private var onCapErr: ((String) -> Void)?
+
+    override init() {
+        super.init()
+        previewView.controller = self
+        previewView.attach(session)
+    }
+
+    // (Re)wire the session for the requested lens ("back"/"front"). Idempotent: a repeated
+    // same-facing call while running is a no-op.
+    func configure(_ want: String) {
+        let facingNow = want == "front" ? "front" : "back"
+        guard facingNow != facing || session.inputs.isEmpty else { return }
+        facing = facingNow
+        q.async { [weak self] in
+            guard let self = self else { return }
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .photo
+            for i in self.session.inputs { self.session.removeInput(i) }
+            let pos: AVCaptureDevice.Position = facingNow == "front" ? .front : .back
+            if let dev = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: pos),
+               let input = try? AVCaptureDeviceInput(device: dev), self.session.canAddInput(input) {
+                self.session.addInput(input)
+            }
+            if self.session.outputs.isEmpty, self.session.canAddOutput(self.photoOut) {
+                self.session.addOutput(self.photoOut)
+            }
+            self.session.commitConfiguration()
+            if !self.session.isRunning { self.session.startRunning() }
+        }
+    }
+
+    func stop() { q.async { [weak self] in if self?.session.isRunning == true { self?.session.stopRunning() } } }
+
+    func capture(ok: @escaping (String) -> Void, err: @escaping (String) -> Void) {
+        guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { err("camera permission not granted"); return }
+        onCapOk = ok; onCapErr = err
+        q.async { [weak self] in
+            guard let self = self, self.session.isRunning else { DispatchQueue.main.async { err("camera not running") }; return }
+            self.photoOut.capturePhoto(with: AVCapturePhotoSettings(), delegate: self)
+        }
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        let ok = onCapOk, err = onCapErr; onCapOk = nil; onCapErr = nil
+        if let e = error { DispatchQueue.main.async { err?(e.localizedDescription) }; return }
+        guard let data = photo.fileDataRepresentation() else { DispatchQueue.main.async { err?("no image data") }; return }
+        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let url = dir.appendingPathComponent("cam_\(UUID().uuidString).jpg")
+        do { try data.write(to: url); DispatchQueue.main.async { ok?("file://" + url.path) } }
+        catch { DispatchQueue.main.async { err?(error.localizedDescription) } }
+    }
+}
+
+// The live camera preview node. Registers its controller with the Scene so a still can be
+// captured from it, and stops the session when the node leaves the tree.
+struct ChuksCamera: UIViewRepresentable {
+    let facing: String
+    weak var scene: Scene?
+    func makeUIView(context: Context) -> CameraPreviewUIView {
+        let ctrl = scene?.cameraController ?? CameraController()
+        scene?.cameraController = ctrl
+        ctrl.previewView.scene = scene
+        ctrl.configure(facing)
+        return ctrl.previewView
+    }
+    func updateUIView(_ v: CameraPreviewUIView, context: Context) { v.controller?.configure(facing) }
+    static func dismantleUIView(_ v: CameraPreviewUIView, coordinator: ()) {
+        v.controller?.stop()
+        if v.scene?.cameraController === v.controller { v.scene?.cameraController = nil }
     }
 }
 
@@ -443,18 +725,36 @@ final class Scene: ObservableObject {
     @Published var sbColor = ""   // status-bar background color (hex); "" = none
 
     private var booted = false
+    // True once a /mount has actually produced a node tree. Until then the DEV watcher
+    // keeps retrying the mount: the very first mount on connect (or a fresh Scene after
+    // reconnect) can come back empty if the dev server is momentarily unreachable, and
+    // without a retry the app would sit on a permanent blank screen (the "blank with the
+    // X icon" symptom). In AOT the engine is in-process so mount never fails this way.
+    private var everMounted = false
     func boot(osDark: Bool) {
         if booted { return }; booted = true
         ChuksURLBridge.shared.attach(self)   // receive deep links (incl. a launch URL delivered before boot)
         UNUserNotificationCenter.current().delegate = notifDelegate  // foreground banners
-        Engine.setup(0); Engine.setPlatform(); Engine.setColorScheme(osDark); apply(Engine.mount()); syncFollow()
+        Engine.setup(0); Engine.setPlatform(); Engine.setColorScheme(osDark)
+        mountFresh()
         if DEV_MODE { startDevWatch() }
+    }
+
+    // Mount from a fresh /mount and record whether it produced anything. Clearing first
+    // keeps a remount (bounce or retry) from merging stale nodes.
+    private func mountFresh() {
+        nodes.removeAll()
+        apply(Engine.mount())
+        syncFollow()
+        if !nodes.isEmpty { everMounted = true }
     }
 
     // DEV hot reload: `chuks watch` restarts the VM dev server (~1s) whenever a .chuks
     // file is saved. We poll it off the main thread; when it comes back after a bounce,
-    // we clear the tree and remount from a fresh /mount, so the edit shows with no
-    // rebuild. (Engine state resets on reload; state preservation is a later refinement.)
+    // we remount from a fresh /mount, so the edit shows with no rebuild. We ALSO remount
+    // while the tree is still empty (everMounted == false), which recovers a failed
+    // initial mount instead of leaving a blank screen. A failed mount returns nothing and
+    // creates no engine subscriptions, so retrying it is safe and does not leak.
     private var devConnected = true
     private func startDevWatch() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -462,12 +762,8 @@ final class Scene: ObservableObject {
                 Thread.sleep(forTimeInterval: 0.4)
                 let up = devHTTP("/state", "", get: true) != nil
                 guard let self = self else { return }
-                if up && !self.devConnected {
-                    DispatchQueue.main.async {
-                        self.nodes.removeAll()
-                        self.apply(Engine.mount())
-                        self.syncFollow()
-                    }
+                if up && (!self.devConnected || !self.everMounted) {
+                    DispatchQueue.main.async { self.mountFresh() }
                 }
                 self.devConnected = up
             }
@@ -547,12 +843,32 @@ final class Scene: ObservableObject {
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
     var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
     var audioRecorder: AVAudioRecorder? = nil   // mic recording (Tier C)
+    var cameraController: CameraController? = nil   // live CameraView session (for camera.capturePreview)
+    var ble: BleManager? = nil          // CoreBluetooth central (lazy)
+    var nfc: NfcReader? = nil           // CoreNFC reader (lazy)
     var recURL: URL? = nil
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
 
     // Execute a native capability requested via an `X|` command. Fire-and-forget
     // commands (token "0") just perform the side effect; async reads call resolve()
     // with the result payload. Runs on the main queue (post-apply).
+    func ensureBle() {
+        if ble == nil {
+            let m = BleManager()
+            m.onResolve = { [weak self] t, p in DispatchQueue.main.async { self?.resolve(t, p) } }
+            m.onFail = { [weak self] t, msg in DispatchQueue.main.async { self?.fail(t, msg) } }
+            ble = m
+        }
+    }
+    func ensureNfc() {
+        if nfc == nil {
+            let n = NfcReader()
+            n.onResolve = { [weak self] t, p in DispatchQueue.main.async { self?.resolve(t, p) } }
+            n.onFail = { [weak self] t, msg in DispatchQueue.main.async { self?.fail(t, msg) } }
+            nfc = n
+        }
+    }
+
     func handleCommand(_ token: String, _ cap: String, _ args: String) {
         switch cap {
         case "__cancel__":
@@ -724,6 +1040,40 @@ final class Scene: ObservableObject {
                 PHPhotoLibrary.shared().performChanges({ PHAssetChangeRequest.creationRequestForAsset(from: img) },
                     completionHandler: { ok, err in DispatchQueue.main.async { ok ? self?.resolve(token, "ok") : self?.fail(token, err?.localizedDescription ?? "save failed") } })
             }
+        case "camera.capturePreview":
+            guard let ctrl = cameraController else { fail(token, "no CameraView on screen"); break }
+            ctrl.capture(ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
+        case "ble.state":
+            ensureBle(); ble!.stateToken = token; ble!.emitState()
+            streamTeardown[token] = { [weak self] in self?.ble?.stateToken = nil }
+        case "ble.scan":
+            ensureBle(); ble!.startScan(token)
+            streamTeardown[token] = { [weak self] in self?.ble?.stopScan() }
+        case "ble.connect":
+            ensureBle(); ble!.connect(args, ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
+        case "ble.disconnect":
+            ble?.disconnect(args)
+        case "ble.read":
+            let a = args.components(separatedBy: "\t")
+            if a.count == 3 { ensureBle(); ble!.read(a[0], a[1], a[2], ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) }) }
+            else { fail(token, "ble.read needs id, service, characteristic") }
+        case "ble.write":
+            let a = args.components(separatedBy: "\t")
+            if a.count == 4 { ensureBle(); ble!.write(a[0], a[1], a[2], a[3], ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) }) }
+            else { fail(token, "ble.write needs id, service, characteristic, hex") }
+        case "ble.subscribe":
+            let a = args.components(separatedBy: "\t")
+            if a.count == 3 {
+                ensureBle()
+                ble!.subscribe(a[0], a[1], a[2], token: token, err: { [weak self] m in self?.fail(token, m) })
+                streamTeardown[token] = { [weak self] in self?.ble?.unsubscribe(token) }
+            } else { fail(token, "ble.subscribe needs id, service, characteristic") }
+        case "nfc.available":
+            ensureNfc(); resolve(token, nfc!.available ? "1" : "0")
+        case "nfc.read":
+            ensureNfc(); nfc!.read(token)
+        case "nfc.write":
+            ensureNfc(); nfc!.write(args, token)
         case "biometrics.available":
             resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
         case "biometrics.authenticate":
@@ -1495,6 +1845,7 @@ struct NodeView: View {
         case "StatusBar": Color.clear.frame(width: 0, height: 0)   // directive only; config read in apply()
         case "Modal": Color.clear.frame(width: 0, height: 0)       // rendered in the overlay by RootView, not inline
         case "Video":  videoView(node)
+        case "CameraView": ChuksCamera(facing: node.text, scene: scene).modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "WebView": webView(node)
         case "ImageBackground": imageBackgroundView(node)
         case "Scroll": ChuksScroll(scene: scene, id: id, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
