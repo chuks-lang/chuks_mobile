@@ -1238,6 +1238,9 @@ export class Reconciler {
     var itemNodes: map[string]Node  // List cell id -> last node it showed (for reconcile prev)
     var mounted: []string           // List cell ids in use this frame
     var listCount: int              // last content count (to re-emit content height only on change)
+    var listContentH: int           // last content height emitted (re-emit when it changes: count/header/footer)
+    var listHeaderShown: map[string]bool  // List id -> header node currently mounted
+    var listFooterShown: map[string]bool  // List id -> footer node currently mounted
     var cellRank: map[string]int    // recycling: cell id -> the row rank it currently shows (-1 = free)
     var poolSize: int               // recycling: how many pool cells have been created
     var pending: map[string]any     // async bridge: token -> result closure (survives frames, unlike handlers)
@@ -1249,6 +1252,9 @@ export class Reconciler {
     var listEndFired: map[string]int // List id -> count at which onEndReached last fired (fire once per count)
     var listRefreshing: map[string]int // List id -> last refreshing flag emitted (diff the spinner)
     var listEmpty: map[string]bool   // List id -> whether the empty-state node is currently mounted
+    var listScrollIdx: map[string]int // List id -> last scrollToIndex target emitted (fire on change)
+    var listScrollEnd: map[string]int // List id -> last scrollToEnd nonce emitted (fire on change)
+    var listScrollPos: map[string]int // List id -> last scroll offset reported to its onScroll
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.rootPrev = null
@@ -1256,7 +1262,9 @@ export class Reconciler {
         this.cellRank = {}; this.poolSize = 0
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
         this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
-        this.listRefreshing = {}; this.listEmpty = {}
+        this.listRefreshing = {}; this.listEmpty = {}; this.listContentH = -1
+        this.listHeaderShown = {}; this.listFooterShown = {}
+        this.listScrollIdx = {}; this.listScrollEnd = {}; this.listScrollPos = {}
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1501,7 +1509,17 @@ export class Reconciler {
         const buffer: int = lpInt(d, "buffer", 3)
         const itemFn: any = d.get("item")
         const contentId: string = id + ".0"
-        const contentH: int = pad + count * stride + pad
+        // Optional header/footer offset the rows. headerH/footerH default 0, so a feed
+        // without them lays out exactly as before (the video feed is unaffected).
+        const headerH: int = lpInt(d, "headerHeight", 0)
+        const footerH: int = lpInt(d, "footerHeight", 0)
+        const rowsTop: int = pad + headerH               // where the first row sits
+        const contentH: int = rowsTop + count * stride + footerH + pad
+        // inverted (chat): row 0 sits at the BOTTOM and later rows stack upward, so a
+        // freshly-appended row 0 (newest) shows at the bottom. `invBase` is row 0's top;
+        // top(r) = invBase - r*stride. Default off, so a feed lays out exactly as before.
+        const inverted: bool = lpInt(d, "inverted", 0) == 1
+        const invBase: int = contentH - pad - footerH - rowH
 
         if (prev == null) {
             // fresh mount (first render, or remount after a page swap tore this List
@@ -1514,16 +1532,25 @@ export class Reconciler {
             const cS: Style = new Style(); cS.h = contentH
             this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
             this.emit("I|" + contentId + "|" + id + "|0")
-            this.listCount = count
-        } else if (count != this.listCount) {
+            this.listCount = count; this.listContentH = contentH
+        } else if (contentH != this.listContentH) {   // count, header, or footer changed the height
             const cS: Style = new Style(); cS.h = contentH
             this.emit("S|" + contentId + "|" + cS.str())
-            this.listCount = count
+            this.listCount = count; this.listContentH = contentH
         }
 
-        var r0: int = (this.vpTop - pad) / stride - buffer
+        // Which rows fall in the viewport (± buffer). Inverted flips the mapping: top
+        // decreases as r grows, so the near/far viewport edges swap which r they bound.
+        var r0: int = 0
+        var r1: int = 0
+        if (inverted) {
+            r0 = (invBase - (this.vpTop + this.vpH)) / stride - buffer
+            r1 = (invBase - this.vpTop) / stride + buffer + 1
+        } else {
+            r0 = (this.vpTop - rowsTop) / stride - buffer
+            r1 = (this.vpTop + this.vpH - rowsTop) / stride + buffer + 1
+        }
         if (r0 < 0) { r0 = 0 }
-        var r1: int = (this.vpTop + this.vpH - pad) / stride + buffer + 1
         if (r1 > count) { r1 = count }
         if (r1 < r0) { r1 = r0 }
 
@@ -1550,7 +1577,7 @@ export class Reconciler {
             if (kept != null) { cid = kept }                  // this row is already on a cell: reuse in place
             else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }   // recycle a leaving cell
             else { cid = contentId + ".cell" + string(this.poolSize); this.poolSize = this.poolSize + 1 }  // grow the pool
-            const top: int = pad + r * stride
+            const top: int = inverted ? invBase - r * stride : rowsTop + r * stride
             const node: Node = itemFn(r, top)
             const pn: Node? = this.itemNodes.get(cid)         // the node this cell last showed (null on first use)
             this.reconcile(pn, node, cid, contentId, 0)       // diff -> minimal S|/P|, no C|/R| when recycling
@@ -1568,7 +1595,7 @@ export class Reconciler {
         // inline, so the closure's setState runs after this render (see flushVisible).
         const vf: any = d.get("onVisible")
         if (vf != null && count > 0 && stride > 0) {
-            var centered: int = (this.vpTop + this.vpH / 2 - pad) / stride
+            var centered: int = inverted ? (invBase - (this.vpTop + this.vpH / 2)) / stride : (this.vpTop + this.vpH / 2 - rowsTop) / stride
             if (centered < 0) { centered = 0 }
             if (centered >= count) { centered = count - 1 }
             if (centered != this.listVisible.getOr(id, -1)) {
@@ -1584,7 +1611,9 @@ export class Reconciler {
         const ef: any = d.get("onEndReached")
         if (ef != null && count > 0 && stride > 0) {
             const threshold: int = lpInt(d, "endThreshold", 0)
-            const lastVisible: int = (this.vpTop + this.vpH - pad) / stride
+            // The "end" is the far edge of the data: the bottom row normally, or the TOP row
+            // when inverted (a chat scrolling up to load older messages).
+            const lastVisible: int = inverted ? (invBase - this.vpTop) / stride : (this.vpTop + this.vpH - rowsTop) / stride
             if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
                 this.listEndFired[id] = count
                 this.pendingVisible.push(function(): void { ef() })
@@ -1615,6 +1644,62 @@ export class Reconciler {
             this.itemNodes[emptyId] = enode
         } else if (this.itemNodes.has(emptyId)) {
             this.emit("R|" + emptyId); this.itemNodes.delete(emptyId)
+        }
+        // header / footer: absolutely-positioned nodes above the rows (top = pad) and below
+        // them (top = rowsTop + count*stride). The app positions its node with abs+top like a row.
+        const headerFn: any = d.get("header")
+        const headerId: string = contentId + ".header"
+        if (headerFn != null) {
+            const hnode: Node = headerFn(pad)
+            this.reconcile(this.itemNodes.get(headerId), hnode, headerId, contentId, 0)
+            this.itemNodes[headerId] = hnode; this.listHeaderShown[id] = true
+        } else if (this.listHeaderShown.getOr(id, false)) {
+            this.emit("R|" + headerId); this.itemNodes.delete(headerId); this.listHeaderShown[id] = false
+        }
+        const footerFn: any = d.get("footer")
+        const footerId: string = contentId + ".footer"
+        if (footerFn != null) {
+            const fnode: Node = footerFn(rowsTop + count * stride)
+            this.reconcile(this.itemNodes.get(footerId), fnode, footerId, contentId, 0)
+            this.itemNodes[footerId] = fnode; this.listFooterShown[id] = true
+        } else if (this.listFooterShown.getOr(id, false)) {
+            this.emit("R|" + footerId); this.itemNodes.delete(footerId); this.listFooterShown[id] = false
+        }
+        // scrollToIndex / scrollToEnd: imperative-style scroll via the declarative model. The
+        // host scrolls the list to a content-offset (LS|id|y), animated. scrollToIndex brings
+        // that row to the top (below the header); it re-fires when the value changes. scrollToEnd
+        // is a NONCE (bump it to re-pin to newest, e.g. on each appended chat message) and scrolls
+        // to the very bottom using the just-computed contentH, so it lands after any new rows.
+        const sti: int = lpInt(d, "scrollToIndex", -1)
+        if (sti >= 0 && sti != this.listScrollIdx.getOr(id, -999)) {
+            this.listScrollIdx[id] = sti
+            const stiY: int = inverted ? invBase - sti * stride : rowsTop + sti * stride
+            this.emit("LS|" + id + "|" + string(stiY))
+        }
+        const ste: int = lpInt(d, "scrollToEnd", 0)
+        if (ste != this.listScrollEnd.getOr(id, 0)) {
+            this.listScrollEnd[id] = ste
+            var endY: int = contentH - this.vpH
+            if (endY < 0) { endY = 0 }
+            this.emit("LS|" + id + "|" + string(endY))
+        }
+        // inverted: on first mount, land at the bottom (row 0 = newest). Tracked via
+        // listScrollEnd so we don't re-scroll every frame; the app bumps `scrollToEnd` to
+        // re-pin to newest after that. (contentH - vpH; the host clamps to the real max.)
+        if (inverted && prev == null) {
+            this.listScrollEnd[id] = lpInt(d, "scrollToEnd", 0)
+            var invY: int = contentH - this.vpH
+            if (invY < 0) { invY = 0 }
+            this.emit("LS|" + id + "|" + string(invY))
+        }
+        // onScroll: report the scroll offset (points) whenever it changes, so an app can drive
+        // a parallax header, a scroll-to-top button, etc. Queued like onVisible (fired after
+        // render); opt-in, so a list without onScroll pays nothing.
+        const osf: any = d.get("onScroll")
+        if (osf != null && this.vpTop != this.listScrollPos.getOr(id, -1)) {
+            this.listScrollPos[id] = this.vpTop
+            const off: int = this.vpTop
+            this.pendingVisible.push(function(): void { osf(off) })
         }
     }
 

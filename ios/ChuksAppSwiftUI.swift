@@ -838,6 +838,10 @@ final class Scene: ObservableObject {
     @Published var sbHidden = false
     @Published var sbStyle = ""
     @Published var sbColor = ""   // status-bar background color (hex); "" = none
+    // List scrollToIndex/scrollToEnd: target content-offset y per list id, plus a nonce so an
+    // identical target (e.g. scrollToEnd bumped again) still re-fires the scroll.
+    @Published var scrollTargets: [String: CGFloat] = [:]
+    @Published var scrollNonce: [String: Int] = [:]
 
     private var booted = false
     // True once a /mount has actually produced a node tree. Until then the DEV watcher
@@ -930,6 +934,9 @@ final class Scene: ObservableObject {
             case "TS" where f.count >= 2: nodes[f[1]]?.submitAction = f[1] + ":submit"
             case "TF" where f.count >= 2: nodes[f[1]]?.focusAction = f[1] + ":focus"
             case "TB" where f.count >= 2: nodes[f[1]]?.blurAction = f[1] + ":blur"
+            case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
+                scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
+                scrollNonce[f[1], default: 0] += 1
             case "I" where f.count >= 4:
                 let id = f[1], parent = f[2], idx = Int(f[3]) ?? 0
                 if parent != "root", nodes[parent] != nil {
@@ -1918,6 +1925,29 @@ struct ScrollOffsetReader: UIViewRepresentable {
     }
 }
 
+// scrollToIndex/scrollToEnd for a List: a zero-size probe placed INSIDE the scroll content
+// (so its superview chain reaches the UIScrollView). When the nonce changes, it sets the
+// underlying scroll view's contentOffset (clamped, animated). Same UIScrollView-walk trick
+// as ScrollOffsetReader — reliable where a pure-SwiftUI scrollTo is not.
+struct ScrollSetter: UIViewRepresentable {
+    let y: CGFloat?
+    let nonce: Int
+    func makeUIView(context: Context) -> UIView { UIView(frame: .zero) }
+    func updateUIView(_ v: UIView, context: Context) {
+        guard let y = y, context.coordinator.lastNonce != nonce else { return }
+        context.coordinator.lastNonce = nonce
+        DispatchQueue.main.async {
+            var s = v.superview
+            while let cur = s, !(cur is UIScrollView) { s = cur.superview }
+            guard let sv = s as? UIScrollView else { return }
+            let maxY = max(0, sv.contentSize.height - sv.bounds.height)
+            sv.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: true)
+        }
+    }
+    func makeCoordinator() -> C { C() }
+    final class C { var lastNonce = -1 }
+}
+
 // Snap-per-screen paging for a Scroll/List (video feeds). iOS 17+ pages by the viewport
 // height via scrollTargetBehavior; older iOS falls back to normal scrolling.
 struct ScrollPaging: ViewModifier {
@@ -1944,6 +1974,9 @@ struct ChuksScroll: View {
                 ScrollOffsetReader { off in
                     scene.viewport(Int32(max(0, off)), Int32(outer.size.height))
                 }.frame(width: 0, height: 0)
+                // scrollToIndex/scrollToEnd: drive the underlying UIScrollView's offset.
+                ScrollSetter(y: scene.scrollTargets[id], nonce: scene.scrollNonce[id] ?? 0)
+                    .frame(width: 0, height: 0)
                 ForEach(scene.nodes[id]?.children ?? [], id: \.self) { cid in
                     NodeView(scene: scene, id: cid, parentRow: false, parentStretch: true)
                 }

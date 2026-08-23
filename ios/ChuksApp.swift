@@ -1137,6 +1137,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
             case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }
             case "TB" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldBlur[tf] = f[1] + ":blur" }
+            case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
             case "X" where f.count >= 3:
@@ -1633,6 +1634,20 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func setFieldValue(_ id: String, _ value: String) {
         if let tf = views[id] as? UITextField { if tf.text != value { tf.text = value } }
         else if let tv = views[id] as? UITextView { if tv.text != value { tv.text = value } }
+    }
+
+    // List scrollToIndex/scrollToEnd: scroll the list's UIScrollView to content-offset y,
+    // clamped to the scrollable range. Deferred to the next runloop so the content-size /
+    // layout emitted in the same batch is applied before we scroll (otherwise maxOffset is
+    // stale). NOT animated on purpose: a big jump lands in an unmounted region, and the
+    // scrollViewDidScroll -> mount -> relayout that follows would cancel an in-flight animated
+    // scroll partway (a small already-mounted jump survives, a large one aborts near the top).
+    func scrollListTo(_ id: String, y: CGFloat) {
+        DispatchQueue.main.async { [weak self] in
+            guard let sc = self?.views[id] as? UIScrollView else { return }
+            let maxY = max(0, sc.contentSize.height - sc.bounds.height)
+            sc.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: false)
+        }
     }
 
     func setText(_ id: String, _ t: String) {

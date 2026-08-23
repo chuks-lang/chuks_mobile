@@ -323,6 +323,18 @@ class MainActivity : Activity() {
     private fun dp(v: Int) = (v * density).toInt()
     private fun dpf(v: Float) = v * density
 
+    // List scrollToIndex/scrollToEnd: smooth-scroll the list's ScrollView to content-offset y
+    // (Chuks logical points -> px), clamped. Posted so the content-size/layout emitted in the
+    // same batch settles first (otherwise the max scroll range is stale).
+    private fun scrollListTo(id: String, y: Int) {
+        val sc = views[id] as? ScrollView ?: return
+        sc.post {
+            val child = if (sc.childCount > 0) sc.getChildAt(0) else null
+            val maxY = if (child != null) (child.height - sc.height).coerceAtLeast(0) else Int.MAX_VALUE
+            sc.smoothScrollTo(0, dp(y).coerceIn(0, maxY))
+        }
+    }
+
     // ---- viewport / scroll -------------------------------------------------
     private fun pushViewport(): Boolean {
         val sc = listScroll ?: return false
@@ -351,6 +363,7 @@ class MainActivity : Activity() {
                 "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
                 "TF" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldFocus[it] = f[1] + ":focus" }
                 "TB" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldBlur[it] = f[1] + ":blur" }
+                "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
                 "X" -> if (f.size >= 3) {

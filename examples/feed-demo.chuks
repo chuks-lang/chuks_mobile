@@ -1,10 +1,9 @@
 // A feed that exercises the P2 List props: onEndReached (infinite scroll), onRefresh
 // (pull-to-refresh), and empty (empty-state). Rows are simple numbered cards.
-import { NavStack, Node, Column, Row, Text, List, setSafeInsets } from "../core/ui.chuks";
+import { NavStack, Node, Column, Row, Text, List, Button, setSafeInsets } from "../core/ui.chuks";
 import { useState, Cell } from "../core/state.chuks";
 import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
-import { time } from "std/time";
 
 const PAGE: int = 20
 const MAX: int = 120
@@ -12,13 +11,24 @@ const MAX: int = 120
 function feed(): Node {
     const n: Cell = useState(PAGE)       // how many rows are loaded
     const busy: Cell = useState(false)   // pull-to-refresh spinner
+    const jump: Cell = useState(-1)      // scrollToIndex target (-1 = none)
+    const endBump: Cell = useState(0)    // scrollToEnd nonce (bump to re-pin to newest)
     const count: int = int(n.get())
 
-    return List({
+    // A fixed control bar (outside the List) to drive scrollToIndex / scrollToEnd.
+    const bar: Node = Row({ bg: tk("surface"), pad: 10, gap: 8, justify: "center" }, [
+        Button({ bg: tk("primary"), grow: 1, h: 40, onPress: function(): void { jump.set(0) } }, "Top"),
+        Button({ bg: tk("primary"), grow: 1, h: 40, onPress: function(): void { jump.set(count / 2) } }, "Middle"),
+        Button({ bg: tk("primary"), grow: 1, h: 40, onPress: function(): void { endBump.set(int(endBump.get()) + 1) } }, "End"),
+    ])
+
+    const list: Node = List({
         count: count,
         rowHeight: 64,
         gap: 8,
         pad: 12,
+        scrollToIndex: int(jump.get()),
+        scrollToEnd: int(endBump.get()),
         onRefresh: function(): void { n.set(PAGE) },        // reset to the first page
         refreshing: bool(busy.get()),
         onEndReached: function(): void {                    // load the next page near the end
@@ -26,6 +36,18 @@ function feed(): Node {
             if (cur < MAX) { n.set(cur + PAGE < MAX ? cur + PAGE : MAX) }
         },
         endThreshold: 3,
+        headerHeight: 56,
+        header: function(top: int): Node {
+            return Row({ abs: true, top: top, left: 12, right: 12, h: 56, align: "center" }, [
+                Text({ color: tk("text"), size: 26, weight: "bold" }, "Feed"),
+            ])
+        },
+        footerHeight: 48,
+        footer: function(top: int): Node {
+            return Row({ abs: true, top: top, left: 0, right: 0, h: 48, justify: "center", align: "center" }, [
+                Text({ color: tk("muted"), size: 14 }, count < MAX ? "Loading more…" : "You're all caught up"),
+            ])
+        },
         empty: function(h: int): Node {
             return Column({ h: h, justify: "center", align: "center" }, [
                 Text({ color: tk("muted"), size: 16 }, "Nothing here yet"),
@@ -38,6 +60,8 @@ function feed(): Node {
             ])
         },
     })
+
+    return Column({ grow: 1, bg: tk("bg") }, [ bar, list ])
 }
 
 function createRoot(): NavStack {

@@ -26,3 +26,4 @@
 
 # Internal design docs / roadmaps — kept local, out of the repo.
 docs/
+.chuks/typecheck/
