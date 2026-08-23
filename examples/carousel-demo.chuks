@@ -1,4 +1,4 @@
-// A horizontal carousel: a full-screen List with `horizontal: 1` scrolls sideways through
+// A horizontal carousel: a full-screen List with `horizontal: true` scrolls sideways through
 // fixed-width cards. It virtualizes + paginates on the x-axis exactly like a vertical feed.
 import { NavStack, Node, Column, Row, Text, List, viewportHeight, setSafeInsets } from "../core/ui.chuks";
 import { useState, Cell } from "../core/state.chuks";
@@ -27,7 +27,7 @@ function reel(): Node {
         itemWidth: 280,
         gap: 16,
         pad: 16,
-        horizontal: 1,
+        horizontal: true,
         onVisible: function(i: int): void { at.set(i) },
         onEndReached: function(): void {
             const cur: int = int(n.get())

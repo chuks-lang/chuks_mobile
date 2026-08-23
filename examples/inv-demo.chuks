@@ -20,7 +20,7 @@ function feed(): Node {
         rowHeight: 56,
         gap: 8,
         pad: 12,
-        inverted: 1,
+        inverted: true,
         onScroll: function(y: int): void { off.set(y) },
         item: function(r: int, top: int): Node {
             // r=0 is newest (bottom). Right-align even rows to read like a chat.

@@ -269,7 +269,7 @@ export unionType Prop = int | string | bool | function(): void | function(v: str
 // List-specific signatures, so they get their own union, distinct from Prop. The
 // last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
 // item(s,r,top)->Node; its header(s,top)->Node reuses (int,int)->Node above.
-export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void | function(): void | function(top: int): Node
+export unionType ListProp = int | bool | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void | function(): void | function(top: int): Node
 
 // ---- Named-prop component builders (the JSX-like API) ----------------------
 // Compose with named props + children + closures:
@@ -310,6 +310,11 @@ var _vpW: int = 0
 export function viewportWidth(): int { return _vpW }
 // Read an int config value `k` from a List's ListProp map, or `def` if absent.
 function lpInt(d: map[string]ListProp, k: string, def: int): int { const v: ListProp? = d.get(k); if (v != null) { return int(v) } return def }
+// Read a BOOLEAN config value `k` (e.g. `horizontal`, `inverted`, `paging`). Accepts a real
+// `bool` (the preferred form: `horizontal: true`) and, for back-compat, any non-zero int as
+// true — so `horizontal: 5` reads as true rather than silently falling through to false the
+// way a `== 1` check would.
+function lpBool(d: map[string]ListProp, k: string, def: bool): bool { const v: ListProp? = d.get(k); if (v != null) { return int(v) != 0 } return def }
 // Copy the layout/visual props onto a Style. Each pInt/pStr defaults to the
 // Style's current value, so an absent prop leaves whatever the builder preset.
 function applyLayout(s: Style, p: map[string]Prop): void {
@@ -327,7 +332,7 @@ function applyLayout(s: Style, p: map[string]Prop): void {
     s.fs = pInt(p, "size", s.fs)
     s.fw = pStr(p, "weight", s.fw)
     s.ta = pStr(p, "ta", s.ta)
-    const abs: Prop? = p.get("abs"); if (abs != null) { s.pos = "abs" }
+    if (pBool(p, "abs", false)) { s.pos = "abs" }   // absolute positioning (top/left/right)
     s.top = pInt(p, "top", s.top)
     s.left = pInt(p, "left", s.left)
     s.right = pInt(p, "right", s.right)
@@ -1509,7 +1514,7 @@ export class Reconciler {
     // moves it to a different rank (its id "c<key>" is stable, only its top moves).
     reconcileList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
         const d0: map[string]ListProp = next.data
-        if (lpInt(d0, "horizontal", 0) == 1) { this.reconcileHList(prev, next, id, parent, index); return }
+        if (lpBool(d0, "horizontal", false)) { this.reconcileHList(prev, next, id, parent, index); return }
         const d: map[string]ListProp = next.data
         const count: int = lpInt(d, "count", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
@@ -1527,7 +1532,7 @@ export class Reconciler {
         // inverted (chat): row 0 sits at the BOTTOM and later rows stack upward, so a
         // freshly-appended row 0 (newest) shows at the bottom. `invBase` is row 0's top;
         // top(r) = invBase - r*stride. Default off, so a feed lays out exactly as before.
-        const inverted: bool = lpInt(d, "inverted", 0) == 1
+        const inverted: bool = lpBool(d, "inverted", false)
         // numColumns (grid): pack `ncol` cells per row across the list WIDTH (reported by the
         // host as vpW). The reconciler computes each cell's column width + x and overrides them
         // on the item node, so the app's item builder need not know the layout. ncol defaults
@@ -1545,7 +1550,7 @@ export class Reconciler {
             // down): start from a clean pool so stale cells can't suppress mounts.
             this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
             const listS: Style = new Style(); listS.grow = 1; listS.basis = 0
-            if (lpInt(d, "paging", 0) == 1) { listS.paging = 1 }   // snap per screen (video feeds)
+            if (lpBool(d, "paging", false)) { listS.paging = 1 }   // snap per screen (video feeds)
             this.emit("C|" + id + "|Scroll"); this.emit("S|" + id + "|" + listS.str())
             this.emit("I|" + id + "|" + parent + "|" + string(index))
             const cS: Style = new Style(); cS.h = contentH
@@ -1659,7 +1664,7 @@ export class Reconciler {
         const rf: any = d.get("onRefresh")
         if (rf != null) {
             this.handlers[id] = rf
-            const refreshing: int = lpInt(d, "refreshing", 0)
+            const refreshing: int = lpBool(d, "refreshing", false) ? 1 : 0
             const prevR: int = this.listRefreshing.getOr(id, -2)
             if (prevR == -2) { this.emit("T|" + id + "|" + id) }   // enable the refresh control once
             if (refreshing != prevR) {
@@ -1759,7 +1764,7 @@ export class Reconciler {
         if (prev == null) {
             this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
             const listS: Style = new Style(); listS.grow = 1; listS.basis = 0; listS.horiz = 1
-            if (lpInt(d, "paging", 0) == 1) { listS.paging = 1 }   // snap one item per screen
+            if (lpBool(d, "paging", false)) { listS.paging = 1 }   // snap one item per screen
             // A distinct kind so a host that needs a different scroll class for the x-axis
             // (Android's HorizontalScrollView) creates the right view; the `horiz` style tells
             // the others (UIKit/SwiftUI reuse their vertical scroll view on the x-axis).

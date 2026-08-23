@@ -45,7 +45,7 @@ function feed(): Node {
     return List({
         count: COUNT,
         rowHeight: h,
-        paging: 1,
+        paging: true,
         onVisible: function(i: int): void { visible.set(i) },
         key: function(r: int): string { return string(r) },
         item: function(r: int, top: int): Node {
