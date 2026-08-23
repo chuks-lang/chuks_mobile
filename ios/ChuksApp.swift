@@ -744,7 +744,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var alertActions: [String: String] = [:]                             // id -> button-dispatch action
     var presentedAlert: String? = nil                                    // the Alert id currently on screen
     var pressOpacity: [String: CGFloat] = [:]                              // id -> Pressable active alpha (0-1)
-    var pressGestures: [UILongPressGestureRecognizer: (String, CGFloat)] = [:]   // gesture -> (action, alpha)
+    var pressGestures: [UILongPressGestureRecognizer: (String, CGFloat, String)] = [:]   // gesture -> (action, alpha, id)
+    var longPressActions: [String: String] = [:]                          // id -> onLongPress action
+    var pressInActions: [String: String] = [:]                            // id -> onPressIn action
+    var pressOutActions: [String: String] = [:]                           // id -> onPressOut action
+    var pressLongTimers: [ObjectIdentifier: Timer] = [:]                  // gesture -> pending long-press timer
+    var pressLongFired = Set<ObjectIdentifier>()                          // gestures whose long-press already fired
+    var disabledIds = Set<String>()                                       // ids whose disabled=1 (block fire)
     var modalIds: Set<String> = []                                        // Modal node ids (full-screen overlays)
     var activeModal: String? = nil                                        // the currently-visible Modal
     var sheetModals: Set<String> = []                                     // Modal ids with position=bottom (draggable sheets)
@@ -1141,6 +1147,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
             case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }
             case "TB" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldBlur[tf] = f[1] + ":blur" }
+            case "TL" where f.count >= 2: longPressActions[f[1]] = f[1] + ":longpress"   // Pressable onLongPress
+            case "TPI" where f.count >= 2: pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
+            case "TPO" where f.count >= 2: pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -1892,6 +1901,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "p":   YGNodeStyleSetPadding(n, YGEdge.all, f)
             case "gap": YGNodeStyleSetGap(n, YGGutter.all, f)
             case "press": pressOpacity[id] = CGFloat(f) / 100     // Pressable active alpha
+            case "nlines": if let l = label { l.numberOfLines = Int(f); if let n = ynodes[id] { YGNodeMarkDirty(n) } }   // Text: cap lines
+            case "ellip": if let l = label {                       // Text truncation mode
+                switch val { case "head": l.lineBreakMode = .byTruncatingHead; case "middle": l.lineBreakMode = .byTruncatingMiddle
+                case "clip": l.lineBreakMode = .byClipping; default: l.lineBreakMode = .byTruncatingTail } }
+            case "dis":   // disabled: dim + block interaction (checked at fire time, since bindAction re-enables interaction)
+                v.alpha = (val == "1") ? 0.4 : 1.0
+                if let b = v as? UIButton { b.isEnabled = (val != "1") }
+                if val == "1" { disabledIds.insert(id) } else { disabledIds.remove(id) }
             case "sec": (v as? UITextField)?.isSecureTextEntry = (val == "1")   // password field
             case "kbt": if let tf = field {
                 switch val { case "email": tf.keyboardType = .emailAddress; case "number": tf.keyboardType = .numberPad
@@ -2190,7 +2207,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let g = UILongPressGestureRecognizer(target: self, action: #selector(handlePress(_:)))
             g.minimumPressDuration = 0
             v.addGestureRecognizer(g)
-            pressGestures[g] = (action, ao)
+            pressGestures[g] = (action, ao, id)
             return
         }
         let g = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
@@ -2199,7 +2216,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     @objc func handleButton(_ b: UIButton) { if let a = buttonActions[b] { fire(a) } }
-    @objc func handleTap(_ g: UITapGestureRecognizer) { if let a = taps[g] { fire(a) } }
+    @objc func handleTap(_ g: UITapGestureRecognizer) { if let a = taps[g], !disabledIds.contains(a) { fire(a) } }
     // A native value event from a Switch node: dispatch, then the re-render syncs the
     // control back to Chuks state (the controlled pattern, like Input).
     @objc func handleSwitch(_ sw: UISwitch) { if let a = switchActions[sw] { fire(a) } }
@@ -2207,13 +2224,29 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // ended inside the view (TouchableOpacity semantics). minimumPressDuration=0 makes
     // .began fire the instant the finger lands.
     @objc func handlePress(_ g: UILongPressGestureRecognizer) {
-        guard let v = g.view, let (action, ao) = pressGestures[g] else { return }
+        guard let v = g.view, let (action, ao, id) = pressGestures[g] else { return }
+        if disabledIds.contains(id) { return }   // disabled Pressable: no dim, no fire
+        let gid = ObjectIdentifier(g)
         switch g.state {
         case .began:
             UIView.animate(withDuration: 0.09) { v.alpha = ao }
+            if let pin = pressInActions[id] { fire(pin) }
+            // onLongPress: after the delay, fire it and suppress the release's onPress.
+            if let lp = longPressActions[id] {
+                pressLongFired.remove(gid)
+                pressLongTimers[gid]?.invalidate()
+                pressLongTimers[gid] = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+                    guard let self = self else { return }
+                    self.pressLongFired.insert(gid); self.fire(lp)
+                }
+            }
         case .ended, .cancelled, .failed:
             UIView.animate(withDuration: 0.09) { v.alpha = 1.0 }
-            if g.state == .ended && v.bounds.contains(g.location(in: v)) { fire(action) }
+            pressLongTimers[gid]?.invalidate(); pressLongTimers[gid] = nil
+            if let po = pressOutActions[id] { fire(po) }
+            // Fire onPress only on a real release inside, and not if a long-press already fired.
+            if g.state == .ended && v.bounds.contains(g.location(in: v)) && !pressLongFired.contains(gid) { fire(action) }
+            pressLongFired.remove(gid)
         default: break
         }
     }

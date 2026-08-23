@@ -81,6 +81,9 @@ export class Style {
     var maxLen: int     // max characters (-1 = unlimited)
     var stick: int      // Scroll: 1 = stick to bottom (chat) when content grows / keyboard opens (-1 = no)
     var horiz: int      // Scroll/List: 1 = scroll horizontally (a carousel); -1 = vertical (default)
+    var nlines: int     // Text: max lines before truncation (-1 = unlimited / wrap freely)
+    var ellip: string   // Text truncation: "tail"|"head"|"middle"|"clip" ("" = tail default)
+    var disabled: int   // interactive controls: 1 = disabled (dimmed, no press); -1 = enabled
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -97,6 +100,7 @@ export class Style {
         this.vidPlay = -1; this.vidLoop = -1; this.vidMute = -1; this.vidFit = ""; this.paging = -1
         this.kbType = ""; this.retKey = ""; this.editable = -1; this.autoFocus = -1
         this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1; this.horiz = -1
+        this.nlines = -1; this.ellip = ""; this.disabled = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -146,6 +150,9 @@ export class Style {
         if (this.maxLen >= 0) { s = s + "maxlen=" + string(this.maxLen) + ";" }
         if (this.stick >= 0) { s = s + "stick=" + string(this.stick) + ";" }
         if (this.horiz >= 0) { s = s + "horiz=" + string(this.horiz) + ";" }
+        if (this.nlines >= 0) { s = s + "nlines=" + string(this.nlines) + ";" }
+        if (this.ellip != "") { s = s + "ellip=" + this.ellip + ";" }
+        if (this.disabled >= 0) { s = s + "dis=" + string(this.disabled) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -197,11 +204,16 @@ export class Node {
     var onSubmit: any
     var onFocus: any
     var onBlur: any
+    // Pressable/Button gesture events (kept `any` like onPress).
+    var onLongPress: any
+    var onPressIn: any
+    var onPressOut: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
         this.comp = null; this.produced = null; this.ckey = ""
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
+        this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -357,6 +369,9 @@ function applyLayout(s: Style, p: map[string]Prop): void {
 function applyEvents(n: Node, p: map[string]Prop): void {
     const op: Prop? = p.get("onPress"); if (op != null) { n.onPress = op }
     const oc: Prop? = p.get("onChange"); if (oc != null) { n.onChange = oc }
+    const ol: Prop? = p.get("onLongPress"); if (ol != null) { n.onLongPress = ol }
+    const oi: Prop? = p.get("onPressIn"); if (oi != null) { n.onPressIn = oi }
+    const oo: Prop? = p.get("onPressOut"); if (oo != null) { n.onPressOut = oo }
 }
 /**
  * A horizontal row (flex-direction: row): lays its children left-to-right.
@@ -418,7 +433,11 @@ export function View(p: map[string]Prop, kids: []Node): Node {
  */
 export function Text(p: map[string]Prop, t: string): Node {
     const s: Style = new Style(); applyLayout(s, p)
-    return mkText(s, t)
+    s.nlines = pInt(p, "numberOfLines", -1)          // cap lines (truncates the overflow)
+    s.ellip = pStr(p, "ellipsizeMode", "")           // "tail"|"head"|"middle"|"clip"
+    const n: Node = mkText(s, t)
+    applyEvents(n, p)                                 // onPress makes the text tappable (a link)
+    return n
 }
 /**
  * A circular icon backed by an SF Symbol.
@@ -546,6 +565,7 @@ export function CameraView(p: map[string]Prop): Node {
  */
 export function Button(p: map[string]Prop, t: string): Node {
     const s: Style = new Style(); s.fw = "bold"; applyLayout(s, p)
+    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     const n: Node = mkButton(s, t); applyEvents(n, p); return n
 }
 /**
@@ -685,9 +705,10 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
 export function Pressable(p: map[string]Prop, kids: []Node): Node {
     const s: Style = new Style(); s.dir = "col"
     s.press = pInt(p, "activeOpacity", 60)
+    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     applyLayout(s, p)
     const n: Node = mkView(s, kids)
-    applyEvents(n, p)
+    applyEvents(n, p)   // onPress + onLongPress + onPressIn/onPressOut
     return n
 }
 /**
@@ -1417,6 +1438,9 @@ export class Reconciler {
         if (n.onSubmit != null) { this.handlers[id + ":submit"] = n.onSubmit; this.emit("TS|" + id) }
         if (n.onFocus != null) { this.handlers[id + ":focus"] = n.onFocus; this.emit("TF|" + id) }
         if (n.onBlur != null) { this.handlers[id + ":blur"] = n.onBlur; this.emit("TB|" + id) }
+        if (n.onLongPress != null) { this.handlers[id + ":longpress"] = n.onLongPress; this.emit("TL|" + id) }
+        if (n.onPressIn != null) { this.handlers[id + ":pressin"] = n.onPressIn; this.emit("TPI|" + id) }
+        if (n.onPressOut != null) { this.handlers[id + ":pressout"] = n.onPressOut; this.emit("TPO|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1493,6 +1517,9 @@ export class Reconciler {
         if (next.onSubmit != null) { this.handlers[id + ":submit"] = next.onSubmit }
         if (next.onFocus != null) { this.handlers[id + ":focus"] = next.onFocus }
         if (next.onBlur != null) { this.handlers[id + ":blur"] = next.onBlur }
+        if (next.onLongPress != null) { this.handlers[id + ":longpress"] = next.onLongPress }
+        if (next.onPressIn != null) { this.handlers[id + ":pressin"] = next.onPressIn }
+        if (next.onPressOut != null) { this.handlers[id + ":pressout"] = next.onPressOut }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)

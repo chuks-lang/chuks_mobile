@@ -639,6 +639,9 @@ struct NodeData {
     var submitAction: String = ""
     var focusAction: String = ""
     var blurAction: String = ""
+    var longPressAction: String = ""
+    var pressInAction: String = ""
+    var pressOutAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -934,6 +937,9 @@ final class Scene: ObservableObject {
             case "TS" where f.count >= 2: nodes[f[1]]?.submitAction = f[1] + ":submit"
             case "TF" where f.count >= 2: nodes[f[1]]?.focusAction = f[1] + ":focus"
             case "TB" where f.count >= 2: nodes[f[1]]?.blurAction = f[1] + ":blur"
+            case "TL" where f.count >= 2: nodes[f[1]]?.longPressAction = f[1] + ":longpress"
+            case "TPI" where f.count >= 2: nodes[f[1]]?.pressInAction = f[1] + ":pressin"
+            case "TPO" where f.count >= 2: nodes[f[1]]?.pressOutAction = f[1] + ":pressout"
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -1572,20 +1578,42 @@ struct PressAction: ViewModifier {
     let action: String
     let activeOpacity: Double
     let scene: Scene
+    var longPress = ""
+    var pressIn = ""
+    var pressOut = ""
+    var disabled = false
     @State private var pressed = false
+    @State private var longFired = false
+    @State private var longTask: DispatchWorkItem? = nil
     func body(content: Content) -> some View {
-        content
+        if disabled {
+            return AnyView(content.contentShape(Rectangle()).opacity(0.4))
+        }
+        return AnyView(content
             .contentShape(Rectangle())
             .opacity(pressed ? activeOpacity : 1.0)
             .animation(.easeOut(duration: 0.09), value: pressed)
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
-                    .onChanged { _ in pressed = true }
+                    .onChanged { _ in
+                        if pressed { return }        // .onChanged fires repeatedly; act on the first
+                        pressed = true
+                        if !pressIn.isEmpty { scene.dispatch(pressIn) }
+                        if !longPress.isEmpty {      // fire onLongPress after the hold delay
+                            longFired = false
+                            let task = DispatchWorkItem { longFired = true; scene.dispatch(longPress) }
+                            longTask = task
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: task)
+                        }
+                    }
                     .onEnded { _ in
                         pressed = false
-                        if !action.isEmpty { scene.dispatch(action) }
+                        longTask?.cancel(); longTask = nil
+                        if !pressOut.isEmpty { scene.dispatch(pressOut) }
+                        if !action.isEmpty && !longFired { scene.dispatch(action) }
+                        longFired = false
                     }
-            )
+            ))
     }
 }
 
@@ -2058,15 +2086,20 @@ struct NodeView: View {
 
     var body: some View {
         if let node = scene.nodes[id] {
-            // A Pressable (press-feedback hint) gets instant press dim + onPress.
+            let disabled = node.style["dis"] == "1"
+            // A Pressable (press-feedback hint) gets instant press dim + onPress + gesture events.
             if let po = node.style["press"] {
                 render(node).modifier(PressAction(action: node.action,
                                                   activeOpacity: Double(numOf(po) ?? 60) / 100.0,
-                                                  scene: scene))
+                                                  scene: scene,
+                                                  longPress: node.longPressAction,
+                                                  pressIn: node.pressInAction,
+                                                  pressOut: node.pressOutAction,
+                                                  disabled: disabled))
             } else {
                 // Button/Input/Switch wire their own action; any other actioned node
-                // (a View tab-bar item, chip, tappable card/row) gets a tap gesture.
-                let tap = (node.kind == "Button" || node.kind == "Input" || node.kind == "Switch") ? "" : node.action
+                // (a View tab-bar item, chip, tappable card/row, pressable Text) gets a tap gesture.
+                let tap = (disabled || node.kind == "Button" || node.kind == "Input" || node.kind == "Switch") ? "" : node.action
                 render(node).modifier(TapAction(action: tap, scene: scene))
             }
         }
@@ -2120,25 +2153,31 @@ struct NodeView: View {
         let align: TextAlignment = ta == "center" ? .center : (ta == "right" ? .trailing : .leading)
         // a grown text box aligns its text left/center/right per ta (default left)
         let boxAlign: Alignment = ta == "center" ? .center : (ta == "right" ? .trailing : .leading)
+        // numberOfLines caps the lines; ellipsizeMode picks how the overflow truncates.
+        let nlines = s["nlines"].flatMap { Int($0) }
+        let trunc: Text.TruncationMode = s["ellip"] == "head" ? .head : (s["ellip"] == "middle" ? .middle : .tail)
         return Text(node.text).font(textFont(s)).foregroundColor(color).multilineTextAlignment(align)
+            .lineLimit(nlines)
+            .truncationMode(trunc)
             .modifier(BoxStyle(s: s, parentRow: parentRow, align: boxAlign, parentStretch: parentStretch))
-            // A label is not interactive, but a grown label (`.frame(maxWidth:.infinity)`,
-            // e.g. a NavBar title) still occupies its full frame for hit-testing and can
-            // swallow taps meant for a sibling button (the theme toggle). Make labels
-            // tap-transparent; a genuinely tappable text still receives taps via the
-            // TapAction wrapper's contentShape applied outside in NodeView.body.
-            .allowsHitTesting(false)
+            // A plain label is tap-transparent so a grown label (`.frame(maxWidth:.infinity)`,
+            // e.g. a NavBar title) doesn't swallow taps meant for a sibling button. A pressable
+            // Text (onPress -> node.action set) must stay hittable so its TapAction fires.
+            .allowsHitTesting(!node.action.isEmpty)
     }
 
     func buttonView(_ node: NodeData) -> some View {
         let s = node.style
         let color = s["fg"].map { hexColor($0) } ?? Color.white
         let action = node.action
+        let disabled = s["dis"] == "1"
         return Button(action: { if !action.isEmpty { scene.dispatch(action) } }) {
             Text(node.text).font(textFont(s)).foregroundColor(color)
                 .frame(maxWidth: numOf(s["g"]) != nil ? .infinity : nil)
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.4 : 1.0)   // dim when disabled
         .modifier(BoxStyle(s: s, parentRow: parentRow, parentStretch: parentStretch))
     }
 

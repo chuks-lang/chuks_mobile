@@ -376,6 +376,9 @@ class MainActivity : Activity() {
                 "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
                 "TF" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldFocus[it] = f[1] + ":focus" }
                 "TB" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldBlur[it] = f[1] + ":blur" }
+                "TL" -> if (f.size >= 2) longPressActions[f[1]] = f[1] + ":longpress"   // Pressable onLongPress
+                "TPI" -> if (f.size >= 2) pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
+                "TPO" -> if (f.size >= 2) pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
@@ -1307,6 +1310,10 @@ class MainActivity : Activity() {
     private val bgRadius = HashMap<String, Float>()
     private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a translucent frosted panel
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
+    private val longPressActions = HashMap<String, String>()   // id -> onLongPress action
+    private val pressInActions = HashMap<String, String>()     // id -> onPressIn action
+    private val pressOutActions = HashMap<String, String>()    // id -> onPressOut action
+    private val disabledIds = HashSet<String>()                // ids whose disabled=1 (block fire)
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
@@ -1411,6 +1418,16 @@ class MainActivity : Activity() {
                 "paging" -> (v as? SnapScrollView)?.pageSnap = (vl == "1")   // List/Scroll snap-per-screen
                 "stick" -> if (v is ScrollView) stickBottomOn = (vl == "1")   // Scroll stickBottom (chat)
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
+                "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (UIKit/SwiftUI do), an explicit `ellip` overrides
+                    it.maxLines = f.toInt()
+                    if (it.ellipsize == null) it.ellipsize = android.text.TextUtils.TruncateAt.END
+                    measureText(id, it) }
+                "ellip" -> (v as? TextView)?.let {                                                    // Text truncation mode
+                    it.ellipsize = when (vl) { "head" -> android.text.TextUtils.TruncateAt.START
+                        "middle" -> android.text.TextUtils.TruncateAt.MIDDLE
+                        "clip" -> null; else -> android.text.TextUtils.TruncateAt.END } }
+                "dis" -> { v.alpha = if (vl == "1") 0.4f else 1f; v.isEnabled = (vl != "1")            // disabled: dim + block
+                    if (vl == "1") disabledIds.add(id) else disabledIds.remove(id) }
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {
                         it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -2267,21 +2284,41 @@ class MainActivity : Activity() {
                 val ao = pressOpacity[id]
                 if (ao != null) {
                     // Pressable: dim on touch-down, restore on release/cancel, fire only
-                    // if released inside (TouchableOpacity). Instant, no round-trip.
+                    // if released inside (TouchableOpacity). Instant, no round-trip. Also
+                    // dispatches onPressIn/onPressOut and onLongPress (after a hold).
                     v.isClickable = true
+                    val longRunnable = arrayOfNulls<Runnable>(1)
+                    val longFired = booleanArrayOf(false)
                     v.setOnTouchListener { view, ev ->
+                        if (disabledIds.contains(id)) return@setOnTouchListener true   // disabled: swallow, no fire
                         when (ev.action) {
-                            MotionEvent.ACTION_DOWN -> { view.animate().alpha(ao).setDuration(90).start(); true }
-                            MotionEvent.ACTION_UP -> {
-                                view.animate().alpha(1f).setDuration(90).start()
-                                if (ev.x >= 0 && ev.y >= 0 && ev.x <= view.width && ev.y <= view.height) fire(action)
+                            MotionEvent.ACTION_DOWN -> {
+                                view.animate().alpha(ao).setDuration(90).start()
+                                pressInActions[id]?.let { fire(it) }
+                                longPressActions[id]?.let { lp ->
+                                    longFired[0] = false
+                                    val r = Runnable { longFired[0] = true; fire(lp) }
+                                    longRunnable[0] = r; view.postDelayed(r, 500)
+                                }
                                 true
                             }
-                            MotionEvent.ACTION_CANCEL -> { view.animate().alpha(1f).setDuration(90).start(); true }
+                            MotionEvent.ACTION_UP -> {
+                                view.animate().alpha(1f).setDuration(90).start()
+                                longRunnable[0]?.let { view.removeCallbacks(it) }
+                                pressOutActions[id]?.let { fire(it) }
+                                if (!longFired[0] && ev.x >= 0 && ev.y >= 0 && ev.x <= view.width && ev.y <= view.height) fire(action)
+                                true
+                            }
+                            MotionEvent.ACTION_CANCEL -> {
+                                view.animate().alpha(1f).setDuration(90).start()
+                                longRunnable[0]?.let { view.removeCallbacks(it) }
+                                pressOutActions[id]?.let { fire(it) }
+                                true
+                            }
                             else -> false
                         }
                     }
-                } else { v.isClickable = true; v.setOnClickListener { fire(action) } }
+                } else { v.isClickable = true; v.setOnClickListener { if (!disabledIds.contains(id)) fire(action) } }
             }
         }
     }

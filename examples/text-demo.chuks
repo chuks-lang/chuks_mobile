@@ -1,0 +1,70 @@
+// P3: Text truncation (numberOfLines + ellipsizeMode), pressable text (onPress), a disabled
+// button, and a long-press card (onLongPress). A vertical Scroll of labelled cards.
+import { NavStack, Node, Column, Row, Text, Button, Pressable, Scroll, setSafeInsets } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
+import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
+import { setPlatformInfo } from "../core/platform.chuks";
+
+const LONG: string = "The quick brown fox jumps over the lazy dog, then keeps on running past the fence, across the field, and all the way down to the river where it finally stops to rest."
+
+function card(title: string, body: Node): Node {
+    return Column({ bg: tk("surface"), radius: 14, pad: 14, gap: 6 }, [
+        Text({ color: tk("muted"), size: 12, weight: "bold" }, title),
+        body,
+    ])
+}
+
+function screen(): Node {
+    const log: Cell = useState("tap something")
+    const enabled: Cell = useState(false)
+
+    return Column({ grow: 1, bg: tk("bg") }, [
+        Column({ bg: tk("surface"), pad: 14 }, [
+            Text({ color: tk("text"), size: 20, weight: "bold" }, "Text & press"),
+            Text({ color: tk("primary"), size: 13 }, string(log.get())),
+        ]),
+        Scroll({ grow: 1 }, [ Column({ pad: 12, gap: 12 }, [
+            // Android wraps/truncates only with a bounded width (like all Yoga-measured text),
+            // so give these a `w`; UIKit/SwiftUI honor it too.
+            card("numberOfLines: 2 (tail)", Text({ color: tk("text"), size: 15, w: 300, numberOfLines: 2 }, LONG)),
+            card("numberOfLines: 1, ellipsizeMode: middle", Text({ color: tk("text"), size: 15, w: 300, numberOfLines: 1, ellipsizeMode: "middle" }, LONG)),
+            card("full text (no cap)", Text({ color: tk("text"), size: 15, w: 300 }, LONG)),
+            card("pressable text (onPress)", Text({ color: tk("primary"), size: 16, weight: "bold", onPress: function(): void { log.set("link tapped") } }, "Tap this link")),
+            card("long-press card (onLongPress)", Pressable({ bg: tk("bg"), radius: 10, pad: 16, onPress: function(): void { log.set("pressed") }, onLongPress: function(): void { log.set("LONG pressed") } }, [
+                Text({ color: tk("text"), size: 15 }, "Press, or hold for long-press"),
+            ])),
+            card("disabled button", Row({ gap: 10, align: "center" }, [
+                Button({ bg: tk("primary"), w: 140, h: 44, disabled: !bool(enabled.get()), onPress: function(): void { log.set("button!") } }, "Submit"),
+                Button({ bg: tk("surface"), w: 120, h: 44, onPress: function(): void { enabled.set(!bool(enabled.get())) } }, bool(enabled.get()) ? "disable" : "enable"),
+            ])),
+        ]) ]),
+    ])
+}
+
+function createRoot(): NavStack {
+    var routes: map[string]function(): Node = {}
+    routes["home"] = function(): Node { return screen() }
+    return new NavStack(routes, "home")
+}
+
+var APP = createRoot()
+
+export function set_count(x: int): void { APP.setup(x) }
+export function mount(): int { return APP.mount() }
+export function remount(): int { return APP.remount() }
+export function setViewport(top: int, height: int, width: int): int { return APP.setViewport(top, height, width) }
+export function tick(): int { return APP.tick() }
+export function dispatch(action: string): int { return APP.dispatch(action) }
+export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
+export function drain(): string { return APP.drain() }
+export function saveState(): string { return APP.saveState() }
+export function loadState(data: string): void { APP.loadState(data) }
+export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
+export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
+export function setPlatform(os: string, version: string, model: string, isTablet: int): void {
+    setPlatformInfo(os, version, model, isTablet == 1)
+}
