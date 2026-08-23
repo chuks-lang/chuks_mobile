@@ -116,6 +116,8 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private var listScroll: ScrollView? = null
     private var scrollId = ""
+    private var stickBottomOn = false   // Scroll stickBottom: keep pinned to newest (chat)
+    private var stickPrevH = 0          // previous content height, to tell if the user was at the bottom
     private val modalIds = HashSet<String>()             // Modal node ids (full-screen overlays)
     private var activeModal: String? = null              // the currently-visible Modal
     private val sheetModals = HashSet<String>()          // Modal ids with position=bottom (draggable sheets)
@@ -144,6 +146,10 @@ class MainActivity : Activity() {
     private val alertIds = HashSet<String>()              // Alert node ids (native AlertDialog)
     private val alertData = HashMap<String, List<String>>()  // id -> [title, message, confirm, cancel]
     private val alertActions = HashMap<String, String>()  // id -> button-dispatch action
+    private val fieldSubmit = HashMap<android.widget.EditText, String>()  // onSubmit tag (IME action / enter)
+    private val fieldFocus = HashMap<android.widget.EditText, String>()   // onFocus tag
+    private val fieldBlur = HashMap<android.widget.EditText, String>()    // onBlur tag
+    private var fieldSelfSet = false                                      // guard: a controlled value.set is not a user edit
     private var presentedAlertId: String? = null          // Alert id currently on screen
     private var presentedAlertDialog: android.app.AlertDialog? = null
     // Bounded in-memory LRU (1/8 of the app heap) so a big image feed can't blow memory.
@@ -231,9 +237,19 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         density = resources.displayMetrics.density
+        // Keyboard avoidance: adjustResize shrinks the window content when the keyboard
+        // shows, so a bottom input bar rises above it (set here too, not only in the
+        // manifest, in case the manifest is regenerated from app.json).
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
+        // Re-layout when the root's own size changes (keyboard show/hide, rotation): the
+        // Chuks tree is laid out to root.height, so the shrink reflows content above the
+        // keyboard. Child layout changes don't resize root, so this never loops.
+        root.addOnLayoutChangeListener { _, l, t, r, bo, ol, ot, or2, ob ->
+            if ((bo - t) != (ob - ot) || (r - l) != (or2 - ol)) { relayout(); pushViewport() }
+        }
         intent?.data?.let { lastUrl = it.toString() }   // deep link that launched the app
 
         // DEV hot reload: assets/chuks-dev.txt (written by a DEV=1 build) points at the
@@ -330,7 +346,11 @@ class MainActivity : Activity() {
                 "C" -> if (f.size >= 3) make(f[1], f[2])
                 "S" -> if (f.size >= 3) style(f[1], f[2])
                 "P" -> if (f.size >= 3) setText(f[1], f[2])
+                "V" -> if (f.size >= 3) setFieldValue(f[1], f.drop(2).joinToString("|"))   // controlled value (may contain '|')
                 "T" -> if (f.size >= 3) bindAction(f[1], f[2])
+                "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
+                "TF" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldFocus[it] = f[1] + ":focus" }
+                "TB" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldBlur[it] = f[1] + ":blur" }
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
                 "X" -> if (f.size >= 3) {
@@ -1122,16 +1142,21 @@ class MainActivity : Activity() {
             }
             "Button" -> Button(this).also { it.setPadding(0, 0, 0, 0); it.gravity = Gravity.CENTER
                 it.setOnClickListener { fire((it as View).getTag(TAG) as? String ?: "") } }
-            "Input" -> EditText(this).also {
-                it.setSingleLine(); it.setPadding(dp(10), 0, dp(10), 0)
-                it.addTextChangedListener(object : TextWatcher {
+            "Input" -> EditText(this).also { ed ->
+                ed.setSingleLine(); ed.setPadding(dp(10), 0, dp(10), 0)
+                ed.addTextChangedListener(object : TextWatcher {
                     override fun afterTextChanged(s: Editable?) {}
                     override fun beforeTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
                     override fun onTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {
-                        val action = it.getTag(TAG) as? String ?: return
-                        applyStream(engInput(action, it.text.toString()))
-                        listScroll?.scrollTo(0, 0); relayout()
-                    } }) }
+                        if (fieldSelfSet) return   // a controlled value.set, not a user edit
+                        val action = ed.getTag(TAG) as? String ?: return
+                        applyStream(engInput(action, ed.text.toString()))
+                        relayout()
+                    } })
+                ed.setOnEditorActionListener { _, _, _ -> fieldSubmit[ed]?.let { hostEvent(it) }; true }   // onSubmit (IME action)
+                ed.onFocusChangeListener = View.OnFocusChangeListener { _, has ->
+                    if (has) fieldFocus[ed]?.let { hostEvent(it) } else fieldBlur[ed]?.let { hostEvent(it) }
+                } }
             "Alert" -> View(this).also { alertIds.add(id) }   // invisible placeholder; the OS dialog shows on avis=1
             "TextArea" -> EditText(this).also {
                 it.setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -1350,6 +1375,7 @@ class MainActivity : Activity() {
                 }
                 "vfit" -> {}                    // cover is the default; contain reserved for a later slice
                 "paging" -> (v as? SnapScrollView)?.pageSnap = (vl == "1")   // List/Scroll snap-per-screen
+                "stick" -> if (v is ScrollView) stickBottomOn = (vl == "1")   // Scroll stickBottom (chat)
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {
@@ -1357,6 +1383,41 @@ class MainActivity : Activity() {
                         it.transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
                     }
                 }
+                "kbt" -> (v as? EditText)?.let {
+                    val it2 = android.text.InputType.TYPE_CLASS_TEXT
+                    it.inputType = when (vl) {
+                        "email" -> android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+                        "number" -> android.text.InputType.TYPE_CLASS_NUMBER
+                        "decimal" -> android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+                        "phone" -> android.text.InputType.TYPE_CLASS_PHONE
+                        "url" -> android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
+                        else -> it2 }
+                    it.setSingleLine()
+                }
+                "ret" -> (v as? EditText)?.let {
+                    it.imeOptions = when (vl) {
+                        "send" -> android.view.inputmethod.EditorInfo.IME_ACTION_SEND
+                        "search" -> android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+                        "next" -> android.view.inputmethod.EditorInfo.IME_ACTION_NEXT
+                        "go" -> android.view.inputmethod.EditorInfo.IME_ACTION_GO
+                        else -> android.view.inputmethod.EditorInfo.IME_ACTION_DONE }
+                }
+                "edit" -> (v as? EditText)?.let { it.isEnabled = (vl == "1"); it.isFocusable = (vl == "1"); it.isFocusableInTouchMode = (vl == "1") }
+                "afoc" -> if (vl == "1") (v as? EditText)?.let { it.post { it.requestFocus(); (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)?.showSoftInput(it, 0) } }
+                "acap" -> (v as? EditText)?.let {
+                    val base = it.inputType and android.text.InputType.TYPE_MASK_FLAGS.inv()
+                    val cap = when (vl) {
+                        "sentences" -> android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                        "words" -> android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS
+                        "characters" -> android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+                        else -> 0 }
+                    it.inputType = base or cap
+                }
+                "acor" -> (v as? EditText)?.let {
+                    it.inputType = if (vl == "1") it.inputType or android.text.InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
+                                   else it.inputType and android.text.InputType.TYPE_TEXT_FLAG_AUTO_CORRECT.inv()
+                }
+                "maxlen" -> (v as? EditText)?.let { val n = vl.toIntOrNull() ?: -1; if (n >= 0) it.filters = arrayOf(android.text.InputFilter.LengthFilter(n)) }
                 "sbh" -> setStatusBarHidden(vl == "1")   // StatusBar: hide/show
                 "sbstyle" -> setStatusBarStyle(vl)       // StatusBar: light/dark icons
                 "sbcolor" -> setStatusBarColor(vl)       // StatusBar: background color
@@ -1578,6 +1639,19 @@ class MainActivity : Activity() {
             idle.addLast(mp)
         } else {
             killVideo(mp)
+        }
+    }
+
+    // A controlled TextInput's value. Set the native text ONLY when it differs (the field
+    // is controlled, so the same value re-emits every keystroke) to avoid fighting the user;
+    // fieldSelfSet stops the TextWatcher from reporting this programmatic change as an edit.
+    private fun setFieldValue(id: String, value: String) {
+        val ed = views[id] as? android.widget.EditText ?: return
+        if (ed.text.toString() != value) {
+            fieldSelfSet = true
+            ed.setText(value)
+            ed.setSelection(value.length)   // cursor to end
+            fieldSelfSet = false
         }
     }
 
@@ -2333,6 +2407,15 @@ class MainActivity : Activity() {
             }
         } else clearSheetChrome()
         root.requestLayout()
+        // stickBottom (chat): after layout settles, keep the transcript pinned to the newest
+        // message if the user was already at the bottom (new message, or the keyboard shrinking).
+        if (stickBottomOn) listScroll?.let { sc -> sc.post {
+            val child = if (sc.childCount > 0) sc.getChildAt(0) else null
+            val newH = child?.height ?: 0
+            val wasAtBottom = sc.scrollY + sc.height >= stickPrevH - dp(20)
+            if (wasAtBottom && newH > sc.height) sc.smoothScrollTo(0, newH - sc.height)
+            stickPrevH = newH
+        } }
         root.post { updateVideoVisibility() }   // recompute on-screen videos once positions settle
     }
 

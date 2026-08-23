@@ -632,6 +632,13 @@ struct NodeData {
     var style: [String: String] = [:]
     var children: [String] = []
     var action: String = ""
+    // Controlled TextInput: `val` is the text, `hasVal` marks it controlled; the extra
+    // input events carry their dispatch tags.
+    var val: String = ""
+    var hasVal: Bool = false
+    var submitAction: String = ""
+    var focusAction: String = ""
+    var blurAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -918,7 +925,11 @@ final class Scene: ObservableObject {
                 nodes[f[1]]?.style = parseStyle(f[2])
                 if nodes[f[1]]?.kind == "StatusBar" { applyStatusBar(nodes[f[1]]!.style) }
             case "P" where f.count >= 3: nodes[f[1]]?.text = f[2]
+            case "V" where f.count >= 3: nodes[f[1]]?.val = f[2...].joined(separator: "|"); nodes[f[1]]?.hasVal = true
             case "T" where f.count >= 3: nodes[f[1]]?.action = f[2]
+            case "TS" where f.count >= 2: nodes[f[1]]?.submitAction = f[1] + ":submit"
+            case "TF" where f.count >= 2: nodes[f[1]]?.focusAction = f[1] + ":focus"
+            case "TB" where f.count >= 2: nodes[f[1]]?.blurAction = f[1] + ":blur"
             case "I" where f.count >= 4:
                 let id = f[1], parent = f[2], idx = Int(f[3]) ?? 0
                 if parent != "root", nodes[parent] != nil {
@@ -1560,23 +1571,57 @@ struct ChuksInput: View {
     let placeholder: String
     let action: String
     let style: [String: String]
+    let value: String
+    let hasVal: Bool
+    let submitAction: String
+    let focusAction: String
+    let blurAction: String
     let parentRow: Bool
     let parentStretch: Bool
     @State private var text: String = ""
-    var body: some View {
-        Group {
-            if style["sec"] == "1" { SecureField(placeholder, text: $text) }   // password field
-            else { TextField(placeholder, text: $text) }
-        }
-            .onChange(of: text) { newVal in if !action.isEmpty { scene.input(action, newVal) } }
+    @FocusState private var focused: Bool
+    @ViewBuilder private var field: some View {
+        if style["sec"] == "1" { SecureField(placeholder, text: $text) }   // password field
+        else { TextField(placeholder, text: $text) }
+    }
+    private var configured: some View {
+        field
+            .focused($focused)
+            .disabled(style["edit"] == "0")
+            .keyboardType(swKeyboardType(style["kbt"]))
             .textFieldStyle(.plain)
-            .autocorrectionDisabled(true)
-            .textInputAutocapitalization(.never)
-            .submitLabel(.done)
+            .autocorrectionDisabled(style["acor"] != "1")
+            .textInputAutocapitalization(swAutocap(style["acap"]))
+            .submitLabel(swSubmitLabel(style["ret"]))
             .font(textFont(style))
             .foregroundColor(style["fg"].map { hexColor($0) } ?? .primary)
+    }
+    var body: some View {
+        configured
+            .onAppear { if hasVal { text = value } }
+            // Controlled: mirror the engine value into the field (only when it differs,
+            // so typing doesn't fight the binding); report edits back to the engine.
+            .onChange(of: value) { nv in if hasVal && text != nv { text = nv } }
+            .onChange(of: text) { newVal in if !action.isEmpty { scene.input(action, newVal) } }
+            .onChange(of: focused) { f in
+                if f { if !focusAction.isEmpty { scene.dispatch(focusAction) } }
+                else { if !blurAction.isEmpty { scene.dispatch(blurAction) } }
+            }
+            .onSubmit { if !submitAction.isEmpty { scene.dispatch(submitAction) } }
             .modifier(BoxStyle(s: style, parentRow: parentRow, parentStretch: parentStretch))
     }
+}
+
+func swKeyboardType(_ v: String?) -> UIKeyboardType {
+    switch v { case "email": return .emailAddress; case "number": return .numberPad; case "decimal": return .decimalPad
+    case "phone": return .phonePad; case "url": return .URL; default: return .default }
+}
+func swSubmitLabel(_ v: String?) -> SubmitLabel {
+    switch v { case "send": return .send; case "search": return .search; case "next": return .next
+    case "go": return .go; case "done": return .done; default: return .done }
+}
+func swAutocap(_ v: String?) -> TextInputAutocapitalization {
+    switch v { case "sentences": return .sentences; case "words": return .words; case "characters": return .characters; default: return .never }
 }
 
 // A native value slider that owns its value across re-renders (stable @State,
@@ -1904,6 +1949,7 @@ struct ChuksScroll: View {
                 }
             }
             .modifier(ScrollPaging(enabled: style["paging"] == "1"))   // snap per screen (video feeds)
+            .modifier(StickBottom(enabled: style["stick"] == "1"))     // pin to newest (chat)
             .onAppear { scene.viewport(0, Int32(outer.size.height)) }
             // Pull-to-refresh when the Scroll has an onRefresh (its style carries `rfsh`).
             .refreshable {
@@ -1913,6 +1959,17 @@ struct ChuksScroll: View {
             }
         }
         .modifier(BoxStyle(s: style, parentRow: parentRow, parentStretch: parentStretch))
+    }
+}
+
+// Chat stick-to-bottom: anchor the scroll to the bottom so new messages appear at the
+// bottom and the view stays pinned there (iOS 17+; a no-op on older, where the content
+// still scrolls, just without the auto-pin).
+struct StickBottom: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled, #available(iOS 17.0, *) { content.defaultScrollAnchor(.bottom) }
+        else { content }
     }
 }
 
@@ -2060,8 +2117,10 @@ struct NodeView: View {
     func inputView(_ node: NodeData) -> some View {
         // Uncontrolled like the UIKit host: the field owns its text (its own @State),
         // reports every change to the engine, and node.text is the placeholder.
-        ChuksInput(scene: scene, placeholder: node.text, action: node.action,
-                   style: node.style, parentRow: parentRow, parentStretch: parentStretch)
+        ChuksInput(scene: scene, placeholder: node.text, action: node.action, style: node.style,
+                   value: node.val, hasVal: node.hasVal, submitAction: node.submitAction,
+                   focusAction: node.focusAction, blurAction: node.blurAction,
+                   parentRow: parentRow, parentStretch: parentStretch)
     }
 
     // A native SwiftUI Toggle. Controlled: `isOn` reads the Chuks state (style "on");
@@ -2225,9 +2284,11 @@ struct RootView: View {
             ZStack(alignment: .topLeading) {
                 hexColor(appBg).ignoresSafeArea()
                 if scene.nodes["app"] != nil {
+                    // NB: do NOT ignoresSafeArea(.keyboard) here — that disables SwiftUI's
+                    // automatic keyboard avoidance, which is what lifts a bottom input bar
+                    // above the keyboard. It only shrinks the layout while a field is focused.
                     NodeView(scene: scene, id: "app")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .ignoresSafeArea(.keyboard, edges: .bottom)
                 }
                 if !scene.sbColor.isEmpty {   // StatusBar color: fill the top safe area
                     hexColor(scene.sbColor)

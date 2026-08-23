@@ -9,6 +9,9 @@ import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo, isAndroid } from "../core/platform.chuks";
 import { connect, WebSocketClient, WSClientOptionsBuilder } from "pkg/@chuks/websocket";
 
+// Point this at the machine running `chuks run examples/echo-server.chuks`:
+//   iOS simulator: ws://localhost:8899   Android emulator: ws://10.0.2.2:8899
+//   a physical device (iOS/Android) on the same WiFi: ws://<your-mac-LAN-IP>:8899
 function wsUrl(): string { return isAndroid() ? "ws://10.0.2.2:8899" : "ws://localhost:8899" }
 
 var CLIENT: WebSocketClient? = null
@@ -28,11 +31,12 @@ function MessageBubble(text: string, mine: bool): Node {
 // ── Composable primitive: the input bar ──────────────────────────────────────
 // A grow-to-fill field + a Send button. The field is uncontrolled, so a bump of
 // `resetKey` remounts it empty after a send. onType keeps the draft; onSend fires it.
-function ChatInput(onType: function(v: string): void, onSend: function(): void): Node {
-    // The field grows to fill; the Send button keeps a comfortable touch target.
-    // onChange keeps the draft; onPress sends.
+function ChatInput(value: string, onType: function(v: string): void, onSend: function(): void): Node {
+    // Controlled field: it always shows `value` (the draft), so clearing the draft after a
+    // send clears the field. onSubmit + returnKeyType make the keyboard's return key send.
     return Row({ bg: tk("surface"), pad: 10, gap: 8, align: "center" }, [
-        TextInput({ placeholder: "Message", bg: tk("bg"), color: tk("text"), grow: 1, h: 48, onChange: onType }),
+        TextInput({ placeholder: "Message", bg: tk("bg"), color: tk("text"), grow: 1, h: 48,
+                    value: value, returnKeyType: "send", onChange: onType, onSubmit: onSend }),
         Button({ bg: tk("primary"), w: 96, h: 48, onPress: onSend }, "Send"),
     ])
 }
@@ -76,8 +80,8 @@ function chat(): Node {
             Text({ color: tk("text"), size: 20, weight: "bold" }, "Echo bot"),
             Text({ color: tk("muted"), size: 13 }, "online"),
         ]),
-        Scroll({ grow: 1 }, [ Column({ pad: 12, gap: 6 }, bubbles) ]),
-        ChatInput(function(v: string): void { draft.set(v) }, send),
+        Scroll({ grow: 1, stickBottom: true }, [ Column({ pad: 12, gap: 6 }, bubbles) ]),
+        ChatInput(string(draft.get()), function(v: string): void { draft.set(v) }, send),
     ])
 }
 

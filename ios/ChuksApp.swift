@@ -679,6 +679,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
     var scrollId = ""
+    var stickBottomOn = false        // Scroll stickBottom: keep pinned to newest (chat)
+    var stickPrevH: CGFloat = 0      // previous content height, to tell if the user was at the bottom
     var contentId = ""
 
     let header = UILabel()                              // host diagnostics only (not app UI)
@@ -710,6 +712,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var perfWarmup = 150        // unmeasured frames to prime players + steady state
     var buttonActions: [UIButton: String] = [:]
     var fieldActions: [UITextField: String] = [:]
+    var fieldSubmit: [UITextField: String] = [:]   // onSubmit tag (return key)
+    var fieldFocus: [UITextField: String] = [:]    // onFocus tag (began editing)
+    var fieldBlur: [UITextField: String] = [:]     // onBlur tag (ended editing)
+    var fieldMaxLen: [UITextField: Int] = [:]      // maxLength (enforced in shouldChangeCharacters)
     var switchActions: [UISwitch: String] = [:]
     var sliderActions: [UISlider: String] = [:]
     var datePickerActions: [UIDatePicker: String] = [:]                   // DatePicker -> onChange action
@@ -1032,6 +1038,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let app = ynodes["app"] { YGNodeFreeRecursive(app) }   // frees the whole subtree
         views.removeAll(); ynodes.removeAll()
         taps.removeAll(); buttonActions.removeAll(); fieldActions.removeAll(); switchActions.removeAll(); sliderActions.removeAll()
+        fieldSubmit.removeAll(); fieldFocus.removeAll(); fieldBlur.removeAll(); fieldMaxLen.removeAll()
         selectIds.removeAll(); selectOptions.removeAll(); selectSel.removeAll(); selectActions.removeAll()
         textAreaActions.removeAll(); textAreaPlaceholders.removeAll()
         alertIds.removeAll(); alertData.removeAll(); alertActions.removeAll(); presentedAlert = nil
@@ -1049,7 +1056,19 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     // return key dismisses the keyboard
-    func textFieldShouldReturn(_ tf: UITextField) -> Bool { tf.resignFirstResponder(); return true }
+    func textFieldShouldReturn(_ tf: UITextField) -> Bool {
+        if let t = fieldSubmit[tf] { fire(t) }   // onSubmit (return key)
+        tf.resignFirstResponder(); return true
+    }
+    func textFieldDidBeginEditing(_ tf: UITextField) { if let t = fieldFocus[tf] { fire(t) } }
+    func textFieldDidEndEditing(_ tf: UITextField) { if let t = fieldBlur[tf] { fire(t) } }
+    // Enforce maxLength on a single-line field.
+    func textField(_ tf: UITextField, shouldChangeCharactersIn range: NSRange, replacementString string: String) -> Bool {
+        guard let max = fieldMaxLen[tf], max >= 0 else { return true }
+        let cur = tf.text ?? ""
+        let next = (cur as NSString).replacingCharacters(in: range, with: string)
+        return next.count <= max
+    }
 
     // Dismiss the keyboard when tapping outside any field.
     @objc func dismissKeyboard() { view.endEditing(true) }
@@ -1113,7 +1132,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "C" where f.count >= 3: make(f[1], f[2])
             case "S" where f.count >= 3: style(f[1], f[2])
             case "P" where f.count >= 3: setText(f[1], f[2])
+            case "V" where f.count >= 3: setFieldValue(f[1], f[2...].joined(separator: "|"))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
+            case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
+            case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }
+            case "TB" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldBlur[tf] = f[1] + ":blur" }
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
             case "X" where f.count >= 3:
@@ -1604,6 +1627,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         self.present(vc, animated: true)
     }
 
+    // A controlled TextInput's value. Set the native text ONLY when it differs, so
+    // re-emitting the same value (every keystroke, since the field is controlled) does
+    // not move the cursor. Clearing (value = "") resets the field.
+    func setFieldValue(_ id: String, _ value: String) {
+        if let tf = views[id] as? UITextField { if tf.text != value { tf.text = value } }
+        else if let tv = views[id] as? UITextView { if tv.text != value { tv.text = value } }
+    }
+
     func setText(_ id: String, _ t: String) {
         if selectIds.contains(id) {                                  // a Select's "text" is its tab-joined options
             selectOptions[id] = t.components(separatedBy: "\t")
@@ -1838,6 +1869,21 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "gap": YGNodeStyleSetGap(n, YGGutter.all, f)
             case "press": pressOpacity[id] = CGFloat(f) / 100     // Pressable active alpha
             case "sec": (v as? UITextField)?.isSecureTextEntry = (val == "1")   // password field
+            case "kbt": if let tf = field {
+                switch val { case "email": tf.keyboardType = .emailAddress; case "number": tf.keyboardType = .numberPad
+                case "decimal": tf.keyboardType = .decimalPad; case "phone": tf.keyboardType = .phonePad
+                case "url": tf.keyboardType = .URL; default: tf.keyboardType = .default } }
+            case "ret": if let tf = field {
+                switch val { case "done": tf.returnKeyType = .done; case "send": tf.returnKeyType = .send
+                case "search": tf.returnKeyType = .search; case "next": tf.returnKeyType = .next
+                case "go": tf.returnKeyType = .go; default: tf.returnKeyType = .default } }
+            case "edit": field?.isEnabled = (val == "1")
+            case "afoc": if val == "1", let tf = field { DispatchQueue.main.async { tf.becomeFirstResponder() } }
+            case "acap": if let tf = field {
+                switch val { case "none": tf.autocapitalizationType = .none; case "sentences": tf.autocapitalizationType = .sentences
+                case "words": tf.autocapitalizationType = .words; case "characters": tf.autocapitalizationType = .allCharacters; default: break } }
+            case "acor": field?.autocorrectionType = (val == "1") ? .yes : .no
+            case "maxlen": if let tf = field { fieldMaxLen[tf] = Int(val) ?? -1 }
             case "sbh": sbHiddenOverride = (val == "1"); setNeedsStatusBarAppearanceUpdate()
             case "sbstyle":
                 sbStyleOverride = (val == "light") ? .lightContent : (val == "dark" ? .darkContent : nil)
@@ -1939,6 +1985,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 (v as? VideoView)?.playerLayer.videoGravity = (val == "contain") ? .resizeAspect : .resizeAspectFill
             case "paging":   // List/Scroll snap-per-screen (video feeds)
                 (v as? UIScrollView)?.isPagingEnabled = (val == "1")
+            case "stick": if v is UIScrollView { stickBottomOn = (val == "1") }
             case "vloop":
                 if let p = videoPlayers[id] {
                     if val == "0" { videoNoLoop.insert(ObjectIdentifier(p)) } else { videoNoLoop.remove(ObjectIdentifier(p)) }
@@ -2050,7 +2097,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let prefix = id + "."
         for k in views.keys.filter({ $0 == id || $0.hasPrefix(prefix) }) {
             if let b = views[k] as? UIButton { buttonActions[b] = nil }
-            if let tf = views[k] as? UITextField { fieldActions[tf] = nil }
+            if let tf = views[k] as? UITextField { fieldActions[tf] = nil; fieldSubmit[tf] = nil; fieldFocus[tf] = nil; fieldBlur[tf] = nil; fieldMaxLen[tf] = nil }
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
             if let sl = views[k] as? UISlider { sliderActions[sl] = nil }
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
@@ -2387,6 +2434,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // the scroll's content size comes from its content node's laid-out size
         if let sc = listScroll, let cn = ynodes[contentId] {
             sc.contentSize = CGSize(width: CGFloat(YGNodeLayoutGetWidth(cn)), height: CGFloat(YGNodeLayoutGetHeight(cn)))
+            // stickBottom (chat): if the user was at the bottom before this layout, stay pinned
+            // to the new bottom (a new message, or the keyboard opening and shrinking the view).
+            if stickBottomOn {
+                let newH = sc.contentSize.height
+                let wasAtBottom = sc.contentOffset.y + sc.bounds.height >= stickPrevH - 40
+                if wasAtBottom && newH > sc.bounds.height {
+                    sc.setContentOffset(CGPoint(x: 0, y: newH - sc.bounds.height), animated: false)
+                }
+                stickPrevH = newH
+            }
         }
     }
 

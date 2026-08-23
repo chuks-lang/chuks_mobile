@@ -71,6 +71,15 @@ export class Style {
     var vidMute: int    // Video muted: 1 muted, 0 with sound (default 1)
     var vidFit: string  // Video resize: "" (cover) | "contain"
     var paging: int     // Scroll/List paging: 1 = snap per screen (full-cell), -1 = normal scroll
+    // TextInput config ("" / -1 = not set, keep the host default)
+    var kbType: string  // keyboard: "email"|"number"|"decimal"|"phone"|"url" ("" = default)
+    var retKey: string  // return key: "done"|"send"|"search"|"next"|"go" ("" = default)
+    var editable: int   // 0 = not editable, 1 = editable (-1 = default editable)
+    var autoFocus: int  // 1 = focus on mount (-1 = no)
+    var autoCap: string // "none"|"sentences"|"words"|"characters" ("" = default)
+    var autoCorr: int   // 0 = off, 1 = on (-1 = default)
+    var maxLen: int     // max characters (-1 = unlimited)
+    var stick: int      // Scroll: 1 = stick to bottom (chat) when content grows / keyboard opens (-1 = no)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -85,6 +94,8 @@ export class Style {
         this.dpmode = ""; this.dpdisp = ""
         this.tx = 0; this.ty = 0; this.rot = 0; this.scl = 100; this.animMs = -1; this.animEz = ""
         this.vidPlay = -1; this.vidLoop = -1; this.vidMute = -1; this.vidFit = ""; this.paging = -1
+        this.kbType = ""; this.retKey = ""; this.editable = -1; this.autoFocus = -1
+        this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -125,6 +136,14 @@ export class Style {
         if (this.vidMute >= 0) { s = s + "vmute=" + string(this.vidMute) + ";" }
         if (this.vidFit != "") { s = s + "vfit=" + this.vidFit + ";" }
         if (this.paging >= 0) { s = s + "paging=" + string(this.paging) + ";" }
+        if (this.kbType != "") { s = s + "kbt=" + this.kbType + ";" }
+        if (this.retKey != "") { s = s + "ret=" + this.retKey + ";" }
+        if (this.editable >= 0) { s = s + "edit=" + string(this.editable) + ";" }
+        if (this.autoFocus >= 0) { s = s + "afoc=" + string(this.autoFocus) + ";" }
+        if (this.autoCap != "") { s = s + "acap=" + this.autoCap + ";" }
+        if (this.autoCorr >= 0) { s = s + "acor=" + string(this.autoCorr) + ";" }
+        if (this.maxLen >= 0) { s = s + "maxlen=" + string(this.maxLen) + ";" }
+        if (this.stick >= 0) { s = s + "stick=" + string(this.stick) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -169,10 +188,18 @@ export class Node {
     var comp: any        // kind=="Comp": the component render fn () -> Node (lazy)
     var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
     var ckey: string     // kind=="Comp": explicit identity key (KeyedComp); "" = use path
+    // Controlled TextInput: `hasVal` marks the field controlled, `val` is its text.
+    // onSubmit/onFocus/onBlur are the extra input events (kept `any` like onPress).
+    var hasVal: bool
+    var val: string
+    var onSubmit: any
+    var onFocus: any
+    var onBlur: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
         this.comp = null; this.produced = null; this.ckey = ""
+        this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -529,11 +556,18 @@ export function Pill(p: map[string]Prop, t: string): Node {
  * A single-line text field. Pass `onChange` as a (string) -> void closure that
  * receives the current text on every edit. Renders as a light field by default.
  *
- * Props: `placeholder`, `onChange`, `bg` (default white "FFFFFF"), `color`, `h`.
+ * Props: `placeholder`, `value` (controlled), `onChange` ((string) -> void),
+ * `onSubmit` (() -> void, return key), `onFocus`, `onBlur`, `keyboardType`
+ * ("email"|"number"|"decimal"|"phone"|"url"), `returnKeyType`
+ * ("done"|"send"|"search"|"next"|"go"), `secure`, `multiline`, `editable` (default
+ * true), `autoFocus`, `maxLength`, `autoCapitalize` ("none"|"sentences"|"words"|
+ * "characters"), `autoCorrect`, `bg`, `color`, `h`.
  *
  * ```chuks
- * TextInput({ placeholder: "Filter services",
- *             onChange: function(v: string): void { self.setQuery(v) } })
+ * // Controlled: the field always shows `draft`; clear it by setting draft to "".
+ * TextInput({ value: draft.get(), keyboardType: "email", returnKeyType: "send",
+ *             onChange: function(v: string): void { draft.set(v) },
+ *             onSubmit: function(): void { send() } })
  * ```
  */
 export function TextInput(p: map[string]Prop): Node {
@@ -542,8 +576,21 @@ export function TextInput(p: map[string]Prop): Node {
     s.h = pInt(p, "h", multi ? 96 : 44); s.bg = pStr(p, "bg", "FFFFFF"); s.radius = 10
     s.fg = pStr(p, "color", "111318"); s.fs = 15; applyLayout(s, p)
     if (pBool(p, "secure", false)) { s.sec = 1 }    // password field: mask input
+    s.kbType = pStr(p, "keyboardType", "")
+    s.retKey = pStr(p, "returnKeyType", "")
+    if (p.get("editable") != null) { s.editable = pBool(p, "editable", true) ? 1 : 0 }
+    if (p.get("autoFocus") != null) { s.autoFocus = pBool(p, "autoFocus", false) ? 1 : 0 }
+    s.autoCap = pStr(p, "autoCapitalize", "")
+    if (p.get("autoCorrect") != null) { s.autoCorr = pBool(p, "autoCorrect", true) ? 1 : 0 }
+    s.maxLen = pInt(p, "maxLength", -1)
     // multiline swaps the native widget (UITextView / TextEditor / multiline EditText)
     const n: Node = multi ? mkTextArea(s, pStr(p, "placeholder", "")) : mkInput(s, pStr(p, "placeholder", ""))
+    // Controlled value: mark it so the reconciler emits the V| channel and the host
+    // mirrors the field to it (only when it differs, so the cursor never jumps).
+    if (p.get("value") != null) { n.hasVal = true; n.val = pStr(p, "value", "") }
+    n.onSubmit = p.get("onSubmit")
+    n.onFocus = p.get("onFocus")
+    n.onBlur = p.get("onBlur")
     applyEvents(n, p); return n
 }
 /**
@@ -601,6 +648,10 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
     const orf: Prop? = p.get("onRefresh")
     if (orf != null) { s.rfsh = pBool(p, "refreshing", false) ? 1 : 0 }
+    // stickBottom: a chat transcript stays pinned to the newest message. The host keeps the
+    // scroll at the bottom when content grows or the keyboard opens, unless the user has
+    // scrolled up to read history.
+    if (pBool(p, "stickBottom", false)) { s.stick = 1 }
     const n: Node = new Node("Scroll", s, "", kids)
     if (orf != null) { n.onPress = orf }
     return n
@@ -1332,6 +1383,10 @@ export class Reconciler {
         if (n.onPress != null) { this.handlers[id] = n.onPress; this.emit("T|" + id + "|" + id) }
         else if (n.onChange != null) { this.handlers[id] = n.onChange; this.emit("T|" + id + "|" + id) }
         else if (n.action != "") { this.emit("T|" + id + "|" + n.action) }
+        // Extra TextInput events, each a separate binding keyed by "<id>:<event>".
+        if (n.onSubmit != null) { this.handlers[id + ":submit"] = n.onSubmit; this.emit("TS|" + id) }
+        if (n.onFocus != null) { this.handlers[id + ":focus"] = n.onFocus; this.emit("TF|" + id) }
+        if (n.onBlur != null) { this.handlers[id + ":blur"] = n.onBlur; this.emit("TB|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1355,6 +1410,7 @@ export class Reconciler {
         const st: string = n.style.str()
         if (st != "") { this.emit("S|" + id + "|" + st) }
         if (n.text != "") { this.emit("P|" + id + "|" + n.text) }
+        if (n.hasVal) { this.emit("V|" + id + "|" + n.val) }   // controlled TextInput value
         this.bindEvents(n, id)
         this.emit("I|" + id + "|" + parent + "|" + string(index))
         for (var i: int = 0; i < n.kids.length; i = i + 1) {
@@ -1388,6 +1444,7 @@ export class Reconciler {
         if (next.kind == "List") { this.reconcileList(prev, next, id, parent, index); return }
         if (next.kind == "SectionList") { this.reconcileSectionList(prev, next, id, parent, index); return }
         if (p.text != next.text) { this.emit("P|" + id + "|" + next.text) }
+        if (next.hasVal && (!p.hasVal || p.val != next.val)) { this.emit("V|" + id + "|" + next.val) }
         const ps: string = p.style.str()
         const ns: string = next.style.str()
         if (ps != ns) { this.emit("S|" + id + "|" + ns) }
@@ -1403,6 +1460,9 @@ export class Reconciler {
         // the closure is recreated each render; rebind it (tag/id unchanged)
         if (next.onPress != null) { this.handlers[id] = next.onPress }
         else if (next.onChange != null) { this.handlers[id] = next.onChange }
+        if (next.onSubmit != null) { this.handlers[id + ":submit"] = next.onSubmit }
+        if (next.onFocus != null) { this.handlers[id + ":focus"] = next.onFocus }
+        if (next.onBlur != null) { this.handlers[id + ":blur"] = next.onBlur }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)
