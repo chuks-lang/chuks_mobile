@@ -1,35 +1,61 @@
-// Smoke-test for the Preview dev-server streaming-cap fix: a MOUNT-TIME stream
-// (Pulse.watch, started in useEffect) should tick continuously. If the counter
-// climbs, mount-time native streams are delivered over the dev server. Also proves
-// the tree renders (no blank screen) on connect and reconnect.
-import { NavStack, Node, Column, Text, Comp, setSafeInsets } from "../core/ui.chuks";
+// ChuksTok: a vertical full-screen paging video feed, COMPOSED from primitives (List +
+// Video), not a black box. The paging List reports the centered cell via onVisible; each
+// cell's Video plays only when it is the visible one. Swipe up/down -> the new clip autoplays,
+// the rest pause. This is the M1 proof that the composition model works.
+import { NavStack, Node, Column, Text, List, Video, Comp, setSafeInsets, viewportHeight } from "../core/ui.chuks";
 import { useState, useEffect, Cell } from "../core/state.chuks";
-import { Pulse, Battery } from "../core/native.chuks";
-import { NativeSub } from "../core/ui.chuks";
+import { DeviceInfo } from "../core/native.chuks";
 import { syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
 
-function screen(): Node {
-    const ticks: Cell = useState("0")
-    const batt: Cell = useState("?")
+// Real vertical (1080x1920) footage from Pexels, verified reachable from the device.
+var CLIPS: []string = [
+    "https://videos.pexels.com/video-files/4434150/4434150-hd_1080_1920_30fps.mp4",
+    "https://videos.pexels.com/video-files/5385885/5385885-hd_1080_1920_25fps.mp4",
+    "https://videos.pexels.com/video-files/2795405/2795405-hd_1080_1920_25fps.mp4",
+]
+
+function feed(): Node {
+    const visible: Cell = useState(0)
+    const sw: Cell = useState(400)
+    const sh: Cell = useState(800)
 
     useEffect(function(): any {
-        const s1: NativeSub = Pulse.watch(function(n: string): void { ticks.set(n) })
-        const s2: NativeSub = Battery.watch(function(b: string): void { batt.set(b) })
-        return function(): void { s1.cancel(); s2.cancel() }
+        DeviceInfo.screen(function(s: string): void {
+            const f: []string = s.split(",")   // "w,h,scale"
+            if (f.length >= 2) { sw.set(int(f[0])); sh.set(int(f[1])) }
+        })
+        return function(): void {}
     }, [])
 
-    return Column({ dir: "col", grow: 1, bg: "0E1116", pad: 24, gap: 12, justify: "center", align: "center" }, [
-        Text({ size: 26, weight: "bold", color: "FFFFFF", ta: "center" }, "Mount-time stream"),
-        Text({ size: 15, color: "9CA3AF", ta: "center" }, "Pulse.watch ticks (started in useEffect)"),
-        Text({ size: 72, weight: "bold", color: "60A5FA", ta: "center" }, string(ticks.get())),
-        Text({ size: 15, color: "9CA3AF", ta: "center" }, "battery: " + string(batt.get())),
-    ])
+    const w: int = int(sw.get())
+    // rowHeight MUST equal the scroll's real page height (viewportHeight), or paging snaps
+    // between cells and the last clip can't be scrolled fully into view. Fall back to the
+    // screen height only for the first frame, before the host reports a viewport.
+    const vph: int = viewportHeight()
+    const h: int = vph > 0 ? vph : int(sh.get())
+    const vis: int = int(visible.get())
+
+    return List({
+        count: CLIPS.length,
+        rowHeight: h,
+        paging: 1,
+        onVisible: function(i: int): void { visible.set(i) },
+        key: function(r: int): string { return string(r) },
+        item: function(r: int, top: int): Node {
+            return Column({ abs: true, top: top, left: 0, w: w, h: h, bg: "000000" }, [
+                Video({ src: CLIPS[r], playing: r == vis, loop: true, muted: true, resizeMode: "cover",
+                        abs: true, top: 0, left: 0, w: w, h: h }),   // explicit fill (grow:1 is unreliable inside an abs cell)
+                Text({ abs: true, top: h - 130, left: 20, color: "FFFFFF", size: 22, weight: "bold" },
+                     "clip " + string(r + 1) + (r == vis ? "   playing" : "   paused")),
+            ])
+        },
+    })
 }
 
 function createRoot(): NavStack {
     var routes: map[string]function(): Node = {}
-    routes["home"] = function(): Node { return Comp(screen) }
+    routes["home"] = function(): Node { return Comp(feed) }
     return new NavStack(routes, "home")
 }
 

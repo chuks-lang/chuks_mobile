@@ -65,6 +65,11 @@ export class Style {
     var scl: int        // transform scale as a percent (100 = 1.0)
     var animMs: int     // transition duration in ms for opacity/transform changes (-1 = no animation)
     var animEz: string  // transition easing: "" (ease) | "linear" | "spring"
+    var vidPlay: int    // Video playback: 1 play, 0 pause (default 1 = autoplay, backward-compatible)
+    var vidLoop: int    // Video loop: 1 loop, 0 play once (default 1)
+    var vidMute: int    // Video muted: 1 muted, 0 with sound (default 1)
+    var vidFit: string  // Video resize: "" (cover) | "contain"
+    var paging: int     // Scroll/List paging: 1 = snap per screen (full-cell), -1 = normal scroll
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -78,6 +83,7 @@ export class Style {
         this.seli = -1; this.avis = -1; this.resize = ""; this.prog = -1; this.rfsh = -1
         this.dpmode = ""; this.dpdisp = ""
         this.tx = 0; this.ty = 0; this.rot = 0; this.scl = 100; this.animMs = -1; this.animEz = ""
+        this.vidPlay = -1; this.vidLoop = -1; this.vidMute = -1; this.vidFit = ""; this.paging = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -111,6 +117,13 @@ export class Style {
         if (this.wrap != "") { s = s + "wrap=" + this.wrap + ";" }
         if (this.font != "") { s = s + "font=" + this.font + ";" }
         if (this.vid != "") { s = s + "vid=" + this.vid + ";" }
+        // Video-only: always emit when set (>=0) so toggling `playing` back on re-applies
+        // (a removed key would never resume). -1 = not a Video, stays out of every other style.
+        if (this.vidPlay >= 0) { s = s + "vplay=" + string(this.vidPlay) + ";" }
+        if (this.vidLoop >= 0) { s = s + "vloop=" + string(this.vidLoop) + ";" }
+        if (this.vidMute >= 0) { s = s + "vmute=" + string(this.vidMute) + ";" }
+        if (this.vidFit != "") { s = s + "vfit=" + this.vidFit + ";" }
+        if (this.paging >= 0) { s = s + "paging=" + string(this.paging) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -226,7 +239,7 @@ export unionType Prop = int | string | bool | function(): void | function(v: str
 // List-specific signatures, so they get their own union, distinct from Prop. The
 // last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
 // item(s,r,top)->Node; its header(s,top)->Node reuses (int,int)->Node above.
-export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node
+export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void
 
 // ---- Named-prop component builders (the JSX-like API) ----------------------
 // Compose with named props + children + closures:
@@ -255,6 +268,11 @@ export function safeTop(): int { return _safeTop }
 export function safeRight(): int { return _safeRight }
 export function safeBottom(): int { return _safeBottom }
 export function safeLeft(): int { return _safeLeft }
+// The scroll viewport height (points) the host last reported. This is the REAL height a
+// paging List pages by (screen minus safe areas / chrome), so a full-screen feed should
+// size its cells to this, NOT to DeviceInfo.screen (that mismatch offsets every page).
+var _vpH: int = 0
+export function viewportHeight(): int { return _vpH }
 // Read an int config value `k` from a List's ListProp map, or `def` if absent.
 function lpInt(d: map[string]ListProp, k: string, def: int): int { const v: ListProp? = d.get(k); if (v != null) { return int(v) } return def }
 // Copy the layout/visual props onto a Style. Each pInt/pStr defaults to the
@@ -381,9 +399,20 @@ export function Text(p: map[string]Prop, t: string): Node {
  * Video({ src: "sample.mp4", h: 320, radius: 12 })
  * ```
  */
+/**
+ * A video surface. Controllable like RN's Video so you can compose a feed: put one in
+ * each cell of a paging List and drive `playing` from the visible index.
+ * Props: `src` (bundled name, "file://…", or http(s) URL), `playing` (default true),
+ * `loop` (default true), `muted` (default true), `resizeMode` ("cover" | "contain").
+ */
 export function Video(p: map[string]Prop): Node {
     const s: Style = new Style(); applyLayout(s, p)
     s.vid = pStr(p, "src", "")
+    // Always set (default on) so these are emitted for every Video and stay controllable.
+    s.vidPlay = pBool(p, "playing", true) ? 1 : 0
+    s.vidLoop = pBool(p, "loop", true) ? 1 : 0
+    s.vidMute = pBool(p, "muted", true) ? 1 : 0
+    s.vidFit = pStr(p, "resizeMode", "cover")
     return new Node("Video", s, "", [])
 }
 export function Icon(p: map[string]Prop): Node {
@@ -1158,12 +1187,15 @@ export class Reconciler {
     var pendingErr: map[string]any  // async bridge: token -> OPTIONAL error closure (host reports a failure)
     var streamTokens: map[string]bool // async bridge: token -> true if a STREAM (fires repeatedly; not dropped on fire)
     var tokenSeq: int               // async bridge: monotonic token counter
+    var listVisible: map[string]int // List id -> last centered row index reported to its onVisible
+    var pendingVisible: []any       // onVisible closures queued this frame, fired after render (see flushVisible)
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
         this.cellRank = {}; this.poolSize = 0
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
+        this.listVisible = {}; this.pendingVisible = []
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1184,6 +1216,17 @@ export class Reconciler {
     public drain(): string { return this.lines.join("\n") }
     // Record the visible scroll window used by reconcileList to pick the mount range.
     public setViewport(top: int, h: int): void { this.vpTop = top; this.vpH = h }
+    // Fire any onVisible callbacks queued during this render (a paging List's centered row
+    // changed). Called AFTER renderRoot so the closures can setState safely; returns true if
+    // any fired, so the caller re-renders to reflect the new state (e.g. play the settled cell).
+    public flushVisible(): bool {
+        if (this.pendingVisible.length == 0) { return false }
+        const cbs: []any = this.pendingVisible
+        this.pendingVisible = []
+        var i: int = 0
+        while (i < cbs.length) { const cb: any = cbs[i]; cb(); i = i + 1 }
+        return true
+    }
     // Reconcile the whole app tree from the root; the app calls this after any
     // state change and the memoization makes everything unchanged bail.
     public renderRoot(next: Node): void {
@@ -1395,6 +1438,7 @@ export class Reconciler {
             // down): start from a clean pool so stale cells can't suppress mounts.
             this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
             const listS: Style = new Style(); listS.grow = 1; listS.basis = 0
+            if (lpInt(d, "paging", 0) == 1) { listS.paging = 1 }   // snap per screen (video feeds)
             this.emit("C|" + id + "|Scroll"); this.emit("S|" + id + "|" + listS.str())
             this.emit("I|" + id + "|" + parent + "|" + string(index))
             const cS: Style = new Style(); cS.h = contentH
@@ -1448,6 +1492,21 @@ export class Reconciler {
         // stale top — reusable next frame. They keep their cellRank, so if that rank
         // scrolls back in they're kept in place. No churn.
         this.mounted = newMounted
+
+        // onVisible: report the centered row (the one under the middle of the viewport) when
+        // it changes, so a feed can set that cell's Video playing = true. Queued, not called
+        // inline, so the closure's setState runs after this render (see flushVisible).
+        const vf: any = d.get("onVisible")
+        if (vf != null && count > 0 && stride > 0) {
+            var centered: int = (this.vpTop + this.vpH / 2 - pad) / stride
+            if (centered < 0) { centered = 0 }
+            if (centered >= count) { centered = count - 1 }
+            if (centered != this.listVisible.getOr(id, -1)) {
+                this.listVisible[id] = centered
+                const idx: int = centered
+                this.pendingVisible.push(function(): void { vf(idx) })
+            }
+        }
     }
 
     // Like reconcileList but SECTIONED: sections each contribute a header (headerH)
@@ -1576,7 +1635,15 @@ export class App {
     public remount(): int { this.recon.forgetCommitted(); return this.mount() }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
     public setViewport(top: int, h: int): int {
-        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        if (h > 0) { _vpH = h }   // expose the real viewport height (viewportHeight()) for full-screen feeds
+        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
+        // then re-render (WITHOUT begin, so the windowing mutations above are kept) so the newly
+        // visible cell's state change (e.g. Video playing) lands in the same frame.
+        if (this.recon.flushVisible()) {
+            hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        }
+        return this.recon.count()
     }
     // Advance one frame: onTick() then re-render. Returns the mutation count.
     public tick(): int { this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }

@@ -633,6 +633,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var videoPlayerKey: [String: String] = [:]        // node id -> resource key (for pooling)
     var videoPool: [String: [AVPlayer]] = [:]         // idle, still-primed players by resource
     var videoObs: [ObjectIdentifier: NSObjectProtocol] = [:]  // player -> loop observer (persists across reuse)
+    var videoNoLoop = Set<ObjectIdentifier>()         // players whose Video set loop=false (checked in the end observer)
     let videoPoolCap = 16                             // bound idle players kept warm
     // Perf harness: auto-scroll the feed while a CADisplayLink measures real frame times.
     var displayLink: CADisplayLink?
@@ -1811,21 +1812,40 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     var player: AVPlayer? = nil
                     if var idle = videoPool[val], !idle.isEmpty {
                         player = idle.removeLast(); videoPool[val] = idle       // reuse (no alloc)
-                    } else if let url = (val.hasPrefix("http") ? URL(string: val) : Bundle.main.url(forResource: val, withExtension: nil)) {
-                        let item = AVPlayerItem(url: url)
-                        let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
-                        let obs = NotificationCenter.default.addObserver(
-                            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak p] _ in
-                                p?.seek(to: .zero); p?.play()
+                    } else {
+                        // http(s) -> remote; file:// -> captured/downloaded; else a bundled asset.
+                        let url: URL? = val.hasPrefix("http") ? URL(string: val)
+                                      : val.hasPrefix("file://") ? URL(fileURLWithPath: String(val.dropFirst(7)))
+                                      : Bundle.main.url(forResource: val, withExtension: nil)
+                        if let url = url {
+                            let item = AVPlayerItem(url: url)
+                            let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
+                            let obs = NotificationCenter.default.addObserver(
+                                forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self, weak p] _ in
+                                    guard let p = p else { return }
+                                    if self?.videoNoLoop.contains(ObjectIdentifier(p)) != true { p.seek(to: .zero); p.play() }
+                            }
+                            videoObs[ObjectIdentifier(p)] = obs
+                            player = p
                         }
-                        videoObs[ObjectIdentifier(p)] = obs
-                        player = p
                     }
                     if let player = player {
                         vv.playerLayer.player = player
                         videoPlayers[id] = player; videoPlayerKey[id] = val
-                        player.play()
+                        player.play()   // default autoplay; a later vplay=0 pauses it
                     }
+                }
+            case "vplay":   // controllable playback: vplay=0 pauses (feed cells drive this)
+                if let p = videoPlayers[id] { if val == "0" { p.pause() } else { p.play() } }
+            case "vmute":
+                videoPlayers[id]?.isMuted = (val != "0")
+            case "vfit":
+                (v as? VideoView)?.playerLayer.videoGravity = (val == "contain") ? .resizeAspect : .resizeAspectFill
+            case "paging":   // List/Scroll snap-per-screen (video feeds)
+                (v as? UIScrollView)?.isPagingEnabled = (val == "1")
+            case "vloop":
+                if let p = videoPlayers[id] {
+                    if val == "0" { videoNoLoop.insert(ObjectIdentifier(p)) } else { videoNoLoop.remove(ObjectIdentifier(p)) }
                 }
             case "r":   v.clipsToBounds = !hasShadow
                         // A huge radius (rounded-full) is a pill: clamp to height/2 in

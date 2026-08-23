@@ -218,26 +218,55 @@ final class LoopingPlayerView: UIView {
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
     private var player: AVPlayer?
     private var looper: NSObjectProtocol?
+    private var statusObs: NSKeyValueObservation?
     private var currentSrc = ""
-    func configure(_ src: String) {
-        guard src != currentSrc, !src.isEmpty else { return }
-        // http(s) URL -> remote; otherwise a bundled asset (e.g. clip.mp4).
-        let url: URL? = src.hasPrefix("http") ? URL(string: src) : Bundle.main.url(forResource: src, withExtension: nil)
-        guard let url = url else { return }
-        teardown()
-        currentSrc = src
-        let item = AVPlayerItem(url: url)
-        let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
-        looper = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
-                                                        object: item, queue: .main) { [weak p] _ in
-            p?.seek(to: .zero); p?.play()
+    private var url: URL?
+    private var loop = true
+    private var wantPlaying = true
+    private var wantMuted = true
+    private var retries = 0
+    // Controllable like RN's Video: `playing`/`loop`/`muted`/`fit` apply on every update, so a
+    // recycled feed cell can pause/resume by flipping `playing`. Only a src change rebuilds the item.
+    func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String) {
+        self.loop = loop; self.wantPlaying = playing; self.wantMuted = muted
+        playerLayer.videoGravity = (fit == "contain") ? .resizeAspect : .resizeAspectFill
+        if src != currentSrc, !src.isEmpty {
+            // http(s) -> remote; file:// -> a captured/downloaded file; else a bundled asset.
+            let u: URL? = src.hasPrefix("http") ? URL(string: src)
+                        : src.hasPrefix("file://") ? URL(fileURLWithPath: String(src.dropFirst(7)))
+                        : Bundle.main.url(forResource: src, withExtension: nil)
+            if let u = u { currentSrc = src; url = u; retries = 0; loadItem() }
         }
-        playerLayer.player = p
-        playerLayer.videoGravity = .resizeAspectFill
-        p.play(); player = p
+        player?.isMuted = muted
+        if playing { player?.play() } else { player?.pause() }
+    }
+    private func loadItem() {
+        guard let u = url else { return }
+        teardown()
+        let item = AVPlayerItem(url: u)
+        let p = AVPlayer(playerItem: item); p.actionAtItemEnd = .none
+        looper = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
+                                                        object: item, queue: .main) { [weak self, weak p] _ in
+            if self?.loop == true { p?.seek(to: .zero); p?.play() }
+        }
+        // Self-heal a failed load: a transient "network down" (the sim hits this at launch, and
+        // any device can on a flaky connection) leaves the item .failed and the card black
+        // forever. Recreate the item with a short backoff, a few times, so it recovers.
+        // Self-heal a FAILED load: a transient network error leaves the item .failed and the
+        // card black forever, so recreate it with a short backoff a few times. (This does not
+        // touch a slow-but-still-loading item, so it never interrupts a working slow connection.)
+        statusObs = item.observe(\.status, options: [.new]) { [weak self] it, _ in
+            guard let self = self, it.status == .failed, self.retries < 5 else { return }
+            self.retries += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4 * Double(self.retries)) { [weak self] in self?.loadItem() }
+        }
+        playerLayer.player = p; player = p
+        p.isMuted = wantMuted
+        if wantPlaying { p.play() }
     }
     private func teardown() {
         player?.pause()
+        statusObs?.invalidate(); statusObs = nil
         if let l = looper { NotificationCenter.default.removeObserver(l); looper = nil }
         player = nil; playerLayer.player = nil
     }
@@ -246,10 +275,17 @@ final class LoopingPlayerView: UIView {
 
 struct ChuksVideo: UIViewRepresentable {
     let src: String
+    let playing: Bool
+    let loop: Bool
+    let muted: Bool
+    let fit: String
     func makeUIView(context: Context) -> LoopingPlayerView {
-        let v = LoopingPlayerView(); v.clipsToBounds = true; v.configure(src); return v
+        let v = LoopingPlayerView(); v.clipsToBounds = true
+        v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit); return v
     }
-    func updateUIView(_ uiView: LoopingPlayerView, context: Context) { uiView.configure(src) }
+    func updateUIView(_ uiView: LoopingPlayerView, context: Context) {
+        uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit)
+    }
 }
 
 // A native web view (WKWebView) loading a URL from the node's text channel.
@@ -1751,6 +1787,16 @@ struct ScrollOffsetReader: UIViewRepresentable {
     }
 }
 
+// Snap-per-screen paging for a Scroll/List (video feeds). iOS 17+ pages by the viewport
+// height via scrollTargetBehavior; older iOS falls back to normal scrolling.
+struct ScrollPaging: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled, #available(iOS 17.0, *) { content.scrollTargetBehavior(.paging) }
+        else { content }
+    }
+}
+
 // A Chuks List/Scroll: a ScrollView whose child is the fixed-height content node
 // (its items are absolutely positioned). It reports the visible window (offset +
 // height) to the engine, which mounts/recycles rows to match (virtualization).
@@ -1771,6 +1817,7 @@ struct ChuksScroll: View {
                     NodeView(scene: scene, id: cid, parentRow: false, parentStretch: true)
                 }
             }
+            .modifier(ScrollPaging(enabled: style["paging"] == "1"))   // snap per screen (video feeds)
             .onAppear { scene.viewport(0, Int32(outer.size.height)) }
             // Pull-to-refresh when the Scroll has an onRefresh (its style carries `rfsh`).
             .refreshable {
@@ -1969,7 +2016,12 @@ struct NodeView: View {
     }
 
     func videoView(_ node: NodeData) -> some View {
-        ChuksVideo(src: node.style["vid"] ?? "")
+        let s = node.style
+        return ChuksVideo(src: s["vid"] ?? "",
+                          playing: s["vplay"] != "0",   // default = playing
+                          loop: s["vloop"] != "0",
+                          muted: s["vmute"] != "0",
+                          fit: s["vfit"] ?? "")
             .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
     }
 

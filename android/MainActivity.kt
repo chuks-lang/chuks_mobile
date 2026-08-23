@@ -1200,7 +1200,7 @@ class MainActivity : Activity() {
                 sw.measure(spec, spec)
                 N.ySetF(n, 5, sw.measuredWidth.toFloat()); N.ySetF(n, 6, sw.measuredHeight.toFloat())
             }
-            "Scroll" -> ScrollView(this).also { sc ->
+            "Scroll" -> SnapScrollView(this).also { sc ->
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility() }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
@@ -1306,6 +1306,20 @@ class MainActivity : Activity() {
                     (if (vl == "right") Gravity.END else if (vl == "center") Gravity.CENTER else Gravity.START) or Gravity.CENTER_VERTICAL
                 "font" -> customFont = vl
                 "vid" -> videoWanted[id] = vl   // a Video node wants this clip; a player is attached only while it's on screen (see updateVideoVisibility)
+                "vplay" -> {                    // controllable playback: vplay=0 pauses (feed cells drive this)
+                    val want = vl != "0"; videoPlayPref[id] = want
+                    videoPlayers[id]?.let { try { if (want) it.start() else if (it.isPlaying) it.pause() } catch (e: Exception) {} }
+                }
+                "vmute" -> {
+                    val muted = vl != "0"; videoMutePref[id] = muted
+                    videoPlayers[id]?.setVolume(if (muted) 0f else 1f, if (muted) 0f else 1f)
+                }
+                "vloop" -> {
+                    val lp = vl != "0"; videoLoopPref[id] = lp
+                    videoPlayers[id]?.let { try { it.isLooping = lp } catch (e: Exception) {} }
+                }
+                "vfit" -> {}                    // cover is the default; contain reserved for a later slice
+                "paging" -> (v as? SnapScrollView)?.pageSnap = (vl == "1")   // List/Scroll snap-per-screen
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {
@@ -1416,6 +1430,9 @@ class MainActivity : Activity() {
     private val videoSizes = HashMap<MediaPlayer, Pair<Int, Int>>()   // player -> native video size
     private val videoAlive = HashSet<MediaPlayer>()                   // every live player (attached + pooled); its size IS the decoder count
     private val videoWanted = HashMap<String, String>()              // id -> asset for every mounted Video node (on- or off-screen)
+    private val videoPlayPref = HashMap<String, Boolean>()           // id -> controllable playing (default true); a feed cell drives this
+    private val videoMutePref = HashMap<String, Boolean>()           // id -> muted (default true)
+    private val videoLoopPref = HashMap<String, Boolean>()           // id -> loop (default true)
     private val visRect = android.graphics.Rect()
 
     // Decode only the videos actually on screen. The virtualized window mounts a
@@ -1450,15 +1467,17 @@ class MainActivity : Activity() {
             try {
                 if (asset.startsWith("http")) {
                     mp.setDataSource(asset)                  // remote URL
+                } else if (asset.startsWith("file://")) {
+                    mp.setDataSource(asset.substring(7))     // captured / downloaded file
                 } else {
                     val afd = assets.openFd(asset)           // bundled asset
                     mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
                     afd.close()
                 }
             } catch (e: Exception) { videoAlive.remove(mp); mp.release(); return }
-            mp.isLooping = true
-            mp.setVolume(0f, 0f)
-            mp.setOnPreparedListener { videoReady.add(it); it.start() }
+            mp.isLooping = videoLoopPref[id] ?: true
+            val muted0 = videoMutePref[id] ?: true; mp.setVolume(if (muted0) 0f else 1f, if (muted0) 0f else 1f)
+            mp.setOnPreparedListener { videoReady.add(it); if (videoPlayPref[id] != false) it.start() }
             mp.setOnVideoSizeChangedListener { _, w, h -> if (w > 0 && h > 0) { videoSizes[mp] = Pair(w, h); applyCover(tv, mp) } }
             // A decoder that fails (routine on the emulator's ~2-decoder ceiling)
             // must free its slot at once, or dead players pile up and clog the cap
@@ -1468,6 +1487,13 @@ class MainActivity : Activity() {
         videoPlayers[id] = mp
         videoKey[id] = asset
         bindSurface(tv, mp)
+        // Apply this node's control prefs. loop/mute are safe in any state; a reused player
+        // is already prepared so honor its play state now (a new one starts in onPrepared).
+        try { mp.isLooping = videoLoopPref[id] ?: true } catch (e: Exception) {}
+        val muted = videoMutePref[id] ?: true; try { mp.setVolume(if (muted) 0f else 1f, if (muted) 0f else 1f) } catch (e: Exception) {}
+        if (reused != null) {
+            try { if (videoPlayPref[id] == false) { if (mp.isPlaying) mp.pause() } else mp.start() } catch (e: Exception) {}
+        }
     }
 
     private fun bindSurface(tv: TextureView, mp: MediaPlayer) {
@@ -1875,6 +1901,33 @@ class MainActivity : Activity() {
         }
     }
 
+    // A ScrollView that snaps to the nearest full-screen page when paging is on (video feeds).
+    // Pure-platform (no androidx ViewPager2): after a drag/fling settles, smooth-scroll to the
+    // nearest multiple of the viewport height. Off by default = a normal ScrollView.
+    inner class SnapScrollView(ctx: Context) : ScrollView(ctx) {
+        var pageSnap = false
+        private var lastY = -1
+        private val settle = object : Runnable {
+            override fun run() {
+                if (!pageSnap) return
+                if (scrollY == lastY) {
+                    val ph = height
+                    if (ph > 0) {
+                        val target = Math.round(scrollY.toFloat() / ph) * ph
+                        if (target != scrollY) smoothScrollTo(0, target)
+                    }
+                } else { lastY = scrollY; postDelayed(this, 80) }
+            }
+        }
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            val handled = super.onTouchEvent(ev)
+            if (pageSnap && (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL)) {
+                lastY = -1; removeCallbacks(settle); postDelayed(settle, 80)
+            }
+            return handled
+        }
+    }
+
     private fun bytesToHex(b: ByteArray?): String {
         if (b == null) return ""
         val sb = StringBuilder(b.size * 2)
@@ -2055,7 +2108,7 @@ class MainActivity : Activity() {
         ynodes[id]?.let { val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
-        videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it) }
+        videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
         views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
