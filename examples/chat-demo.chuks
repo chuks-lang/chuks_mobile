@@ -3,7 +3,7 @@
 // with a Scroll + the @chuks/websocket client. Incoming messages arrive on the read pump's
 // task and are handed to the render thread with dispatchAsync (no locks). The demo talks to
 // a local echo server, so what you send comes back as the "bot" replying.
-import { NavStack, Node, Column, Row, Text, Scroll, TextInput, Button, KeyedComp, dispatchAsync, setSafeInsets } from "../core/ui.chuks";
+import { NavStack, Node, Column, Row, Text, Scroll, TextInput, Button, dispatchAsync, setSafeInsets } from "../core/ui.chuks";
 import { useState, useEffect, Cell } from "../core/state.chuks";
 import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo, isAndroid } from "../core/platform.chuks";
@@ -28,22 +28,18 @@ function MessageBubble(text: string, mine: bool): Node {
 // ── Composable primitive: the input bar ──────────────────────────────────────
 // A grow-to-fill field + a Send button. The field is uncontrolled, so a bump of
 // `resetKey` remounts it empty after a send. onType keeps the draft; onSend fires it.
-function ChatInput(resetKey: int, onType: function(v: string): void, onSend: function(): void): Node {
-    // The field grows to fill; the Send button keeps a comfortable touch target. The whole bar
-    // is wrapped in a KeyedComp whose key (resetKey) is bumped after a send, which remounts the
-    // (uncontrolled) field empty. onChange keeps the draft; onPress sends.
-    return KeyedComp(string(resetKey), function(): Node {
-        return Row({ bg: tk("surface"), pad: 10, gap: 8, align: "center" }, [
-            TextInput({ placeholder: "Message", bg: tk("bg"), color: tk("text"), grow: 1, h: 48, onChange: onType }),
-            Button({ bg: tk("primary"), w: 96, h: 48, onPress: onSend }, "Send"),
-        ])
-    })
+function ChatInput(onType: function(v: string): void, onSend: function(): void): Node {
+    // The field grows to fill; the Send button keeps a comfortable touch target.
+    // onChange keeps the draft; onPress sends.
+    return Row({ bg: tk("surface"), pad: 10, gap: 8, align: "center" }, [
+        TextInput({ placeholder: "Message", bg: tk("bg"), color: tk("text"), grow: 1, h: 48, onChange: onType }),
+        Button({ bg: tk("primary"), w: 96, h: 48, onPress: onSend }, "Send"),
+    ])
 }
 
 function chat(): Node {
     const msgs: Cell = useState([])        // []string, each "1<text>" (mine) or "0<text>" (bot)
     const draft: Cell = useState("")
-    const resetKey: Cell = useState(0)
 
     useEffect(function(): any {
         if (STARTED) { return function(): void {} }
@@ -64,7 +60,6 @@ function chat(): Node {
         if (c != null && c.isOpen()) { c.send(t) }
         const cur: []string = msgs.get(); cur.push("1" + t); msgs.set(cur)   // show mine immediately
         draft.set("")
-        resetKey.set(int(resetKey.get()) + 1)   // remount the field so it clears
     }
 
     const rows: []string = msgs.get()
@@ -82,7 +77,7 @@ function chat(): Node {
             Text({ color: tk("muted"), size: 13 }, "online"),
         ]),
         Scroll({ grow: 1 }, [ Column({ pad: 12, gap: 6 }, bubbles) ]),
-        ChatInput(int(resetKey.get()), function(v: string): void { draft.set(v) }, send),
+        ChatInput(function(v: string): void { draft.set(v) }, send),
     ])
 }
 

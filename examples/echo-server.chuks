@@ -1,0 +1,30 @@
+// Local WebSocket bot for the chat example: it REPLIES to each message (a distinct line,
+// not a bounce of your own text) so a single client sees a real send<->receive conversation,
+// and it relays messages to any OTHER connected clients (a genuine 2-way chat when two
+// devices connect). Run on the dev machine with `chuks run examples/echo-server.chuks`.
+import { WebSocketServer, WSServerOptionsBuilder, WebSocketConnection } from "pkg/@chuks/websocket"
+
+var PEERS: []WebSocketConnection = []
+
+function main(): void {
+    const wss: WebSocketServer = new WebSocketServer(new WSServerOptionsBuilder().host("0.0.0.0").port(8899).build())
+
+    wss.onConnection(function(conn: WebSocketConnection): void {
+        PEERS.push(conn)
+        conn.send("Hey! Send me a message and I'll reply.")   // greeting, shown as a bot bubble
+        conn.onMessage(function(msg: string): void {
+            conn.send("you said: " + msg)          // the bot's reply to the sender (a distinct line)
+            var i: int = 0                          // relay the raw message to every OTHER client
+            while (i < PEERS.length) {
+                const p: WebSocketConnection = PEERS[i]
+                if (p != conn && p.isOpen()) { p.send(msg) }
+                i = i + 1
+            }
+        })
+    })
+
+    println("chat bot listening on ws://0.0.0.0:8899")
+    wss.listen()
+}
+
+main()
