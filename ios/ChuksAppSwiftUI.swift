@@ -32,13 +32,6 @@ import CoreNFC
 // (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
 // re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
 // uncached SwiftUI AsyncImage.
-extension UIImage {
-    // Force the bitmap decode NOW (off the main thread), so the first draw doesn't stall.
-    func chuksDecoded() -> UIImage {
-        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = scale; fmt.opaque = false
-        return UIGraphicsImageRenderer(size: size, format: fmt).image { _ in draw(at: .zero) }
-    }
-}
 final class ChuksImageLoader {
     static let shared = ChuksImageLoader()
     private let mem = NSCache<NSString, UIImage>()
@@ -59,7 +52,10 @@ final class ChuksImageLoader {
         guard let url = URL(string: urlStr) else { return }
         session.dataTask(with: url) { [weak self] data, _, _ in
             guard let data = data, let raw = UIImage(data: data) else { return }
-            let img = raw.chuksDecoded()
+            // Thread-safe off-main decode (UIGraphicsImageRenderer is UIKit and NOT thread-safe
+            // off main — it corrupts UIKit state and crashes text drawing). preparingForDisplay
+            // is the designed-for-background decode API.
+            let img = raw.preparingForDisplay() ?? raw
             let cost = Int(img.size.width * img.size.height * img.scale * img.scale) * 4  // ~bytes of the decoded bitmap
             self?.mem.setObject(img, forKey: urlStr as NSString, cost: cost)
             DispatchQueue.main.async { done(img) }

@@ -32,13 +32,6 @@ import CoreNFC
 // (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
 // re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
 // uncached SwiftUI AsyncImage.
-extension UIImage {
-    // Force the bitmap decode NOW (off the main thread), so the first draw doesn't stall.
-    func chuksDecoded() -> UIImage {
-        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = scale; fmt.opaque = false
-        return UIGraphicsImageRenderer(size: size, format: fmt).image { _ in draw(at: .zero) }
-    }
-}
 final class ChuksImageLoader {
     static let shared = ChuksImageLoader()
     private let mem = NSCache<NSString, UIImage>()
@@ -59,7 +52,10 @@ final class ChuksImageLoader {
         guard let url = URL(string: urlStr) else { return }
         session.dataTask(with: url) { [weak self] data, _, _ in
             guard let data = data, let raw = UIImage(data: data) else { return }
-            let img = raw.chuksDecoded()
+            // Thread-safe off-main decode (UIGraphicsImageRenderer is UIKit and NOT thread-safe
+            // off main — it corrupts UIKit state and crashes text drawing). preparingForDisplay
+            // is the designed-for-background decode API.
+            let img = raw.preparingForDisplay() ?? raw
             let cost = Int(img.size.width * img.size.height * img.scale * img.scale) * 4  // ~bytes of the decoded bitmap
             self?.mem.setObject(img, forKey: urlStr as NSString, cost: cost)
             DispatchQueue.main.async { done(img) }
@@ -675,12 +671,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var videoObs: [ObjectIdentifier: NSObjectProtocol] = [:]  // player -> loop observer (persists across reuse)
     var videoNoLoop = Set<ObjectIdentifier>()         // players whose Video set loop=false (checked in the end observer)
     let videoPoolCap = 16                             // bound idle players kept warm
+    var inViewportSync = false                        // reentrancy guard: relayout() sets contentSize, which can
+                                                      // clamp the offset and re-fire scrollViewDidScroll synchronously.
+                                                      // Without this the two call each other until the stack overflows.
     // Perf harness: auto-scroll the feed while a CADisplayLink measures real frame times.
     var displayLink: CADisplayLink?
     var perfActive = false
     var perfLastTs: CFTimeInterval = 0
     var perfFrames = 0, perfJanky = 0, perfMaxPlayers = 0
     var perfMaxFrame: Double = 0, perfSumTime: Double = 0
+    var perfLog: [String] = []                        // every velocity's result line, for on-screen + file readout
     // Velocity sweep: ramp the fling speed to find the breaking point.
     let perfVels: [CGFloat] = [120, 180, 240, 300, 360, 480]
     var perfVelIdx = 0
@@ -885,6 +885,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func scrollViewDidScroll(_ sv: UIScrollView) {
+        // relayout() below can nudge contentSize/offset and re-enter this delegate synchronously.
+        // Skip the re-entrant call: the outer relayout already positioned for the current offset,
+        // and the next real scroll frame picks up any newer offset. Prevents unbounded recursion.
+        if inViewportSync { return }
+        inViewportSync = true
+        defer { inViewportSync = false }
         if pushViewport() { relayout() }
         if !perfActive { headerText("scroll \(Int(sv.contentOffset.y))pt") }
     }
@@ -950,7 +956,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let avg = Double(n) / max(0.0001, perfSumTime)
         let msg = String(format: "BENCHMARK CHUKS vel=%d: avg %.0f fps | worst frame %.1f ms | janky(<50fps) %d/%d | %d video players peak | mem %.0f MB",
                          Int(vel), avg, perfMaxFrame * 1000, perfJanky, n, perfMaxPlayers, physFootprintMB())
-        print(msg); NSLog(msg); header.text = msg
+        print(msg); NSLog(msg); perfLog.append(msg)
+        header.numberOfLines = 0; header.text = perfLog.joined(separator: "\n")   // keep all lines on screen
         perfVelIdx += 1
         if perfVelIdx >= perfVels.count { stopPerf(); return }
         resetPhase()
@@ -958,6 +965,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func stopPerf() {
         perfActive = false; displayLink?.invalidate(); displayLink = nil
         print("BENCHMARK CHUKS: sweep done")
+        // Persist to the app's Documents so the results can be pulled off a real device
+        // (headless syslog capture is unreliable on a locked/untrusted phone).
+        let out = (perfLog + ["sweep done"]).joined(separator: "\n") + "\n"
+        if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            try? out.write(to: dir.appendingPathComponent("bench_results.txt"), atomically: true, encoding: .utf8)
+        }
     }
 
     func step() {
