@@ -16,7 +16,7 @@ import { os } from "std/os";
 
 // A FIXED kind order (not the parsed map's order, which isn't stable) so the generated
 // plist / manifest is deterministic across builds.
-const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications"]
+const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "bluetooth", "nfc"]
 
 // permission kind -> iOS Info.plist usage-description key(s)
 function iosKeysFor(kind: string): []string {
@@ -28,6 +28,8 @@ function iosKeysFor(kind: string): []string {
     if (kind == "contacts") { return ["NSContactsUsageDescription"] }
     if (kind == "calendar") { return ["NSCalendarsUsageDescription", "NSCalendarsFullAccessUsageDescription"] }
     if (kind == "faceId") { return ["NSFaceIDUsageDescription"] }
+    if (kind == "bluetooth") { return ["NSBluetoothAlwaysUsageDescription"] }
+    if (kind == "nfc") { return ["NFCReaderUsageDescription"] }
     var empty: []string = []          // notifications need no iOS plist string
     return empty
 }
@@ -41,6 +43,8 @@ function androidPermsFor(kind: string): []string {
     if (kind == "calendar") { return ["READ_CALENDAR", "WRITE_CALENDAR"] }
     if (kind == "faceId") { return ["USE_BIOMETRIC"] }
     if (kind == "notifications") { return ["POST_NOTIFICATIONS"] }
+    if (kind == "bluetooth") { return ["BLUETOOTH_SCAN", "BLUETOOTH_CONNECT"] }
+    if (kind == "nfc") { return ["NFC"] }
     var empty: []string = []          // photosAdd (MediaStore) needs no permission on API 29+
     return empty
 }

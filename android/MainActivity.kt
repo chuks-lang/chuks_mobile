@@ -23,6 +23,32 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.provider.CalendarContract
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CameraMetadata
+import android.media.ImageReader
+import android.graphics.ImageFormat
+import android.util.Size
+import android.os.HandlerThread
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.nfc.NfcAdapter
+import android.nfc.Tag
+import android.nfc.NdefMessage
+import android.nfc.NdefRecord
+import android.nfc.tech.Ndef
+import java.util.UUID
 import android.view.WindowManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -97,6 +123,11 @@ class MainActivity : Activity() {
     private val contextMenuData = HashMap<String, List<String>>()  // id -> [item0, item1, ...]
     private val mapIds = HashSet<String>()                 // Map node ids (an OSM web view)
     private val gestureIds = HashSet<String>()             // Gesture node ids (GestureDetector wrappers)
+    private val cameraIds = HashSet<String>()              // CameraView node ids (Camera2 preview on a TextureView)
+    private var cameraController: CameraController? = null  // the live CameraView session (for camera.capturePreview)
+    private var bleManager: BleManager? = null             // BLE central (lazy)
+    private var nfcReader: NfcReader? = null               // NFC reader (lazy)
+    private val bleStateTokens = HashSet<String>()         // ble.state stream subscribers
     private val alertIds = HashSet<String>()              // Alert node ids (native AlertDialog)
     private val alertData = HashMap<String, List<String>>()  // id -> [title, message, confirm, cancel]
     private val alertActions = HashMap<String, String>()  // id -> button-dispatch action
@@ -222,6 +253,11 @@ class MainActivity : Activity() {
                         handler.post { recreate() }
                         return@Thread
                     }
+                    if (up && !everMounted) {
+                        // The initial mount came back empty (server up but returned nothing):
+                        // retry it so the app doesn't sit on a blank screen with no recovery.
+                        handler.post { hostMount(); if (pushViewport()) relayout() }
+                    }
                     devConnected = up
                 }
             }.apply { isDaemon = true; start() }
@@ -323,7 +359,12 @@ class MainActivity : Activity() {
 
     // Dispatch helpers used by every widget handler, so DEV vs production routing lives in
     // one place. They apply the resulting stream and relayout on the main thread.
-    private fun hostMount() { applyStream(engMount()); relayout() }
+    // True once a /mount has actually built a view tree. Until then the dev watcher keeps
+    // retrying the mount, so a failed/empty initial mount (dev server momentarily
+    // unreachable, or an empty-body race) recovers instead of stranding the app on a blank
+    // screen. In the JNI (AOT) path the engine is in-process and this never fails.
+    private var everMounted = false
+    private fun hostMount() { applyStream(engMount()); relayout(); if (views.isNotEmpty()) everMounted = true }
     private fun hostEvent(a: String) { applyStream(engEvent(a)); relayout() }
     private fun hostInput(a: String, v: String) { applyStream(engInput(a, v)); relayout() }
 
@@ -552,6 +593,45 @@ class MainActivity : Activity() {
                 try { startActivityForResult(intent, code) }
                 catch (e: Exception) { pendingMedia.remove(code); fail(token, "no camera app") }
             }
+            "camera.capturePreview" -> {
+                val ctrl = cameraController
+                if (ctrl == null) { fail(token, "no CameraView on screen"); return }
+                ctrl.capture({ p -> resolve(token, p) }, { m -> fail(token, m) })
+            }
+            "ble.state" -> {
+                val b = ensureBle()
+                bleStateTokens.add(token)
+                resolve(token, b.state())
+                streamTeardown[token] = { bleStateTokens.remove(token) }
+            }
+            "ble.scan" -> {
+                val b = ensureBle()
+                if (b.state() != "on") { fail(token, "bluetooth is ${b.state()}"); return }
+                b.startScan(token)
+                streamTeardown[token] = { bleManager?.stopScan() }
+            }
+            "ble.connect" -> ensureBle().connect(args, { p -> resolve(token, p) }, { m -> fail(token, m) })
+            "ble.disconnect" -> bleManager?.disconnect(args)
+            "ble.read" -> {
+                val a = args.split("\t")
+                if (a.size == 3) ensureBle().read(a[0], a[1], a[2], { p -> resolve(token, p) }, { m -> fail(token, m) })
+                else fail(token, "ble.read needs id, service, characteristic")
+            }
+            "ble.write" -> {
+                val a = args.split("\t")
+                if (a.size == 4) ensureBle().write(a[0], a[1], a[2], a[3], { p -> resolve(token, p) }, { m -> fail(token, m) })
+                else fail(token, "ble.write needs id, service, characteristic, hex")
+            }
+            "ble.subscribe" -> {
+                val a = args.split("\t")
+                if (a.size == 3) {
+                    ensureBle().subscribe(a[0], a[1], a[2], token, { m -> fail(token, m) })
+                    streamTeardown[token] = { bleManager?.unsubscribe(token) }
+                } else fail(token, "ble.subscribe needs id, service, characteristic")
+            }
+            "nfc.available" -> resolve(token, if (ensureNfc().available()) "1" else "0")
+            "nfc.read" -> ensureNfc().read(token) { m -> fail(token, m) }
+            "nfc.write" -> ensureNfc().write(args, token) { m -> fail(token, m) }
             "mediapicker.save" -> {
                 val path = if (args.startsWith("file://")) args.substring(7) else args
                 val f = java.io.File(path)
@@ -972,6 +1052,11 @@ class MainActivity : Activity() {
         val v: View = when (kind) {
             "Text" -> TextView(this).also { it.gravity = Gravity.CENTER_VERTICAL }
             "Video" -> TextureView(this).also { it.isOpaque = false }   // MediaPlayer target (iOS: AVPlayerLayer)
+            "CameraView" -> TextureView(this).also {                     // Camera2 preview (iOS: AVCaptureVideoPreviewLayer)
+                it.isOpaque = true
+                cameraIds.add(id)
+                cameraController = CameraController(it)
+            }
             "WebView" -> android.webkit.WebView(this).also {            // native WebView (iOS: WKWebView)
                 it.settings.javaScriptEnabled = true
                 it.settings.domStorageEnabled = true
@@ -1285,10 +1370,21 @@ class MainActivity : Activity() {
             val bw = borderW[id]
             if (bw != null && bw > 0f) gd.setStroke(bw.toInt(), borderC[id] ?: Color.parseColor("#334155"))
             else if (glassIds.contains(id)) gd.setStroke(dpf(1f).toInt(), Color.argb(40, 255, 255, 255))   // subtle glass rim
-            v.background = gd
-        } else if (v !is Switch && !modalIds.contains(id)) {
+            if (v !is TextureView) v.background = gd   // TextureView rejects a background drawable (rounded below via outline)
+        } else if (v !is Switch && v !is TextureView && !modalIds.contains(id)) {
             v.background = null   // the new style has no bg/border: clear a stale drawable on a reused view
         }                        // (a Modal keeps its dim scrim background)
+        // A TextureView (Video / CameraView) can't take a rounded background drawable; clip
+        // its corners via the outline instead so radius still works.
+        if (v is TextureView && bgRadius.containsKey(id)) {
+            val rad = bgRadius[id]!!
+            v.clipToOutline = true
+            v.outlineProvider = object : android.view.ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: android.graphics.Outline) {
+                    outline.setRoundRect(0, 0, view.width, view.height, rad)
+                }
+            }
+        }
         // An ImageView's foreground bitmap isn't clipped by a rounded background, so
         // round it via the outline (radius 36 on a 72x72 image → a circle).
         if (v is ImageView && bgRadius.containsKey(id)) {
@@ -1458,6 +1554,7 @@ class MainActivity : Activity() {
             }
             return
         }
+        if (cameraIds.contains(id)) { cameraController?.setFacing(t); return }   // CameraView facing (node text)
         (views[id] as? DrawCanvas)?.let { it.shapes = t; return }               // Canvas shape list
         (views[id] as? android.webkit.WebView)?.let { it.loadUrl(t); return }   // WebView URL
         if (t.startsWith("http")) {                                           // remote image / background URL
@@ -1646,13 +1743,321 @@ class MainActivity : Activity() {
         N.yInsert(pn, ynodes[id]!!, minOf(index, N.yChildCount(pn)))
     }
 
+    // Drives the live camera preview for a CameraView node on a TextureView, via Camera2
+    // (no androidx/CameraX). Opens the requested lens, runs a repeating preview request, and
+    // captures a still through an ImageReader on demand. One controller is retained by the
+    // Activity while a CameraView is mounted (iOS: CameraController + AVCaptureSession).
+    inner class CameraController(private val texture: TextureView) {
+        private val camMgr = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        private var device: CameraDevice? = null
+        private var session: CameraCaptureSession? = null
+        private var reader: ImageReader? = null
+        private var camId: String? = null
+        private var facing = "back"
+        private var sensorOrientation = 0
+        private val bg = HandlerThread("chuks.camera").apply { start() }
+        private val bgH = Handler(bg.looper)
+        private var onCapOk: ((String) -> Unit)? = null
+        private var onCapErr: ((String) -> Unit)? = null
+
+        init {
+            texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) { open() }
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { close(); return true }
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            }
+            if (texture.isAvailable) open()
+        }
+
+        fun setFacing(f: String) {
+            val want = if (f == "front") "front" else "back"
+            if (want == facing) return
+            facing = want
+            if (texture.isAvailable) { close(); open() }
+        }
+
+        private fun pickCamera(): String? {
+            val want = if (facing == "front") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+            for (id in camMgr.cameraIdList) {
+                if (camMgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == want) return id
+            }
+            return camMgr.cameraIdList.firstOrNull()
+        }
+
+        @SuppressLint("MissingPermission")
+        private fun open() {
+            if (device != null) return
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+            val id = pickCamera() ?: return
+            camId = id
+            try {
+                camMgr.openCamera(id, object : CameraDevice.StateCallback() {
+                    override fun onOpened(cam: CameraDevice) { device = cam; startPreview() }
+                    override fun onDisconnected(cam: CameraDevice) { cam.close(); if (device === cam) device = null }
+                    override fun onError(cam: CameraDevice, error: Int) { cam.close(); if (device === cam) device = null }
+                }, bgH)
+            } catch (e: Exception) {}
+        }
+
+        private fun startPreview() {
+            val cam = device ?: return
+            val st = texture.surfaceTexture ?: return
+            val chars = camMgr.getCameraCharacteristics(camId ?: return)
+            sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val previewSize = map?.getOutputSizes(SurfaceTexture::class.java)?.maxByOrNull { it.width.toLong() * it.height } ?: Size(1280, 720)
+            st.setDefaultBufferSize(previewSize.width, previewSize.height)
+            val previewSurface = Surface(st)
+            val jpegSize = map?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height } ?: previewSize
+            reader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2)
+            try {
+                val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                req.addTarget(previewSurface)
+                cam.createCaptureSession(listOf(previewSurface, reader!!.surface), object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(s: CameraCaptureSession) {
+                        session = s
+                        req.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        try { s.setRepeatingRequest(req.build(), null, bgH) } catch (e: Exception) {}
+                    }
+                    override fun onConfigureFailed(s: CameraCaptureSession) {}
+                }, bgH)
+            } catch (e: Exception) {}
+        }
+
+        fun capture(ok: (String) -> Unit, err: (String) -> Unit) {
+            val cam = device; val s = session; val rd = reader
+            if (cam == null || s == null || rd == null) { err("camera not running"); return }
+            onCapOk = ok; onCapErr = err
+            rd.setOnImageAvailableListener({ r ->
+                val img = r.acquireLatestImage()
+                if (img == null) { runOnUiThread { onCapErr?.invoke("no image") }; return@setOnImageAvailableListener }
+                try {
+                    val buf = img.planes[0].buffer
+                    val bytes = ByteArray(buf.remaining()); buf.get(bytes)
+                    // The ImageReader hands back raw sensor-oriented pixels (sideways, since the
+                    // sensor is mounted rotated). Rotate them upright on save so the file is
+                    // correct for every consumer, including our own EXIF-agnostic Image loader.
+                    val deviceDeg = when (windowManager.defaultDisplay.rotation) {
+                        Surface.ROTATION_90 -> 90; Surface.ROTATION_180 -> 180; Surface.ROTATION_270 -> 270; else -> 0
+                    }
+                    val rot = if (facing == "front") (sensorOrientation - deviceDeg + 360) % 360
+                              else (sensorOrientation + deviceDeg) % 360
+                    var bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null && (rot != 0 || facing == "front")) {
+                        val m = android.graphics.Matrix()
+                        if (rot != 0) m.postRotate(rot.toFloat())
+                        if (facing == "front") m.postScale(-1f, 1f)   // un-mirror the selfie
+                        bmp = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                    }
+                    val f = java.io.File(filesDir, "cam_${System.nanoTime()}.jpg")
+                    if (bmp != null) {
+                        val out = java.io.ByteArrayOutputStream()
+                        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, out)
+                        f.writeBytes(out.toByteArray())
+                    } else { f.writeBytes(bytes) }
+                    runOnUiThread { onCapOk?.invoke("file://" + f.absolutePath) }
+                } catch (e: Exception) { runOnUiThread { onCapErr?.invoke(e.message ?: "capture failed") } }
+                finally { img.close() }
+            }, bgH)
+            try {
+                val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                req.addTarget(rd.surface)
+                req.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                s.capture(req.build(), null, bgH)
+            } catch (e: Exception) { runOnUiThread { err(e.message ?: "capture failed") } }
+        }
+
+        fun close() {
+            try { session?.close() } catch (e: Exception) {}; session = null
+            try { device?.close() } catch (e: Exception) {}; device = null
+            try { reader?.close() } catch (e: Exception) {}; reader = null
+        }
+    }
+
+    private fun bytesToHex(b: ByteArray?): String {
+        if (b == null) return ""
+        val sb = StringBuilder(b.size * 2)
+        for (x in b) sb.append(String.format("%02x", x))
+        return sb.toString()
+    }
+    private fun hexToBytes(hex: String): ByteArray {
+        val n = hex.length / 2
+        val out = ByteArray(n)
+        var i = 0
+        while (i < n) { out[i] = ((Character.digit(hex[i * 2], 16) shl 4) + Character.digit(hex[i * 2 + 1], 16)).toByte(); i++ }
+        return out
+    }
+
+    // A BLE central via android.bluetooth.le (no androidx): scan, connect, and read /
+    // write / subscribe to GATT characteristics. Values cross the bridge as hex strings.
+    // The "bluetooth" permission (BLUETOOTH_SCAN + BLUETOOTH_CONNECT) must be granted.
+    inner class BleManager {
+        private val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        private val adapter get() = mgr.adapter
+        private var scanner: BluetoothLeScanner? = null
+        private var scanCb: ScanCallback? = null
+        var scanToken: String? = null
+        private val devices = HashMap<String, BluetoothDevice>()
+        private val gatts = HashMap<String, BluetoothGatt>()
+        private val chars = HashMap<String, BluetoothGattCharacteristic>()
+        private val connectOk = HashMap<String, (String) -> Unit>()
+        private val connectErr = HashMap<String, (String) -> Unit>()
+        private val readOk = HashMap<String, (String) -> Unit>()
+        private val readErr = HashMap<String, (String) -> Unit>()
+        private val writeOk = HashMap<String, (String) -> Unit>()
+        private val writeErr = HashMap<String, (String) -> Unit>()
+        private val notifyTokens = HashMap<String, String>()
+
+        init {
+            // Re-emit adapter state to ble.state subscribers when Bluetooth is toggled.
+            registerReceiver(object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) { bleStateTokens.toList().forEach { resolve(it, state()) } }
+            }, android.content.IntentFilter(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED))
+        }
+
+        fun state(): String = when { adapter == null -> "unsupported"; !adapter.isEnabled -> "off"; else -> "on" }
+        private fun key(addr: String, s: String, c: String) = "$addr|${s.lowercase()}|${c.lowercase()}"
+        private fun keyFor(addr: String, ch: BluetoothGattCharacteristic) = key(addr, ch.service.uuid.toString(), ch.uuid.toString())
+
+        @SuppressLint("MissingPermission")
+        fun startScan(token: String) {
+            scanToken = token
+            val a = adapter ?: return
+            if (!a.isEnabled) return
+            scanner = a.bluetoothLeScanner
+            scanCb = object : ScanCallback() {
+                override fun onScanResult(callbackType: Int, result: ScanResult) {
+                    val d = result.device; devices[d.address] = d
+                    val name = try { d.name ?: result.scanRecord?.deviceName ?: "" } catch (e: SecurityException) { "" }
+                    scanToken?.let { t -> runOnUiThread { resolve(t, "${d.address}\t$name\t${result.rssi}") } }
+                }
+            }
+            scanner?.startScan(scanCb)
+        }
+        @SuppressLint("MissingPermission")
+        fun stopScan() { try { scanner?.stopScan(scanCb) } catch (e: Exception) {}; scanToken = null }
+
+        @SuppressLint("MissingPermission")
+        fun connect(addr: String, ok: (String) -> Unit, err: (String) -> Unit) {
+            val d = devices[addr] ?: try { adapter?.getRemoteDevice(addr) } catch (e: Exception) { null }
+            if (d == null) { err("unknown device (scan first)"); return }
+            connectOk[addr] = ok; connectErr[addr] = err
+            d.connectGatt(this@MainActivity, false, gattCb)
+        }
+        @SuppressLint("MissingPermission")
+        fun disconnect(addr: String) { gatts[addr]?.let { try { it.disconnect(); it.close() } catch (e: Exception) {} }; gatts.remove(addr) }
+
+        private val gattCb = object : BluetoothGattCallback() {
+            @SuppressLint("MissingPermission")
+            override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+                val addr = g.device.address
+                if (newState == BluetoothProfile.STATE_CONNECTED) { gatts[addr] = g; g.discoverServices() }
+                else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    runOnUiThread { connectErr.remove(addr)?.invoke("disconnected"); connectOk.remove(addr) }
+                    gatts.remove(addr); try { g.close() } catch (e: Exception) {}
+                }
+            }
+            override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+                val addr = g.device.address
+                for (svc in g.services) for (ch in svc.characteristics) chars[key(addr, svc.uuid.toString(), ch.uuid.toString())] = ch
+                runOnUiThread { connectOk.remove(addr)?.invoke("connected"); connectErr.remove(addr) }
+            }
+            @Suppress("DEPRECATION")
+            override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+                val k = keyFor(g.device.address, ch); val hex = bytesToHex(ch.value)
+                runOnUiThread { if (status == BluetoothGatt.GATT_SUCCESS) readOk.remove(k)?.invoke(hex) else readErr.remove(k)?.invoke("read failed ($status)"); readOk.remove(k); readErr.remove(k) }
+            }
+            override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+                val k = keyFor(g.device.address, ch)
+                runOnUiThread { if (status == BluetoothGatt.GATT_SUCCESS) writeOk.remove(k)?.invoke("ok") else writeErr.remove(k)?.invoke("write failed ($status)"); writeOk.remove(k); writeErr.remove(k) }
+            }
+            @Suppress("DEPRECATION")
+            override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+                val k = keyFor(g.device.address, ch); val hex = bytesToHex(ch.value)
+                runOnUiThread { notifyTokens[k]?.let { resolve(it, hex) } }
+            }
+        }
+        @SuppressLint("MissingPermission")
+        fun read(addr: String, s: String, c: String, ok: (String) -> Unit, err: (String) -> Unit) {
+            val g = gatts[addr]; val ch = chars[key(addr, s, c)]
+            if (g == null || ch == null) { err("characteristic not found"); return }
+            readOk[key(addr, s, c)] = ok; readErr[key(addr, s, c)] = err
+            g.readCharacteristic(ch)
+        }
+        @SuppressLint("MissingPermission")
+        @Suppress("DEPRECATION")
+        fun write(addr: String, s: String, c: String, hex: String, ok: (String) -> Unit, err: (String) -> Unit) {
+            val g = gatts[addr]; val ch = chars[key(addr, s, c)]
+            if (g == null || ch == null) { err("characteristic not found"); return }
+            writeOk[key(addr, s, c)] = ok; writeErr[key(addr, s, c)] = err
+            ch.value = hexToBytes(hex)
+            g.writeCharacteristic(ch)
+        }
+        @SuppressLint("MissingPermission")
+        fun subscribe(addr: String, s: String, c: String, token: String, err: (String) -> Unit) {
+            val g = gatts[addr]; val ch = chars[key(addr, s, c)]
+            if (g == null || ch == null) { err("characteristic not found"); return }
+            notifyTokens[key(addr, s, c)] = token
+            g.setCharacteristicNotification(ch, true)
+            val cccd = ch.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+            if (cccd != null) { cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE; @Suppress("DEPRECATION") g.writeDescriptor(cccd) }
+        }
+        fun unsubscribe(token: String) { notifyTokens.filterValues { it == token }.keys.toList().forEach { notifyTokens.remove(it) } }
+    }
+
+    // NFC (NDEF) via NfcAdapter reader mode. Needs the "nfc" permission + NFC hardware.
+    inner class NfcReader {
+        private val adapter = NfcAdapter.getDefaultAdapter(this@MainActivity)
+        private var token: String? = null
+        private var writeText: String? = null
+        fun available(): Boolean = adapter != null && adapter.isEnabled
+        fun read(tok: String, err: (String) -> Unit) { if (adapter == null) { err("NFC not available"); return }; token = tok; writeText = null; enable() }
+        fun write(text: String, tok: String, err: (String) -> Unit) { if (adapter == null) { err("NFC not available"); return }; token = tok; writeText = text; enable() }
+        private fun enable() {
+            val flags = NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or
+                        NfcAdapter.FLAG_READER_NFC_F or NfcAdapter.FLAG_READER_NFC_V or
+                        NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS
+            adapter?.enableReaderMode(this@MainActivity, { tag -> onTag(tag) }, flags, null)
+        }
+        private fun onTag(tag: Tag) {
+            val tok = token ?: return
+            val ndef = Ndef.get(tag)
+            if (ndef == null) { runOnUiThread { fail(tok, "tag is not NDEF") }; disable(); return }
+            try {
+                ndef.connect()
+                if (writeText != null) {
+                    ndef.writeNdefMessage(NdefMessage(arrayOf(NdefRecord.createTextRecord("en", writeText))))
+                    runOnUiThread { resolve(tok, "ok") }
+                } else {
+                    val msg = ndef.ndefMessage
+                    val text = msg?.records?.firstOrNull()?.let { textFromRecord(it) } ?: ""
+                    runOnUiThread { resolve(tok, text) }
+                }
+                ndef.close()
+            } catch (e: Exception) { runOnUiThread { fail(tok, e.message ?: "nfc failed") } }
+            finally { disable() }
+        }
+        private fun disable() { token = null; writeText = null; try { adapter?.disableReaderMode(this@MainActivity) } catch (e: Exception) {} }
+        private fun textFromRecord(r: NdefRecord): String {
+            val p = r.payload
+            if (p.isEmpty()) return ""
+            val langLen = p[0].toInt() and 0x3f
+            return try { String(p, 1 + langLen, p.size - 1 - langLen, Charsets.UTF_8) } catch (e: Exception) { String(p, Charsets.UTF_8) }
+        }
+    }
+
+    private fun ensureBle(): BleManager { val b = bleManager ?: BleManager().also { bleManager = it }; return b }
+    private fun ensureNfc(): NfcReader { val n = nfcReader ?: NfcReader().also { nfcReader = it }; return n }
+
     private fun remove(id: String) {
         views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
         ynodes[id]?.let { val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it) }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
+        if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 

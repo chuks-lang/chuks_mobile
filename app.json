@@ -19,6 +19,8 @@
     "contacts": "Find people you know.",
     "calendar": "Read and add calendar events.",
     "faceId": "Unlock the app with Face ID.",
-    "notifications": "Send you notifications."
+    "notifications": "Send you notifications.",
+    "bluetooth": "Scan for and connect to nearby Bluetooth devices.",
+    "nfc": "Read and write NFC tags."
   }
 }

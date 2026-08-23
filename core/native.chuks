@@ -120,6 +120,67 @@ export class Camera {
     public static takePhoto(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("camera.photo", "", onResult, onError)
     }
+    // Capture a still from a live CameraView that is currently on screen. Resolves a
+    // "file://<path>" JPEG you can pass to Image. Fails if no CameraView is mounted.
+    public static capturePreview(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("camera.capturePreview", "", onResult, onError)
+    }
+}
+
+// ---- Bluetooth LE -----------------------------------------------------------
+// A BLE central: scan for peripherals, connect, and read / write / subscribe to
+// characteristics. Needs the "bluetooth" permission. Characteristic values cross the
+// bridge as hex strings (binary-safe); service/characteristic are UUID strings. There
+// is no BLE radio on the iOS Simulator or the Android emulator, so test on a device.
+export class Bluetooth {
+    // Adapter state, fires on change until cancelled: "on" | "off" | "unauthorized" | "unsupported".
+    public static state(onState: (string)=> void): NativeSub {
+        return emitNativeStream("ble.state", "", onState, null)
+    }
+    // Stream discovered peripherals as "id\tname\trssi" until the returned sub is cancelled.
+    // id is an opaque handle (a CBPeripheral UUID on iOS, a MAC on Android) to pass to connect().
+    public static scan(onDevice: (string)=> void, onError: (string)=> void): NativeSub {
+        return emitNativeStream("ble.scan", "", onDevice, onError)
+    }
+    // Connect to a scanned peripheral; onOk fires once services are discovered.
+    public static connect(deviceId: string, onOk: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("ble.connect", deviceId, onOk, onError)
+    }
+    public static disconnect(deviceId: string): void {
+        emitNativeCommand("ble.disconnect", deviceId, null)
+    }
+    // Read a characteristic once; onOk gets its value as a hex string.
+    public static read(deviceId: string, service: string, characteristic: string, onOk: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("ble.read", deviceId + "\t" + service + "\t" + characteristic, onOk, onError)
+    }
+    // Write a hex-string value to a characteristic; onOk fires when the write completes.
+    public static write(deviceId: string, service: string, characteristic: string, valueHex: string, onOk: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("ble.write", deviceId + "\t" + service + "\t" + characteristic + "\t" + valueHex, onOk, onError)
+    }
+    // Subscribe to notifications/indications; onValue fires with each new value (hex) until cancelled.
+    public static subscribe(deviceId: string, service: string, characteristic: string, onValue: (string)=> void, onError: (string)=> void): NativeSub {
+        return emitNativeStream("ble.subscribe", deviceId + "\t" + service + "\t" + characteristic, onValue, onError)
+    }
+}
+
+// ---- NFC --------------------------------------------------------------------
+// Read and write NFC tags (NDEF). Needs the "nfc" permission; iOS additionally needs
+// the CoreNFC reader entitlement in the app's provisioning profile. available() reports
+// whether the device has usable NFC hardware. No NFC on the Simulator/emulator.
+export class Nfc {
+    // true if the device has NFC hardware available to this app.
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("nfc.available", "", function(s: string): void { onResult(s == "1") })
+    }
+    // Scan one tag; onOk gets its first NDEF text record (empty string if the tag has none).
+    // iOS shows the system scan sheet; Android reads the next tag tapped.
+    public static readTag(onOk: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("nfc.read", "", onOk, onError)
+    }
+    // Write a single NDEF text record to the next tag; onOk fires when the write completes.
+    public static writeText(text: string, onOk: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("nfc.write", text, onOk, onError)
+    }
 }
 
 // ---- Calendar ---------------------------------------------------------------

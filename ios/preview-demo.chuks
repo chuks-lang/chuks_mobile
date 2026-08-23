@@ -1,34 +1,35 @@
-// Smoke-test app for the Chuks Preview host, exercising the Liquid Glass material:
-// glass: true on any container. On iOS 26 it is the real .glassEffect / UIGlassEffect; on
-// older iOS an ultraThinMaterial blur; on Android a translucent frosted panel. A colorful
-// photo sits behind so the material has something to refract. Served over the dev server.
-import { NavStack, Node, Column, Row, Text, ImageBackground, Comp, setSafeInsets } from "../core/ui.chuks";
+// Smoke-test for the Preview dev-server streaming-cap fix: a MOUNT-TIME stream
+// (Pulse.watch, started in useEffect) should tick continuously. If the counter
+// climbs, mount-time native streams are delivered over the dev server. Also proves
+// the tree renders (no blank screen) on connect and reconnect.
+import { NavStack, Node, Column, Text, Comp, setSafeInsets } from "../core/ui.chuks";
+import { useState, useEffect, Cell } from "../core/state.chuks";
+import { Pulse, Battery } from "../core/native.chuks";
+import { NativeSub } from "../core/ui.chuks";
 import { syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
 
-function tab(label: string): Node {
-    return Column({ dir: "col", align: "center", gap: 3 }, [ Text({ size: 14, weight: "bold", color: "FFFFFF", ta: "center" }, label) ])
-}
+function screen(): Node {
+    const ticks: Cell = useState("0")
+    const batt: Cell = useState("?")
 
-function screenBody(): Node {
-    return ImageBackground({ src: "https://picsum.photos/id/1025/800/1500", grow: 1, dir: "col",
-                             justify: "center", align: "center", gap: 26, pad: 24 }, [
-        // a floating glass card
-        Column({ glass: true, radius: 26, pad: 26, w: 300, align: "center", gap: 10,
-                 border: 1, borderColor: "AAFFFFFF" }, [
-            Text({ size: 26, weight: "bold", color: "FFFFFF", ta: "center" }, "Liquid Glass"),
-            Text({ size: 15, color: "FFFFFF", ta: "center", w: 250 }, "glass: true on any container"),
-        ]),
-        // a glass tab bar
-        Row({ glass: true, radius: 30, pad: 16, gap: 30, align: "center", border: 1, borderColor: "AAFFFFFF" }, [
-            tab("Home"), tab("Search"), tab("Profile"),
-        ]),
+    useEffect(function(): any {
+        const s1: NativeSub = Pulse.watch(function(n: string): void { ticks.set(n) })
+        const s2: NativeSub = Battery.watch(function(b: string): void { batt.set(b) })
+        return function(): void { s1.cancel(); s2.cancel() }
+    }, [])
+
+    return Column({ dir: "col", grow: 1, bg: "0E1116", pad: 24, gap: 12, justify: "center", align: "center" }, [
+        Text({ size: 26, weight: "bold", color: "FFFFFF", ta: "center" }, "Mount-time stream"),
+        Text({ size: 15, color: "9CA3AF", ta: "center" }, "Pulse.watch ticks (started in useEffect)"),
+        Text({ size: 72, weight: "bold", color: "60A5FA", ta: "center" }, string(ticks.get())),
+        Text({ size: 15, color: "9CA3AF", ta: "center" }, "battery: " + string(batt.get())),
     ])
 }
 
 function createRoot(): NavStack {
     var routes: map[string]function(): Node = {}
-    routes["home"] = function(): Node { return Comp(screenBody) }
+    routes["home"] = function(): Node { return Comp(screen) }
     return new NavStack(routes, "home")
 }
 

@@ -128,6 +128,8 @@ fi
 ICONNAME_PLIST=""
 if [ "$PREVIEW" = "1" ]; then
     IOS_PLIST_EXTRA='  <key>NSCameraUsageDescription</key><string>Scan a Chuks dev-server QR code to run your app.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>Scan for nearby Bluetooth devices in previewed apps.</string>
+  <key>NFCReaderUsageDescription</key><string>Read NFC tags in previewed apps.</string>
   <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.chuks.preview</string><key>CFBundleURLSchemes</key><array><string>chuks</string></array></dict></array>'
     [ -f "$PKGDIR/preview-icon.png" ] && ICONNAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
 else

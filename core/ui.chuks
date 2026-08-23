@@ -450,6 +450,20 @@ export function WebView(p: map[string]Prop): Node {
     applyLayout(s, p)
     return new Node("WebView", s, pStr(p, "url", ""), [])   // URL in the text channel
 }
+
+/**
+ * A live camera preview surface. `facing` selects the lens: "back" (default) or "front".
+ * Needs the "camera" permission (request it with Permission.request("camera", ...) first).
+ * On iOS it is a real AVCaptureVideoPreviewLayer over an AVCaptureSession; on Android a
+ * Camera2 preview on a TextureView. Grab a still from the running preview with
+ * Camera.capturePreview(onResult, onError), which resolves a file:// path you can hand to Image.
+ */
+export function CameraView(p: map[string]Prop): Node {
+    const s: Style = new Style()
+    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
+    applyLayout(s, p)
+    return new Node("CameraView", s, pStr(p, "facing", "back"), [])   // facing in the text channel
+}
 /**
  * A tappable button showing title `t`. Pass `onPress` as a () -> void closure;
  * the framework registers it by node id and calls it on tap.
