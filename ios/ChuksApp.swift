@@ -266,6 +266,34 @@ final class VideoView: UIView {
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }
 
+// A UILabel that can be selected/copied (Text `selectable`). It becomes first responder on a
+// long-press and shows the system Copy menu; with `selectable` off it's an ordinary label.
+final class SelectableLabel: UILabel {
+    var selectable = false
+    override var canBecomeFirstResponder: Bool { selectable }
+    func enableSelection() {
+        guard gestureRecognizers?.isEmpty ?? true else { return }
+        isUserInteractionEnabled = true
+        addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(showCopy(_:))))
+    }
+    @objc private func showCopy(_ g: UILongPressGestureRecognizer) {
+        guard selectable, g.state == .began, becomeFirstResponder() else { return }
+        let menu = UIMenuController.shared
+        menu.showMenu(from: self, rect: bounds)
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { action == #selector(copy(_:)) }
+    override func copy(_ sender: Any?) { UIPasteboard.general.string = text; UIMenuController.shared.hideMenu() }
+}
+
+// A view that also accepts touches within `hitSlop` px beyond its bounds (Pressable `hitSlop`).
+final class HitSlopView: UIView {
+    var hitSlop: CGFloat = 0
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if hitSlop <= 0 { return super.point(inside: point, with: event) }
+        return bounds.insetBy(dx: -hitSlop, dy: -hitSlop).contains(point)
+    }
+}
+
 // A UIView whose backing layer IS the camera preview layer, so it tracks the view frame.
 final class CameraPreviewUIView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
@@ -758,6 +786,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var mediaProgress: [String: String] = [:]                             // id -> onProgress action (Video)
     var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
     var imageBlur: [String: CGFloat] = [:]                                // id -> Image blur radius (px)
+    var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
+    var videoPosters: [String: UIImageView] = [:]                        // id -> poster overlay (until first frame)
+    var posterObs: [String: NSKeyValueObservation] = [:]                 // id -> readyForDisplay observation
     var pressLongDelay: [String: TimeInterval] = [:]                      // id -> onLongPress hold time (s)
     var videoSeek: [String: Int] = [:]                                    // id -> last-applied seek (seconds)
     var videoTimeObservers: [String: Any] = [:]                           // id -> periodic time observer token
@@ -1685,6 +1716,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func setText(_ id: String, _ t: String) {
+        if let vv = views[id] as? VideoView {   // a Video's "text" is an optional poster URL shown until the first frame
+            if !t.isEmpty && videoPosters[id] == nil {
+                let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
+                iv.frame = vv.bounds; iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                vv.addSubview(iv); videoPosters[id] = iv
+                loadRemoteImage(t, into: iv)
+            }
+            return
+        }
         if selectIds.contains(id) {                                  // a Select's "text" is its tab-joined options
             selectOptions[id] = t.components(separatedBy: "\t")
             rebuildSelectMenu(id)
@@ -1739,7 +1779,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let n = YGNodeNewWithConfig(config)
         switch kind {
         case "Text":
-            let l = UILabel(); l.font = .systemFont(ofSize: 14); l.numberOfLines = 0; v = l   // 0 = wrap to as many lines as fit the measured (Yoga) width
+            let l = SelectableLabel(); l.font = .systemFont(ofSize: 14); l.numberOfLines = 0; v = l   // 0 = wrap to as many lines as fit the measured (Yoga) width
             YGNodeSetContext(n, Unmanaged.passUnretained(l).toOpaque())
             YGNodeSetMeasureFunc(n, measureText)
         case "Image":
@@ -1891,7 +1931,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let a = UIView(); a.isUserInteractionEnabled = false   // invisible placeholder; the OS alert shows on avis=1
             alertIds.insert(id); v = a
         default:
-            v = UIView()
+            v = HitSlopView()   // a plain container that can also carry a Pressable hitSlop
         }
         v.translatesAutoresizingMaskIntoConstraints = true   // we drive .frame directly
         views[id] = v
@@ -2061,6 +2101,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         vv.playerLayer.player = player
                         videoPlayers[id] = player; videoPlayerKey[id] = val
                         if mediaProgress[id] != nil { addVideoProgress(id) }   // onProgress may have registered already
+                        // poster: remove the overlay once the first frame is ready to display.
+                        if videoPosters[id] != nil {
+                            posterObs[id] = vv.playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
+                                if layer.isReadyForDisplay { self?.videoPosters[id]?.removeFromSuperview(); self?.videoPosters[id] = nil; self?.posterObs[id] = nil }
+                            }
+                        }
                         player.play()   // default autoplay; a later vplay=0 pauses it
                     }
                 }
@@ -2083,6 +2129,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "vrate": if let p = videoPlayers[id], p.rate != 0 { p.rate = f / 100 }   // playback speed while playing
             case "ldelay": pressLongDelay[id] = TimeInterval(f) / 1000       // onLongPress hold time (ms)
             case "blur": if let iv = v as? UIImageView { imageBlur[id] = CGFloat(f); applyBlur(iv, id) }   // Image blur (px)
+            case "sel": if let l = v as? SelectableLabel { l.selectable = (val == "1"); if val == "1" { l.enableSelection() } }   // Text selectable
+            case "hitslop": if let h = v as? HitSlopView { h.hitSlop = CGFloat(f) }   // Pressable enlarged tap area
+            case "spin": if val == "1", let iv = v as? UIImageView, iv.image == nil { showImageSpinner(id, iv) }   // Image loading spinner
             case "vloop":
                 if let p = videoPlayers[id] {
                     if val == "0" { videoNoLoop.insert(ObjectIdentifier(p)) } else { videoNoLoop.remove(ObjectIdentifier(p)) }
@@ -2467,15 +2516,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
-        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); applyBlur(iv, id); fireMedia(mediaLoad[id]); return }
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); applyBlur(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
         ChuksImageLoader.shared.load(urlStr) { [weak self] img in
             guard let self = self else { return }
             if iv.tag == wanted { iv.image = self.tinted(img, id); self.applyBlur(iv, id) }
+            self.hideImageSpinner(id)
             self.fireMedia(self.mediaLoad[id])
-        } fail: { [weak self] in self?.fireMedia(self?.mediaError[id]) }
+        } fail: { [weak self] in self?.hideImageSpinner(id); self?.fireMedia(self?.mediaError[id]) }
     }
+    // Image loading spinner: a centered activity indicator over the image view until it loads.
+    func showImageSpinner(_ id: String, _ iv: UIImageView) {
+        if imageSpinners[id] != nil { return }
+        let sp = UIActivityIndicatorView(style: .medium); sp.color = .lightGray
+        sp.translatesAutoresizingMaskIntoConstraints = false; sp.startAnimating()
+        iv.addSubview(sp)
+        NSLayoutConstraint.activate([sp.centerXAnchor.constraint(equalTo: iv.centerXAnchor), sp.centerYAnchor.constraint(equalTo: iv.centerYAnchor)])
+        imageSpinners[id] = sp
+    }
+    func hideImageSpinner(_ id: String) { imageSpinners[id]?.removeFromSuperview(); imageSpinners[id] = nil }
     // Render as a template (for tintColor) when the node has a tint, else leave the image as-is.
     func tinted(_ img: UIImage?, _ id: String) -> UIImage? { imageTint[id] != nil ? img?.withRenderingMode(.alwaysTemplate) : img }
     // Image blurRadius: Gaussian-blur the current image in place (cropped to the original extent).

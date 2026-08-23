@@ -91,6 +91,9 @@ export class Style {
     var vidRate: int    // Video playback rate as a percent (100 = 1x; -1 = default)
     var blur: int       // Image blur radius in px (-1 = none)
     var longDelay: int  // Pressable onLongPress delay in ms (-1 = default 500)
+    var selectable: int // Text: 1 = user can select/copy the text (-1 = no)
+    var hitSlop: int    // Pressable: extra tappable px beyond the visual bounds (-1 = none)
+    var spinner: int    // Image: 1 = show a loading spinner until the image loads (-1 = no)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -110,6 +113,7 @@ export class Style {
         this.nlines = -1; this.ellip = ""; this.disabled = -1
         this.tint = ""; this.seekTo = -1; this.vidCtrls = -1
         this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
+        this.selectable = -1; this.hitSlop = -1; this.spinner = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -169,6 +173,9 @@ export class Style {
         if (this.vidRate >= 0) { s = s + "vrate=" + string(this.vidRate) + ";" }
         if (this.blur >= 0) { s = s + "blur=" + string(this.blur) + ";" }
         if (this.longDelay >= 0) { s = s + "ldelay=" + string(this.longDelay) + ";" }
+        if (this.selectable >= 0) { s = s + "sel=" + string(this.selectable) + ";" }
+        if (this.hitSlop >= 0) { s = s + "hitslop=" + string(this.hitSlop) + ";" }
+        if (this.spinner >= 0) { s = s + "spin=" + string(this.spinner) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -464,6 +471,7 @@ export function Text(p: map[string]Prop, t: string): Node {
     const s: Style = new Style(); applyLayout(s, p)
     s.nlines = pInt(p, "numberOfLines", -1)          // cap lines (truncates the overflow)
     s.ellip = pStr(p, "ellipsizeMode", "")           // "tail"|"head"|"middle"|"clip"
+    if (pBool(p, "selectable", false)) { s.selectable = 1 }   // user can select/copy the text
     const n: Node = mkText(s, t)
     applyEvents(n, p)                                 // onPress makes the text tappable (a link)
     return n
@@ -509,7 +517,8 @@ export function Video(p: map[string]Prop): Node {
     // A video with `controls` renders the platform's full native player UI (transport, scrubber,
     // fullscreen, AirPlay, PiP, subtitle/audio menus), so it's a distinct kind the host maps to
     // AVPlayerViewController / VideoPlayer / a MediaController-backed view.
-    const n: Node = new Node(controls ? "VideoControls" : "Video", s, "", [])
+    // The node text carries an optional `poster` image URL shown until the first frame plays.
+    const n: Node = new Node(controls ? "VideoControls" : "Video", s, pStr(p, "poster", ""), [])
     applyMediaEvents(n, p)                                // onLoad / onEnd / onProgress
     return n
 }
@@ -539,6 +548,7 @@ export function Image(p: map[string]Prop): Node {
     s.bg = pStr(p, "bg", "")
     s.tint = pStr(p, "tintColor", "")                     // recolor a template image
     s.blur = pInt(p, "blurRadius", -1)                    // blur the image (px)
+    if (pBool(p, "spinner", false)) { s.spinner = 1 }     // show a loading spinner until it loads
     if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
     applyLayout(s, p)
     const n: Node = new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
@@ -749,6 +759,7 @@ export function Pressable(p: map[string]Prop, kids: []Node): Node {
     const s: Style = new Style(); s.dir = "col"
     s.press = pInt(p, "activeOpacity", 60)
     s.longDelay = pInt(p, "delayLongPress", -1)           // onLongPress hold time (ms)
+    s.hitSlop = pInt(p, "hitSlop", -1)                    // extra tappable px beyond the bounds
     if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     applyLayout(s, p)
     const n: Node = mkView(s, kids)

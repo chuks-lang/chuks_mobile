@@ -1478,6 +1478,10 @@ class MainActivity : Activity() {
                 "vrate" -> videoPlayers[id]?.let { mp -> try {                                          // playback speed percent
                     if (mp.isPlaying) mp.playbackParams = mp.playbackParams.setSpeed(f / 100f) } catch (e: Exception) {} }
                 "ldelay" -> longDelayMs[id] = f.toLong()                                                // onLongPress hold time (ms)
+                "sel" -> (v as? TextView)?.setTextIsSelectable(vl == "1")                                // Text selectable
+                "hitslop" -> { val slop = dp(f.toInt()); v.post {                                        // enlarge the tap area
+                    (v.parent as? View)?.let { p -> val r = android.graphics.Rect(); v.getHitRect(r)
+                        r.inset(-slop, -slop); p.touchDelegate = android.view.TouchDelegate(r, v) } } }
                 "blur" -> imageBlur[id] = f   // Image blurRadius; applied to the bitmap when it loads (below)
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {

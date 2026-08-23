@@ -264,6 +264,9 @@ final class LoopingPlayerView: UIView {
     private var retries = 0
     var onEnd: (() -> Void)?
     var onProgress: ((Int) -> Void)?
+    var posterURL = ""
+    private var posterView: UIImageView?
+    private var readyObs: NSKeyValueObservation?
     private var lastSeek = -1
     private var lastSec = -1
     private var progressObs: Any?
@@ -271,6 +274,15 @@ final class LoopingPlayerView: UIView {
     // recycled feed cell can pause/resume by flipping `playing`. Only a src change rebuilds the item.
     func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String, seekTo: Int = -1, vol: Int = -1, rate: Int = -1) {
         self.loop = loop; self.wantPlaying = playing; self.wantMuted = muted
+        if !posterURL.isEmpty && posterView == nil {   // poster shown until the first frame is ready
+            let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
+            iv.frame = bounds; iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            addSubview(iv); posterView = iv
+            ChuksImageLoader.shared.load(posterURL) { [weak iv] img in iv?.image = img }
+            readyObs = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
+                if layer.isReadyForDisplay { self?.posterView?.removeFromSuperview(); self?.posterView = nil; self?.readyObs = nil }
+            }
+        }
         playerLayer.videoGravity = (fit == "contain") ? .resizeAspect : .resizeAspectFill
         if src != currentSrc, !src.isEmpty {
             // http(s) -> remote; file:// -> a captured/downloaded file; else a bundled asset.
@@ -361,8 +373,9 @@ struct ChuksVideo: UIViewRepresentable {
     var rate: Int = -1
     var onEnd: (() -> Void)? = nil
     var onProgress: ((Int) -> Void)? = nil
+    var poster: String = ""
     func makeUIView(context: Context) -> LoopingPlayerView {
-        let v = LoopingPlayerView(); v.clipsToBounds = true; v.onEnd = onEnd; v.onProgress = onProgress
+        let v = LoopingPlayerView(); v.clipsToBounds = true; v.onEnd = onEnd; v.onProgress = onProgress; v.posterURL = poster
         v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo, vol: vol, rate: rate); return v
     }
     func updateUIView(_ uiView: LoopingPlayerView, context: Context) {
@@ -2159,9 +2172,10 @@ struct NodeView: View {
     var body: some View {
         if let node = scene.nodes[id] {
             let disabled = node.style["dis"] == "1"
+            let slop = numOf(node.style["hitslop"]) ?? 0   // enlarge the tappable area beyond the bounds
             // A Pressable (press-feedback hint) gets instant press dim + onPress + gesture events.
             if let po = node.style["press"] {
-                render(node).modifier(PressAction(action: node.action,
+                render(node).padding(-slop).contentShape(Rectangle()).padding(slop).modifier(PressAction(action: node.action,
                                                   activeOpacity: Double(numOf(po) ?? 60) / 100.0,
                                                   scene: scene,
                                                   longPress: node.longPressAction,
@@ -2231,14 +2245,15 @@ struct NodeView: View {
         // numberOfLines caps the lines; ellipsizeMode picks how the overflow truncates.
         let nlines = s["nlines"].flatMap { Int($0) }
         let trunc: Text.TruncationMode = s["ellip"] == "head" ? .head : (s["ellip"] == "middle" ? .middle : .tail)
-        return Text(node.text).font(textFont(s)).foregroundColor(color).multilineTextAlignment(align)
+        let base = Text(node.text).font(textFont(s)).foregroundColor(color).multilineTextAlignment(align)
             .lineLimit(nlines)
             .truncationMode(trunc)
             .modifier(BoxStyle(s: s, parentRow: parentRow, align: boxAlign, parentStretch: parentStretch))
             // A plain label is tap-transparent so a grown label (`.frame(maxWidth:.infinity)`,
             // e.g. a NavBar title) doesn't swallow taps meant for a sibling button. A pressable
-            // Text (onPress -> node.action set) must stay hittable so its TapAction fires.
-            .allowsHitTesting(!node.action.isEmpty)
+            // Text (onPress -> node.action set) or a selectable one must stay hittable.
+            .allowsHitTesting(!node.action.isEmpty || s["sel"] == "1")
+        return s["sel"] == "1" ? AnyView(base.textSelection(.enabled)) : AnyView(base)   // select/copy
     }
 
     func buttonView(_ node: NodeData) -> some View {
@@ -2262,9 +2277,12 @@ struct NodeView: View {
             let cm: UIView.ContentMode = s["rmode"] == "contain" ? .scaleAspectFit : .scaleAspectFill
             let tint = s["tint"].map { hexColor($0) }
             let load = node.loadAction, err = node.errorAction
-            ChuksCachedImage(url: node.text, contentMode: cm, tint: tint,
-                             onLoad: load.isEmpty ? nil : { self.scene.dispatch(load) },
-                             onError: err.isEmpty ? nil : { self.scene.dispatch(err) })
+            ZStack {
+                if s["spin"] == "1" { ProgressView() }   // loading spinner behind the image (covered once it loads)
+                ChuksCachedImage(url: node.text, contentMode: cm, tint: tint,
+                                 onLoad: load.isEmpty ? nil : { self.scene.dispatch(load) },
+                                 onError: err.isEmpty ? nil : { self.scene.dispatch(err) })
+            }
                 .frame(width: numOf(s["w"]), height: numOf(s["h"]))
                 .clipped()
                 .blur(radius: numOf(s["blur"]) ?? 0)   // blurRadius
@@ -2353,7 +2371,8 @@ struct NodeView: View {
                           vol: s["vvol"].flatMap { Int($0) } ?? -1,
                           rate: s["vrate"].flatMap { Int($0) } ?? -1,
                           onEnd: end.isEmpty ? nil : { self.scene.dispatch(end) },
-                          onProgress: prog.isEmpty ? nil : { sec in self.scene.input(prog, "\(sec)") })
+                          onProgress: prog.isEmpty ? nil : { sec in self.scene.input(prog, "\(sec)") },
+                          poster: node.text)
             .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
     }
 

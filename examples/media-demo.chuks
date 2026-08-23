@@ -23,6 +23,8 @@ function screen(): Node {
             Text({ color: tk("text"), size: 20, weight: "bold" }, "Media events"),
         ]),
         Scroll({ grow: 1 }, [ Column({ pad: 12, gap: 12 }, [
+            card("Text selectable (long-press to copy)", Text({ color: tk("text"), size: 15, selectable: true }, "Hold this text to select and copy it.")),
+            card("Image spinner (while loading)", Image({ src: "https://picsum.photos/id/1043/300/140?x=9", w: 300, h: 140, radius: 10, bg: tk("bg"), spinner: true })),
             card("Image onLoad -> " + string(imgState.get()), Image({
                 src: "https://picsum.photos/id/237/400/200", w: 300, h: 150, radius: 10,
                 onLoad: function(): void { imgState.set("loaded") },
@@ -35,6 +37,10 @@ function screen(): Node {
             })),
             card("Image tintColor", Image({ src: "https://picsum.photos/id/1025/200/120", w: 200, h: 120, radius: 10, tintColor: tk("primary") })),
             card("Image blurRadius: 12", Image({ src: "https://picsum.photos/id/1025/300/140", w: 300, h: 140, radius: 10, blurRadius: 12 })),
+            card("Video poster (until first frame)", Video({
+                src: "https://videos.pexels.com/video-files/5385885/5385885-hd_1080_1920_25fps.mp4",
+                poster: "https://picsum.photos/id/1039/300/200", w: 220, h: 150, radius: 10, loop: true, muted: true,
+            })),
             card("Video " + string(int(vidTime.get())) + "s" + (bool(vidEnded.get()) ? " (ended)" : "") + " / seek", Column({ gap: 8 }, [
                 Video({
                     src: "https://videos.pexels.com/video-files/4434150/4434150-hd_1080_1920_30fps.mp4",
