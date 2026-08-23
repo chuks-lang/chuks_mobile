@@ -14,6 +14,7 @@ function card(title: string, body: Node): Node {
 function screen(): Node {
     const imgState: Cell = useState("loading…")
     const errState: Cell = useState("loading…")
+    const vidTime: Cell = useState(0)
     const vidEnded: Cell = useState(false)
     const seekTo: Cell = useState(-1)
 
@@ -33,14 +34,16 @@ function screen(): Node {
                 onError: function(): void { errState.set("failed to load") },
             })),
             card("Image tintColor", Image({ src: "https://picsum.photos/id/1025/200/120", w: 200, h: 120, radius: 10, tintColor: tk("primary") })),
-            card("Video onEnd / seek -> " + (bool(vidEnded.get()) ? "ended" : "playing"), Column({ gap: 8 }, [
+            card("Video " + string(int(vidTime.get())) + "s" + (bool(vidEnded.get()) ? " (ended)" : "") + " / seek", Column({ gap: 8 }, [
                 Video({
-                    src: "sample.mp4", w: 300, h: 170, radius: 10, loop: false, muted: true,
+                    src: "https://videos.pexels.com/video-files/4434150/4434150-hd_1080_1920_30fps.mp4",
+                    w: 220, h: 300, radius: 10, loop: false, muted: true,
                     seek: int(seekTo.get()),
+                    onProgress: function(t: int): void { vidTime.set(t) },
                     onEnd: function(): void { vidEnded.set(true) },
                 }),
                 Row({ gap: 10 }, [
-                    Button({ bg: tk("primary"), w: 130, h: 40, onPress: function(): void { seekTo.set(2) } }, "seek 2s"),
+                    Button({ bg: tk("primary"), w: 130, h: 40, onPress: function(): void { seekTo.set(8) } }, "seek 8s"),
                     Button({ bg: tk("primary"), w: 130, h: 40, onPress: function(): void { seekTo.set(0) } }, "restart"),
                 ]),
             ])),

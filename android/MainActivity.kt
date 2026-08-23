@@ -327,6 +327,31 @@ class MainActivity : Activity() {
     // List scrollToIndex/scrollToEnd: smooth-scroll the list's ScrollView to content-offset y
     // (Chuks logical points -> px), clamped. Posted so the content-size/layout emitted in the
     // same batch settles first (otherwise the max scroll range is stale).
+    // onProgress: poll the MediaPlayer's position (MediaPlayer has no periodic callback) and fire
+    // when the whole second changes, clamped to the clip length. Re-posts itself while the video
+    // and its onProgress handler live; only one poller per id.
+    private fun startProgressPoll(id: String) {
+        if (progressPollers.containsKey(id)) return
+        val h = Handler(Looper.getMainLooper())
+        val r = object : Runnable {
+            override fun run() {
+                val a = mediaProgress[id]
+                if (a == null) { progressPollers.remove(id); return }   // onProgress gone (node unmounted): stop
+                val mp = videoPlayers[id]                                // may be null transiently (attaches after layout)
+                if (mp != null) try {
+                    val sec = mp.currentPosition / 1000
+                    val dur = mp.duration / 1000
+                    if (sec >= 0 && (dur <= 0 || sec <= dur + 1) && videoLastSec[id] != sec) {
+                        videoLastSec[id] = sec; hostInput(a, sec.toString())
+                    }
+                } catch (e: Exception) {}
+                h.postDelayed(this, 250)
+            }
+        }
+        progressPollers[id] = r
+        h.postDelayed(r, 250)
+    }
+
     private fun scrollListTo(id: String, y: Int) {
         val vv = views[id] ?: return
         if (vv is HorizontalScrollView) {   // horizontal list: y is really the x offset
@@ -382,7 +407,7 @@ class MainActivity : Activity() {
                 "ML" -> if (f.size >= 2) mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
                 "ME" -> if (f.size >= 2) mediaError[f[1]] = f[1] + ":error"              // Image onError
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
-                "MP" -> {}   // onProgress: deferred (re-render storm)
+                "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
@@ -1321,8 +1346,11 @@ class MainActivity : Activity() {
     private val mediaLoad = HashMap<String, String>()          // id -> onLoad action (Image)
     private val mediaError = HashMap<String, String>()         // id -> onError action (Image)
     private val mediaEnd = HashMap<String, String>()           // id -> onEnd action (Video)
+    private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
     private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
+    private val videoLastSec = HashMap<String, Int>()          // id -> last whole second reported to onProgress
+    private val progressPollers = HashMap<String, Runnable>()  // id -> the active progress poll Runnable
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it

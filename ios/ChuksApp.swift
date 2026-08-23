@@ -758,6 +758,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
     var videoSeek: [String: Int] = [:]                                    // id -> last-applied seek (seconds)
     var videoTimeObservers: [String: Any] = [:]                           // id -> periodic time observer token
+    var videoLastSec: [String: Int] = [:]                                 // id -> last whole second reported to onProgress
     var modalIds: Set<String> = []                                        // Modal node ids (full-screen overlays)
     var activeModal: String? = nil                                        // the currently-visible Modal
     var sheetModals: Set<String> = []                                     // Modal ids with position=bottom (draggable sheets)
@@ -2479,10 +2480,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         videoSeek[id] = seconds
         videoPlayers[id]?.seek(to: CMTime(seconds: Double(seconds), preferredTimescale: 600))
     }
-    // onProgress: DEFERRED. A periodic observer that fires a full re-render each tick churns the
-    // pooled feed player (stacked players / runaway time). It needs a throttled, non-re-render
-    // channel; wired end-to-end but the observer is a no-op until that redesign lands.
-    func addVideoProgress(_ id: String) { }
+    // onProgress: attach a periodic observer, but fire only when the WHOLE SECOND changes and
+    // stays within the clip (throttles the re-render to ~1/sec and never reports a stray time
+    // past the end). One observer per id.
+    func addVideoProgress(_ id: String) {
+        guard let p = videoPlayers[id], videoTimeObservers[id] == nil else { return }
+        let tok = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self, weak p] _ in
+            guard let self = self, let p = p, let a = self.mediaProgress[id] else { return }
+            let sec = Int(p.currentTime().seconds)
+            let dur = p.currentItem?.duration.seconds ?? 0
+            if sec < 0 || (dur.isFinite && Double(sec) > dur + 1) { return }   // ignore out-of-range ticks
+            if self.videoLastSec[id] == sec { return }                        // dedup to whole seconds
+            self.videoLastSec[id] = sec
+            self.fireValue(a, "\(sec)")
+        }
+        videoTimeObservers[id] = tok
+    }
 
     func justify(_ v: String) -> YGJustify {
         switch v { case "center": return .center; case "end": return .flexEnd

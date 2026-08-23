@@ -262,7 +262,10 @@ final class LoopingPlayerView: UIView {
     private var wantMuted = true
     private var retries = 0
     var onEnd: (() -> Void)?
+    var onProgress: ((Int) -> Void)?
     private var lastSeek = -1
+    private var lastSec = -1
+    private var progressObs: Any?
     // Controllable like RN's Video: `playing`/`loop`/`muted`/`fit` apply on every update, so a
     // recycled feed cell can pause/resume by flipping `playing`. Only a src change rebuilds the item.
     func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String, seekTo: Int = -1) {
@@ -300,11 +303,24 @@ final class LoopingPlayerView: UIView {
         }
         playerLayer.player = p; player = p
         p.isMuted = wantMuted
+        // onProgress: report the whole second while it plays (dedup + clamp to the clip length).
+        if onProgress != nil {
+            lastSec = -1
+            progressObs = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self, weak p] _ in
+                guard let self = self, let p = p else { return }
+                let sec = Int(p.currentTime().seconds)
+                let dur = p.currentItem?.duration.seconds ?? 0
+                if sec < 0 || (dur.isFinite && Double(sec) > dur + 1) { return }
+                if self.lastSec == sec { return }
+                self.lastSec = sec; self.onProgress?(sec)
+            }
+        }
         if wantPlaying { p.play() }
     }
     private func teardown() {
         player?.pause()
         statusObs?.invalidate(); statusObs = nil
+        if let o = progressObs { player?.removeTimeObserver(o); progressObs = nil }
         if let l = looper { NotificationCenter.default.removeObserver(l); looper = nil }
         player = nil; playerLayer.player = nil
     }
@@ -319,12 +335,13 @@ struct ChuksVideo: UIViewRepresentable {
     let fit: String
     var seekTo: Int = -1
     var onEnd: (() -> Void)? = nil
+    var onProgress: ((Int) -> Void)? = nil
     func makeUIView(context: Context) -> LoopingPlayerView {
-        let v = LoopingPlayerView(); v.clipsToBounds = true; v.onEnd = onEnd
+        let v = LoopingPlayerView(); v.clipsToBounds = true; v.onEnd = onEnd; v.onProgress = onProgress
         v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo); return v
     }
     func updateUIView(_ uiView: LoopingPlayerView, context: Context) {
-        uiView.onEnd = onEnd
+        uiView.onEnd = onEnd; uiView.onProgress = onProgress
         uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo)
     }
 }
@@ -666,6 +683,7 @@ struct NodeData {
     var loadAction: String = ""
     var errorAction: String = ""
     var endAction: String = ""
+    var progressAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -967,7 +985,7 @@ final class Scene: ObservableObject {
             case "ML" where f.count >= 2: nodes[f[1]]?.loadAction = f[1] + ":load"
             case "ME" where f.count >= 2: nodes[f[1]]?.errorAction = f[1] + ":error"
             case "MN" where f.count >= 2: nodes[f[1]]?.endAction = f[1] + ":end"
-            case "MP" where f.count >= 2: break   // onProgress: deferred (re-render storm)
+            case "MP" where f.count >= 2: nodes[f[1]]?.progressAction = f[1] + ":progress"
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -2295,14 +2313,15 @@ struct NodeView: View {
 
     func videoView(_ node: NodeData) -> some View {
         let s = node.style
-        let end = node.endAction
+        let end = node.endAction, prog = node.progressAction
         return ChuksVideo(src: s["vid"] ?? "",
                           playing: s["vplay"] != "0",   // default = playing
                           loop: s["vloop"] != "0",
                           muted: s["vmute"] != "0",
                           fit: s["vfit"] ?? "",
                           seekTo: s["seek"].flatMap { Int($0) } ?? -1,
-                          onEnd: end.isEmpty ? nil : { self.scene.dispatch(end) })
+                          onEnd: end.isEmpty ? nil : { self.scene.dispatch(end) },
+                          onProgress: prog.isEmpty ? nil : { sec in self.scene.input(prog, "\(sec)") })
             .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
     }
 
