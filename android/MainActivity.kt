@@ -2477,11 +2477,17 @@ class MainActivity : Activity() {
     // so it works below API 31 where RenderEffect isn't available.
     private fun blurBitmap(src: android.graphics.Bitmap, radius: Float): android.graphics.Bitmap {
         if (radius <= 0f) return src
-        val scale = (radius / 2.5f).coerceIn(1f, 40f)
-        val w = (src.width / scale).toInt().coerceAtLeast(1)
-        val h = (src.height / scale).toInt().coerceAtLeast(1)
-        val small = android.graphics.Bitmap.createScaledBitmap(src, w, h, true)
-        return android.graphics.Bitmap.createScaledBitmap(small, src.width, src.height, true)
+        // Downscale hard then bilinear-upscale to approximate a Gaussian; two passes smooth out
+        // the blockiness and deepen the blur so it reads like iOS's CIGaussianBlur.
+        var out = src
+        for (i in 0 until 3) {
+            val scale = radius.coerceIn(2f, 30f)
+            val w = (src.width / scale).toInt().coerceAtLeast(1)
+            val h = (src.height / scale).toInt().coerceAtLeast(1)
+            val small = android.graphics.Bitmap.createScaledBitmap(out, w, h, true)
+            out = android.graphics.Bitmap.createScaledBitmap(small, src.width, src.height, true)
+        }
+        return out
     }
     private fun bmpFor(bmp: android.graphics.Bitmap, id: String): android.graphics.Bitmap {
         val r = imageBlur[id] ?: return bmp
