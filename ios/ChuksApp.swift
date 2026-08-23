@@ -837,7 +837,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
         NotificationCenter.default.addObserver(self, selector: #selector(kbShow(_:)),
             name: UIResponder.keyboardWillShowNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(kbHide),
+        NotificationCenter.default.addObserver(self, selector: #selector(kbHide(_:)),
             name: UIResponder.keyboardWillHideNotification, object: nil)
 
         // Tap anywhere outside a text field to dismiss the keyboard. cancelsTouchesInView
@@ -1063,16 +1063,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return true
     }
 
+    // Keyboard avoidance (adjust-resize): shrink the app's usable height by the keyboard
+    // height and relayout, so bottom-anchored content (a chat input bar) sits above the
+    // keyboard and scrollable content fits the reduced area. Automatic for every app, no
+    // KeyboardAvoidingView needed. Animated to match the keyboard's own curve.
+    var kbHeight: CGFloat = 0
     @objc func kbShow(_ n: Notification) {
-        guard let sc = listScroll,
-              let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
-        let inset = max(0, end.height - view.safeAreaInsets.bottom)
-        sc.contentInset.bottom = inset
-        sc.verticalScrollIndicatorInsets.bottom = inset
+        guard let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
+        let h = max(0, end.height - view.safeAreaInsets.bottom)
+        if h == kbHeight { return }
+        kbHeight = h
+        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        UIView.animate(withDuration: dur) { self.relayout() }
     }
-    @objc func kbHide() {
-        listScroll?.contentInset.bottom = 0
-        listScroll?.verticalScrollIndicatorInsets.bottom = 0
+    @objc func kbHide(_ n: Notification) {
+        if kbHeight == 0 { return }
+        kbHeight = 0
+        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        UIView.animate(withDuration: dur) { self.relayout() }
     }
 
     // ---- apply a Chuks mutation stream to both trees -----------------------
@@ -2339,7 +2347,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // since a hidden header has a .zero frame.
         let topY = BENCHMARK_MODE ? header.frame.maxY + 6 : insets.top
         let W = Float(view.bounds.width - insets.left - insets.right)
-        let H = Float(view.bounds.height - topY - insets.bottom)
+        let H = Float(view.bounds.height - topY - insets.bottom - kbHeight)   // shrink for the keyboard
         if W <= 0 || H <= 0 { return }
         YGNodeStyleSetWidth(app, W); YGNodeStyleSetHeight(app, H)
         YGNodeCalculateLayout(app, W, H, YGDirection.LTR)

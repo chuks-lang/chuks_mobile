@@ -28,15 +28,16 @@ function MessageBubble(text: string, mine: bool): Node {
 // ── Composable primitive: the input bar ──────────────────────────────────────
 // A grow-to-fill field + a Send button. The field is uncontrolled, so a bump of
 // `resetKey` remounts it empty after a send. onType keeps the draft; onSend fires it.
-function ChatInput(draft: Cell, resetKey: int, onSend: function(): void): Node {
-    return Row({ bg: tk("surface"), pad: 10, gap: 8, align: "center" }, [
-        Column({ grow: 1 }, [
-            KeyedComp(string(resetKey), function(): Node {
-                return TextInput({ placeholder: "Message", bg: tk("bg"), color: tk("text"), onChange: function(v: string): void { draft.set(v) } })
-            }),
-        ]),
-        Button({ bg: tk("primary"), onPress: onSend }, "Send"),
-    ])
+function ChatInput(resetKey: int, onType: function(v: string): void, onSend: function(): void): Node {
+    // The field grows to fill; the Send button keeps a comfortable touch target. The whole bar
+    // is wrapped in a KeyedComp whose key (resetKey) is bumped after a send, which remounts the
+    // (uncontrolled) field empty. onChange keeps the draft; onPress sends.
+    return KeyedComp(string(resetKey), function(): Node {
+        return Row({ bg: tk("surface"), pad: 10, gap: 8, align: "center" }, [
+            TextInput({ placeholder: "Message", bg: tk("bg"), color: tk("text"), grow: 1, h: 48, onChange: onType }),
+            Button({ bg: tk("primary"), w: 96, h: 48, onPress: onSend }, "Send"),
+        ])
+    })
 }
 
 function chat(): Node {
@@ -81,7 +82,7 @@ function chat(): Node {
             Text({ color: tk("muted"), size: 13 }, "online"),
         ]),
         Scroll({ grow: 1 }, [ Column({ pad: 12, gap: 6 }, bubbles) ]),
-        ChatInput(draft, int(resetKey.get()), send),
+        ChatInput(int(resetKey.get()), function(v: string): void { draft.set(v) }, send),
     ])
 }
 
