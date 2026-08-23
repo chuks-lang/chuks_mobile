@@ -1,0 +1,69 @@
+// A feed that exercises the P2 List props: onEndReached (infinite scroll), onRefresh
+// (pull-to-refresh), and empty (empty-state). Rows are simple numbered cards.
+import { NavStack, Node, Column, Row, Text, List, setSafeInsets } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
+import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
+import { setPlatformInfo } from "../core/platform.chuks";
+import { time } from "std/time";
+
+const PAGE: int = 20
+const MAX: int = 120
+
+function feed(): Node {
+    const n: Cell = useState(PAGE)       // how many rows are loaded
+    const busy: Cell = useState(false)   // pull-to-refresh spinner
+    const count: int = int(n.get())
+
+    return List({
+        count: count,
+        rowHeight: 64,
+        gap: 8,
+        pad: 12,
+        onRefresh: function(): void { n.set(PAGE) },        // reset to the first page
+        refreshing: bool(busy.get()),
+        onEndReached: function(): void {                    // load the next page near the end
+            const cur: int = int(n.get())
+            if (cur < MAX) { n.set(cur + PAGE < MAX ? cur + PAGE : MAX) }
+        },
+        endThreshold: 3,
+        empty: function(h: int): Node {
+            return Column({ h: h, justify: "center", align: "center" }, [
+                Text({ color: tk("muted"), size: 16 }, "Nothing here yet"),
+            ])
+        },
+        key: function(r: int): string { return string(r) },
+        item: function(r: int, top: int): Node {
+            return Row({ abs: true, top: top, left: 12, right: 12, h: 64, bg: tk("surface"), radius: 14, pad: 16, align: "center" }, [
+                Text({ color: tk("text"), size: 17, weight: "bold" }, "Item " + string(r + 1)),
+            ])
+        },
+    })
+}
+
+function createRoot(): NavStack {
+    var routes: map[string]function(): Node = {}
+    routes["home"] = function(): Node { return feed() }
+    return new NavStack(routes, "home")
+}
+
+var APP = createRoot()
+
+export function set_count(x: int): void { APP.setup(x) }
+export function mount(): int { return APP.mount() }
+export function remount(): int { return APP.remount() }
+export function setViewport(top: int, height: int): int { return APP.setViewport(top, height) }
+export function tick(): int { return APP.tick() }
+export function dispatch(action: string): int { return APP.dispatch(action) }
+export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
+export function drain(): string { return APP.drain() }
+export function saveState(): string { return APP.saveState() }
+export function loadState(data: string): void { APP.loadState(data) }
+export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
+export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
+export function setPlatform(os: string, version: string, model: string, isTablet: int): void {
+    setPlatformInfo(os, version, model, isTablet == 1)
+}

@@ -267,7 +267,7 @@ export unionType Prop = int | string | bool | function(): void | function(v: str
 // List-specific signatures, so they get their own union, distinct from Prop. The
 // last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
 // item(s,r,top)->Node; its header(s,top)->Node reuses (int,int)->Node above.
-export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void
+export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void | function(): void | function(top: int): Node
 
 // ---- Named-prop component builders (the JSX-like API) ----------------------
 // Compose with named props + children + closures:
@@ -1116,6 +1116,11 @@ export function Screen(p: map[string]Prop, kids: []Node): Node {
  *   - `gap`       vertical gap between rows
  *   - `pad`       top/bottom padding (optional)
  *   - `buffer`    extra rows kept above/below the window (optional, default 3)
+ *   - `paging`    snap one full screen per swipe (video feeds)
+ *   - `onVisible` (rank: int) -> void    the centered row changed (autoplay-follows-visible)
+ *   - `onEndReached` () -> void + `endThreshold` (rows)   fire near the end (infinite scroll)
+ *   - `onRefresh` () -> void + `refreshing` (bool)        pull-to-refresh + its spinner
+ *   - `empty`     (height: int) -> Node                   shown (filling the viewport) when count == 0
  *
  * Identity comes from `key()` (NOT the rank), so a row's views and state survive
  * when a filter moves it to a different position.
@@ -1241,13 +1246,17 @@ export class Reconciler {
     var tokenSeq: int               // async bridge: monotonic token counter
     var listVisible: map[string]int // List id -> last centered row index reported to its onVisible
     var pendingVisible: []any       // onVisible closures queued this frame, fired after render (see flushVisible)
+    var listEndFired: map[string]int // List id -> count at which onEndReached last fired (fire once per count)
+    var listRefreshing: map[string]int // List id -> last refreshing flag emitted (diff the spinner)
+    var listEmpty: map[string]bool   // List id -> whether the empty-state node is currently mounted
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
         this.cellRank = {}; this.poolSize = 0
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
-        this.listVisible = {}; this.pendingVisible = []
+        this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
+        this.listRefreshing = {}; this.listEmpty = {}
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1567,6 +1576,45 @@ export class Reconciler {
                 const idx: int = centered
                 this.pendingVisible.push(function(): void { vf(idx) })
             }
+        }
+        // onEndReached: infinite scroll. Fire when the last visible row reaches within
+        // `endThreshold` of the end. Fired once per `count` (recorded in listEndFired), so a
+        // steady view at the bottom doesn't spam it; when the app appends data (count grows)
+        // it can fire again. Queued like onVisible so its setState runs after this render.
+        const ef: any = d.get("onEndReached")
+        if (ef != null && count > 0 && stride > 0) {
+            const threshold: int = lpInt(d, "endThreshold", 0)
+            const lastVisible: int = (this.vpTop + this.vpH - pad) / stride
+            if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
+                this.listEndFired[id] = count
+                this.pendingVisible.push(function(): void { ef() })
+            }
+        }
+        // onRefresh: pull-to-refresh on the List's own scroll (reuses the Scroll path). The
+        // parent owns `refreshing` and clears it when the work is done to stop the spinner.
+        const rf: any = d.get("onRefresh")
+        if (rf != null) {
+            this.handlers[id] = rf
+            const refreshing: int = lpInt(d, "refreshing", 0)
+            const prevR: int = this.listRefreshing.getOr(id, -2)
+            if (prevR == -2) { this.emit("T|" + id + "|" + id) }   // enable the refresh control once
+            if (refreshing != prevR) {
+                this.listRefreshing[id] = refreshing
+                const rS: Style = new Style(); rS.rfsh = refreshing
+                this.emit("S|" + id + "|" + rS.str())
+            }
+        }
+        // empty: when there are no rows, render the empty-state node (filled to the viewport
+        // height) in place of the list; remove it once rows arrive.
+        const emptyFn: any = d.get("empty")
+        const emptyId: string = contentId + ".empty"
+        if (count == 0 && emptyFn != null) {
+            const enode: Node = emptyFn(this.vpH)
+            const pe: Node? = this.itemNodes.get(emptyId)
+            this.reconcile(pe, enode, emptyId, contentId, 0)
+            this.itemNodes[emptyId] = enode
+        } else if (this.itemNodes.has(emptyId)) {
+            this.emit("R|" + emptyId); this.itemNodes.delete(emptyId)
         }
     }
 
