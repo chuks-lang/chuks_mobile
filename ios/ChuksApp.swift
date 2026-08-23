@@ -27,6 +27,46 @@ import Network
 import CoreBluetooth
 import CoreNFC
 
+// ===== Feed-grade image cache (shared by both iOS hosts) =====
+// Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
+// (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
+// re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
+// uncached SwiftUI AsyncImage.
+extension UIImage {
+    // Force the bitmap decode NOW (off the main thread), so the first draw doesn't stall.
+    func chuksDecoded() -> UIImage {
+        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = scale; fmt.opaque = false
+        return UIGraphicsImageRenderer(size: size, format: fmt).image { _ in draw(at: .zero) }
+    }
+}
+final class ChuksImageLoader {
+    static let shared = ChuksImageLoader()
+    private let mem = NSCache<NSString, UIImage>()
+    private let session: URLSession
+    init() {
+        mem.countLimit = 200                 // secondary bound
+        mem.totalCostLimit = 128 << 20       // primary bound: 128MB of decoded pixels, byte-accurate
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 20
+        c.requestCachePolicy = .returnCacheDataElseLoad
+        c.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 256 << 20, diskPath: "chuks-img")
+        session = URLSession(configuration: c)
+    }
+    func cached(_ url: String) -> UIImage? { mem.object(forKey: url as NSString) }
+    // done() is always called on the main thread with the decoded image.
+    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void) {
+        if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
+        guard let url = URL(string: urlStr) else { return }
+        session.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data, let raw = UIImage(data: data) else { return }
+            let img = raw.chuksDecoded()
+            let cost = Int(img.size.width * img.size.height * img.scale * img.scale) * 4  // ~bytes of the decoded bitmap
+            self?.mem.setObject(img, forKey: urlStr as NSString, cost: cost)
+            DispatchQueue.main.async { done(img) }
+        }.resume()
+    }
+}
+
 // ===== Bluetooth LE (CoreBluetooth) + NFC (CoreNFC): shared by both iOS hosts =====
 // Decoupled from the host via onResolve/onFail closures (set to the host's resolve/fail).
 // CoreBluetooth is driven on the main queue, so callbacks fire on main.
@@ -2209,15 +2249,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return URLSession(configuration: c)
     }()
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView) {
-        if let cached = CardsVC.imageCache[urlStr] { iv.image = cached; return }
-        guard let url = URL(string: urlStr) else { return }
+        // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
+        // recycled cell never gets a late image for a URL it no longer shows.
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = cached; return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
-        CardsVC.imageSession.dataTask(with: url) { data, _, _ in
-            guard let data = data, let img = UIImage(data: data) else { return }
-            CardsVC.imageCache[urlStr] = img
-            DispatchQueue.main.async { if iv.tag == wanted { iv.image = img } }
-        }.resume()
+        ChuksImageLoader.shared.load(urlStr) { img in if iv.tag == wanted { iv.image = img } }
     }
 
     // Pull-to-refresh fired: run onRefresh (synchronous — its state change re-renders),

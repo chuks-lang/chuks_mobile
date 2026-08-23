@@ -27,6 +27,46 @@ import Network
 import CoreBluetooth
 import CoreNFC
 
+// ===== Feed-grade image cache (shared by both iOS hosts) =====
+// Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
+// (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
+// re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
+// uncached SwiftUI AsyncImage.
+extension UIImage {
+    // Force the bitmap decode NOW (off the main thread), so the first draw doesn't stall.
+    func chuksDecoded() -> UIImage {
+        let fmt = UIGraphicsImageRendererFormat.default(); fmt.scale = scale; fmt.opaque = false
+        return UIGraphicsImageRenderer(size: size, format: fmt).image { _ in draw(at: .zero) }
+    }
+}
+final class ChuksImageLoader {
+    static let shared = ChuksImageLoader()
+    private let mem = NSCache<NSString, UIImage>()
+    private let session: URLSession
+    init() {
+        mem.countLimit = 200                 // secondary bound
+        mem.totalCostLimit = 128 << 20       // primary bound: 128MB of decoded pixels, byte-accurate
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 20
+        c.requestCachePolicy = .returnCacheDataElseLoad
+        c.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 256 << 20, diskPath: "chuks-img")
+        session = URLSession(configuration: c)
+    }
+    func cached(_ url: String) -> UIImage? { mem.object(forKey: url as NSString) }
+    // done() is always called on the main thread with the decoded image.
+    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void) {
+        if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
+        guard let url = URL(string: urlStr) else { return }
+        session.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data, let raw = UIImage(data: data) else { return }
+            let img = raw.chuksDecoded()
+            let cost = Int(img.size.width * img.size.height * img.scale * img.scale) * 4  // ~bytes of the decoded bitmap
+            self?.mem.setObject(img, forKey: urlStr as NSString, cost: cost)
+            DispatchQueue.main.async { done(img) }
+        }.resume()
+    }
+}
+
 // ===== Bluetooth LE (CoreBluetooth) + NFC (CoreNFC): shared by both iOS hosts =====
 // Decoupled from the host via onResolve/onFail closures (set to the host's resolve/fail).
 // CoreBluetooth is driven on the main queue, so callbacks fire on main.
@@ -250,8 +290,6 @@ final class LoopingPlayerView: UIView {
             if self?.loop == true { p?.seek(to: .zero); p?.play() }
         }
         // Self-heal a failed load: a transient "network down" (the sim hits this at launch, and
-        // any device can on a flaky connection) leaves the item .failed and the card black
-        // forever. Recreate the item with a short backoff, a few times, so it recovers.
         // Self-heal a FAILED load: a transient network error leaves the item .failed and the
         // card black forever, so recreate it with a short backoff a few times. (This does not
         // touch a slow-but-still-loading item, so it never interrupts a working slow connection.)
@@ -285,6 +323,22 @@ struct ChuksVideo: UIViewRepresentable {
     }
     func updateUIView(_ uiView: LoopingPlayerView, context: Context) {
         uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit)
+    }
+}
+
+// A remote image backed by ChuksImageLoader (bounded LRU + disk + off-main decode), so a
+// recycled feed cell repaints instantly from cache instead of re-downloading like AsyncImage.
+struct ChuksCachedImage: UIViewRepresentable {
+    let url: String
+    let contentMode: UIView.ContentMode
+    func makeUIView(context: Context) -> UIImageView {
+        let iv = UIImageView(); iv.contentMode = contentMode; iv.clipsToBounds = true; return iv
+    }
+    func updateUIView(_ iv: UIImageView, context: Context) {
+        iv.contentMode = contentMode
+        if let cached = ChuksImageLoader.shared.cached(url) { iv.image = cached; return }
+        let wanted = url.hashValue; iv.tag = wanted; iv.image = nil
+        ChuksImageLoader.shared.load(url) { img in if iv.tag == wanted { iv.image = img } }
     }
 }
 
@@ -1932,16 +1986,12 @@ struct NodeView: View {
 
     @ViewBuilder func imageView(_ node: NodeData) -> some View {
         let s = node.style
-        if node.text.hasPrefix("http") {                     // remote (network) image
-            let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
-            AsyncImage(url: URL(string: node.text)) { img in
-                img.resizable().aspectRatio(contentMode: mode)
-            } placeholder: {
-                s["bg"].map { hexColor($0) } ?? Color.gray.opacity(0.15)
-            }
-            .frame(width: numOf(s["w"]), height: numOf(s["h"]))
-            .clipped()
-            .cornerRadius(numOf(s["r"]) ?? 0)
+        if node.text.hasPrefix("http") {                     // remote (network) image (cached)
+            let cm: UIView.ContentMode = s["rmode"] == "contain" ? .scaleAspectFit : .scaleAspectFill
+            ChuksCachedImage(url: node.text, contentMode: cm)
+                .frame(width: numOf(s["w"]), height: numOf(s["h"]))
+                .clipped()
+                .cornerRadius(numOf(s["r"]) ?? 0)
         } else if node.text.hasPrefix("file://"),
                   let ui = UIImage(contentsOfFile: String(node.text.dropFirst(7))) {   // picked/captured local file
             let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
@@ -1969,12 +2019,9 @@ struct NodeView: View {
     // A container whose background is a remote image, children on top.
     func imageBackgroundView(_ node: NodeData) -> some View {
         let s = node.style
-        let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
+        let cm: UIView.ContentMode = s["rmode"] == "contain" ? .scaleAspectFit : .scaleAspectFill
         return container(node).background(
-            AsyncImage(url: URL(string: node.text)) { img in
-                img.resizable().aspectRatio(contentMode: mode)
-            } placeholder: { Color.gray.opacity(0.15) }
-                .clipped()
+            ChuksCachedImage(url: node.text, contentMode: cm).clipped()
         ).cornerRadius(numOf(s["r"]) ?? 0)
     }
 

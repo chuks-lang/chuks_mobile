@@ -133,7 +133,12 @@ class MainActivity : Activity() {
     private val alertActions = HashMap<String, String>()  // id -> button-dispatch action
     private var presentedAlertId: String? = null          // Alert id currently on screen
     private var presentedAlertDialog: android.app.AlertDialog? = null
-    private val imageCache = HashMap<String, android.graphics.Bitmap>()  // URL -> decoded bitmap
+    // Bounded in-memory LRU (1/8 of the app heap) so a big image feed can't blow memory.
+    private val imageMem = object : android.util.LruCache<String, android.graphics.Bitmap>(
+        (Runtime.getRuntime().maxMemory() / 1024 / 8).toInt()) {
+        override fun sizeOf(key: String, b: android.graphics.Bitmap): Int = b.byteCount / 1024
+    }
+    private val imgDir by lazy { java.io.File(cacheDir, "imgcache").apply { mkdirs() } }  // disk cache (survives relaunch)
     private val bgImageViews = HashMap<String, ImageView>()              // ImageBackground id -> its backing image view
     private var refreshAction = ""                                       // Scroll onRefresh action
     private var refreshSpinner: ProgressBar? = null                      // pull-to-refresh spinner (overlaid on root)
@@ -2228,14 +2233,36 @@ class MainActivity : Activity() {
 
     // Fetch a remote image off the main thread (cached), then set it. Tag-guarded so a
     // recycled ImageView doesn't get a late bitmap for a URL it no longer wants.
+    // Keep the on-disk image cache bounded (oldest-first eviction) so it can't grow forever.
+    private fun trimImgDir() {
+        try {
+            val files = imgDir.listFiles() ?: return
+            var total = files.sumOf { it.length() }
+            val cap = 100L * 1024 * 1024   // 100MB
+            if (total <= cap) return
+            for (fl in files.sortedBy { it.lastModified() }) {
+                if (total <= cap) break
+                total -= fl.length(); fl.delete()
+            }
+        } catch (e: Exception) {}
+    }
     private fun loadRemoteImage(url: String, iv: ImageView) {
-        imageCache[url]?.let { iv.setImageBitmap(it); return }
+        // Feed-grade: memory LRU -> disk cache -> network, decoded off the main thread, with
+        // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
+        imageMem.get(url)?.let { iv.setImageBitmap(it); return }
         iv.setTag(TAG, url)
         Thread {
             try {
-                val bmp = java.net.URL(url).openStream().use { android.graphics.BitmapFactory.decodeStream(it) }
+                val key = Integer.toHexString(url.hashCode())
+                val f = java.io.File(imgDir, key)
+                var bmp = if (f.exists()) android.graphics.BitmapFactory.decodeFile(f.absolutePath) else null
+                if (bmp == null) {
+                    val bytes = java.net.URL(url).openStream().use { it.readBytes() }
+                    bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null) try { f.outputStream().use { os -> bmp!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os) }; trimImgDir() } catch (e: Exception) {}
+                }
                 if (bmp != null) {
-                    imageCache[url] = bmp
+                    imageMem.put(url, bmp)
                     iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmp) }
                 }
             } catch (e: Exception) { /* leave the placeholder */ }
