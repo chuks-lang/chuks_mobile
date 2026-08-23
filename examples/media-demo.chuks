@@ -38,7 +38,7 @@ function screen(): Node {
             card("Video " + string(int(vidTime.get())) + "s" + (bool(vidEnded.get()) ? " (ended)" : "") + " / seek", Column({ gap: 8 }, [
                 Video({
                     src: "https://videos.pexels.com/video-files/4434150/4434150-hd_1080_1920_30fps.mp4",
-                    w: 220, h: 300, radius: 10, loop: false, muted: true,
+                    w: 220, h: 300, radius: 10, loop: true, muted: true, controls: true,
                     seek: int(seekTo.get()),
                     onProgress: function(t: int): void { vidTime.set(t) },
                     onEnd: function(): void { vidEnded.set(true) },

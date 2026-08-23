@@ -504,8 +504,12 @@ export function Video(p: map[string]Prop): Node {
     s.seekTo = pInt(p, "seek", -1)                        // seek to N seconds when this changes
     s.vidVol = pInt(p, "volume", -1)                      // 0-100
     s.vidRate = pInt(p, "rate", -1)                       // playback speed percent (100 = 1x)
-    if (p.get("controls") != null) { s.vidCtrls = pBool(p, "controls", false) ? 1 : 0 }
-    const n: Node = new Node("Video", s, "", [])
+    const controls: bool = pBool(p, "controls", false)
+    if (p.get("controls") != null) { s.vidCtrls = controls ? 1 : 0 }
+    // A video with `controls` renders the platform's full native player UI (transport, scrubber,
+    // fullscreen, AirPlay, PiP, subtitle/audio menus), so it's a distinct kind the host maps to
+    // AVPlayerViewController / VideoPlayer / a MediaController-backed view.
+    const n: Node = new Node(controls ? "VideoControls" : "Video", s, "", [])
     applyMediaEvents(n, p)                                // onLoad / onEnd / onProgress
     return n
 }

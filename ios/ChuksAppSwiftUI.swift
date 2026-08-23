@@ -12,6 +12,7 @@ import UIKit
 import MapKit
 import Foundation
 import AVFoundation
+import AVKit
 import WebKit
 import Photos
 import PhotosUI
@@ -326,6 +327,27 @@ final class LoopingPlayerView: UIView {
         player = nil; playerLayer.player = nil
     }
     deinit { teardown() }
+}
+
+// Video `controls`: Apple's complete native player UI (transport, scrubber, fullscreen, AirPlay,
+// PiP, subtitle/audio menus) via AVPlayerViewController. The VC persists across re-renders so the
+// player isn't recreated each frame.
+struct ChuksControlsVideo: UIViewControllerRepresentable {
+    let src: String
+    let fit: String
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController(); vc.showsPlaybackControls = true
+        vc.videoGravity = fit == "contain" ? .resizeAspect : .resizeAspectFill
+        vc.view.backgroundColor = .black; vc.view.clipsToBounds = true
+        let u: URL? = src.hasPrefix("http") ? URL(string: src)
+                    : src.hasPrefix("file://") ? URL(fileURLWithPath: String(src.dropFirst(7)))
+                    : Bundle.main.url(forResource: src, withExtension: nil)
+        if let u = u { vc.player = AVPlayer(url: u); vc.player?.play() }
+        return vc
+    }
+    func updateUIViewController(_ vc: AVPlayerViewController, context: Context) {
+        vc.videoGravity = fit == "contain" ? .resizeAspect : .resizeAspectFill
+    }
 }
 
 struct ChuksVideo: UIViewRepresentable {
@@ -2188,6 +2210,8 @@ struct NodeView: View {
         case "StatusBar": Color.clear.frame(width: 0, height: 0)   // directive only; config read in apply()
         case "Modal": Color.clear.frame(width: 0, height: 0)       // rendered in the overlay by RootView, not inline
         case "Video":  videoView(node)
+        case "VideoControls": ChuksControlsVideo(src: node.style["vid"] ?? "", fit: node.style["vfit"] ?? "")
+            .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "CameraView": ChuksCamera(facing: node.text, scene: scene).modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "WebView": webView(node)
         case "ImageBackground": imageBackgroundView(node)

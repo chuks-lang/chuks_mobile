@@ -1160,6 +1160,7 @@ class MainActivity : Activity() {
         val v: View = when (kind) {
             "Text" -> TextView(this).also { it.gravity = Gravity.CENTER_VERTICAL }
             "Video" -> TextureView(this).also { it.isOpaque = false }   // MediaPlayer target (iOS: AVPlayerLayer)
+            "VideoControls" -> TextureView(this).also { it.isOpaque = false; videoControlsIds.add(id) }   // + native MediaController
             "CameraView" -> TextureView(this).also {                     // Camera2 preview (iOS: AVCaptureVideoPreviewLayer)
                 it.isOpaque = true
                 cameraIds.add(id)
@@ -1351,6 +1352,8 @@ class MainActivity : Activity() {
     private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
+    private val videoControlsIds = HashSet<String>()           // ids that show a native MediaController
+    private val videoMediaControllers = HashMap<String, android.widget.MediaController>()  // id -> attached controller
     private val videoLastSec = HashMap<String, Int>()          // id -> last whole second reported to onProgress
     private val progressPollers = HashMap<String, Runnable>()  // id -> the active progress poll Runnable
     private val borderW = HashMap<String, Float>()   // border width (px)
@@ -1642,6 +1645,31 @@ class MainActivity : Activity() {
         }
     }
 
+    // Video `controls`: Android's native MediaController (play/pause, scrubber, seek buttons)
+    // anchored to the video; it pops up on tap and auto-hides. (The richer fullscreen/PiP/subtitle
+    // menus that AVPlayerViewController gives on iOS would need ExoPlayer's PlayerView on Android.)
+    private fun attachMediaController(id: String, tv: TextureView, mp: MediaPlayer) {
+        if (videoMediaControllers.containsKey(id)) return
+        val ctrl = object : android.widget.MediaController.MediaPlayerControl {
+            override fun start() { try { mp.start() } catch (e: Exception) {} }
+            override fun pause() { try { mp.pause() } catch (e: Exception) {} }
+            override fun getDuration() = try { mp.duration } catch (e: Exception) { 0 }
+            override fun getCurrentPosition() = try { mp.currentPosition } catch (e: Exception) { 0 }
+            override fun seekTo(pos: Int) { try { mp.seekTo(pos) } catch (e: Exception) {} }
+            override fun isPlaying() = try { mp.isPlaying } catch (e: Exception) { false }
+            override fun getBufferPercentage() = 0
+            override fun canPause() = true
+            override fun canSeekBackward() = true
+            override fun canSeekForward() = true
+            override fun getAudioSessionId() = try { mp.audioSessionId } catch (e: Exception) { 0 }
+        }
+        val mc = android.widget.MediaController(this)
+        mc.setMediaPlayer(ctrl); mc.setAnchorView(tv); mc.isEnabled = true
+        tv.setOnClickListener { mc.show() }
+        videoMediaControllers[id] = mc
+        tv.post { mc.show(0) }   // show once, sticky, until first tap toggles it
+    }
+
     private fun attachVideo(id: String, asset: String) {
         if (videoPlayers.containsKey(id)) return
         val tv = views[id] as? TextureView ?: return
@@ -1667,7 +1695,8 @@ class MainActivity : Activity() {
             } catch (e: Exception) { videoAlive.remove(mp); mp.release(); return }
             mp.isLooping = videoLoopPref[id] ?: true
             val muted0 = videoMutePref[id] ?: true; mp.setVolume(if (muted0) 0f else 1f, if (muted0) 0f else 1f)
-            mp.setOnPreparedListener { videoReady.add(it); if (videoPlayPref[id] != false) it.start() }
+            mp.setOnPreparedListener { videoReady.add(it); if (videoPlayPref[id] != false) it.start()
+                if (videoControlsIds.contains(id)) attachMediaController(id, tv, it) }
             // onEnd: MediaPlayer only fires completion when NOT looping. Fire onEnd for the id
             // currently showing this (pooled) player.
             mp.setOnCompletionListener { player ->

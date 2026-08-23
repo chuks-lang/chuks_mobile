@@ -11,6 +11,7 @@
 
 import UIKit
 import AVFoundation
+import AVKit
 import WebKit
 import MapKit
 import Photos
@@ -761,6 +762,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var videoSeek: [String: Int] = [:]                                    // id -> last-applied seek (seconds)
     var videoTimeObservers: [String: Any] = [:]                           // id -> periodic time observer token
     var videoLastSec: [String: Int] = [:]                                 // id -> last whole second reported to onProgress
+    var videoCtrlVCs: [String: AVPlayerViewController] = [:]              // id -> native player+controls VC (controls: true)
     var modalIds: Set<String> = []                                        // Modal node ids (full-screen overlays)
     var activeModal: String? = nil                                        // the currently-visible Modal
     var sheetModals: Set<String> = []                                     // Modal ids with position=bottom (draggable sheets)
@@ -1750,6 +1752,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             bgImageViews[id] = iv; v = box
         case "Video":
             let vv = VideoView(); vv.playerLayer.videoGravity = .resizeAspectFill; vv.clipsToBounds = true; v = vv
+        case "VideoControls":
+            // Apple's complete native player UI (transport, scrubber, fullscreen, AirPlay, PiP,
+            // subtitle/audio menus) via AVPlayerViewController — added as a child VC of the host.
+            let vc = AVPlayerViewController(); vc.showsPlaybackControls = true
+            vc.videoGravity = .resizeAspectFill   // cover (default resizeMode), no letterbox bars
+            vc.view.backgroundColor = .black; vc.view.clipsToBounds = true
+            addChild(vc); vc.didMove(toParent: self)
+            videoCtrlVCs[id] = vc; v = vc.view
         case "CameraView":
             let ctrl = cameraController ?? CameraController()
             cameraController = ctrl
@@ -1926,7 +1936,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 let c = hexColor(val); imageTint[id] = c; iv.tintColor = c
                 if let img = iv.image { iv.image = img.withRenderingMode(.alwaysTemplate) } }
             case "seek": if let vv = v as? VideoView { seekVideo(id, to: Int(f)) }   // Video seek (seconds)
-            case "vctrl": break   // native video controls: deferred (needs AVPlayerViewController)
+            case "vctrl": break   // handled by the VideoControls kind (native AVPlayerViewController)
             case "dis":   // disabled: dim + block interaction (checked at fire time, since bindAction re-enables interaction)
                 v.alpha = (val == "1") ? 0.4 : 1.0
                 if let b = v as? UIButton { b.isEnabled = (val != "1") }
@@ -2008,6 +2018,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 (v as? UIImageView)?.contentMode = mode
                 bgImageViews[id]?.contentMode = mode
             case "vid":
+                // VideoControls: a standalone AVPlayer (not pooled) driven by the native UI. The
+                // pooled path below is skipped for it (its view isn't a VideoView).
+                if let vc = videoCtrlVCs[id], videoPlayers[id] == nil, !val.isEmpty {
+                    let url: URL? = val.hasPrefix("http") ? URL(string: val)
+                                  : val.hasPrefix("file://") ? URL(fileURLWithPath: String(val.dropFirst(7)))
+                                  : Bundle.main.url(forResource: val, withExtension: nil)
+                    if let url = url {
+                        let p = AVPlayer(url: url); vc.player = p; videoPlayers[id] = p; videoPlayerKey[id] = val; p.play()
+                    }
+                }
                 // Attach a muted, looping player when a Video node mounts. Reuse an
                 // idle player from the pool (its item + loop observer are still primed)
                 // instead of rebuilding an AVPlayerItem/AVPlayer on the main thread --
@@ -2050,6 +2070,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 videoPlayers[id]?.isMuted = (val != "0")
             case "vfit":
                 (v as? VideoView)?.playerLayer.videoGravity = (val == "contain") ? .resizeAspect : .resizeAspectFill
+                videoCtrlVCs[id]?.videoGravity = (val == "contain") ? .resizeAspect : .resizeAspectFill
             case "paging":   // List/Scroll snap-per-screen (video feeds)
                 (v as? UIScrollView)?.isPagingEnabled = (val == "1")
             case "stick": if v is UIScrollView { stickBottomOn = (val == "1") }
