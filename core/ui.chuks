@@ -87,6 +87,10 @@ export class Style {
     var tint: string    // Image tintColor (hex): recolor a template image ("" = none)
     var seekTo: int     // Video: seek to this time in seconds when it changes (-1 = no seek)
     var vidCtrls: int   // Video: 1 = show native playback controls (-1 = none)
+    var vidVol: int     // Video volume 0-100 (-1 = default, honors `muted`)
+    var vidRate: int    // Video playback rate as a percent (100 = 1x; -1 = default)
+    var blur: int       // Image blur radius in px (-1 = none)
+    var longDelay: int  // Pressable onLongPress delay in ms (-1 = default 500)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -105,6 +109,7 @@ export class Style {
         this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1; this.horiz = -1
         this.nlines = -1; this.ellip = ""; this.disabled = -1
         this.tint = ""; this.seekTo = -1; this.vidCtrls = -1
+        this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -160,6 +165,10 @@ export class Style {
         if (this.tint != "") { s = s + "tint=" + this.tint + ";" }
         if (this.seekTo >= 0) { s = s + "seek=" + string(this.seekTo) + ";" }
         if (this.vidCtrls >= 0) { s = s + "vctrl=" + string(this.vidCtrls) + ";" }
+        if (this.vidVol >= 0) { s = s + "vvol=" + string(this.vidVol) + ";" }
+        if (this.vidRate >= 0) { s = s + "vrate=" + string(this.vidRate) + ";" }
+        if (this.blur >= 0) { s = s + "blur=" + string(this.blur) + ";" }
+        if (this.longDelay >= 0) { s = s + "ldelay=" + string(this.longDelay) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -493,6 +502,8 @@ export function Video(p: map[string]Prop): Node {
     s.vidMute = pBool(p, "muted", true) ? 1 : 0
     s.vidFit = pStr(p, "resizeMode", "cover")
     s.seekTo = pInt(p, "seek", -1)                        // seek to N seconds when this changes
+    s.vidVol = pInt(p, "volume", -1)                      // 0-100
+    s.vidRate = pInt(p, "rate", -1)                       // playback speed percent (100 = 1x)
     if (p.get("controls") != null) { s.vidCtrls = pBool(p, "controls", false) ? 1 : 0 }
     const n: Node = new Node("Video", s, "", [])
     applyMediaEvents(n, p)                                // onLoad / onEnd / onProgress
@@ -523,6 +534,7 @@ export function Image(p: map[string]Prop): Node {
     s.resize = pStr(p, "resize", "cover")
     s.bg = pStr(p, "bg", "")
     s.tint = pStr(p, "tintColor", "")                     // recolor a template image
+    s.blur = pInt(p, "blurRadius", -1)                    // blur the image (px)
     if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
     applyLayout(s, p)
     const n: Node = new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
@@ -732,6 +744,7 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
 export function Pressable(p: map[string]Prop, kids: []Node): Node {
     const s: Style = new Style(); s.dir = "col"
     s.press = pInt(p, "activeOpacity", 60)
+    s.longDelay = pInt(p, "delayLongPress", -1)           // onLongPress hold time (ms)
     if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     applyLayout(s, p)
     const n: Node = mkView(s, kids)

@@ -1343,6 +1343,7 @@ class MainActivity : Activity() {
     private val pressInActions = HashMap<String, String>()     // id -> onPressIn action
     private val pressOutActions = HashMap<String, String>()    // id -> onPressOut action
     private val disabledIds = HashSet<String>()                // ids whose disabled=1 (block fire)
+    private val longDelayMs = HashMap<String, Long>()          // id -> onLongPress hold time (ms)
     private val mediaLoad = HashMap<String, String>()          // id -> onLoad action (Image)
     private val mediaError = HashMap<String, String>()         // id -> onError action (Image)
     private val mediaEnd = HashMap<String, String>()           // id -> onEnd action (Video)
@@ -1469,6 +1470,13 @@ class MainActivity : Activity() {
                 "seek" -> videoPlayers[id]?.let { mp ->                                                // Video seek (seconds)
                     val secs = f.toInt()
                     if (videoSeek[id] != secs) { videoSeek[id] = secs; try { mp.seekTo(secs * 1000) } catch (e: Exception) {} } }
+                "vvol" -> videoPlayers[id]?.let { try { it.setVolume(f / 100f, f / 100f) } catch (e: Exception) {} }   // Video volume 0-100
+                "vrate" -> videoPlayers[id]?.let { mp -> try {                                          // playback speed percent
+                    if (mp.isPlaying) mp.playbackParams = mp.playbackParams.setSpeed(f / 100f) } catch (e: Exception) {} }
+                "ldelay" -> longDelayMs[id] = f.toLong()                                                // onLongPress hold time (ms)
+                "blur" -> (v as? ImageView)?.let {                                                      // Image blurRadius (API 31+)
+                    if (android.os.Build.VERSION.SDK_INT >= 31) it.setRenderEffect(
+                        if (f > 0f) android.graphics.RenderEffect.createBlurEffect(f, f, android.graphics.Shader.TileMode.CLAMP) else null) }
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {
                         it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -2348,7 +2356,7 @@ class MainActivity : Activity() {
                                 longPressActions[id]?.let { lp ->
                                     longFired[0] = false
                                     val r = Runnable { longFired[0] = true; fire(lp) }
-                                    longRunnable[0] = r; view.postDelayed(r, 500)
+                                    longRunnable[0] = r; view.postDelayed(r, longDelayMs[id] ?: 500L)
                                 }
                                 true
                             }

@@ -268,7 +268,7 @@ final class LoopingPlayerView: UIView {
     private var progressObs: Any?
     // Controllable like RN's Video: `playing`/`loop`/`muted`/`fit` apply on every update, so a
     // recycled feed cell can pause/resume by flipping `playing`. Only a src change rebuilds the item.
-    func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String, seekTo: Int = -1) {
+    func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String, seekTo: Int = -1, vol: Int = -1, rate: Int = -1) {
         self.loop = loop; self.wantPlaying = playing; self.wantMuted = muted
         playerLayer.videoGravity = (fit == "contain") ? .resizeAspect : .resizeAspectFill
         if src != currentSrc, !src.isEmpty {
@@ -279,7 +279,8 @@ final class LoopingPlayerView: UIView {
             if let u = u { currentSrc = src; url = u; retries = 0; loadItem() }
         }
         player?.isMuted = muted
-        if playing { player?.play() } else { player?.pause() }
+        if vol >= 0 { player?.volume = Float(vol) / 100 }
+        if playing { player?.play(); if rate >= 0 { player?.rate = Float(rate) / 100 } } else { player?.pause() }
         if seekTo >= 0 && seekTo != lastSeek { lastSeek = seekTo; player?.seek(to: CMTime(seconds: Double(seekTo), preferredTimescale: 600)) }
     }
     private func loadItem() {
@@ -334,15 +335,17 @@ struct ChuksVideo: UIViewRepresentable {
     let muted: Bool
     let fit: String
     var seekTo: Int = -1
+    var vol: Int = -1
+    var rate: Int = -1
     var onEnd: (() -> Void)? = nil
     var onProgress: ((Int) -> Void)? = nil
     func makeUIView(context: Context) -> LoopingPlayerView {
         let v = LoopingPlayerView(); v.clipsToBounds = true; v.onEnd = onEnd; v.onProgress = onProgress
-        v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo); return v
+        v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo, vol: vol, rate: rate); return v
     }
     func updateUIView(_ uiView: LoopingPlayerView, context: Context) {
         uiView.onEnd = onEnd; uiView.onProgress = onProgress
-        uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo)
+        uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo, vol: vol, rate: rate)
     }
 }
 
@@ -1628,6 +1631,7 @@ struct PressAction: ViewModifier {
     var pressIn = ""
     var pressOut = ""
     var disabled = false
+    var longDelay = 0.5
     @State private var pressed = false
     @State private var longFired = false
     @State private var longTask: DispatchWorkItem? = nil
@@ -1649,7 +1653,7 @@ struct PressAction: ViewModifier {
                             longFired = false
                             let task = DispatchWorkItem { longFired = true; scene.dispatch(longPress) }
                             longTask = task
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: task)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + longDelay, execute: task)
                         }
                     }
                     .onEnded { _ in
@@ -2141,7 +2145,8 @@ struct NodeView: View {
                                                   longPress: node.longPressAction,
                                                   pressIn: node.pressInAction,
                                                   pressOut: node.pressOutAction,
-                                                  disabled: disabled))
+                                                  disabled: disabled,
+                                                  longDelay: (numOf(node.style["ldelay"]).map { Double($0) / 1000 }) ?? 0.5))
             } else {
                 // Button/Input/Switch wire their own action; any other actioned node
                 // (a View tab-bar item, chip, tappable card/row, pressable Text) gets a tap gesture.
@@ -2238,6 +2243,7 @@ struct NodeView: View {
                              onError: err.isEmpty ? nil : { self.scene.dispatch(err) })
                 .frame(width: numOf(s["w"]), height: numOf(s["h"]))
                 .clipped()
+                .blur(radius: numOf(s["blur"]) ?? 0)   // blurRadius
                 .cornerRadius(numOf(s["r"]) ?? 0)
         } else if node.text.hasPrefix("file://"),
                   let ui = UIImage(contentsOfFile: String(node.text.dropFirst(7))) {   // picked/captured local file
@@ -2320,6 +2326,8 @@ struct NodeView: View {
                           muted: s["vmute"] != "0",
                           fit: s["vfit"] ?? "",
                           seekTo: s["seek"].flatMap { Int($0) } ?? -1,
+                          vol: s["vvol"].flatMap { Int($0) } ?? -1,
+                          rate: s["vrate"].flatMap { Int($0) } ?? -1,
                           onEnd: end.isEmpty ? nil : { self.scene.dispatch(end) },
                           onProgress: prog.isEmpty ? nil : { sec in self.scene.input(prog, "\(sec)") })
             .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))

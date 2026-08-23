@@ -756,6 +756,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var mediaEnd: [String: String] = [:]                                  // id -> onEnd action (Video)
     var mediaProgress: [String: String] = [:]                             // id -> onProgress action (Video)
     var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
+    var imageBlur: [String: CGFloat] = [:]                                // id -> Image blur radius (px)
+    var pressLongDelay: [String: TimeInterval] = [:]                      // id -> onLongPress hold time (s)
     var videoSeek: [String: Int] = [:]                                    // id -> last-applied seek (seconds)
     var videoTimeObservers: [String: Any] = [:]                           // id -> periodic time observer token
     var videoLastSec: [String: Int] = [:]                                 // id -> last whole second reported to onProgress
@@ -2056,6 +2058,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 sc.showsHorizontalScrollIndicator = false
                 sc.showsVerticalScrollIndicator = false
             }
+            case "vvol": videoPlayers[id]?.volume = f / 100                 // Video volume 0-100
+            case "vrate": if let p = videoPlayers[id], p.rate != 0 { p.rate = f / 100 }   // playback speed while playing
+            case "ldelay": pressLongDelay[id] = TimeInterval(f) / 1000       // onLongPress hold time (ms)
+            case "blur": if let iv = v as? UIImageView { imageBlur[id] = CGFloat(f); applyBlur(iv, id) }   // Image blur (px)
             case "vloop":
                 if let p = videoPlayers[id] {
                     if val == "0" { videoNoLoop.insert(ObjectIdentifier(p)) } else { videoNoLoop.remove(ObjectIdentifier(p)) }
@@ -2259,7 +2265,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let lp = longPressActions[id] {
                 pressLongFired.remove(gid)
                 pressLongTimers[gid]?.invalidate()
-                pressLongTimers[gid] = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+                pressLongTimers[gid] = Timer.scheduledTimer(withTimeInterval: pressLongDelay[id] ?? 0.5, repeats: false) { [weak self] _ in
                     guard let self = self else { return }
                     self.pressLongFired.insert(gid); self.fire(lp)
                 }
@@ -2440,17 +2446,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
-        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); fireMedia(mediaLoad[id]); return }
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); applyBlur(iv, id); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
         ChuksImageLoader.shared.load(urlStr) { [weak self] img in
             guard let self = self else { return }
-            if iv.tag == wanted { iv.image = self.tinted(img, id) }
+            if iv.tag == wanted { iv.image = self.tinted(img, id); self.applyBlur(iv, id) }
             self.fireMedia(self.mediaLoad[id])
         } fail: { [weak self] in self?.fireMedia(self?.mediaError[id]) }
     }
     // Render as a template (for tintColor) when the node has a tint, else leave the image as-is.
     func tinted(_ img: UIImage?, _ id: String) -> UIImage? { imageTint[id] != nil ? img?.withRenderingMode(.alwaysTemplate) : img }
+    // Image blurRadius: Gaussian-blur the current image in place (cropped to the original extent).
+    func applyBlur(_ iv: UIImageView, _ id: String) {
+        guard let r = imageBlur[id], r > 0, let img = iv.image, let ci = CIImage(image: img),
+              let filter = CIFilter(name: "CIGaussianBlur") else { return }
+        filter.setValue(ci, forKey: kCIInputImageKey); filter.setValue(r, forKey: kCIInputRadiusKey)
+        guard let out = filter.outputImage, let cg = ciContext.createCGImage(out, from: ci.extent) else { return }
+        iv.image = UIImage(cgImage: cg)
+    }
+    let ciContext = CIContext()
     // Dispatch a media event action (onLoad/onError/onEnd) if one is registered for the node.
     func fireMedia(_ action: String?) { if let a = action { DispatchQueue.main.async { [weak self] in self?.fire(a) } } }
 
