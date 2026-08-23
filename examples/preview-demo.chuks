@@ -71,7 +71,7 @@ var APP = createRoot()
 export function set_count(n: int): void { APP.setup(n) }
 export function mount(): int { return APP.mount() }
 export function remount(): int { return APP.remount() }
-export function setViewport(top: int, height: int): int { return APP.setViewport(top, height) }
+export function setViewport(top: int, height: int, width: int): int { return APP.setViewport(top, height, width) }
 export function tick(): int { return APP.tick() }
 export function dispatch(action: string): int { return APP.dispatch(action) }
 export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }

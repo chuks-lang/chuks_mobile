@@ -15,7 +15,7 @@ extern "C" {
 JNIEXPORT void  JNICALL J(setup)(JNIEnv* e, jobject, jint n) { chuks_set_count(n); }
 JNIEXPORT jint  JNICALL J(mount)(JNIEnv* e, jobject) { return chuks_mount(); }
 JNIEXPORT jint  JNICALL J(tick)(JNIEnv* e, jobject) { return chuks_tick(); }
-JNIEXPORT jint  JNICALL J(viewport)(JNIEnv* e, jobject, jint t, jint h) { return chuks_setViewport(t, h); }
+JNIEXPORT jint  JNICALL J(viewport)(JNIEnv* e, jobject, jint t, jint h, jint w) { return chuks_setViewport(t, h, w); }
 JNIEXPORT jstring JNICALL J(drain)(JNIEnv* e, jobject) {
     char* s = chuks_drain();
     jstring r = e->NewStringUTF(s);

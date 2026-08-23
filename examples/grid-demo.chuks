@@ -1,44 +1,53 @@
-// Inverted List (chat-style: newest at the bottom, scroll up for older) + onScroll.
-// A fixed bar shows the live scroll offset (onScroll), so scrolling updates it. The list
-// is inverted, so "Msg 1" (row 0) sits at the bottom and "Msg 30" (row 29) is at the top.
-import { NavStack, Node, Column, Row, Text, List, setSafeInsets } from "../core/ui.chuks";
+// A 2-column photo-grid-style List: numColumns packs cells across the list width, and the
+// grid still virtualizes + paginates (onEndReached) exactly like a single-column feed.
+import { NavStack, Node, Row, Text, List, setSafeInsets } from "../core/ui.chuks";
 import { useState, Cell } from "../core/state.chuks";
 import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
 
-const N: int = 30
+const PAGE: int = 24
+const MAX: int = 120
 
-function feed(): Node {
-    const off: Cell = useState(0)   // last scroll offset, from onScroll
+// A palette so cells read as distinct tiles.
+function tint(r: int): string {
+    var hues: []string = ["6C5CE7", "00B894", "0984E3", "E17055", "E84393", "FDCB6E"]
+    return hues[r % hues.length]
+}
 
-    const bar: Node = Row({ bg: tk("surface"), pad: 12, justify: "center" }, [
-        Text({ color: tk("text"), size: 16, weight: "bold" }, "inverted chat — scrollY=" + string(int(off.get()))),
-    ])
+function grid(): Node {
+    const n: Cell = useState(PAGE)
+    const count: int = int(n.get())
 
-    const list: Node = List({
-        count: N,
-        rowHeight: 56,
-        gap: 8,
+    return List({
+        count: count,
+        rowHeight: 140,
+        gap: 12,
         pad: 12,
-        inverted: 1,
-        onScroll: function(y: int): void { off.set(y) },
+        numColumns: 2,
+        onEndReached: function(): void {
+            const cur: int = int(n.get())
+            if (cur < MAX) { n.set(cur + PAGE < MAX ? cur + PAGE : MAX) }
+        },
+        endThreshold: 4,
+        headerHeight: 56,
+        header: function(top: int): Node {
+            return Row({ abs: true, top: top, left: 12, right: 12, h: 56, align: "center" }, [
+                Text({ color: tk("text"), size: 26, weight: "bold" }, "Gallery"),
+            ])
+        },
+        key: function(r: int): string { return string(r) },
         item: function(r: int, top: int): Node {
-            // r=0 is newest (bottom). Right-align even rows to read like a chat.
-            const mine: bool = r % 2 == 0
-            return Row({ abs: true, top: top, left: 12, right: 12, h: 56, justify: mine ? "end" : "start", align: "center" }, [
-                Column({ bg: mine ? tk("primary") : tk("surface"), radius: 16, pad: 12 }, [
-                    Text({ color: mine ? "FFFFFF" : tk("text"), size: 15 }, "Msg " + string(r + 1)),
-                ]),
+            // The List sets left + width (columns); we just fill our cell with a card.
+            return Row({ abs: true, top: top, h: 140, bg: tint(r), radius: 16, justify: "center", align: "center" }, [
+                Text({ color: "FFFFFF", size: 22, weight: "bold" }, string(r + 1)),
             ])
         },
     })
-
-    return Column({ grow: 1, bg: tk("bg") }, [ bar, list ])
 }
 
 function createRoot(): NavStack {
     var routes: map[string]function(): Node = {}
-    routes["home"] = function(): Node { return feed() }
+    routes["home"] = function(): Node { return grid() }
     return new NavStack(routes, "home")
 }
 

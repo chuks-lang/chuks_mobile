@@ -80,6 +80,7 @@ export class Style {
     var autoCorr: int   // 0 = off, 1 = on (-1 = default)
     var maxLen: int     // max characters (-1 = unlimited)
     var stick: int      // Scroll: 1 = stick to bottom (chat) when content grows / keyboard opens (-1 = no)
+    var horiz: int      // Scroll/List: 1 = scroll horizontally (a carousel); -1 = vertical (default)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -95,7 +96,7 @@ export class Style {
         this.tx = 0; this.ty = 0; this.rot = 0; this.scl = 100; this.animMs = -1; this.animEz = ""
         this.vidPlay = -1; this.vidLoop = -1; this.vidMute = -1; this.vidFit = ""; this.paging = -1
         this.kbType = ""; this.retKey = ""; this.editable = -1; this.autoFocus = -1
-        this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1
+        this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1; this.horiz = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -144,6 +145,7 @@ export class Style {
         if (this.autoCorr >= 0) { s = s + "acor=" + string(this.autoCorr) + ";" }
         if (this.maxLen >= 0) { s = s + "maxlen=" + string(this.maxLen) + ";" }
         if (this.stick >= 0) { s = s + "stick=" + string(this.stick) + ";" }
+        if (this.horiz >= 0) { s = s + "horiz=" + string(this.horiz) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -301,6 +303,11 @@ export function safeLeft(): int { return _safeLeft }
 // size its cells to this, NOT to DeviceInfo.screen (that mismatch offsets every page).
 var _vpH: int = 0
 export function viewportHeight(): int { return _vpH }
+// The cross-axis viewport size the host reports alongside the scroll window: the list's
+// WIDTH for a vertical list (used to size grid columns for `numColumns`), or its height for
+// a horizontal list. 0 until the host first reports it.
+var _vpW: int = 0
+export function viewportWidth(): int { return _vpW }
 // Read an int config value `k` from a List's ListProp map, or `def` if absent.
 function lpInt(d: map[string]ListProp, k: string, def: int): int { const v: ListProp? = d.get(k); if (v != null) { return int(v) } return def }
 // Copy the layout/visual props onto a Style. Each pInt/pStr defaults to the
@@ -1234,6 +1241,7 @@ export class Reconciler {
     var handlers: map[string]any    // node id -> onPress/onChange closure (events)
     var vpTop: int                  // viewport (set by the host each scroll) for List windowing
     var vpH: int
+    var vpW: int                    // cross-axis viewport size (list width for a vertical list; grid columns)
     var rootPrev: Node?             // last rendered root, for diffing
     var itemNodes: map[string]Node  // List cell id -> last node it showed (for reconcile prev)
     var mounted: []string           // List cell ids in use this frame
@@ -1257,7 +1265,7 @@ export class Reconciler {
     var listScrollPos: map[string]int // List id -> last scroll offset reported to its onScroll
     constructor() {
         this.lines = []; this.handlers = {}
-        this.vpTop = 0; this.vpH = 0; this.rootPrev = null
+        this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
         this.cellRank = {}; this.poolSize = 0
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
@@ -1284,7 +1292,7 @@ export class Reconciler {
     // Join the buffered mutations into the newline-delimited stream the host applies.
     public drain(): string { return this.lines.join("\n") }
     // Record the visible scroll window used by reconcileList to pick the mount range.
-    public setViewport(top: int, h: int): void { this.vpTop = top; this.vpH = h }
+    public setViewport(top: int, h: int, w: int): void { this.vpTop = top; this.vpH = h; if (w > 0) { this.vpW = w } }
     // Fire any onVisible callbacks queued during this render (a paging List's centered row
     // changed). Called AFTER renderRoot so the closures can setState safely; returns true if
     // any fired, so the caller re-renders to reflect the new state (e.g. play the settled cell).
@@ -1500,6 +1508,8 @@ export class Reconciler {
     // rest. Item identity comes from key(rank), so a row survives when a filter
     // moves it to a different rank (its id "c<key>" is stable, only its top moves).
     reconcileList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        const d0: map[string]ListProp = next.data
+        if (lpInt(d0, "horizontal", 0) == 1) { this.reconcileHList(prev, next, id, parent, index); return }
         const d: map[string]ListProp = next.data
         const count: int = lpInt(d, "count", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
@@ -1514,11 +1524,20 @@ export class Reconciler {
         const headerH: int = lpInt(d, "headerHeight", 0)
         const footerH: int = lpInt(d, "footerHeight", 0)
         const rowsTop: int = pad + headerH               // where the first row sits
-        const contentH: int = rowsTop + count * stride + footerH + pad
         // inverted (chat): row 0 sits at the BOTTOM and later rows stack upward, so a
         // freshly-appended row 0 (newest) shows at the bottom. `invBase` is row 0's top;
         // top(r) = invBase - r*stride. Default off, so a feed lays out exactly as before.
         const inverted: bool = lpInt(d, "inverted", 0) == 1
+        // numColumns (grid): pack `ncol` cells per row across the list WIDTH (reported by the
+        // host as vpW). The reconciler computes each cell's column width + x and overrides them
+        // on the item node, so the app's item builder need not know the layout. ncol defaults
+        // to 1 (a plain list); grids are non-inverted, so inverted forces ncol back to 1.
+        const ncol0: int = lpInt(d, "numColumns", 1)
+        const ncol: int = (inverted || ncol0 < 1) ? 1 : ncol0
+        const gridRows: int = (count + ncol - 1) / ncol   // rows of `ncol` cells; == count when ncol==1
+        var colW: int = 0
+        if (ncol > 1 && this.vpW > 0) { colW = (this.vpW - 2 * pad - (ncol - 1) * gap) / ncol }
+        const contentH: int = rowsTop + gridRows * stride + footerH + pad
         const invBase: int = contentH - pad - footerH - rowH
 
         if (prev == null) {
@@ -1541,18 +1560,23 @@ export class Reconciler {
 
         // Which rows fall in the viewport (± buffer). Inverted flips the mapping: top
         // decreases as r grows, so the near/far viewport edges swap which r they bound.
-        var r0: int = 0
-        var r1: int = 0
+        // Window on GRID ROWS (each holds `ncol` cells), then expand to item ranks. For a plain
+        // list ncol==1, so a grid row is a row and this is unchanged.
+        var gr0: int = 0
+        var gr1: int = 0
         if (inverted) {
-            r0 = (invBase - (this.vpTop + this.vpH)) / stride - buffer
-            r1 = (invBase - this.vpTop) / stride + buffer + 1
+            gr0 = (invBase - (this.vpTop + this.vpH)) / stride - buffer
+            gr1 = (invBase - this.vpTop) / stride + buffer + 1
         } else {
-            r0 = (this.vpTop - rowsTop) / stride - buffer
-            r1 = (this.vpTop + this.vpH - rowsTop) / stride + buffer + 1
+            gr0 = (this.vpTop - rowsTop) / stride - buffer
+            gr1 = (this.vpTop + this.vpH - rowsTop) / stride + buffer + 1
         }
-        if (r0 < 0) { r0 = 0 }
+        if (gr0 < 0) { gr0 = 0 }
+        if (gr1 > gridRows) { gr1 = gridRows }
+        if (gr1 < gr0) { gr1 = gr0 }
+        var r0: int = gr0 * ncol
+        var r1: int = gr1 * ncol
         if (r1 > count) { r1 = count }
-        if (r1 < r0) { r1 = r0 }
 
         // ---- VIEW RECYCLING (the FlashList trick) --------------------------------
         // A fixed POOL of cell views ("<content>.cell<i>"). On scroll we don't destroy
@@ -1577,8 +1601,17 @@ export class Reconciler {
             if (kept != null) { cid = kept }                  // this row is already on a cell: reuse in place
             else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }   // recycle a leaving cell
             else { cid = contentId + ".cell" + string(this.poolSize); this.poolSize = this.poolSize + 1 }  // grow the pool
-            const top: int = inverted ? invBase - r * stride : rowsTop + r * stride
+            const gridRow: int = r / ncol
+            const top: int = inverted ? invBase - r * stride : rowsTop + gridRow * stride
             const node: Node = itemFn(r, top)
+            // Grid: the list owns each cell's column x + width; override them on the node so the
+            // app's item builder stays layout-agnostic. `right` is cleared so width wins.
+            if (ncol > 1 && colW > 0) {
+                const col: int = r % ncol
+                node.style.left = pad + col * (colW + gap)
+                node.style.w = colW
+                node.style.right = -1
+            }
             const pn: Node? = this.itemNodes.get(cid)         // the node this cell last showed (null on first use)
             this.reconcile(pn, node, cid, contentId, 0)       // diff -> minimal S|/P|, no C|/R| when recycling
             this.itemNodes[cid] = node
@@ -1612,8 +1645,10 @@ export class Reconciler {
         if (ef != null && count > 0 && stride > 0) {
             const threshold: int = lpInt(d, "endThreshold", 0)
             // The "end" is the far edge of the data: the bottom row normally, or the TOP row
-            // when inverted (a chat scrolling up to load older messages).
-            const lastVisible: int = inverted ? (invBase - this.vpTop) / stride : (this.vpTop + this.vpH - rowsTop) / stride
+            // when inverted (a chat scrolling up to load older messages). In a grid the last
+            // visible GRID ROW covers up to `ncol` ranks, so convert to the last visible rank.
+            const lastGridRow: int = inverted ? (invBase - this.vpTop) / stride : (this.vpTop + this.vpH - rowsTop) / stride
+            const lastVisible: int = ncol > 1 ? (lastGridRow + 1) * ncol - 1 : lastGridRow
             if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
                 this.listEndFired[id] = count
                 this.pendingVisible.push(function(): void { ef() })
@@ -1695,6 +1730,120 @@ export class Reconciler {
         // onScroll: report the scroll offset (points) whenever it changes, so an app can drive
         // a parallax header, a scroll-to-top button, etc. Queued like onVisible (fired after
         // render); opt-in, so a list without onScroll pays nothing.
+        const osf: any = d.get("onScroll")
+        if (osf != null && this.vpTop != this.listScrollPos.getOr(id, -1)) {
+            this.listScrollPos[id] = this.vpTop
+            const off: int = this.vpTop
+            this.pendingVisible.push(function(): void { osf(off) })
+        }
+    }
+
+    // A HORIZONTAL virtualized list (a carousel / story reel). Same windowed cell-recycling
+    // as reconcileList, but the main axis is x: the host scrolls sideways and reports its
+    // x-offset + width as the scroll window (vpTop/vpH), so the windowing math is unchanged;
+    // only the layout flips. Cells fill the list HEIGHT (the app sizes the cross axis) and the
+    // reconciler places each at its x (left) with a fixed `itemWidth`.
+    reconcileHList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        const d: map[string]ListProp = next.data
+        const count: int = lpInt(d, "count", 0)
+        const itemW: int = lpInt(d, "itemWidth", 0)
+        const gap: int = lpInt(d, "gap", 0)
+        const pad: int = lpInt(d, "pad", 0)
+        const stride: int = itemW + gap
+        const buffer: int = lpInt(d, "buffer", 3)
+        const itemFn: any = d.get("item")
+        const contentId: string = id + ".0"
+        const leftStart: int = pad
+        const contentW: int = leftStart + count * stride + pad
+
+        if (prev == null) {
+            this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
+            const listS: Style = new Style(); listS.grow = 1; listS.basis = 0; listS.horiz = 1
+            if (lpInt(d, "paging", 0) == 1) { listS.paging = 1 }   // snap one item per screen
+            // A distinct kind so a host that needs a different scroll class for the x-axis
+            // (Android's HorizontalScrollView) creates the right view; the `horiz` style tells
+            // the others (UIKit/SwiftUI reuse their vertical scroll view on the x-axis).
+            this.emit("C|" + id + "|HScroll"); this.emit("S|" + id + "|" + listS.str())
+            this.emit("I|" + id + "|" + parent + "|" + string(index))
+            const cS: Style = new Style(); cS.w = contentW           // content is WIDE; height fills
+            this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
+            this.emit("I|" + contentId + "|" + id + "|0")
+            this.listCount = count; this.listContentH = contentW
+        } else if (contentW != this.listContentH) {
+            const cS: Style = new Style(); cS.w = contentW
+            this.emit("S|" + contentId + "|" + cS.str())
+            this.listCount = count; this.listContentH = contentW
+        }
+
+        var c0: int = (this.vpTop - leftStart) / stride - buffer
+        if (c0 < 0) { c0 = 0 }
+        var c1: int = (this.vpTop + this.vpH - leftStart) / stride + buffer + 1
+        if (c1 > count) { c1 = count }
+        if (c1 < c0) { c1 = c0 }
+
+        var freeCells: []string = []
+        var rankCell: map[string]string = {}
+        for (var i: int = 0; i < this.poolSize; i = i + 1) {
+            const cid: string = contentId + ".cell" + string(i)
+            const cr: int = this.cellRank.getOr(cid, -1)
+            if (cr >= c0 && cr < c1) { rankCell[string(cr)] = cid } else { freeCells.push(cid) }
+        }
+
+        const newMounted: []string = []
+        var fi: int = 0
+        for (var c: int = c0; c < c1; c = c + 1) {
+            var cid: string = ""
+            const kept: string? = rankCell.get(string(c))
+            if (kept != null) { cid = kept }
+            else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }
+            else { cid = contentId + ".cell" + string(this.poolSize); this.poolSize = this.poolSize + 1 }
+            const left: int = leftStart + c * stride
+            const node: Node = itemFn(c, pad)                 // pass the cross-axis top (pad); we own x
+            node.style.left = left; node.style.w = itemW; node.style.right = -1
+            const pn: Node? = this.itemNodes.get(cid)
+            this.reconcile(pn, node, cid, contentId, 0)
+            this.itemNodes[cid] = node
+            this.cellRank[cid] = c
+            newMounted.push(cid)
+        }
+        this.mounted = newMounted
+
+        // onVisible: the item under the horizontal center.
+        const vf: any = d.get("onVisible")
+        if (vf != null && count > 0 && stride > 0) {
+            var centered: int = (this.vpTop + this.vpH / 2 - leftStart) / stride
+            if (centered < 0) { centered = 0 }
+            if (centered >= count) { centered = count - 1 }
+            if (centered != this.listVisible.getOr(id, -1)) {
+                this.listVisible[id] = centered
+                const idx: int = centered
+                this.pendingVisible.push(function(): void { vf(idx) })
+            }
+        }
+        // onEndReached: near the right edge.
+        const ef: any = d.get("onEndReached")
+        if (ef != null && count > 0 && stride > 0) {
+            const threshold: int = lpInt(d, "endThreshold", 0)
+            const lastVisible: int = (this.vpTop + this.vpH - leftStart) / stride
+            if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
+                this.listEndFired[id] = count
+                this.pendingVisible.push(function(): void { ef() })
+            }
+        }
+        // scrollToIndex / scrollToEnd along x (reuses the LS command; host reports/moves x).
+        const sti: int = lpInt(d, "scrollToIndex", -1)
+        if (sti >= 0 && sti != this.listScrollIdx.getOr(id, -999)) {
+            this.listScrollIdx[id] = sti
+            this.emit("LS|" + id + "|" + string(leftStart + sti * stride))
+        }
+        const ste: int = lpInt(d, "scrollToEnd", 0)
+        if (ste != this.listScrollEnd.getOr(id, 0)) {
+            this.listScrollEnd[id] = ste
+            var endX: int = contentW - this.vpH
+            if (endX < 0) { endX = 0 }
+            this.emit("LS|" + id + "|" + string(endX))
+        }
+        // onScroll: report the x offset when it changes.
         const osf: any = d.get("onScroll")
         if (osf != null && this.vpTop != this.listScrollPos.getOr(id, -1)) {
             this.listScrollPos[id] = this.vpTop
@@ -1879,10 +2028,11 @@ export class App {
     // tree, not an empty diff against a tree it never received. Not called in production.
     public remount(): int { this.recon.forgetCommitted(); return this.mount() }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
-    public setViewport(top: int, h: int): int {
+    public setViewport(top: int, h: int, w: int): int {
         runAsyncQueue()
         if (h > 0) { _vpH = h }   // expose the real viewport height (viewportHeight()) for full-screen feeds
-        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        if (w > 0) { _vpW = w }   // expose the list width (viewportWidth()) for grid column sizing
+        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h, w); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
         // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
         // then re-render (WITHOUT begin, so the windowing mutations above are kept) so the newly
         // visible cell's state change (e.g. Video playing) lands in the same frame.

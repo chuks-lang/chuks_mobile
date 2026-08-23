@@ -679,6 +679,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
     var scrollId = ""
+    var listHoriz = false            // the tracked list scrolls horizontally (report x, not y)
     var stickBottomOn = false        // Scroll stickBottom: keep pinned to newest (chat)
     var stickPrevH: CGFloat = 0      // previous content height, to tell if the user was at the bottom
     var contentId = ""
@@ -769,9 +770,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if DEV_MODE { return devHTTP("/tick", "") }
         _ = chuks_tick(); return drainStr()
     }
-    func eViewport(_ top: Int32, _ h: Int32) -> String? {
-        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h)") }
-        _ = chuks_setViewport(top, h); return drainStr()
+    func eViewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String? {
+        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h) \(w)") }
+        _ = chuks_setViewport(top, h, w); return drainStr()
     }
     // Report the OS appearance to the engine (updates the theme unless the user has
     // overridden). No render here — the caller mounts/ticks afterwards.
@@ -909,9 +910,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     @discardableResult
     func pushViewport() -> Bool {
         guard let sc = listScroll else { return false }
-        let h = Int32(sc.bounds.height); if h <= 0 { return false }
-        let top = Int32(max(0, sc.contentOffset.y))
-        guard let s = eViewport(top, h) else { connected = false; return false }
+        // The main axis is x for a horizontal list: report its x-offset + width as the scroll
+        // window, and the height as the cross size. Vertical lists report y + height + width.
+        let mainExtent = Int32(listHoriz ? sc.bounds.width : sc.bounds.height); if mainExtent <= 0 { return false }
+        let top = Int32(max(0, listHoriz ? sc.contentOffset.x : sc.contentOffset.y))
+        let cross = Int32(max(0, listHoriz ? sc.bounds.height : sc.bounds.width))
+        guard let s = eViewport(top, mainExtent, cross) else { connected = false; return false }
         if !s.isEmpty { apply(s); return true }
         return false
     }
@@ -1644,9 +1648,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // scroll partway (a small already-mounted jump survives, a large one aborts near the top).
     func scrollListTo(_ id: String, y: CGFloat) {
         DispatchQueue.main.async { [weak self] in
-            guard let sc = self?.views[id] as? UIScrollView else { return }
-            let maxY = max(0, sc.contentSize.height - sc.bounds.height)
-            sc.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: false)
+            guard let self = self, let sc = self.views[id] as? UIScrollView else { return }
+            if self.listHoriz && sc == self.listScroll {   // horizontal list: y is really the x offset
+                let maxX = max(0, sc.contentSize.width - sc.bounds.width)
+                sc.setContentOffset(CGPoint(x: min(max(0, y), maxX), y: 0), animated: false)
+            } else {
+                let maxY = max(0, sc.contentSize.height - sc.bounds.height)
+                sc.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: false)
+            }
         }
     }
 
@@ -1834,10 +1843,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             dt.numberOfTapsRequired = 2; gv.addGestureRecognizer(dt)
             gv.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:))))
             gestureIds.insert(id); v = gv
-        case "Scroll":
+        case "Scroll", "HScroll":   // one UIScrollView for both axes; the `horiz` style picks x vs y
             let sc = UIScrollView(); sc.delegate = self; sc.keyboardDismissMode = .onDrag
             sc.showsVerticalScrollIndicator = true
-            listScroll = sc; scrollId = id; v = sc
+            listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll"); v = sc   // horiz confirmed by the style too
         case "Modal":
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
             mv.isHidden = true                     // shown when mvis=1
@@ -2001,6 +2010,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "paging":   // List/Scroll snap-per-screen (video feeds)
                 (v as? UIScrollView)?.isPagingEnabled = (val == "1")
             case "stick": if v is UIScrollView { stickBottomOn = (val == "1") }
+            case "horiz": if let sc = v as? UIScrollView {   // horizontal list (carousel): report x + scroll sideways
+                listHoriz = (val == "1")
+                sc.showsHorizontalScrollIndicator = false
+                sc.showsVerticalScrollIndicator = false
+            }
             case "vloop":
                 if let p = videoPlayers[id] {
                     if val == "0" { videoNoLoop.insert(ObjectIdentifier(p)) } else { videoNoLoop.remove(ObjectIdentifier(p)) }
@@ -2446,9 +2460,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         } else {
             clearSheetChrome()
         }
-        // the scroll's content size comes from its content node's laid-out size
+        // the scroll's content size comes from its content node's laid-out size. A horizontal
+        // list's content node has an explicit WIDTH but no height (its rows are abs), so pin the
+        // content height to the scroll's own height — it scrolls sideways only, rows never clip.
         if let sc = listScroll, let cn = ynodes[contentId] {
-            sc.contentSize = CGSize(width: CGFloat(YGNodeLayoutGetWidth(cn)), height: CGFloat(YGNodeLayoutGetHeight(cn)))
+            let cw = CGFloat(YGNodeLayoutGetWidth(cn)), chh = CGFloat(YGNodeLayoutGetHeight(cn))
+            sc.contentSize = CGSize(width: cw, height: listHoriz ? sc.bounds.height : chh)
             // stickBottom (chat): if the user was at the bottom before this layout, stay pinned
             // to the new bottom (a new message, or the keyboard opening and shrinking the view).
             if stickBottomOn {

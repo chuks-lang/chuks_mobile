@@ -526,9 +526,9 @@ enum Engine {
             chuks_fail(UnsafeMutablePointer(mutating: a), UnsafeMutablePointer(mutating: b)) } }
         return drain()
     }
-    static func viewport(_ top: Int32, _ h: Int32) -> String {
-        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h)") ?? "" }
-        _ = chuks_setViewport(top, h); return drain()
+    static func viewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String {
+        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h) \(w)") ?? "" }
+        _ = chuks_setViewport(top, h, w); return drain()
     }
     // Dark-mode sync: report the OS appearance (no render), and query whether the app
     // is still following it. setColorScheme updates the theme; the caller re-renders.
@@ -904,7 +904,7 @@ final class Scene: ObservableObject {
     }
     func dispatch(_ tag: String) { apply(Engine.dispatch(tag)); syncFollow() }
     func input(_ tag: String, _ v: String) { apply(Engine.input(tag, v)) }
-    func viewport(_ top: Int32, _ h: Int32) { apply(Engine.viewport(top, h)) }
+    func viewport(_ top: Int32, _ h: Int32, _ w: Int32) { apply(Engine.viewport(top, h, w)) }
     // The OS appearance changed while following it: update the theme and re-render.
     func osChanged(dark: Bool) { Engine.setColorScheme(dark); apply(Engine.tick()); syncFollow() }
     func syncFollow() { let f = Engine.colorSchemeFollows(); if f != followSystem { followSystem = f } }
@@ -1502,9 +1502,28 @@ struct BoxStyle: ViewModifier {
         // rows collapsed to invisible content-width pills.)
         if s["pos"] == "abs" {
             let h = numOf(s["h"])
-            v = AnyView(v.frame(maxWidth: .infinity, minHeight: h, maxHeight: h))
-            v = decor(v)
             let top = numOf(s["top"]) ?? 0, left = numOf(s["left"]) ?? 0, right = numOf(s["right"]) ?? 0
+            // Fixed-width abs cell (e.g. a `numColumns` grid column): size to w and place its
+            // left edge at `left`. Without an explicit width, fall back to the full-width row
+            // (inset by left/right) that a single-column feed uses.
+            if let w = numOf(s["w"]) {
+                v = AnyView(v.frame(width: w, height: h))
+                v = decor(v)
+                return AnyView(v.frame(maxWidth: .infinity, alignment: .leading).offset(x: left, y: top))
+            }
+            // Align the content to match Yoga (UIKit/Android): without this the content is
+            // content-sized and SwiftUI's default .center frame alignment centers it (a `justify:
+            // start` row rendered centered instead of left). `justify` is the MAIN axis (default
+            // start) and `align` the CROSS axis (default center); which is horizontal vs vertical
+            // flips with `d` (row vs column). 0=start/leading/top, 1=center, 2=end/trailing/bottom.
+            let idx: (String?, Int) -> Int = { v, def in v == "center" ? 1 : (v == "end" ? 2 : (v == "start" ? 0 : def)) }
+            let mainI = idx(s["j"], 0), crossI = idx(s["a"], 1)
+            let hI = s["d"] == "row" ? mainI : crossI
+            let vI = s["d"] == "row" ? crossI : mainI
+            let ha: HorizontalAlignment = hI == 1 ? .center : (hI == 2 ? .trailing : .leading)
+            let va: VerticalAlignment = vI == 1 ? .center : (vI == 2 ? .bottom : .top)
+            v = AnyView(v.frame(maxWidth: .infinity, minHeight: h, maxHeight: h, alignment: Alignment(horizontal: ha, vertical: va)))
+            v = decor(v)
             return AnyView(v.padding(.leading, left).padding(.trailing, right).offset(y: top))
         }
         // grow along the parent's main axis
@@ -1895,7 +1914,9 @@ struct ChuksMenu: View {
 // a fast/programmatic scroll of a very tall List content) — the List's windowing
 // depends on getting the offset on every frame of a fling.
 struct ScrollOffsetReader: UIViewRepresentable {
+    let horizontal: Bool
     let onOffset: (CGFloat) -> Void
+    init(horizontal: Bool = false, onOffset: @escaping (CGFloat) -> Void) { self.horizontal = horizontal; self.onOffset = onOffset }
     func makeUIView(context: Context) -> UIView {
         let v = UIView(frame: .zero)
         DispatchQueue.main.async { context.coordinator.attach(from: v) }
@@ -1904,12 +1925,13 @@ struct ScrollOffsetReader: UIViewRepresentable {
     func updateUIView(_ uiView: UIView, context: Context) {
         DispatchQueue.main.async { context.coordinator.attach(from: uiView) }
     }
-    func makeCoordinator() -> Coordinator { Coordinator(onOffset) }
+    func makeCoordinator() -> Coordinator { Coordinator(horizontal, onOffset) }
     final class Coordinator: NSObject {
+        let horizontal: Bool
         let onOffset: (CGFloat) -> Void
         weak var scrollView: UIScrollView?
         var obs: NSKeyValueObservation?
-        init(_ cb: @escaping (CGFloat) -> Void) { onOffset = cb }
+        init(_ h: Bool, _ cb: @escaping (CGFloat) -> Void) { horizontal = h; onOffset = cb }
         func attach(from v: UIView) {
             guard scrollView == nil else { return }
             var s = v.superview
@@ -1917,7 +1939,7 @@ struct ScrollOffsetReader: UIViewRepresentable {
             if let sv = s as? UIScrollView {
                 scrollView = sv
                 obs = sv.observe(\.contentOffset, options: [.initial, .new]) { [weak self] sv, _ in
-                    self?.onOffset(sv.contentOffset.y)
+                    self?.onOffset(self?.horizontal == true ? sv.contentOffset.x : sv.contentOffset.y)
                 }
             }
         }
@@ -1932,16 +1954,23 @@ struct ScrollOffsetReader: UIViewRepresentable {
 struct ScrollSetter: UIViewRepresentable {
     let y: CGFloat?
     let nonce: Int
+    var horizontal: Bool = false
     func makeUIView(context: Context) -> UIView { UIView(frame: .zero) }
     func updateUIView(_ v: UIView, context: Context) {
         guard let y = y, context.coordinator.lastNonce != nonce else { return }
         context.coordinator.lastNonce = nonce
+        let horizontal = self.horizontal
         DispatchQueue.main.async {
             var s = v.superview
             while let cur = s, !(cur is UIScrollView) { s = cur.superview }
             guard let sv = s as? UIScrollView else { return }
-            let maxY = max(0, sv.contentSize.height - sv.bounds.height)
-            sv.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: true)
+            if horizontal {
+                let maxX = max(0, sv.contentSize.width - sv.bounds.width)
+                sv.setContentOffset(CGPoint(x: min(max(0, y), maxX), y: 0), animated: true)
+            } else {
+                let maxY = max(0, sv.contentSize.height - sv.bounds.height)
+                sv.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: true)
+            }
         }
     }
     func makeCoordinator() -> C { C() }
@@ -1968,14 +1997,18 @@ struct ChuksScroll: View {
     let parentRow: Bool
     let parentStretch: Bool
     var body: some View {
-        GeometryReader { outer in
-            ScrollView {
+        let horiz = style["horiz"] == "1"
+        return GeometryReader { outer in
+            // A horizontal list reports its x-offset + width as the scroll window (main axis)
+            // and its height as the cross size; a vertical list reports y + height + width.
+            ScrollView(horiz ? .horizontal : .vertical) {
                 // probe the underlying UIScrollView for its live contentOffset
-                ScrollOffsetReader { off in
-                    scene.viewport(Int32(max(0, off)), Int32(outer.size.height))
+                ScrollOffsetReader(horizontal: horiz) { off in
+                    if horiz { scene.viewport(Int32(max(0, off)), Int32(outer.size.width), Int32(max(0, outer.size.height))) }
+                    else { scene.viewport(Int32(max(0, off)), Int32(outer.size.height), Int32(max(0, outer.size.width))) }
                 }.frame(width: 0, height: 0)
                 // scrollToIndex/scrollToEnd: drive the underlying UIScrollView's offset.
-                ScrollSetter(y: scene.scrollTargets[id], nonce: scene.scrollNonce[id] ?? 0)
+                ScrollSetter(y: scene.scrollTargets[id], nonce: scene.scrollNonce[id] ?? 0, horizontal: horiz)
                     .frame(width: 0, height: 0)
                 ForEach(scene.nodes[id]?.children ?? [], id: \.self) { cid in
                     NodeView(scene: scene, id: cid, parentRow: false, parentStretch: true)
@@ -1983,7 +2016,10 @@ struct ChuksScroll: View {
             }
             .modifier(ScrollPaging(enabled: style["paging"] == "1"))   // snap per screen (video feeds)
             .modifier(StickBottom(enabled: style["stick"] == "1"))     // pin to newest (chat)
-            .onAppear { scene.viewport(0, Int32(outer.size.height)) }
+            .onAppear {
+                if horiz { scene.viewport(0, Int32(outer.size.width), Int32(max(0, outer.size.height))) }
+                else { scene.viewport(0, Int32(outer.size.height), Int32(max(0, outer.size.width))) }
+            }
             // Pull-to-refresh when the Scroll has an onRefresh (its style carries `rfsh`).
             .refreshable {
                 guard style["rfsh"] != nil, let action = scene.nodes[id]?.action, !action.isEmpty else { return }
@@ -2071,7 +2107,7 @@ struct NodeView: View {
         case "CameraView": ChuksCamera(facing: node.text, scene: scene).modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "WebView": webView(node)
         case "ImageBackground": imageBackgroundView(node)
-        case "Scroll": ChuksScroll(scene: scene, id: id, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
+        case "Scroll", "HScroll": ChuksScroll(scene: scene, id: id, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         default:       container(node)   // "View" and anything structural
         }
     }

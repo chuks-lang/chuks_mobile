@@ -74,7 +74,7 @@ object N {
     external fun setup(n: Int)
     external fun mount(): Int
     external fun tick(): Int
-    external fun viewport(top: Int, h: Int): Int
+    external fun viewport(top: Int, h: Int, w: Int): Int
     external fun event(action: String): Int
     external fun input(action: String, value: String): Int
     external fun resolve(token: String, payload: String): Int   // F3: async capability result
@@ -114,7 +114,8 @@ class MainActivity : Activity() {
     private var density = 1f
 
     private lateinit var root: FrameLayout
-    private var listScroll: ScrollView? = null
+    private var listScroll: FrameLayout? = null   // a ScrollView (vertical) or HorizontalScrollView (carousel)
+    private var listHoriz = false                 // the tracked list scrolls horizontally (report x, not y)
     private var scrollId = ""
     private var stickBottomOn = false   // Scroll stickBottom: keep pinned to newest (chat)
     private var stickPrevH = 0          // previous content height, to tell if the user was at the bottom
@@ -327,7 +328,16 @@ class MainActivity : Activity() {
     // (Chuks logical points -> px), clamped. Posted so the content-size/layout emitted in the
     // same batch settles first (otherwise the max scroll range is stale).
     private fun scrollListTo(id: String, y: Int) {
-        val sc = views[id] as? ScrollView ?: return
+        val vv = views[id] ?: return
+        if (vv is HorizontalScrollView) {   // horizontal list: y is really the x offset
+            vv.post {
+                val child = if (vv.childCount > 0) vv.getChildAt(0) else null
+                val maxX = if (child != null) (child.width - vv.width).coerceAtLeast(0) else Int.MAX_VALUE
+                vv.smoothScrollTo(dp(y).coerceIn(0, maxX), 0)
+            }
+            return
+        }
+        val sc = vv as? ScrollView ?: return
         sc.post {
             val child = if (sc.childCount > 0) sc.getChildAt(0) else null
             val maxY = if (child != null) (child.height - sc.height).coerceAtLeast(0) else Int.MAX_VALUE
@@ -338,12 +348,15 @@ class MainActivity : Activity() {
     // ---- viewport / scroll -------------------------------------------------
     private fun pushViewport(): Boolean {
         val sc = listScroll ?: return false
-        val h = sc.height
-        if (h <= 0) return false
-        val topDp = (sc.scrollY / density).toInt()
-        val hDp = (h / density).toInt()
-        if (devMode) { applyStream(devBlocking("/viewport", "$topDp $hDp")); return true }
-        if (N.viewport(topDp, hDp) > 0) { applyDrain(); return true }
+        // Horizontal list: report the x-offset + width as the scroll window (main axis) and the
+        // height as the cross size. Vertical list reports y + height + width.
+        val mainExtent = if (listHoriz) sc.width else sc.height
+        if (mainExtent <= 0) return false
+        val topDp = ((if (listHoriz) sc.scrollX else sc.scrollY) / density).toInt()
+        val hDp = (mainExtent / density).toInt()
+        val wDp = ((if (listHoriz) sc.height else sc.width) / density).toInt()
+        if (devMode) { applyStream(devBlocking("/viewport", "$topDp $hDp $wDp")); return true }
+        if (N.viewport(topDp, hDp, wDp) > 0) { applyDrain(); return true }
         return false
     }
 
@@ -1272,7 +1285,12 @@ class MainActivity : Activity() {
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility() }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
-                listScroll = sc; scrollId = id }
+                listScroll = sc; scrollId = id; listHoriz = false }
+            "HScroll" -> HorizontalScrollView(this).also { sc ->   // horizontal list (carousel)
+                sc.isFillViewport = false
+                sc.isHorizontalScrollBarEnabled = false
+                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout() }
+                listScroll = sc; scrollId = id; listHoriz = true }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
                 it.setBackgroundColor(Color.argb(128, 0, 0, 0))
                 it.visibility = View.GONE                // shown when mvis=1
@@ -1322,7 +1340,10 @@ class MainActivity : Activity() {
                 "a" -> N.ySetF(n, 2, align(vl))
                 "g" -> N.ySetF(n, 3, f)
                 "basis" -> N.ySetF(n, 4, dpf(f))
-                "w" -> { N.ySetF(n, 5, dpf(f)); textWidthPx[id] = dpf(f) }   // record so Text wraps to this width
+                "w" -> { N.ySetF(n, 5, dpf(f)); textWidthPx[id] = dpf(f)   // record so Text wraps to this width
+                    // A HorizontalScrollView measures its child with UNSPECIFIED width, so force
+                    // the content to its true (wide) width via minimumWidth, mirroring `h` below.
+                    v.minimumWidth = dpf(f).toInt() }
                 "h" -> { N.ySetF(n, 6, dpf(f))
                     // A ScrollView measures its child with UNSPECIFIED height, so a
                     // FrameLayout content sizes to its (windowed) children and ignores the
@@ -2404,6 +2425,10 @@ class MainActivity : Activity() {
             val lp = FrameLayout.LayoutParams(N.yGet(node, 2).toInt(), N.yGet(node, 3).toInt())
             lp.leftMargin = N.yGet(node, 0).toInt()
             lp.topMargin = N.yGet(node, 1).toInt()
+            // A horizontal list's content node has an explicit WIDTH but no height (its cells
+            // are abs), so Yoga gives it height 0 and Android would clip the cells. Fill it to
+            // the scroll's own height (the cross axis); it scrolls sideways only.
+            if (listHoriz && id == contentId) { lp.height = listScroll?.height ?: lp.height }
             v.layoutParams = lp
         }
         // place the whole Chuks app just below the top inset
@@ -2422,7 +2447,7 @@ class MainActivity : Activity() {
         root.requestLayout()
         // stickBottom (chat): after layout settles, keep the transcript pinned to the newest
         // message if the user was already at the bottom (new message, or the keyboard shrinking).
-        if (stickBottomOn) listScroll?.let { sc -> sc.post {
+        if (stickBottomOn) (listScroll as? ScrollView)?.let { sc -> sc.post {
             val child = if (sc.childCount > 0) sc.getChildAt(0) else null
             val newH = child?.height ?: 0
             val wasAtBottom = sc.scrollY + sc.height >= stickPrevH - dp(20)
