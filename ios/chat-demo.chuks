@@ -1,0 +1,119 @@
+// ChuksIn DM: a real-time chat assembled from composable primitives (RN-style), not a
+// black-box ChatScreen. MessageBubble and ChatInput are the pieces; chat() composes them
+// with a Scroll + the @chuks/websocket client. Incoming messages arrive on the read pump's
+// task and are handed to the render thread with dispatchAsync (no locks). The demo talks to
+// a local echo server, so what you send comes back as the "bot" replying.
+import { NavStack, Node, Column, Row, Text, Scroll, TextInput, Button, KeyedComp, dispatchAsync, setSafeInsets } from "../core/ui.chuks";
+import { useState, useEffect, Cell } from "../core/state.chuks";
+import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
+import { setPlatformInfo, isAndroid } from "../core/platform.chuks";
+import { connect, WebSocketClient, WSClientOptionsBuilder } from "pkg/@chuks/websocket";
+
+function wsUrl(): string { return isAndroid() ? "ws://10.0.2.2:8899" : "ws://localhost:8899" }
+
+var CLIENT: WebSocketClient? = null
+var STARTED: bool = false
+
+// ── Composable primitive: one message bubble ─────────────────────────────────
+// `mine` right-aligns it in the brand color; otherwise it sits left in a surface
+// bubble. Text wraps inside a max width so long messages stack, like any chat.
+function MessageBubble(text: string, mine: bool): Node {
+    return Row({ justify: mine ? "end" : "start" }, [
+        Column({ bg: mine ? tk("primary") : tk("surface"), radius: 18, pad: 12 }, [
+            Text({ color: mine ? "FFFFFF" : tk("text"), size: 16 }, text),
+        ]),
+    ])
+}
+
+// ── Composable primitive: the input bar ──────────────────────────────────────
+// A grow-to-fill field + a Send button. The field is uncontrolled, so a bump of
+// `resetKey` remounts it empty after a send. onType keeps the draft; onSend fires it.
+function ChatInput(draft: Cell, resetKey: int, onSend: function(): void): Node {
+    return Row({ bg: tk("surface"), pad: 10, gap: 8, align: "center" }, [
+        Column({ grow: 1 }, [
+            KeyedComp(string(resetKey), function(): Node {
+                return TextInput({ placeholder: "Message", bg: tk("bg"), color: tk("text"), onChange: function(v: string): void { draft.set(v) } })
+            }),
+        ]),
+        Button({ bg: tk("primary"), onPress: onSend }, "Send"),
+    ])
+}
+
+function chat(): Node {
+    const msgs: Cell = useState([])        // []string, each "1<text>" (mine) or "0<text>" (bot)
+    const draft: Cell = useState("")
+    const resetKey: Cell = useState(0)
+
+    useEffect(function(): any {
+        if (STARTED) { return function(): void {} }
+        STARTED = true
+        const c: WebSocketClient = connect(wsUrl(), new WSClientOptionsBuilder().autoReconnect(true).build())
+        CLIENT = c
+        c.onMessage(function(text: string): void {
+            // read-pump task -> hand to the render thread; the echo is the "bot" reply
+            dispatchAsyncAppend(msgs, "0" + text)
+        })
+        return function(): void { c.close(1000, "bye") }
+    }, [])
+
+    const send = function(): void {
+        const t: string = string(draft.get())
+        if (t == "") { return }
+        const c = CLIENT
+        if (c != null && c.isOpen()) { c.send(t) }
+        const cur: []string = msgs.get(); cur.push("1" + t); msgs.set(cur)   // show mine immediately
+        draft.set("")
+        resetKey.set(int(resetKey.get()) + 1)   // remount the field so it clears
+    }
+
+    const rows: []string = msgs.get()
+    var bubbles: []Node = []
+    var i: int = 0
+    while (i < rows.length) {
+        const m: string = rows[i]
+        bubbles.push(MessageBubble(m.substring(1, m.length), m.substring(0, 1) == "1"))
+        i = i + 1
+    }
+
+    return Column({ grow: 1, bg: tk("bg") }, [
+        Column({ bg: tk("surface"), pad: 16, gap: 2 }, [
+            Text({ color: tk("text"), size: 20, weight: "bold" }, "Echo bot"),
+            Text({ color: tk("muted"), size: 13 }, "online"),
+        ]),
+        Scroll({ grow: 1 }, [ Column({ pad: 12, gap: 6 }, bubbles) ]),
+        ChatInput(draft, int(resetKey.get()), send),
+    ])
+}
+
+// Append a message to a useState list from a background task, safely on the render thread.
+function dispatchAsyncAppend(cell: Cell, m: string): void {
+    dispatchAsync(function(): void { const cur: []string = cell.get(); cur.push(m); cell.set(cur) })
+}
+
+function createRoot(): NavStack {
+    var routes: map[string]function(): Node = {}
+    routes["home"] = function(): Node { return chat() }
+    return new NavStack(routes, "home")
+}
+
+var APP = createRoot()
+
+export function set_count(n: int): void { APP.setup(n) }
+export function mount(): int { return APP.mount() }
+export function remount(): int { return APP.remount() }
+export function setViewport(top: int, height: int): int { return APP.setViewport(top, height) }
+export function tick(): int { return APP.tick() }
+export function dispatch(action: string): int { return APP.dispatch(action) }
+export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
+export function drain(): string { return APP.drain() }
+export function saveState(): string { return APP.saveState() }
+export function loadState(data: string): void { APP.loadState(data) }
+export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
+export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
+export function setPlatform(os: string, version: string, model: string, isTablet: int): void {
+    setPlatformInfo(os, version, model, isTablet == 1)
+}
