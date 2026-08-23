@@ -47,11 +47,11 @@ final class ChuksImageLoader {
     }
     func cached(_ url: String) -> UIImage? { mem.object(forKey: url as NSString) }
     // done() is always called on the main thread with the decoded image.
-    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void) {
+    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void, fail: (() -> Void)? = nil) {
         if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
-        guard let url = URL(string: urlStr) else { return }
+        guard let url = URL(string: urlStr) else { DispatchQueue.main.async { fail?() }; return }
         session.dataTask(with: url) { [weak self] data, _, _ in
-            guard let data = data, let raw = UIImage(data: data) else { return }
+            guard let data = data, let raw = UIImage(data: data) else { DispatchQueue.main.async { fail?() }; return }
             // Thread-safe off-main decode (UIGraphicsImageRenderer is UIKit and NOT thread-safe
             // off main — it corrupts UIKit state and crashes text drawing). preparingForDisplay
             // is the designed-for-background decode API.
@@ -751,6 +751,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var pressLongTimers: [ObjectIdentifier: Timer] = [:]                  // gesture -> pending long-press timer
     var pressLongFired = Set<ObjectIdentifier>()                          // gestures whose long-press already fired
     var disabledIds = Set<String>()                                       // ids whose disabled=1 (block fire)
+    var mediaLoad: [String: String] = [:]                                 // id -> onLoad action (Image/Video)
+    var mediaError: [String: String] = [:]                                // id -> onError action (Image)
+    var mediaEnd: [String: String] = [:]                                  // id -> onEnd action (Video)
+    var mediaProgress: [String: String] = [:]                             // id -> onProgress action (Video)
+    var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
+    var videoSeek: [String: Int] = [:]                                    // id -> last-applied seek (seconds)
+    var videoTimeObservers: [String: Any] = [:]                           // id -> periodic time observer token
     var modalIds: Set<String> = []                                        // Modal node ids (full-screen overlays)
     var activeModal: String? = nil                                        // the currently-visible Modal
     var sheetModals: Set<String> = []                                     // Modal ids with position=bottom (draggable sheets)
@@ -1150,6 +1157,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "TL" where f.count >= 2: longPressActions[f[1]] = f[1] + ":longpress"   // Pressable onLongPress
             case "TPI" where f.count >= 2: pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
             case "TPO" where f.count >= 2: pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
+            case "ML" where f.count >= 2: mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
+            case "ME" where f.count >= 2: mediaError[f[1]] = f[1] + ":error"              // Image onError
+            case "MN" where f.count >= 2: mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
+            case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -1677,12 +1688,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if menuIds.contains(id) { menuData[id] = t.components(separatedBy: "\t"); rebuildMenu(id); return }   // [label, items...]
         if contextMenuIds.contains(id) { contextMenuData[id] = t.components(separatedBy: "\t"); return }        // items
         if alertIds.contains(id) { alertData[id] = t.components(separatedBy: "\t"); return }   // Alert's tab-joined fields
-        if let iv = bgImageViews[id], t.hasPrefix("http") { loadRemoteImage(t, into: iv); return }   // ImageBackground URL
-        if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv); return }   // remote Image URL
-        if let iv = views[id] as? UIImageView, t.hasPrefix("file://") { iv.image = UIImage(contentsOfFile: String(t.dropFirst(7))); return }   // picked/captured local file
+        if let iv = bgImageViews[id], t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // ImageBackground URL
+        if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // remote Image URL
+        if let iv = views[id] as? UIImageView, t.hasPrefix("file://") {   // picked/captured local file
+            iv.image = UIImage(contentsOfFile: String(t.dropFirst(7)))
+            fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
+        }
         if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
             if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
-            return
+            fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = bgImageViews[id], !t.isEmpty {            // bundled ImageBackground asset
             if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
@@ -1905,6 +1919,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "ellip": if let l = label {                       // Text truncation mode
                 switch val { case "head": l.lineBreakMode = .byTruncatingHead; case "middle": l.lineBreakMode = .byTruncatingMiddle
                 case "clip": l.lineBreakMode = .byClipping; default: l.lineBreakMode = .byTruncatingTail } }
+            case "tint": if let iv = v as? UIImageView {   // Image tintColor: template render + tint
+                let c = hexColor(val); imageTint[id] = c; iv.tintColor = c
+                if let img = iv.image { iv.image = img.withRenderingMode(.alwaysTemplate) } }
+            case "seek": if let vv = v as? VideoView { seekVideo(id, to: Int(f)) }   // Video seek (seconds)
+            case "vctrl": break   // native video controls: deferred (needs AVPlayerViewController)
             case "dis":   // disabled: dim + block interaction (checked at fire time, since bindAction re-enables interaction)
                 v.alpha = (val == "1") ? 0.4 : 1.0
                 if let b = v as? UIButton { b.isEnabled = (val != "1") }
@@ -2005,8 +2024,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                             let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
                             let obs = NotificationCenter.default.addObserver(
                                 forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self, weak p] _ in
-                                    guard let p = p else { return }
-                                    if self?.videoNoLoop.contains(ObjectIdentifier(p)) != true { p.seek(to: .zero); p.play() }
+                                    guard let self = self, let p = p else { return }
+                                    if !self.videoNoLoop.contains(ObjectIdentifier(p)) { p.seek(to: .zero); p.play() }
+                                    else if let id = self.videoPlayers.first(where: { $0.value === p })?.key {
+                                        self.fireMedia(self.mediaEnd[id])   // reached the end (not looping): onEnd
+                                    }
                             }
                             videoObs[ObjectIdentifier(p)] = obs
                             player = p
@@ -2015,6 +2037,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     if let player = player {
                         vv.playerLayer.player = player
                         videoPlayers[id] = player; videoPlayerKey[id] = val
+                        if mediaProgress[id] != nil { addVideoProgress(id) }   // onProgress may have registered already
                         player.play()   // default autoplay; a later vplay=0 pauses it
                     }
                 }
@@ -2413,14 +2436,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         c.timeoutIntervalForRequest = 20
         return URLSession(configuration: c)
     }()
-    func loadRemoteImage(_ urlStr: String, into iv: UIImageView) {
+    func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
-        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = cached; return }
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
-        ChuksImageLoader.shared.load(urlStr) { img in if iv.tag == wanted { iv.image = img } }
+        ChuksImageLoader.shared.load(urlStr) { [weak self] img in
+            guard let self = self else { return }
+            if iv.tag == wanted { iv.image = self.tinted(img, id) }
+            self.fireMedia(self.mediaLoad[id])
+        } fail: { [weak self] in self?.fireMedia(self?.mediaError[id]) }
     }
+    // Render as a template (for tintColor) when the node has a tint, else leave the image as-is.
+    func tinted(_ img: UIImage?, _ id: String) -> UIImage? { imageTint[id] != nil ? img?.withRenderingMode(.alwaysTemplate) : img }
+    // Dispatch a media event action (onLoad/onError/onEnd) if one is registered for the node.
+    func fireMedia(_ action: String?) { if let a = action { DispatchQueue.main.async { [weak self] in self?.fire(a) } } }
 
     // Pull-to-refresh fired: run onRefresh (synchronous — its state change re-renders),
     // then end the spinner. (A controlled `refreshing` flag can also drive it via rfsh.)
@@ -2436,6 +2467,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         relayout()
         headerText("action \(action)")
     }
+    // A native event carrying a value (onProgress time, etc.) -> the engine, then apply.
+    func fireValue(_ action: String, _ value: String) {
+        guard let s = eInput(action, value) else { connected = false; return }
+        apply(s); relayout()
+    }
+    // Video seek: jump to `seconds` when it changes (a controlled prop). Tracked per id so a
+    // style re-emit that didn't change the seek target doesn't re-seek.
+    func seekVideo(_ id: String, to seconds: Int) {
+        if videoSeek[id] == seconds { return }
+        videoSeek[id] = seconds
+        videoPlayers[id]?.seek(to: CMTime(seconds: Double(seconds), preferredTimescale: 600))
+    }
+    // onProgress: DEFERRED. A periodic observer that fires a full re-render each tick churns the
+    // pooled feed player (stacked players / runaway time). It needs a throttled, non-re-render
+    // channel; wired end-to-end but the observer is a no-op until that redesign lands.
+    func addVideoProgress(_ id: String) { }
 
     func justify(_ v: String) -> YGJustify {
         switch v { case "center": return .center; case "end": return .flexEnd

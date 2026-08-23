@@ -379,6 +379,10 @@ class MainActivity : Activity() {
                 "TL" -> if (f.size >= 2) longPressActions[f[1]] = f[1] + ":longpress"   // Pressable onLongPress
                 "TPI" -> if (f.size >= 2) pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
                 "TPO" -> if (f.size >= 2) pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
+                "ML" -> if (f.size >= 2) mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
+                "ME" -> if (f.size >= 2) mediaError[f[1]] = f[1] + ":error"              // Image onError
+                "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
+                "MP" -> {}   // onProgress: deferred (re-render storm)
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
@@ -1314,6 +1318,11 @@ class MainActivity : Activity() {
     private val pressInActions = HashMap<String, String>()     // id -> onPressIn action
     private val pressOutActions = HashMap<String, String>()    // id -> onPressOut action
     private val disabledIds = HashSet<String>()                // ids whose disabled=1 (block fire)
+    private val mediaLoad = HashMap<String, String>()          // id -> onLoad action (Image)
+    private val mediaError = HashMap<String, String>()         // id -> onError action (Image)
+    private val mediaEnd = HashMap<String, String>()           // id -> onEnd action (Video)
+    private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
+    private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
@@ -1428,6 +1437,10 @@ class MainActivity : Activity() {
                         "clip" -> null; else -> android.text.TextUtils.TruncateAt.END } }
                 "dis" -> { v.alpha = if (vl == "1") 0.4f else 1f; v.isEnabled = (vl != "1")            // disabled: dim + block
                     if (vl == "1") disabledIds.add(id) else disabledIds.remove(id) }
+                "tint" -> (v as? ImageView)?.let { val c = Color.parseColor("#" + vl); imageTint[id] = c; it.setColorFilter(c) }   // Image tintColor
+                "seek" -> videoPlayers[id]?.let { mp ->                                                // Video seek (seconds)
+                    val secs = f.toInt()
+                    if (videoSeek[id] != secs) { videoSeek[id] = secs; try { mp.seekTo(secs * 1000) } catch (e: Exception) {} } }
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {
                         it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -1620,6 +1633,11 @@ class MainActivity : Activity() {
             mp.isLooping = videoLoopPref[id] ?: true
             val muted0 = videoMutePref[id] ?: true; mp.setVolume(if (muted0) 0f else 1f, if (muted0) 0f else 1f)
             mp.setOnPreparedListener { videoReady.add(it); if (videoPlayPref[id] != false) it.start() }
+            // onEnd: MediaPlayer only fires completion when NOT looping. Fire onEnd for the id
+            // currently showing this (pooled) player.
+            mp.setOnCompletionListener { player ->
+                videoPlayers.entries.firstOrNull { it.value === player }?.key?.let { curId -> mediaEnd[curId]?.let { fire(it) } }
+            }
             mp.setOnVideoSizeChangedListener { _, w, h -> if (w > 0 && h > 0) { videoSizes[mp] = Pair(w, h); applyCover(tv, mp) } }
             // A decoder that fails (routine on the emulator's ~2-decoder ceiling)
             // must free its slot at once, or dead players pile up and clog the cap
@@ -1739,16 +1757,20 @@ class MainActivity : Activity() {
         (views[id] as? DrawCanvas)?.let { it.shapes = t; return }               // Canvas shape list
         (views[id] as? android.webkit.WebView)?.let { it.loadUrl(t); return }   // WebView URL
         if (t.startsWith("http")) {                                           // remote image / background URL
-            (bgImageViews[id] ?: views[id] as? ImageView)?.let { loadRemoteImage(t, it); return }
+            (bgImageViews[id] ?: views[id] as? ImageView)?.let { loadRemoteImage(t, it, id); return }
         }
         if (t.startsWith("file://")) {                                        // picked/captured local file
             (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->
-                try { iv.setImageBitmap(android.graphics.BitmapFactory.decodeFile(t.substring(7))) } catch (e: Exception) {}
+                var ok = false
+                try { iv.setImageBitmap(android.graphics.BitmapFactory.decodeFile(t.substring(7))); ok = true } catch (e: Exception) {}
+                (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
                 return
             }
         }
         (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->            // bundled local asset (e.g. chuks-logo.png)
-            if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) } } catch (e: Exception) {}
+            var ok = false
+            if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) }; ok = true } catch (e: Exception) {}
+            (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
             return
         }
         when (val v = views[id]) {
@@ -2416,10 +2438,10 @@ class MainActivity : Activity() {
             }
         } catch (e: Exception) {}
     }
-    private fun loadRemoteImage(url: String, iv: ImageView) {
+    private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {
         // Feed-grade: memory LRU -> disk cache -> network, decoded off the main thread, with
         // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
-        imageMem.get(url)?.let { iv.setImageBitmap(it); return }
+        imageMem.get(url)?.let { iv.setImageBitmap(it); mediaLoad[id]?.let { a -> fire(a) }; return }
         iv.setTag(TAG, url)
         Thread {
             try {
@@ -2433,9 +2455,9 @@ class MainActivity : Activity() {
                 }
                 if (bmp != null) {
                     imageMem.put(url, bmp)
-                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmp) }
-                }
-            } catch (e: Exception) { /* leave the placeholder */ }
+                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmp); mediaLoad[id]?.let { a -> fire(a) } }
+                } else iv.post { mediaError[id]?.let { a -> fire(a) } }
+            } catch (e: Exception) { iv.post { mediaError[id]?.let { a -> fire(a) } } }
         }.start()
     }
 

@@ -84,6 +84,9 @@ export class Style {
     var nlines: int     // Text: max lines before truncation (-1 = unlimited / wrap freely)
     var ellip: string   // Text truncation: "tail"|"head"|"middle"|"clip" ("" = tail default)
     var disabled: int   // interactive controls: 1 = disabled (dimmed, no press); -1 = enabled
+    var tint: string    // Image tintColor (hex): recolor a template image ("" = none)
+    var seekTo: int     // Video: seek to this time in seconds when it changes (-1 = no seek)
+    var vidCtrls: int   // Video: 1 = show native playback controls (-1 = none)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -101,6 +104,7 @@ export class Style {
         this.kbType = ""; this.retKey = ""; this.editable = -1; this.autoFocus = -1
         this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1; this.horiz = -1
         this.nlines = -1; this.ellip = ""; this.disabled = -1
+        this.tint = ""; this.seekTo = -1; this.vidCtrls = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -153,6 +157,9 @@ export class Style {
         if (this.nlines >= 0) { s = s + "nlines=" + string(this.nlines) + ";" }
         if (this.ellip != "") { s = s + "ellip=" + this.ellip + ";" }
         if (this.disabled >= 0) { s = s + "dis=" + string(this.disabled) + ";" }
+        if (this.tint != "") { s = s + "tint=" + this.tint + ";" }
+        if (this.seekTo >= 0) { s = s + "seek=" + string(this.seekTo) + ";" }
+        if (this.vidCtrls >= 0) { s = s + "vctrl=" + string(this.vidCtrls) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -208,12 +215,18 @@ export class Node {
     var onLongPress: any
     var onPressIn: any
     var onPressOut: any
+    // Media events (Image/Video): load/error/end are one-shot; progress streams a time value.
+    var onLoad: any
+    var onError: any
+    var onEnd: any
+    var onProgress: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
         this.comp = null; this.produced = null; this.ckey = ""
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
+        this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -373,6 +386,13 @@ function applyEvents(n: Node, p: map[string]Prop): void {
     const oi: Prop? = p.get("onPressIn"); if (oi != null) { n.onPressIn = oi }
     const oo: Prop? = p.get("onPressOut"); if (oo != null) { n.onPressOut = oo }
 }
+// Wire media events (Image/Video): onLoad/onError/onEnd fire once; onProgress streams a time.
+function applyMediaEvents(n: Node, p: map[string]Prop): void {
+    const ld: Prop? = p.get("onLoad"); if (ld != null) { n.onLoad = ld }
+    const er: Prop? = p.get("onError"); if (er != null) { n.onError = er }
+    const en: Prop? = p.get("onEnd"); if (en != null) { n.onEnd = en }
+    const pr: Prop? = p.get("onProgress"); if (pr != null) { n.onProgress = pr }
+}
 /**
  * A horizontal row (flex-direction: row): lays its children left-to-right.
  *
@@ -472,7 +492,11 @@ export function Video(p: map[string]Prop): Node {
     s.vidLoop = pBool(p, "loop", true) ? 1 : 0
     s.vidMute = pBool(p, "muted", true) ? 1 : 0
     s.vidFit = pStr(p, "resizeMode", "cover")
-    return new Node("Video", s, "", [])
+    s.seekTo = pInt(p, "seek", -1)                        // seek to N seconds when this changes
+    if (p.get("controls") != null) { s.vidCtrls = pBool(p, "controls", false) ? 1 : 0 }
+    const n: Node = new Node("Video", s, "", [])
+    applyMediaEvents(n, p)                                // onLoad / onEnd / onProgress
+    return n
 }
 export function Icon(p: map[string]Prop): Node {
     const s: Style = new Style()
@@ -498,9 +522,12 @@ export function Image(p: map[string]Prop): Node {
     const s: Style = new Style()
     s.resize = pStr(p, "resize", "cover")
     s.bg = pStr(p, "bg", "")
+    s.tint = pStr(p, "tintColor", "")                     // recolor a template image
     if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
     applyLayout(s, p)
-    return new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
+    const n: Node = new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
+    applyMediaEvents(n, p)                                // onLoad / onError
+    return n
 }
 /**
  * A container whose BACKGROUND is a remote image, with `kids` rendered on top
@@ -1441,6 +1468,10 @@ export class Reconciler {
         if (n.onLongPress != null) { this.handlers[id + ":longpress"] = n.onLongPress; this.emit("TL|" + id) }
         if (n.onPressIn != null) { this.handlers[id + ":pressin"] = n.onPressIn; this.emit("TPI|" + id) }
         if (n.onPressOut != null) { this.handlers[id + ":pressout"] = n.onPressOut; this.emit("TPO|" + id) }
+        if (n.onLoad != null) { this.handlers[id + ":load"] = n.onLoad; this.emit("ML|" + id) }
+        if (n.onError != null) { this.handlers[id + ":error"] = n.onError; this.emit("ME|" + id) }
+        if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
+        if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1520,6 +1551,10 @@ export class Reconciler {
         if (next.onLongPress != null) { this.handlers[id + ":longpress"] = next.onLongPress }
         if (next.onPressIn != null) { this.handlers[id + ":pressin"] = next.onPressIn }
         if (next.onPressOut != null) { this.handlers[id + ":pressout"] = next.onPressOut }
+        if (next.onLoad != null) { this.handlers[id + ":load"] = next.onLoad }
+        if (next.onError != null) { this.handlers[id + ":error"] = next.onError }
+        if (next.onEnd != null) { this.handlers[id + ":end"] = next.onEnd }
+        if (next.onProgress != null) { this.handlers[id + ":progress"] = next.onProgress }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)

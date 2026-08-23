@@ -47,11 +47,11 @@ final class ChuksImageLoader {
     }
     func cached(_ url: String) -> UIImage? { mem.object(forKey: url as NSString) }
     // done() is always called on the main thread with the decoded image.
-    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void) {
+    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void, fail: (() -> Void)? = nil) {
         if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
-        guard let url = URL(string: urlStr) else { return }
+        guard let url = URL(string: urlStr) else { DispatchQueue.main.async { fail?() }; return }
         session.dataTask(with: url) { [weak self] data, _, _ in
-            guard let data = data, let raw = UIImage(data: data) else { return }
+            guard let data = data, let raw = UIImage(data: data) else { DispatchQueue.main.async { fail?() }; return }
             // Thread-safe off-main decode (UIGraphicsImageRenderer is UIKit and NOT thread-safe
             // off main — it corrupts UIKit state and crashes text drawing). preparingForDisplay
             // is the designed-for-background decode API.
@@ -261,9 +261,11 @@ final class LoopingPlayerView: UIView {
     private var wantPlaying = true
     private var wantMuted = true
     private var retries = 0
+    var onEnd: (() -> Void)?
+    private var lastSeek = -1
     // Controllable like RN's Video: `playing`/`loop`/`muted`/`fit` apply on every update, so a
     // recycled feed cell can pause/resume by flipping `playing`. Only a src change rebuilds the item.
-    func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String) {
+    func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String, seekTo: Int = -1) {
         self.loop = loop; self.wantPlaying = playing; self.wantMuted = muted
         playerLayer.videoGravity = (fit == "contain") ? .resizeAspect : .resizeAspectFill
         if src != currentSrc, !src.isEmpty {
@@ -275,6 +277,7 @@ final class LoopingPlayerView: UIView {
         }
         player?.isMuted = muted
         if playing { player?.play() } else { player?.pause() }
+        if seekTo >= 0 && seekTo != lastSeek { lastSeek = seekTo; player?.seek(to: CMTime(seconds: Double(seekTo), preferredTimescale: 600)) }
     }
     private func loadItem() {
         guard let u = url else { return }
@@ -284,6 +287,7 @@ final class LoopingPlayerView: UIView {
         looper = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
                                                         object: item, queue: .main) { [weak self, weak p] _ in
             if self?.loop == true { p?.seek(to: .zero); p?.play() }
+            else { self?.onEnd?() }   // reached the end (not looping): onEnd
         }
         // Self-heal a failed load: a transient "network down" (the sim hits this at launch, and
         // Self-heal a FAILED load: a transient network error leaves the item .failed and the
@@ -313,12 +317,15 @@ struct ChuksVideo: UIViewRepresentable {
     let loop: Bool
     let muted: Bool
     let fit: String
+    var seekTo: Int = -1
+    var onEnd: (() -> Void)? = nil
     func makeUIView(context: Context) -> LoopingPlayerView {
-        let v = LoopingPlayerView(); v.clipsToBounds = true
-        v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit); return v
+        let v = LoopingPlayerView(); v.clipsToBounds = true; v.onEnd = onEnd
+        v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo); return v
     }
     func updateUIView(_ uiView: LoopingPlayerView, context: Context) {
-        uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit)
+        uiView.onEnd = onEnd
+        uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo)
     }
 }
 
@@ -327,15 +334,29 @@ struct ChuksVideo: UIViewRepresentable {
 struct ChuksCachedImage: UIViewRepresentable {
     let url: String
     let contentMode: UIView.ContentMode
+    var tint: Color? = nil
+    var onLoad: (() -> Void)? = nil
+    var onError: (() -> Void)? = nil
     func makeUIView(context: Context) -> UIImageView {
         let iv = UIImageView(); iv.contentMode = contentMode; iv.clipsToBounds = true; return iv
     }
     func updateUIView(_ iv: UIImageView, context: Context) {
         iv.contentMode = contentMode
-        if let cached = ChuksImageLoader.shared.cached(url) { iv.image = cached; return }
+        if let t = tint { iv.tintColor = UIColor(t) }
+        let tmpl = tint != nil
+        if context.coordinator.loaded == url { return }   // already resolved this url
+        if let cached = ChuksImageLoader.shared.cached(url) {
+            iv.image = tmpl ? cached.withRenderingMode(.alwaysTemplate) : cached
+            context.coordinator.loaded = url; DispatchQueue.main.async { onLoad?() }; return
+        }
         let wanted = url.hashValue; iv.tag = wanted; iv.image = nil
-        ChuksImageLoader.shared.load(url) { img in if iv.tag == wanted { iv.image = img } }
+        ChuksImageLoader.shared.load(url) { img in
+            if iv.tag == wanted { iv.image = tmpl ? img.withRenderingMode(.alwaysTemplate) : img }
+            context.coordinator.loaded = url; onLoad?()
+        } fail: { context.coordinator.loaded = url; onError?() }
     }
+    func makeCoordinator() -> C { C() }
+    final class C { var loaded = "" }
 }
 
 // A native web view (WKWebView) loading a URL from the node's text channel.
@@ -642,6 +663,9 @@ struct NodeData {
     var longPressAction: String = ""
     var pressInAction: String = ""
     var pressOutAction: String = ""
+    var loadAction: String = ""
+    var errorAction: String = ""
+    var endAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -940,6 +964,10 @@ final class Scene: ObservableObject {
             case "TL" where f.count >= 2: nodes[f[1]]?.longPressAction = f[1] + ":longpress"
             case "TPI" where f.count >= 2: nodes[f[1]]?.pressInAction = f[1] + ":pressin"
             case "TPO" where f.count >= 2: nodes[f[1]]?.pressOutAction = f[1] + ":pressout"
+            case "ML" where f.count >= 2: nodes[f[1]]?.loadAction = f[1] + ":load"
+            case "ME" where f.count >= 2: nodes[f[1]]?.errorAction = f[1] + ":error"
+            case "MN" where f.count >= 2: nodes[f[1]]?.endAction = f[1] + ":end"
+            case "MP" where f.count >= 2: break   // onProgress: deferred (re-render storm)
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -2185,7 +2213,11 @@ struct NodeView: View {
         let s = node.style
         if node.text.hasPrefix("http") {                     // remote (network) image (cached)
             let cm: UIView.ContentMode = s["rmode"] == "contain" ? .scaleAspectFit : .scaleAspectFill
-            ChuksCachedImage(url: node.text, contentMode: cm)
+            let tint = s["tint"].map { hexColor($0) }
+            let load = node.loadAction, err = node.errorAction
+            ChuksCachedImage(url: node.text, contentMode: cm, tint: tint,
+                             onLoad: load.isEmpty ? nil : { self.scene.dispatch(load) },
+                             onError: err.isEmpty ? nil : { self.scene.dispatch(err) })
                 .frame(width: numOf(s["w"]), height: numOf(s["h"]))
                 .clipped()
                 .cornerRadius(numOf(s["r"]) ?? 0)
@@ -2263,11 +2295,14 @@ struct NodeView: View {
 
     func videoView(_ node: NodeData) -> some View {
         let s = node.style
+        let end = node.endAction
         return ChuksVideo(src: s["vid"] ?? "",
                           playing: s["vplay"] != "0",   // default = playing
                           loop: s["vloop"] != "0",
                           muted: s["vmute"] != "0",
-                          fit: s["vfit"] ?? "")
+                          fit: s["vfit"] ?? "",
+                          seekTo: s["seek"].flatMap { Int($0) } ?? -1,
+                          onEnd: end.isEmpty ? nil : { self.scene.dispatch(end) })
             .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
     }
 

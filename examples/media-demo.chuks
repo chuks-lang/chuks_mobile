@@ -1,0 +1,77 @@
+// P4: media events. Image onLoad/onError + tintColor; Video onProgress/onEnd + seek.
+import { NavStack, Node, Column, Row, Text, Image, Video, Button, Scroll, setSafeInsets } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
+import { tk, syncSystemTheme, followingSystem } from "../core/theme.chuks";
+import { setPlatformInfo } from "../core/platform.chuks";
+
+function card(title: string, body: Node): Node {
+    return Column({ bg: tk("surface"), radius: 14, pad: 14, gap: 8 }, [
+        Text({ color: tk("muted"), size: 12, weight: "bold" }, title),
+        body,
+    ])
+}
+
+function screen(): Node {
+    const imgState: Cell = useState("loading…")
+    const errState: Cell = useState("loading…")
+    const vidEnded: Cell = useState(false)
+    const seekTo: Cell = useState(-1)
+
+    return Column({ grow: 1, bg: tk("bg") }, [
+        Column({ bg: tk("surface"), pad: 14 }, [
+            Text({ color: tk("text"), size: 20, weight: "bold" }, "Media events"),
+        ]),
+        Scroll({ grow: 1 }, [ Column({ pad: 12, gap: 12 }, [
+            card("Image onLoad -> " + string(imgState.get()), Image({
+                src: "https://picsum.photos/id/237/400/200", w: 300, h: 150, radius: 10,
+                onLoad: function(): void { imgState.set("loaded") },
+                onError: function(): void { imgState.set("error") },
+            })),
+            card("Image onError (bad url) -> " + string(errState.get()), Image({
+                src: "https://example.invalid/nope.png", w: 300, h: 90, radius: 10, bg: tk("bg"),
+                onLoad: function(): void { errState.set("loaded") },
+                onError: function(): void { errState.set("failed to load") },
+            })),
+            card("Image tintColor", Image({ src: "https://picsum.photos/id/1025/200/120", w: 200, h: 120, radius: 10, tintColor: tk("primary") })),
+            card("Video onEnd / seek -> " + (bool(vidEnded.get()) ? "ended" : "playing"), Column({ gap: 8 }, [
+                Video({
+                    src: "sample.mp4", w: 300, h: 170, radius: 10, loop: false, muted: true,
+                    seek: int(seekTo.get()),
+                    onEnd: function(): void { vidEnded.set(true) },
+                }),
+                Row({ gap: 10 }, [
+                    Button({ bg: tk("primary"), w: 130, h: 40, onPress: function(): void { seekTo.set(2) } }, "seek 2s"),
+                    Button({ bg: tk("primary"), w: 130, h: 40, onPress: function(): void { seekTo.set(0) } }, "restart"),
+                ]),
+            ])),
+        ]) ]),
+    ])
+}
+
+function createRoot(): NavStack {
+    var routes: map[string]function(): Node = {}
+    routes["home"] = function(): Node { return screen() }
+    return new NavStack(routes, "home")
+}
+
+var APP = createRoot()
+
+export function set_count(x: int): void { APP.setup(x) }
+export function mount(): int { return APP.mount() }
+export function remount(): int { return APP.remount() }
+export function setViewport(top: int, height: int, width: int): int { return APP.setViewport(top, height, width) }
+export function tick(): int { return APP.tick() }
+export function dispatch(action: string): int { return APP.dispatch(action) }
+export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
+export function drain(): string { return APP.drain() }
+export function saveState(): string { return APP.saveState() }
+export function loadState(data: string): void { APP.loadState(data) }
+export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
+export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
+export function setPlatform(os: string, version: string, model: string, isTablet: int): void {
+    setPlatformInfo(os, version, model, isTablet == 1)
+}
