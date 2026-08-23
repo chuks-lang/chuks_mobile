@@ -1,0 +1,204 @@
+// @chuks/ui animated -- an imperative Animated value (RN's Animated.Value), the
+// native-driver way.
+//
+// The insight: the Style model ALREADY carries opacity / tx / ty / rotate / scale
+// plus a transition (anim = duration ms, easing = ""|linear|spring), and all three
+// native hosts already interpolate those to their target at 60fps (UIView.animate,
+// SwiftUI .animation, Android ViewPropertyAnimator). So an animation is just:
+//   1. hold a value that persists across renders   (useAnimated)
+//   2. read it into a prop + set anim/easing        (.value()/.dur()/.easing())
+//   3. move its target                              (.timing()/.spring()/.setValue())
+// The engine emits ONE style line with the new target + duration; the host tweens.
+// No per-frame Chuks tick, no per-frame mutation stream -- this is the native driver.
+//
+//   const fade = useAnimated(0)
+//   View({ opacity: fade.value(), anim: fade.dur(), easing: fade.easing() }, [...])
+//   // later, from an event / effect:
+//   fade.timing(100, 300, "spring")
+//
+// interpolate() derives many outputs from one value (drive opacity AND translateY,
+// or two different nodes, from a single 0..100 progress, all tweening in sync):
+//   const ty = fade.interpolate(0, 100, 40, 0)   // progress 0->100 maps 40px->0px
+//   View({ opacity: fade.value(), ty: ty.value(), anim: fade.dur(), easing: fade.easing() }, ...)
+//
+// Values are integers (opacity 0-100, translate px, scale percent where 100 = 1.0,
+// rotate degrees). Color interpolation is not covered (the host tweens numbers, not
+// hex); cross-fade with opacity instead.
+
+import { useState, Cell } from "./state.chuks";
+import { dispatchAsync } from "./ui.chuks";
+import { host } from "std/host";
+import { time } from "std/time";
+
+// Default duration a spring() runs for (the host's spring curve uses this as its
+// settling time). timing() takes an explicit duration.
+var _SPRING_MS: int = 400
+
+// Ask the host to render promptly so a target moved from an effect or a background
+// task paints this frame. Inside an event dispatch the surrounding re-render already
+// picks the new target up; this extra wake is a cheap no-op there.
+function _requestFrame(): void { host.wake() }
+
+/**
+ * An animated numeric value. Persist it with useAnimated() so it survives renders;
+ * read value()/dur()/easing() into a node's props and move it with timing()/spring().
+ */
+export class Animated {
+    var cur: int        // current target value
+    var ms: int         // active transition duration ms (-1 = snap, no animation)
+    var ez: string      // "" ease | "linear" | "spring"
+    constructor(initial: int) { this.cur = initial; this.ms = -1; this.ez = "" }
+
+    // The current target -- feed this into opacity / tx / ty / rotate / scale.
+    public value(): int { return this.cur }
+    // The active transition duration -- feed into the `anim` prop (-1 = snap).
+    public dur(): int { return this.ms }
+    // The active easing -- feed into the `easing` prop.
+    public easing(): string { return this.ez }
+
+    // Jump to `v` immediately, with no animation.
+    public setValue(v: int): void { this.cur = v; this.ms = -1; this.ez = ""; _requestFrame() }
+
+    // Animate toward `to` over `duration` ms. `easing` is "" (ease-in-out),
+    // "linear", or "spring". The host runs the interpolation natively.
+    public timing(to: int, duration: int, easing: string): void {
+        this.cur = to; this.ms = duration; this.ez = easing; _requestFrame()
+    }
+
+    // Spring toward `to` with the platform's spring curve (a soft overshoot).
+    public spring(to: int): void { this.timing(to, _SPRING_MS, "spring") }
+
+    // Derive a value that maps this one's [inA, inB] range onto [outA, outB]
+    // (linear, clamped at the ends). inA must be <= inB. The derived value carries
+    // this value's active duration/easing, so bound props tween together.
+    public interpolate(inA: int, inB: int, outA: int, outB: int): AnimatedInterp {
+        return new AnimatedInterp(this, inA, inB, outA, outB)
+    }
+}
+
+/**
+ * A read-only value derived from an Animated by interpolate(). value() maps the
+ * source's current target through the range; dur()/easing() mirror the source so a
+ * node driven by it animates in lock-step with the source.
+ */
+export class AnimatedInterp {
+    var src: Animated
+    var inA: int
+    var inB: int
+    var outA: int
+    var outB: int
+    constructor(src: Animated, inA: int, inB: int, outA: int, outB: int) {
+        this.src = src; this.inA = inA; this.inB = inB; this.outA = outA; this.outB = outB
+    }
+    // The source's target mapped through [inA,inB] -> [outA,outB], clamped.
+    public value(): int {
+        var v: int = this.src.cur
+        var lo: int = this.inA
+        var hi: int = this.inB
+        if (v < lo) { v = lo }
+        if (v > hi) { v = hi }
+        var span: int = hi - lo
+        if (span == 0) { return this.outA }
+        return this.outA + ((v - lo) * (this.outB - this.outA)) / span
+    }
+    public dur(): int { return this.src.ms }
+    public easing(): string { return this.src.ez }
+}
+
+/**
+ * Declare an animated value that persists across renders (like useRef(new
+ * Animated.Value())). Identity comes from the component's position in the tree, so
+ * no key is needed. Returns the SAME Animated object every render.
+ *
+ *   const fade = useAnimated(0)
+ */
+export function useAnimated(initial: int): Animated {
+    const c: Cell = useState(new Animated(initial))
+    const a: any = c.get()
+    return a
+}
+
+// ---- Composition: sequence / parallel / loop ------------------------------
+// A sequence runs on its own coroutine: it hands each step's effect to the render
+// thread (dispatchAsync, which also wakes the host), then sleeps that step's
+// duration so the next step starts as the tween lands. Hold the returned handle and
+// call stop() to end a running/looping animation (e.g. in a useEffect cleanup).
+
+// A running (possibly looping) animation. Call stop() to end it. The driver
+// coroutine and the render thread both touch `alive`, so it is guarded by a lock.
+@threadSafe
+export class AnimHandle {
+    var alive: bool
+    constructor() { this.alive = true }
+    // End the animation (safe to call from the app / a useEffect cleanup).
+    public stop(): void { lock (this) { this.alive = false } }
+    // Driver-side: is it still running?
+    public live(): bool { var v: bool = true; lock (this) { v = this.alive }; return v }
+}
+
+/** One step of a composed animation: an effect to run and how long it lasts (ms). */
+export class AnimFrame {
+    var ms: int
+    var fn: function(): void
+    constructor(ms: int, fn: function(): void) { this.ms = ms; this.fn = fn }
+}
+
+/** Build a step: run `fn` (usually a .timing/.spring call) and hold `ms` before the next. */
+export function animStep(ms: int, fn: function(): void): AnimFrame { return new AnimFrame(ms, fn) }
+/** A pause of `ms` with no effect (spacing between steps). */
+export function animDelay(ms: int): AnimFrame { return new AnimFrame(ms, function(): void { }) }
+
+/** Run steps in order, once. Returns a handle you can stop() early. */
+export function animSequence(steps: []AnimFrame): AnimHandle {
+    const h: AnimHandle = new AnimHandle()
+    spawn _driveSeq(steps, h, false)
+    return h
+}
+
+/** Run steps in order, forever, until stop(). */
+export function animLoop(steps: []AnimFrame): AnimHandle {
+    const h: AnimHandle = new AnimHandle()
+    spawn _driveSeq(steps, h, true)
+    return h
+}
+
+/** Start every step at once; the handle settles after the longest step. */
+export function animParallel(steps: []AnimFrame): AnimHandle {
+    const h: AnimHandle = new AnimHandle()
+    spawn _driveParallel(steps, h)
+    return h
+}
+
+// Coroutine body: run each step's effect on the render thread, then wait its
+// duration. Loops back to the start when `loop`, else stops after the last step.
+// Uses if/break (no `continue`) to sidestep the AOT continue-in-loop miscompiles.
+function _driveSeq(steps: []AnimFrame, h: AnimHandle, loop: bool): void {
+    if (steps.length == 0) { return }
+    var i: int = 0
+    var running: bool = true
+    while (running && h.live()) {
+        const st: AnimFrame = steps[i]
+        const fn: function(): void = st.fn
+        dispatchAsync(fn)
+        time.sleep(st.ms)
+        i = i + 1
+        if (i >= steps.length) {
+            if (loop) { i = 0 } else { running = false }
+        }
+    }
+}
+
+// Coroutine body: fire every step's effect this frame, then wait the longest one.
+function _driveParallel(steps: []AnimFrame, h: AnimHandle): void {
+    var maxMs: int = 0
+    var i: int = 0
+    while (i < steps.length) {
+        const st: AnimFrame = steps[i]
+        const fn: function(): void = st.fn
+        dispatchAsync(fn)
+        if (st.ms > maxMs) { maxMs = st.ms }
+        i = i + 1
+    }
+    time.sleep(maxMs)
+    h.stop()
+}
