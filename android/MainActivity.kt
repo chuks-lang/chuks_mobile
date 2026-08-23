@@ -1349,6 +1349,7 @@ class MainActivity : Activity() {
     private val mediaEnd = HashMap<String, String>()           // id -> onEnd action (Video)
     private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
     private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
+    private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
     private val videoLastSec = HashMap<String, Int>()          // id -> last whole second reported to onProgress
     private val progressPollers = HashMap<String, Runnable>()  // id -> the active progress poll Runnable
@@ -1474,9 +1475,7 @@ class MainActivity : Activity() {
                 "vrate" -> videoPlayers[id]?.let { mp -> try {                                          // playback speed percent
                     if (mp.isPlaying) mp.playbackParams = mp.playbackParams.setSpeed(f / 100f) } catch (e: Exception) {} }
                 "ldelay" -> longDelayMs[id] = f.toLong()                                                // onLongPress hold time (ms)
-                "blur" -> (v as? ImageView)?.let {                                                      // Image blurRadius (API 31+)
-                    if (android.os.Build.VERSION.SDK_INT >= 31) it.setRenderEffect(
-                        if (f > 0f) android.graphics.RenderEffect.createBlurEffect(f, f, android.graphics.Shader.TileMode.CLAMP) else null) }
+                "blur" -> imageBlur[id] = f   // Image blurRadius; applied to the bitmap when it loads (below)
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {
                         it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
@@ -2474,10 +2473,25 @@ class MainActivity : Activity() {
             }
         } catch (e: Exception) {}
     }
+    // blurRadius: a cheap, all-versions Gaussian-ish blur (downscale then bilinear upscale),
+    // so it works below API 31 where RenderEffect isn't available.
+    private fun blurBitmap(src: android.graphics.Bitmap, radius: Float): android.graphics.Bitmap {
+        if (radius <= 0f) return src
+        val scale = (radius / 2.5f).coerceIn(1f, 40f)
+        val w = (src.width / scale).toInt().coerceAtLeast(1)
+        val h = (src.height / scale).toInt().coerceAtLeast(1)
+        val small = android.graphics.Bitmap.createScaledBitmap(src, w, h, true)
+        return android.graphics.Bitmap.createScaledBitmap(small, src.width, src.height, true)
+    }
+    private fun bmpFor(bmp: android.graphics.Bitmap, id: String): android.graphics.Bitmap {
+        val r = imageBlur[id] ?: return bmp
+        return if (r > 0f) blurBitmap(bmp, r) else bmp
+    }
+
     private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {
         // Feed-grade: memory LRU -> disk cache -> network, decoded off the main thread, with
         // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
-        imageMem.get(url)?.let { iv.setImageBitmap(it); mediaLoad[id]?.let { a -> fire(a) }; return }
+        imageMem.get(url)?.let { iv.setImageBitmap(bmpFor(it, id)); mediaLoad[id]?.let { a -> fire(a) }; return }
         iv.setTag(TAG, url)
         Thread {
             try {
@@ -2491,7 +2505,7 @@ class MainActivity : Activity() {
                 }
                 if (bmp != null) {
                     imageMem.put(url, bmp)
-                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmp); mediaLoad[id]?.let { a -> fire(a) } }
+                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmpFor(bmp!!, id)); mediaLoad[id]?.let { a -> fire(a) } }
                 } else iv.post { mediaError[id]?.let { a -> fire(a) } }
             } catch (e: Exception) { iv.post { mediaError[id]?.let { a -> fire(a) } } }
         }.start()
