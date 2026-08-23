@@ -647,6 +647,27 @@ final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
 }
 let notifDelegate = NotifDelegate()
 
+// ── Host wake ────────────────────────────────────────────────────────────────
+// The engine calls this (from a background goroutine, via the chuks_set_wake C
+// callback) when a spawned Chuks task has posted work to the render thread. It is
+// @convention(c): no captures, so it reaches the live controller through a file
+// global and hops to the main thread. Coalesced: a burst of messages schedules at
+// most one pending main-thread pump.
+private weak var gChuksWakeVC: CardsVC?
+private let gWakeLock = NSLock()
+private var gWakeScheduled = false
+
+func chuksWakeThunk() {
+    gWakeLock.lock()
+    if gWakeScheduled { gWakeLock.unlock(); return }
+    gWakeScheduled = true
+    gWakeLock.unlock()
+    DispatchQueue.main.async {
+        gWakeLock.lock(); gWakeScheduled = false; gWakeLock.unlock()
+        gChuksWakeVC?.pumpWake()
+    }
+}
+
 final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate {
     let N: Int32 = 1000
 
@@ -838,6 +859,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
         // (dev: if the server isn't up yet / returned empty, step() reconnects + remounts)
 
+        // Register the host wake: a spawned Chuks task that posts to the render thread
+        // (dispatchAsync) fires this so we tick immediately instead of on the heartbeat.
+        gChuksWakeVC = self
+        chuks_set_wake(unsafeBitCast(chuksWakeThunk as (@convention(c) () -> Void), to: UnsafeMutableRawPointer.self))
+
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.step() }
         // Auto-start the perf harness after a warmup (benchmark builds only — otherwise
         // it would auto-scroll the on-screen Scroll, e.g. the Components gallery).
@@ -988,6 +1014,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let s = eTick() else { connected = false; headerText("dev server down — reloading…"); return }
         apply(s); relayout()
         headerText("frame \(frame): live")
+    }
+
+    // Called on the main thread when a background Chuks task posted work (via the
+    // wake callback). A tick drains the engine's async queue and re-renders, so the
+    // result paints this frame instead of waiting for the 0.4s heartbeat.
+    func pumpWake() {
+        if DEV_MODE && !connected { return }   // let step() own the reconnect path
+        guard let s = eTick() else { return }
+        if !s.isEmpty { apply(s); relayout() }
     }
 
     // Tear down the view + Yoga trees and rebuild from a fresh mount stream. Used

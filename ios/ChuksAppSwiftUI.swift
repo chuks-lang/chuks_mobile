@@ -799,6 +799,28 @@ final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
 }
 let notifDelegate = NotifDelegate()
 
+// ── Host wake ────────────────────────────────────────────────────────────────
+// The engine calls this (from a background task, via the chuks_set_wake C
+// callback) when a spawned Chuks task has posted work to the render thread. It is
+// @convention(c): no captures, so it reaches the live Scene through a file global
+// and hops to the main thread. Coalesced: a burst of messages schedules at most
+// one pending main-thread pump. This is what gives the SwiftUI host prompt
+// background-to-UI updates (it has no idle heartbeat of its own).
+private weak var gWakeScene: Scene?
+private let gWakeLock = NSLock()
+private var gWakeScheduled = false
+
+func chuksWakeThunk() {
+    gWakeLock.lock()
+    if gWakeScheduled { gWakeLock.unlock(); return }
+    gWakeScheduled = true
+    gWakeLock.unlock()
+    DispatchQueue.main.async {
+        gWakeLock.lock(); gWakeScheduled = false; gWakeLock.unlock()
+        gWakeScene?.pumpWake()
+    }
+}
+
 final class Scene: ObservableObject {
     @Published var nodes: [String: NodeData] = [:]
     // Whether the app is still tracking the OS appearance (false once the user picks a
@@ -823,7 +845,21 @@ final class Scene: ObservableObject {
         UNUserNotificationCenter.current().delegate = notifDelegate  // foreground banners
         Engine.setup(0); Engine.setPlatform(); Engine.setColorScheme(osDark)
         mountFresh()
+        // Register the host wake: a spawned Chuks task that posts to the render thread
+        // (dispatchAsync) fires this so we tick + re-render immediately. The SwiftUI host
+        // has no idle heartbeat, so without this a background message would only paint on
+        // the next user event.
+        gWakeScene = self
+        chuks_set_wake(unsafeBitCast(chuksWakeThunk as (@convention(c) () -> Void), to: UnsafeMutableRawPointer.self))
         if DEV_MODE { startDevWatch() }
+    }
+
+    // Called on the main thread when a background Chuks task posted work (via the wake
+    // callback). Ticking drains the engine's async queue and re-renders. Skipped in DEV,
+    // where the engine is driven over HTTP and this in-process path is not the app.
+    func pumpWake() {
+        if DEV_MODE { return }
+        apply(Engine.tick())
     }
 
     // Mount from a fresh /mount and record whether it produced anything. Clearing first

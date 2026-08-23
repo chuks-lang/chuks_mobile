@@ -93,6 +93,19 @@ object N {
     external fun yCalc(node: Long, w: Float, h: Float)
     external fun yGet(node: Long, which: Int): Float
     external fun ySetF(node: Long, key: Int, v: Float)
+
+    // Host wake: registers a native callback (jni.cpp) that a background Chuks task
+    // fires when it posts work to the render thread. onNativeWake is called FROM that
+    // native trampoline on the task's own thread; it hops to the UI thread and runs
+    // the activity's pump. Coalesced so a burst of messages schedules one tick.
+    external fun setWake()
+    var onWake: (() -> Unit)? = null
+    private val wakeHandler = Handler(Looper.getMainLooper())
+    private val wakeScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+    @JvmStatic fun onNativeWake() {
+        if (wakeScheduled.getAndSet(true)) return
+        wakeHandler.post { wakeScheduled.set(false); onWake?.invoke() }
+    }
 }
 
 class MainActivity : Activity() {
@@ -267,7 +280,12 @@ class MainActivity : Activity() {
                 }
             }.apply { isDaemon = true; start() }
         } else {
-            // tick timer
+            // Host wake: a spawned Chuks task that posts to the render thread fires this so
+            // we tick immediately instead of waiting for the 400ms heartbeat below.
+            N.onWake = { pumpWake() }
+            N.setWake()
+            // tick timer (idle heartbeat / fallback; the wake drives prompt paints, this
+            // covers any host without a wake and background state that changed with no wake)
             val ticker = object : Runnable {
                 override fun run() {
                     frame++
@@ -277,6 +295,13 @@ class MainActivity : Activity() {
             }
             handler.postDelayed(ticker, 400)
         }
+    }
+
+    // Called on the UI thread when a background Chuks task posted work (via the wake
+    // callback). Ticking drains the engine's async queue and re-renders.
+    private fun pumpWake() {
+        if (devMode) return
+        N.tick(); applyDrain(); relayout()
     }
 
     private fun dp(v: Int) = (v * density).toInt()

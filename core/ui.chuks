@@ -9,6 +9,7 @@
 // shared mutable state.
 
 import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells } from "./state.chuks";
+import { host } from "std/host";
 
 // ---- Style: a compact subset of the flexbox + visual model -----------------
 export class Style {
@@ -1607,6 +1608,57 @@ export class Reconciler {
 // can reach the reconciler to enqueue an async command. One app instance exists.
 var HOST: App? = null
 
+// ─── Background → render-thread dispatch ─────────────────────────────────────
+// Chuks is multithreaded: a spawned task (a WebSocket read pump, a download, a
+// timer) runs on its own coroutine and must NOT touch useState or the reconciler
+// directly (those are only safe on the render thread, and the cell map is not
+// locked). Instead it hands a closure to dispatchAsync(); the closure is queued
+// under a lock and RUN on the render thread at the start of the next host entry
+// point, where mutating state is safe. wakeHost() asks the native host to tick
+// immediately so the closure paints within a frame instead of waiting for the
+// idle heartbeat.
+@threadSafe
+class AsyncQueue {
+    var _q: []function(): void
+    constructor() { this._q = [] }
+    public post(fn: function(): void): void {
+        lock (this) { this._q.push(fn) }
+        wakeHost()
+    }
+    // Atomically swap out the pending closures; they are run OUTSIDE the lock (by
+    // runAsyncQueue) so a closure that posts again cannot deadlock on the
+    // non-reentrant lock.
+    public take(): []function(): void {
+        var out: []function(): void = []
+        lock (this) { out = this._q; this._q = [] }
+        return out
+    }
+    public pending(): int { var n: int = 0; lock (this) { n = this._q.length }; return n }
+}
+
+var ASYNC: AsyncQueue = new AsyncQueue()
+
+// Hand a result back to the render thread from a spawned task. The closure runs on
+// the render thread at the next host entry point, so it may safely touch useState:
+//   c.onMessage(function(m: string): void { dispatchAsync(function(): void { msgs.set(...) }) })
+export function dispatchAsync(fn: function(): void): void { ASYNC.post(fn) }
+
+// Queued-closure count (host heartbeat gating / diagnostics).
+export function asyncPending(): int { return ASYNC.pending() }
+
+// Run all queued closures on the CURRENT (render) thread, before the render that
+// follows, so their state changes are reflected this frame.
+function runAsyncQueue(): void {
+    var fns: []function(): void = ASYNC.take()
+    var i: int = 0
+    while (i < fns.length) { fns[i](); i = i + 1 }
+}
+
+// Ask the native host to call tick() promptly. Wired to the C-ABI wake callback via
+// a runtime builtin; until that lands (and on hosts that never register one) this is
+// a no-op and the host's idle heartbeat drains the queue instead.
+function wakeHost(): void { host.wake() }
+
 export class App {
     var recon: Reconciler
     constructor() { this.recon = new Reconciler(); HOST = this }
@@ -1628,13 +1680,14 @@ export class App {
     // Render the tree and emit the initial mutation stream. Returns mutation count.
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
     // reconnected by identity, and freed when a component leaves the tree.
-    public mount(): int { this.recon.begin(); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    public mount(): int { runAsyncQueue(); this.recon.begin(); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
     // Full re-mount: re-emit the entire current tree (state preserved). The dev server
     // calls this on every /mount so any host that connects or relaunches gets a complete
     // tree, not an empty diff against a tree it never received. Not called in production.
     public remount(): int { this.recon.forgetCommitted(); return this.mount() }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
     public setViewport(top: int, h: int): int {
+        runAsyncQueue()
         if (h > 0) { _vpH = h }   // expose the real viewport height (viewportHeight()) for full-screen feeds
         this.recon.begin(); hookBegin(); this.recon.setViewport(top, h); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
         // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
@@ -1646,29 +1699,34 @@ export class App {
         return this.recon.count()
     }
     // Advance one frame: onTick() then re-render. Returns the mutation count.
-    public tick(): int { this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    public tick(): int { runAsyncQueue(); this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // A native input change arrived for node `tag`: fire its onChange(value), then re-render.
     public dispatchInput(tag: string, value: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // A native async result arrived for `token` (F3): fire the registered callback
     // with `payload`, then re-render. Mirrors dispatch, but keyed by an async token
     // rather than a UI node id.
     public resolve(token: string, payload: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // The host reports that `token` is dead (user dismissed the picker, native op
     // ended with no result). Drop it and re-render. Mirrors resolve, without a fire.
     public cancelToken(token: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // The host reports a FAILURE for `token` (permission denied, hardware missing,
     // native error). Fire the request's error callback and re-render.
     public failToken(token: string, message: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.failToken(token, message); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // Return the pending mutation stream as text and hand it to the host.

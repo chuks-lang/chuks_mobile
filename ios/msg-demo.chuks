@@ -1,0 +1,120 @@
+// M2 messaging demo: a live chat over @chuks/websocket running INSIDE the Chuks engine
+// (pure Chuks, std/net TCP). The spawned read pump runs on a background coroutine; instead of
+// touching useState directly (unsafe off the render thread) it hands each update to
+// dispatchAsync(), which runs the closure on the render thread at the next host tick. No manual
+// locks in app code: the engine's async queue does the marshalling.
+import { NavStack, Node, Column, Row, Text, List, Button, setSafeInsets, dispatchAsync } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
+import { syncSystemTheme, followingSystem } from "../core/theme.chuks";
+import { setPlatformInfo, isAndroid } from "../core/platform.chuks";
+import { connect, WebSocketClient, WSClientOptionsBuilder } from "pkg/@chuks/websocket";
+import { time } from "std/time";
+
+// The Android emulator reaches the Mac host at 10.0.2.2; iOS sim/device uses localhost.
+function wsUrl(): string { return isAndroid() ? "ws://10.0.2.2:8899" : "ws://localhost:8899" }
+
+var CLIENT: WebSocketClient? = null
+var STARTED: bool = false
+
+// Connect once. The read pump is a background task; every UI update it makes goes through
+// dispatchAsync so it lands safely on the render thread.
+function ensureConnected(status: Cell, msgs: Cell, rtt: Cell): void {
+    if (STARTED) { return }
+    STARTED = true
+    const opts = new WSClientOptionsBuilder().autoReconnect(true).reconnectDelayMs(1000).build()
+    const c: WebSocketClient = connect(wsUrl(), opts)
+    CLIENT = c
+    c.onClose(function(code: int, r: string): void { dispatchAsync(function(): void { status.set("reconnecting") }) })
+    c.onError(function(e: string): void { dispatchAsync(function(): void { status.set("error") }) })
+    c.onMessage(function(msg: string): void {
+        // The read pump runs on its own task; hand each message to the render thread
+        // via dispatchAsync so it lands safely (no locks) and paints within a frame.
+        const at: int = msg.lastIndexOf("@")
+        var r: int = -1
+        if (at >= 0) {
+            const sent: int = int(msg.substring(at + 1, msg.length))
+            if (sent > 0) { r = time.now() - sent }   // round-trip for a "ping@<sentMillis>"
+        }
+        const rttV: int = r
+        dispatchAsync(function(): void {
+            const cur: []string = msgs.get()
+            cur.push(msg)
+            msgs.set(cur)
+            if (rttV >= 0) { rtt.set(rttV) }
+        })
+    })
+    spawn pingLoop(c)
+}
+
+// A self-demo pinger: send a timestamped ping every 100ms so the feed shows live
+// traffic (the server echoes it back). "last echo" then shows the round-trip time.
+function pingLoop(c: WebSocketClient): void {
+    time.sleep(600)
+    var i: int = 0
+    while (i < 30) {
+        if (c.isOpen()) { c.send("ping@" + string(time.now())) }
+        time.sleep(100)
+        i = i + 1
+    }
+}
+
+function chat(): Node {
+    const status: Cell = useState("connecting")
+    const msgs: Cell = useState([])
+    const rtt: Cell = useState(-1)
+    ensureConnected(status, msgs, rtt)
+
+    const c0 = CLIENT
+    const open: bool = c0 != null ? c0.isOpen() : false
+    const st: string = open ? "connected" : string(status.get())   // onOpen fires in the ctor before our handler; derive from isOpen()
+    const rttV: int = int(rtt.get())
+    const rows: []string = msgs.get()
+
+    return Column({ pad: 16, grow: 1, bg: "0B0B0F" }, [
+        Text({ color: "FFFFFF", size: 26, weight: "bold", mb: 4 }, "Chuks Chat"),
+        Text({ color: open ? "34D399" : "F59E0B", size: 15, mb: 2 }, "status: " + st),
+        Text({ color: "9CA3AF", size: 14, mb: 12 }, rttV >= 0 ? ("last echo: " + string(rttV) + " ms") : "last echo: --"),
+        Button({ mb: 12, onPress: function(): void {
+            const c = CLIENT
+            if (c != null && c.isOpen()) { c.send("ping@" + string(time.now())) }
+        }}, "Send ping"),
+        List({
+            count: rows.length,
+            rowHeight: 34,
+            key: function(k: int): string { return string(k) },
+            item: function(k: int, top: int): Node {
+                return Row({ abs: true, top: top, left: 0, right: 0, h: 34 }, [
+                    Text({ color: "E5E7EB", size: 15 }, rows[k]),
+                ])
+            },
+        }),
+    ])
+}
+
+function createRoot(): NavStack {
+    var routes: map[string]function(): Node = {}
+    routes["home"] = function(): Node { return chat() }
+    return new NavStack(routes, "home")
+}
+
+var APP = createRoot()
+
+export function set_count(n: int): void { APP.setup(n) }
+export function mount(): int { return APP.mount() }
+export function remount(): int { return APP.remount() }
+export function setViewport(top: int, height: int): int { return APP.setViewport(top, height) }
+export function tick(): int { return APP.tick() }
+export function dispatch(action: string): int { return APP.dispatch(action) }
+export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
+export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
+export function cancelToken(token: string): int { return APP.cancelToken(token) }
+export function fail(token: string, message: string): int { return APP.failToken(token, message) }
+export function drain(): string { return APP.drain() }
+export function saveState(): string { return APP.saveState() }
+export function loadState(data: string): void { APP.loadState(data) }
+export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
+export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
+export function setPlatform(os: string, version: string, model: string, isTablet: int): void {
+    setPlatformInfo(os, version, model, isTablet == 1)
+}
