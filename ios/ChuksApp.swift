@@ -795,7 +795,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
     var imageBlur: [String: CGFloat] = [:]                                // id -> Image blur radius (px)
     var imageFilter: [String: String] = [:]                              // id -> Image photo-filter preset
-    var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter swap re-applies from the original
+    var imageOpChain: [String: String] = [:]                             // id -> Image GPU op-chain (JSON)
+    var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter/op swap re-applies from the original
     var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
     var videoPosters: [String: UIImageView] = [:]                        // id -> poster overlay (until first frame)
     var posterObs: [String: NSKeyValueObservation] = [:]                 // id -> readyForDisplay observation
@@ -1242,6 +1243,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
             case "SC" where f.count >= 2: if let sl = views[f[1]] as? UISlider { sliderDoneAction[sl] = f[1] + ":slidedone" }   // Slider onSlidingComplete
             case "SS" where f.count >= 2: if let sc = views[f[1]] as? UIScrollView { scrollOnScroll[sc] = f[1] + ":scroll" }   // Scroll onScroll
+            case "IF" where f.count >= 3:   // Image GPU op-chain (JSON may contain '|', so rejoin)
+                imageOpChain[f[1]] = f[2...].joined(separator: "|")
+                if let iv = views[f[1]] as? UIImageView { applyOps(iv, f[1]) }
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -1787,12 +1791,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // remote Image URL
         if let iv = views[id] as? UIImageView, t.hasPrefix("file://") {   // picked/captured local file
             iv.image = UIImage(contentsOfFile: String(t.dropFirst(7)))
-            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id)
+            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
             if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
-            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id)
+            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = bgImageViews[id], !t.isEmpty {            // bundled ImageBackground asset
@@ -2636,12 +2640,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
-        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
         ChuksImageLoader.shared.load(urlStr) { [weak self] img in
             guard let self = self else { return }
-            if iv.tag == wanted { iv.image = self.tinted(img, id); self.imageOriginal[id] = nil; self.applyFilter(iv, id); self.applyBlur(iv, id) }
+            if iv.tag == wanted { iv.image = self.tinted(img, id); self.imageOriginal[id] = nil; self.applyFilter(iv, id); self.applyBlur(iv, id); self.applyOps(iv, id) }
             self.hideImageSpinner(id)
             self.fireMedia(self.mediaLoad[id])
         } fail: { [weak self] in self?.hideImageSpinner(id); self?.fireMedia(self?.mediaError[id]) }
@@ -2688,6 +2692,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         guard let o = out, let cg = ciContext.createCGImage(o, from: ci.extent) else { return }
         iv.image = UIImage(cgImage: cg)
+    }
+    // Image `ops`: run the GPU op-chain (from effects.chain) on the GPU, from the pre-filter
+    // original so switching chains does not stack. Supersedes the preset filter when set.
+    func applyOps(_ iv: UIImageView, _ id: String) {
+        let json = imageOpChain[id] ?? ""
+        if json.isEmpty { return }
+        let base = imageOriginal[id] ?? iv.image
+        if imageOriginal[id] == nil, let b = base { imageOriginal[id] = b }
+        guard let img = base else { return }
+        iv.image = runOpChain(img, json)
     }
     let ciContext = CIContext()
     // Dispatch a media event action (onLoad/onError/onEnd) if one is registered for the node.

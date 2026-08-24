@@ -411,6 +411,7 @@ struct ChuksCachedImage: UIViewRepresentable {
     let contentMode: UIView.ContentMode
     var tint: Color? = nil
     var filter: String = ""
+    var ops: String = ""
     var onLoad: (() -> Void)? = nil
     var onError: (() -> Void)? = nil
     func makeUIView(context: Context) -> UIImageView {
@@ -420,9 +421,13 @@ struct ChuksCachedImage: UIViewRepresentable {
         iv.contentMode = contentMode
         if let t = tint { iv.tintColor = UIColor(t) }
         let tmpl = tint != nil
-        if context.coordinator.loaded == url && context.coordinator.filter == filter { return }   // already resolved this url+filter
-        context.coordinator.filter = filter
-        let fx: (UIImage) -> UIImage = { tmpl ? $0.withRenderingMode(.alwaysTemplate) : photoFiltered($0, filter) }
+        if context.coordinator.loaded == url && context.coordinator.filter == filter && context.coordinator.ops == ops { return }   // already resolved this url+filter+ops
+        context.coordinator.filter = filter; context.coordinator.ops = ops
+        let fx: (UIImage) -> UIImage = { img in
+            if tmpl { return img.withRenderingMode(.alwaysTemplate) }
+            if !ops.isEmpty { return runOpChain(img, ops) }   // op-chain supersedes the preset filter
+            return photoFiltered(img, filter)
+        }
         if let cached = ChuksImageLoader.shared.cached(url) {
             iv.image = fx(cached)
             context.coordinator.loaded = url; DispatchQueue.main.async { onLoad?() }; return
@@ -434,7 +439,7 @@ struct ChuksCachedImage: UIViewRepresentable {
         } fail: { context.coordinator.loaded = url; onError?() }
     }
     func makeCoordinator() -> C { C() }
-    final class C { var loaded = ""; var filter = "" }
+    final class C { var loaded = ""; var filter = ""; var ops = "" }
 }
 
 // A native web view (WKWebView) loading a URL from the node's text channel.
@@ -747,6 +752,7 @@ struct NodeData {
     var progressAction: String = ""
     var slideDoneAction: String = ""
     var scrollAction: String = ""
+    var opsChain: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -1083,6 +1089,7 @@ final class Scene: ObservableObject {
             case "MP" where f.count >= 2: nodes[f[1]]?.progressAction = f[1] + ":progress"
             case "SC" where f.count >= 2: nodes[f[1]]?.slideDoneAction = f[1] + ":slidedone"   // Slider onSlidingComplete
             case "SS" where f.count >= 2: nodes[f[1]]?.scrollAction = f[1] + ":scroll"         // Scroll onScroll
+            case "IF" where f.count >= 3: nodes[f[1]]?.opsChain = f[2...].joined(separator: "|")   // Image GPU op-chain
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -2421,7 +2428,7 @@ struct NodeView: View {
             let load = node.loadAction, err = node.errorAction
             ZStack {
                 if s["spin"] == "1" { ProgressView() }   // loading spinner behind the image (covered once it loads)
-                ChuksCachedImage(url: node.text, contentMode: cm, tint: tint, filter: s["filt"] ?? "",
+                ChuksCachedImage(url: node.text, contentMode: cm, tint: tint, filter: s["filt"] ?? "", ops: node.opsChain,
                                  onLoad: load.isEmpty ? nil : { self.scene.dispatch(load) },
                                  onError: err.isEmpty ? nil : { self.scene.dispatch(err) })
             }
@@ -2432,7 +2439,7 @@ struct NodeView: View {
         } else if node.text.hasPrefix("file://"),
                   let ui = UIImage(contentsOfFile: String(node.text.dropFirst(7))) {   // picked/captured local file
             let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
-            Image(uiImage: photoFiltered(ui, s["filt"] ?? "")).resizable().aspectRatio(contentMode: mode)
+            Image(uiImage: node.opsChain.isEmpty ? photoFiltered(ui, s["filt"] ?? "") : runOpChain(ui, node.opsChain)).resizable().aspectRatio(contentMode: mode)
                 .frame(width: numOf(s["w"]), height: numOf(s["h"]))
                 .clipped()
                 .blur(radius: numOf(s["blur"]) ?? 0)
@@ -2441,7 +2448,7 @@ struct NodeView: View {
                   let url = Bundle.main.url(forResource: node.text, withExtension: nil),
                   let ui = UIImage(contentsOfFile: url.path) {   // bundled local asset (e.g. chuks-logo.png)
             let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
-            Image(uiImage: photoFiltered(ui, s["filt"] ?? "")).resizable().aspectRatio(contentMode: mode)
+            Image(uiImage: node.opsChain.isEmpty ? photoFiltered(ui, s["filt"] ?? "") : runOpChain(ui, node.opsChain)).resizable().aspectRatio(contentMode: mode)
                 .frame(width: numOf(s["w"]), height: numOf(s["h"]))
                 .clipped()
                 .cornerRadius(numOf(s["r"]) ?? 0)

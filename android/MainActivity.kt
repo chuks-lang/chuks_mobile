@@ -446,6 +446,10 @@ class MainActivity : Activity() {
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
                 "SC" -> if (f.size >= 2) sliderDone[f[1]] = f[1] + ":slidedone"          // Slider onSlidingComplete
                 "SS" -> if (f.size >= 2) scrollOnScroll[f[1]] = f[1] + ":scroll"         // Scroll onScroll
+                "IF" -> if (f.size >= 3) {                                                // Image GPU op-chain (JSON; rejoin '|')
+                    imageOpChain[f[1]] = f.drop(2).joinToString("|")
+                    imageOrigBmp[f[1]]?.let { b -> (views[f[1]] as? ImageView)?.setImageBitmap(runOps(f[1], b)) }
+                }
                 "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
@@ -1454,6 +1458,8 @@ class MainActivity : Activity() {
     private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
     private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
+    private val imageOpChain = HashMap<String, String>()       // id -> Image GPU op-chain (JSON)
+    private val imageOrigBmp = HashMap<String, android.graphics.Bitmap>()   // id -> pre-op bitmap, for re-applying a changed chain
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
     private val videoControlsIds = HashSet<String>()           // ids that show a native MediaController
     private val videoMediaControllers = HashMap<String, android.widget.MediaController>()  // id -> attached controller
@@ -1944,14 +1950,14 @@ class MainActivity : Activity() {
         if (t.startsWith("file://")) {                                        // picked/captured local file
             (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->
                 var ok = false
-                try { iv.setImageBitmap(android.graphics.BitmapFactory.decodeFile(t.substring(7))); ok = true } catch (e: Exception) {}
+                try { android.graphics.BitmapFactory.decodeFile(t.substring(7))?.let { iv.setImageBitmap(bmpFor(it, id)) }; ok = true } catch (e: Exception) {}
                 (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
                 return
             }
         }
         (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->            // bundled local asset (e.g. chuks-logo.png)
             var ok = false
-            if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) }; ok = true } catch (e: Exception) {}
+            if (t.isNotEmpty()) try { assets.open(t).use { android.graphics.BitmapFactory.decodeStream(it)?.let { b -> iv.setImageBitmap(bmpFor(b, id)) } }; ok = true } catch (e: Exception) {}
             (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
             return
         }
@@ -2731,8 +2737,15 @@ class MainActivity : Activity() {
         return out
     }
     private fun bmpFor(bmp: android.graphics.Bitmap, id: String): android.graphics.Bitmap {
-        val r = imageBlur[id] ?: return bmp
-        return if (r > 0f) blurBitmap(bmp, r) else bmp
+        val r = imageBlur[id] ?: 0f
+        val base = if (r > 0f) blurBitmap(bmp, r) else bmp
+        imageOrigBmp[id] = base
+        return runOps(id, base)
+    }
+    // Run the Image GPU op-chain (effects.chain) on the GPU, if set (else the base bitmap).
+    private fun runOps(id: String, bmp: android.graphics.Bitmap): android.graphics.Bitmap {
+        val j = imageOpChain[id]
+        return if (j.isNullOrEmpty()) bmp else try { ChuksEffects.run(bmp, j) } catch (e: Exception) { bmp }
     }
 
     private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {

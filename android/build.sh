@@ -58,7 +58,7 @@ echo "2. Building the Android engine (arm64)"
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" . )
 
 echo "3. Building the Android host${PREVIEW:+ (Chuks Preview)}"
-KT_SRC="$PKGDIR/MainActivity.kt"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
+KT_SRC="$PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
 if [ "$PREVIEW" = "1" ]; then
     KT_SRC="$KT_SRC $PKGDIR/ConnectActivity.kt $PKGDIR/ScannerActivity.kt"   # + in-app QR scanner
     [ -f "$ZXING" ] && KT_CP="$AJAR:$ZXING"

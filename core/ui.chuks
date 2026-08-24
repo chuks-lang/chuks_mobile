@@ -249,6 +249,8 @@ export class Node {
     // user scrolls; scrollTo imperatively scrolls to an offset (>= 0 = active).
     var onScroll: any
     var scrollTo: int
+    // Image GPU op-chain (a JSON op list from effects.chain); the host runs it on the GPU.
+    var opsChain: string
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -256,7 +258,7 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
-        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1
+        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1; this.opsChain = ""
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -570,6 +572,7 @@ export function Image(p: map[string]Prop): Node {
     if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
     applyLayout(s, p)
     const n: Node = new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
+    n.opsChain = pStr(p, "ops", "")                       // GPU op-chain (from effects.chain); host runs it on the GPU
     applyMediaEvents(n, p)                                // onLoad / onError
     return n
 }
@@ -1696,6 +1699,7 @@ export class Reconciler {
         const st: string = n.style.str()
         if (st != "") { this.emit("S|" + id + "|" + st) }
         if (n.text != "") { this.emit("P|" + id + "|" + n.text) }
+        if (n.opsChain != "") { this.emit("IF|" + id + "|" + n.opsChain) }   // Image GPU op-chain
         if (n.hasVal) { this.emit("V|" + id + "|" + n.val) }   // controlled TextInput value
         this.bindEvents(n, id)
         this.emit("I|" + id + "|" + parent + "|" + string(index))
@@ -1730,6 +1734,7 @@ export class Reconciler {
         if (next.kind == "List") { this.reconcileList(prev, next, id, parent, index); return }
         if (next.kind == "SectionList") { this.reconcileSectionList(prev, next, id, parent, index); return }
         if (p.text != next.text) { this.emit("P|" + id + "|" + next.text) }
+        if (p.opsChain != next.opsChain) { this.emit("IF|" + id + "|" + next.opsChain) }   // Image GPU op-chain change
         if (next.hasVal && (!p.hasVal || p.val != next.val)) { this.emit("V|" + id + "|" + next.val) }
         const ps: string = p.style.str()
         const ns: string = next.style.str()
