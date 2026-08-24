@@ -44,6 +44,30 @@ var _X_EPS: float = 0.5     // distance below this (units) counts as arrived
 function _fabs(x: float): float { if (x < 0.0) { return 0.0 - x } return x }
 function _round(x: float): int { if (x >= 0.0) { return int(x + 0.5) } return int(x - 0.5) }
 
+// ---- hex color helpers (for interpolateColor) ------------------------------
+var _HEXD: string = "0123456789abcdef"
+function _nib(c: string): int {
+    var i: int = _HEXD.indexOf(c)
+    if (i >= 0) { return i }
+    i = "0123456789ABCDEF".indexOf(c)   // accept upper-case hex too
+    if (i >= 0) { return i }
+    return 0
+}
+// Parse the two hex digits of a "RRGGBB" string at byte offset `at` -> 0..255.
+function _hex2(s: string, at: int): int { return _nib(s.slice(at, at + 1)) * 16 + _nib(s.slice(at + 1, at + 2)) }
+// Format 0..255 as two lower-case hex digits.
+function _toHex2(v: int): string {
+    var x: int = v; if (x < 0) { x = 0 }; if (x > 255) { x = 255 }
+    return _HEXD.slice(x / 16, x / 16 + 1) + _HEXD.slice(x % 16, x % 16 + 1)
+}
+// Blend two "RRGGBB" colors, t = 0..100 (0 = c0, 100 = c1). Returns "rrggbb".
+function _blendHex(c0: string, c1: string, t: int): string {
+    const r: int = _hex2(c0, 0) + (_hex2(c1, 0) - _hex2(c0, 0)) * t / 100
+    const g: int = _hex2(c0, 2) + (_hex2(c1, 2) - _hex2(c0, 2)) * t / 100
+    const b: int = _hex2(c0, 4) + (_hex2(c1, 4) - _hex2(c0, 4)) * t / 100
+    return _toHex2(r) + _toHex2(g) + _toHex2(b)
+}
+
 // Ask the host to render promptly so a target moved from an effect or a background
 // task paints this frame. Inside an event dispatch the surrounding re-render already
 // picks the new target up; this extra wake is a cheap no-op there.
@@ -174,6 +198,19 @@ export class Animated {
     public interpolate(inA: int, inB: int, outA: int, outB: int): AnimatedInterp {
         return new AnimatedInterp(this, inA, inB, outA, outB)
     }
+    // Multi-point (piecewise-linear) interpolation: map this value through the segments
+    // defined by `inRange` (ascending) onto `outRange` (same length), clamped at the ends.
+    // e.g. interpolateN([0,50,100],[0,200,0]) peaks in the middle. Recomputed each frame,
+    // so it shines when the source is driven per-frame (physics / a gesture).
+    public interpolateN(inRange: []int, outRange: []int): AnimatedInterpN {
+        return new AnimatedInterpN(this, inRange, outRange)
+    }
+    // Color interpolation: map this value through `inRange` (ascending) onto `colors`
+    // (same length, each "RRGGBB" hex, no leading #), blending between adjacent colors.
+    // value() returns a hex string to feed into a `bg`/`color` prop.
+    public interpolateColor(inRange: []int, colors: []string): AnimatedColor {
+        return new AnimatedColor(this, inRange, colors)
+    }
 }
 
 /**
@@ -203,6 +240,64 @@ export class AnimatedInterp {
     }
     public dur(): int { return this.src.ms }
     public easing(): string { return this.src.ez }
+}
+
+/** Piecewise-linear multi-point interpolation of an Animated (see interpolateN). */
+export class AnimatedInterpN {
+    var src: Animated
+    var inR: []int
+    var outR: []int
+    constructor(src: Animated, inR: []int, outR: []int) { this.src = src; this.inR = inR; this.outR = outR }
+    public value(): int {
+        const v: int = this.src.cur
+        const n: int = this.inR.length
+        if (n == 0) { return 0 }
+        if (n == 1) { return this.outR[0] }
+        if (v <= this.inR[0]) { return this.outR[0] }
+        if (v >= this.inR[n - 1]) { return this.outR[n - 1] }
+        var i: int = 0
+        while (i < n - 1) {
+            const a: int = this.inR[i]
+            const b: int = this.inR[i + 1]
+            if (v >= a && v <= b) {
+                const span: int = b - a
+                if (span == 0) { return this.outR[i] }
+                return this.outR[i] + ((v - a) * (this.outR[i + 1] - this.outR[i])) / span
+            }
+            i = i + 1
+        }
+        return this.outR[n - 1]
+    }
+    public dur(): int { return this.src.ms }
+    public easing(): string { return this.src.ez }
+}
+
+/** Color interpolation of an Animated: value() is a blended "rrggbb" hex (see interpolateColor). */
+export class AnimatedColor {
+    var src: Animated
+    var inR: []int
+    var cols: []string
+    constructor(src: Animated, inR: []int, cols: []string) { this.src = src; this.inR = inR; this.cols = cols }
+    public value(): string {
+        const v: int = this.src.cur
+        const n: int = this.inR.length
+        if (n == 0) { return "000000" }
+        if (n == 1) { return this.cols[0] }
+        if (v <= this.inR[0]) { return this.cols[0] }
+        if (v >= this.inR[n - 1]) { return this.cols[n - 1] }
+        var i: int = 0
+        while (i < n - 1) {
+            const a: int = this.inR[i]
+            const b: int = this.inR[i + 1]
+            if (v >= a && v <= b) {
+                const span: int = b - a
+                const t: int = span == 0 ? 0 : ((v - a) * 100) / span
+                return _blendHex(this.cols[i], this.cols[i + 1], t)
+            }
+            i = i + 1
+        }
+        return this.cols[n - 1]
+    }
 }
 
 /**
