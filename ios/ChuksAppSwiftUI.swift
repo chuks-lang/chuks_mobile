@@ -2537,7 +2537,15 @@ struct NodeView: View {
         let hasMainSize = isRow ? (numOf(s["w"]) != nil) : (numOf(s["h"]) != nil)
         let grows = (numOf(s["g"]) ?? 0) > 0
         let a = s["a"]
-        let crossStretch = (a == nil || a == "stretch")
+        // A content-sized COLUMN inside a ROW (a chat bubble in a justify Row: no
+        // width, no grow) must NOT stretch its children to full width. Its own width is
+        // content-sized (a row doesn't give a child a definite width), but align-stretch
+        // would put .frame(maxWidth:.infinity) on the child, and SwiftUI fills all
+        // available space rather than the flexbox content width — ballooning the bubble.
+        // Only this case is suppressed; a column in a column (cards, the header/screen
+        // chain) keeps stretching, and a column in a row with grow/explicit-w does too.
+        let contentSizedColInRow = !isRow && parentRow && numOf(s["w"]) == nil && !grows
+        let crossStretch = (a == nil || a == "stretch") && !contentSizedColInRow
         let kids = node.children
         let hasGrowChild = kids.contains { (numOf(scene.nodes[$0]?.style["g"]) ?? 0) > 0 }
         // This container fills its own main axis (has room to distribute) if it has a
