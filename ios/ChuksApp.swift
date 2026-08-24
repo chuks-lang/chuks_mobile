@@ -2572,15 +2572,28 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if presentedAlert == id { return }
         DispatchQueue.main.async {
             guard self.alertIds.contains(id), self.presentedAlert == nil else { return }
+            // Encoding: title, message, promptFlag, placeholder, promptValue, buttonsPipe.
             let f = self.alertData[id] ?? []
             let title = f.count > 0 ? f[0] : "", msg = f.count > 1 ? f[1] : ""
-            let confirm = f.count > 2 ? f[2] : "OK", cancel = f.count > 3 ? f[3] : ""
+            let isPrompt = f.count > 2 && f[2] == "1"
+            let placeholder = f.count > 3 ? f[3] : "", promptValue = f.count > 4 ? f[4] : ""
             let ac = UIAlertController(title: title.isEmpty ? nil : title,
                                        message: msg.isEmpty ? nil : msg, preferredStyle: .alert)
-            if !cancel.isEmpty {
-                ac.addAction(UIAlertAction(title: cancel, style: .cancel) { _ in self.presentedAlert = nil; self.alertDispatch(id, "0") })
+            if isPrompt {
+                ac.addTextField { tf in tf.placeholder = placeholder; tf.text = promptValue }
             }
-            ac.addAction(UIAlertAction(title: confirm, style: .default) { _ in self.presentedAlert = nil; self.alertDispatch(id, "1") })
+            // Fields from index 5 on are the buttons, in tap-index order; "!"=destructive, "~"=cancel.
+            let labels = f.count > 5 ? Array(f[5...]) : ["OK"]
+            for (i, raw) in labels.enumerated() {
+                var label = raw, style: UIAlertAction.Style = .default
+                if label.hasPrefix("!") { style = .destructive; label.removeFirst() }
+                else if label.hasPrefix("~") { style = .cancel; label.removeFirst() }
+                ac.addAction(UIAlertAction(title: label, style: style) { _ in
+                    self.presentedAlert = nil
+                    let text = isPrompt ? (ac.textFields?.first?.text ?? "") : ""
+                    self.alertDispatch(id, isPrompt ? "\(i)\t\(text)" : "\(i)")
+                })
+            }
             self.presentedAlert = id
             self.present(ac, animated: true)
         }

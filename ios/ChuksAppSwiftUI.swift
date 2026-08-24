@@ -726,8 +726,11 @@ struct NodeData {
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
+struct AlertButtonInfo { let label: String; let role: ButtonRole?; let index: Int }
 struct AlertInfo {
-    let id: String, title: String, message: String, confirm: String, cancel: String
+    let id: String, title: String, message: String
+    let isPrompt: Bool, placeholder: String, promptValue: String
+    let buttons: [AlertButtonInfo]
 }
 
 // Permission (F2): map each framework's status enum to the cross-platform grant
@@ -2583,6 +2586,7 @@ struct NodeView: View {
 // ================= app entry (SwiftUI lifecycle, no AppDelegate) =================
 struct RootView: View {
     @ObservedObject var scene: Scene
+    @State private var alertText = ""   // the prompt Alert's text field
     // The true OS appearance — readable as long as we DON'T force preferredColorScheme
     // (we only force it once the user overrides), so live OS changes stay detectable.
     @Environment(\.colorScheme) private var osScheme
@@ -2590,10 +2594,21 @@ struct RootView: View {
     private var alertInfo: AlertInfo? {
         guard let id = scene.nodes.first(where: { $0.value.kind == "Alert" && $0.value.style["avis"] == "1" })?.key,
               let n = scene.nodes[id] else { return nil }
+        // Encoding: title, message, promptFlag, placeholder, promptValue, then one
+        // TAB field per button (in tap-index order).
         let f = n.text.components(separatedBy: "\t")
+        let rawButtons = f.count > 5 ? Array(f[5...]) : ["OK"]
+        let buttons = rawButtons.enumerated().map { (i, raw) -> AlertButtonInfo in
+            var label = raw; var role: ButtonRole? = nil
+            if label.hasPrefix("!") { role = .destructive; label.removeFirst() }
+            else if label.hasPrefix("~") { role = .cancel; label.removeFirst() }
+            return AlertButtonInfo(label: label, role: role, index: i)
+        }
         return AlertInfo(id: id,
                          title: f.count > 0 ? f[0] : "", message: f.count > 1 ? f[1] : "",
-                         confirm: f.count > 2 ? f[2] : "OK", cancel: f.count > 3 ? f[3] : "")
+                         isPrompt: f.count > 2 && f[2] == "1",
+                         placeholder: f.count > 3 ? f[3] : "", promptValue: f.count > 4 ? f[4] : "",
+                         buttons: buttons)
     }
     var body: some View {
         // The app's root background IS the theme signal: it flips 0B1120 -> F6F7F9
@@ -2649,11 +2664,19 @@ struct RootView: View {
         .alert(alertInfo?.title ?? "",
                isPresented: Binding(get: { alertInfo != nil }, set: { _ in }),
                presenting: alertInfo) { info in
-            Button(info.confirm) { scene.input(info.id, "1") }
-            if !info.cancel.isEmpty { Button(info.cancel, role: .cancel) { scene.input(info.id, "0") } }
+            if info.isPrompt { TextField(info.placeholder, text: $alertText) }
+            ForEach(info.buttons, id: \.index) { btn in
+                Button(btn.label, role: btn.role) {
+                    scene.input(info.id, info.isPrompt ? "\(btn.index)\t\(alertText)" : "\(btn.index)")
+                }
+            }
         } message: { info in
             Text(info.message)
         }
+        // Seed the prompt field with promptValue each time an alert appears (onChange
+        // covers the normal flow; onAppear covers an alert already visible at launch).
+        .onChange(of: alertInfo?.id) { _ in alertText = alertInfo?.promptValue ?? "" }
+        .onAppear { if let pv = alertInfo?.promptValue, !pv.isEmpty { alertText = pv } }
     }
 
     // The overlay for a visible Modal: a dimmed scrim (tap dismisses) with the modal's

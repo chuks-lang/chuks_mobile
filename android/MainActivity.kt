@@ -2530,23 +2530,74 @@ class MainActivity : Activity() {
         super.onBackPressed()
     }
 
-    // Present a native AlertDialog for an Alert node (title/message/buttons from alertData).
+    // Present a native AlertDialog for an Alert node. Encoding:
+    // title, message, promptFlag, placeholder, promptValue, buttonsPipe.
     private fun presentAlert(id: String) {
         if (presentedAlertId == id) return
         val f = alertData[id] ?: return
         val title = f.getOrNull(0) ?: ""; val msg = f.getOrNull(1) ?: ""
-        val confirm = f.getOrNull(2) ?: "OK"; val cancel = f.getOrNull(3) ?: ""
+        val isPrompt = (f.getOrNull(2) ?: "0") == "1"
+        val placeholder = f.getOrNull(3) ?: ""; val promptValue = f.getOrNull(4) ?: ""
+        // Fields from index 5 on are the buttons; "!"=destructive, "~"=cancel style.
+        val labels = if (f.size > 5) f.subList(5, f.size) else listOf("OK")
+        val cleaned = labels.map { when { it.startsWith("!") || it.startsWith("~") -> it.substring(1); else -> it } }
+        val destructive = labels.map { it.startsWith("!") }
+        val cancelIdx = labels.indexOfFirst { it.startsWith("~") }   // -1 if none
         val b = android.app.AlertDialog.Builder(this)
         if (title.isNotEmpty()) b.setTitle(title)
-        if (msg.isNotEmpty()) b.setMessage(msg)
-        b.setPositiveButton(confirm) { _, _ -> presentedAlertId = null; alertDispatch(id, "1") }
-        if (cancel.isNotEmpty()) {
-            b.setNegativeButton(cancel) { _, _ -> presentedAlertId = null; alertDispatch(id, "0") }
-            b.setOnCancelListener { presentedAlertId = null; alertDispatch(id, "0") }   // back / tap-outside = cancel
-        } else b.setCancelable(false)
+        if (msg.isNotEmpty() && !isPrompt) b.setMessage(msg)
+
+        // Prompt: an EditText inside a padded container (also carries the message above it).
+        var promptField: android.widget.EditText? = null
+        if (isPrompt) {
+            val box = LinearLayout(this); box.orientation = LinearLayout.VERTICAL
+            box.setPadding(dp(20), dp(8), dp(20), 0)
+            if (msg.isNotEmpty()) box.addView(TextView(this).also { it.text = msg; it.setPadding(0, 0, 0, dp(8)) })
+            val et = android.widget.EditText(this); et.hint = placeholder; et.setText(promptValue)
+            box.addView(et); promptField = et; b.setView(box)
+        }
+
+        fun report(which: Int) {
+            presentedAlertId = null
+            val text = promptField?.text?.toString() ?: ""
+            alertDispatch(id, if (isPrompt) "$which\t$text" else "$which")
+        }
+
+        if (cleaned.size > 3 && !isPrompt) {
+            // More buttons than the 3 native slots: a selectable list reports its index.
+            b.setItems(cleaned.toTypedArray()) { _, which -> report(which) }
+        } else {
+            // Map tap-index -> native slots. 1: positive[0]. 2: negative[0],positive[1].
+            // 3: negative[0],neutral[1],positive[2]. Index in the callback is the tap-index.
+            when (cleaned.size) {
+                1 -> b.setPositiveButton(cleaned[0]) { _, _ -> report(0) }
+                2 -> { b.setNegativeButton(cleaned[0]) { _, _ -> report(0) }
+                       b.setPositiveButton(cleaned[1]) { _, _ -> report(1) } }
+                else -> { b.setNegativeButton(cleaned[0]) { _, _ -> report(0) }
+                          b.setNeutralButton(cleaned[1]) { _, _ -> report(1) }
+                          b.setPositiveButton(cleaned[2]) { _, _ -> report(2) } }
+            }
+        }
+        if (cancelIdx >= 0) b.setOnCancelListener { report(cancelIdx) }   // back / tap-outside = the cancel button
+        else b.setCancelable(false)
+
         val d = b.create()
         presentedAlertId = id; presentedAlertDialog = d
         d.show()
+        // Redden destructive buttons after show() (AlertDialog has no destructive style).
+        // Map each tap-index to its native slot for the 1..3-button layouts.
+        if (cleaned.size <= 3 || isPrompt) {
+            val red = Color.parseColor("#DC2626")
+            for (i in cleaned.indices) {
+                if (!destructive.getOrElse(i) { false }) continue
+                val slot = when {
+                    cleaned.size == 1 -> android.app.AlertDialog.BUTTON_POSITIVE
+                    cleaned.size == 2 -> if (i == 0) android.app.AlertDialog.BUTTON_NEGATIVE else android.app.AlertDialog.BUTTON_POSITIVE
+                    else -> if (i == 0) android.app.AlertDialog.BUTTON_NEGATIVE else if (i == 1) android.app.AlertDialog.BUTTON_NEUTRAL else android.app.AlertDialog.BUTTON_POSITIVE
+                }
+                d.getButton(slot)?.setTextColor(red)
+            }
+        }
     }
     private fun dismissAlert(id: String) {
         if (presentedAlertId == id) { presentedAlertId = null; presentedAlertDialog?.dismiss(); presentedAlertDialog = null }

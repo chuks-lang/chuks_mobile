@@ -889,16 +889,26 @@ export function Modal(p: map[string]Prop, kids: []Node): Node {
 /**
  * A NATIVE alert / confirm dialog (UIAlertController / SwiftUI .alert / AlertDialog).
  * Declarative like Modal: the parent owns `visible` and passes it; the host presents
- * the OS alert when it flips true. `confirmText` is the primary button; a non-empty
- * `cancelText` adds a second (cancel) button. `onConfirm` / `onCancel` fire on tap.
- * Renders nothing inline.
+ * the OS alert when it flips true. Renders nothing inline.
+ *
+ * Three shapes, from a shared builder:
+ *  - Simple confirm: `confirmText` is the primary button; a non-empty `cancelText`
+ *    adds a cancel button; `destructive: true` reddens the confirm button.
+ *    `onConfirm` / `onCancel` fire on tap.
+ *  - Multi-button: pass `buttons` as a pipe-separated string ("Save|Discard|Cancel").
+ *    Prefix a label with `!` for a destructive (red) button or `~` for a cancel-style
+ *    button. `onButton` fires with the tapped index (as a string; parse with int()).
+ *  - Prompt: `prompt: true` adds a text field (`placeholder`, `promptValue` seed the
+ *    it); on confirm, `onSubmit` fires with the entered text.
  *
  * Props: `visible` (bool), `title`, `message`, `confirmText` ("OK"), `cancelText`
- * ("" = single-button), `onConfirm` (() -> void), `onCancel` (() -> void).
+ * ("" = single-button), `destructive` (bool), `buttons` (pipe string), `prompt` (bool),
+ * `placeholder`, `promptValue`, `onConfirm` (() -> void), `onCancel` (() -> void),
+ * `onButton` ((string) -> void), `onSubmit` ((string) -> void).
  *
  * ```chuks
  * Alert({ visible: confirming.get(), title: "Delete?", message: "This can't be undone.",
- *         confirmText: "Delete", cancelText: "Cancel",
+ *         confirmText: "Delete", cancelText: "Cancel", destructive: true,
  *         onConfirm: function(): void { doDelete(); confirming.set(false) },
  *         onCancel:  function(): void { confirming.set(false) } })
  * ```
@@ -908,17 +918,51 @@ export function Alert(p: map[string]Prop): Node {
     s.avis = pBool(p, "visible", false) ? 1 : 0
     const title: string = pStr(p, "title", "")
     const message: string = pStr(p, "message", "")
-    const confirm: string = pStr(p, "confirmText", "OK")
-    const cancel: string = pStr(p, "cancelText", "")     // "" = single-button alert
-    const joined: string = title + "\t" + message + "\t" + confirm + "\t" + cancel
+    const isPrompt: bool = pBool(p, "prompt", false)
+    const placeholder: string = pStr(p, "placeholder", "")
+    const promptValue: string = pStr(p, "promptValue", "")
+    const buttonsProp: string = pStr(p, "buttons", "")
+    // Build the button list in tap-index order. The user API takes `buttons` as a
+    // pipe-separated string; internally each button is its own trailing TAB field (the
+    // mutation protocol splits ops on '|', so a '|' in the text truncates it). Multi-
+    // button: index -> onButton. Simple: [~cancel, confirm] or [confirm], so index
+    // 0/last map to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
+    var buttonList: []string = []
+    var confirmIdx: int = -1
+    var cancelIdx: int = -1
+    if (buttonsProp != "") {
+        buttonList = buttonsProp.split("|")
+    } else {
+        const confirm: string = pStr(p, "confirmText", "OK")
+        const cancel: string = pStr(p, "cancelText", "")
+        const confirmLabel: string = (pBool(p, "destructive", false) ? "!" : "") + confirm
+        if (cancel != "") { buttonList = ["~" + cancel, confirmLabel]; cancelIdx = 0; confirmIdx = 1 }
+        else { buttonList = [confirmLabel]; confirmIdx = 0 }
+    }
+    var joined: string = title + "\t" + message + "\t" + (isPrompt ? "1" : "0") + "\t" + placeholder + "\t" + promptValue
+    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + buttonList[bi] }
     const n: Node = mkAlert(s, joined)
-    // The host reports a button tap as "1" (confirm) or "0" (cancel); route to the callbacks.
-    // The closure body is a single call: locals declared inside a captured closure
-    // miscompile under AOT, so callOpt (a top-level helper) holds the const + call.
+    // The host reports the tapped button INDEX ("0","1",...), plus "\t<text>" for a
+    // prompt. routeAlert (top-level, so its locals don't sit inside the captured
+    // closure and miscompile under AOT) dispatches to the right callback.
+    const ob: Prop? = p.get("onButton")
     const oc: Prop? = p.get("onConfirm")
     const ox: Prop? = p.get("onCancel")
-    n.onChange = function(v: string): void { if (v == "1") { callOpt(oc) } else { callOpt(ox) } }
+    const os: Prop? = p.get("onSubmit")
+    n.onChange = function(v: string): void { routeAlert(v, ob, oc, ox, os, confirmIdx, cancelIdx) }
     return n
+}
+// Route an Alert button tap. `v` is "<idx>" or "<idx>\t<promptText>". Multi-button
+// alerts fire onButton(idx); simple/prompt alerts map idx to onConfirm/onCancel and
+// pass the prompt text to onSubmit. Top-level (not a closure) so its locals are safe.
+function routeAlert(v: string, ob: Prop?, oc: Prop?, ox: Prop?, os: Prop?, confirmIdx: int, cancelIdx: int): void {
+    const tab: int = v.indexOf("\t")
+    const idxStr: string = tab >= 0 ? v.slice(0, tab) : v
+    const text: string = tab >= 0 ? v.slice(tab + 1) : ""
+    if (ob != null) { const f: any = ob; f(idxStr); return }
+    const idx: int = int(idxStr)
+    if (idx == confirmIdx) { if (os != null) { const g: any = os; g(text) } callOpt(oc) }
+    else if (idx == cancelIdx) { callOpt(ox) }
 }
 // Invoke an optional Prop closure (a () -> void callback), if present.
 function callOpt(cb: Prop?): void { if (cb != null) { const f: any = cb; f() } }
