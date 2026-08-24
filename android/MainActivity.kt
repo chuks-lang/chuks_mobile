@@ -2517,6 +2517,19 @@ class MainActivity : Activity() {
         hostEvent(action)
     }
 
+    // Hardware / gesture back: if a Modal is open, dismiss it (fire its onDismiss) and
+    // consume the press, matching iOS's expectation that back closes the top sheet
+    // first. Only when no Modal is showing does back fall through to the default
+    // (finish the activity).
+    override fun onBackPressed() {
+        val mid = activeModal
+        if (mid != null && views[mid]?.visibility == View.VISIBLE) {
+            modalActions[mid]?.let { fire(it) }   // parent flips `visible` false; the re-render hides it
+            return
+        }
+        super.onBackPressed()
+    }
+
     // Present a native AlertDialog for an Alert node (title/message/buttons from alertData).
     private fun presentAlert(id: String) {
         if (presentedAlertId == id) return
