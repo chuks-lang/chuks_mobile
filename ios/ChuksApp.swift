@@ -2017,6 +2017,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "dis":   // disabled: dim + block interaction (checked at fire time, since bindAction re-enables interaction)
                 v.alpha = (val == "1") ? 0.4 : 1.0
                 if let b = v as? UIButton { b.isEnabled = (val != "1") }
+                if let sw = v as? UISwitch { sw.isEnabled = (val != "1") }   // native block: a disabled toggle won't flip
+                if let sl = v as? UISlider { sl.isEnabled = (val != "1") }
                 if val == "1" { disabledIds.insert(id) } else { disabledIds.remove(id) }
             case "sec": (v as? UITextField)?.isSecureTextEntry = (val == "1")   // password field
             case "kbt": if let tf = field {
@@ -2081,6 +2083,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                           }
             case "avis":  if val == "1" { presentAlert(id) } else { dismissAlert(id) }
             case "bg":  if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) } else { v.backgroundColor = hexColor(val) }
+            case "swtc": (v as? UISwitch)?.thumbTintColor = hexColor(val)   // Switch thumb (knob) color
             case "fg":  label?.textColor = hexColor(val); btn?.setTitleColor(hexColor(val), for: .normal)
                         field?.textColor = hexColor(val); imgView?.tintColor = hexColor(val)
                         (v as? UIActivityIndicatorView)?.color = hexColor(val)

@@ -42,6 +42,7 @@ export class Style {
     var font: string    // custom font family (e.g. an icon font); "" = system
     var vid: string     // video filename for a Video node
     var swOn: int       // Switch on-state: 1 = on, 0 = off (-1 = not a Switch)
+    var swThumb: string // Switch thumb color (hex, e.g. "FFFFFF"); "" = platform default
     var press: int      // Pressable active opacity 0-100 while held (-1 = no press feedback)
     var sec: int        // Input secure-entry (password): 1 = masked (-1 = normal)
     var sbHide: int     // StatusBar hidden: 1 hide, 0 show (-1 = not a StatusBar)
@@ -101,7 +102,7 @@ export class Style {
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
         this.bw = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
-        this.swOn = -1; this.press = -1; this.sec = -1
+        this.swOn = -1; this.swThumb = ""; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
         this.slval = -1; this.slmin = 0; this.slmax = 100; this.slstep = 0
@@ -178,6 +179,7 @@ export class Style {
         if (this.hitSlop >= 0) { s = s + "hitslop=" + string(this.hitSlop) + ";" }
         if (this.spinner >= 0) { s = s + "spin=" + string(this.spinner) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
+        if (this.swThumb != "") { s = s + "swtc=" + this.swThumb + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
         if (this.sbHide >= 0) { s = s + "sbh=" + string(this.sbHide) + ";" }
@@ -692,7 +694,8 @@ export function TextInput(p: map[string]Prop): Node {
  * the switch always reflects Chuks state, never drifts. `bg` is the on-tint (the
  * track color when on); omit for the platform default.
  *
- * Props: `on` (bool), `onPress` (() -> void), `bg` (on-tint hex).
+ * Props: `on` (bool), `onPress` (() -> void), `bg` (on-tint hex),
+ *        `thumbColor` (knob color hex), `disabled` (bool: dim + block taps).
  *
  * ```chuks
  * Toggle({ on: enabled, onPress: function(): void { enabled = !enabled }, bg: ACCENT })
@@ -907,6 +910,8 @@ function callOpt(cb: Prop?): void { if (cb != null) { const f: any = cb; f() } }
 export function Toggle(p: map[string]Prop): Node {
     const s: Style = new Style()
     s.swOn = pBool(p, "on", false) ? 1 : 0
+    s.swThumb = pStr(p, "thumbColor", "")                                          // thumb (knob) color
+    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     applyLayout(s, p)
     const n: Node = mkSwitch(s)
     applyEvents(n, p)

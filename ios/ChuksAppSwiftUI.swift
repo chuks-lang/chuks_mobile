@@ -1827,6 +1827,37 @@ struct ChuksSlider: View {
     }
 }
 
+// A UIKit UISwitch wrapped for SwiftUI. SwiftUI's own Toggle renders as a UISwitch on
+// iOS but exposes no thumb-color API, so we back the switch with a real UISwitch to
+// support thumbColor (plus on-tint and disabled) at full parity with the UIKit host.
+// Controlled: `on` always reflects Chuks state; a user flip fires onFlip (which
+// dispatches), and the re-render re-syncs isOn.
+struct ChuksUISwitch: UIViewRepresentable {
+    let on: Bool
+    let onTint: UIColor?
+    let thumbColor: UIColor?
+    let disabled: Bool
+    let onFlip: () -> Void
+    func makeUIView(context: Context) -> UISwitch {
+        let sw = UISwitch()
+        sw.addTarget(context.coordinator, action: #selector(Coordinator.flipped(_:)), for: .valueChanged)
+        return sw
+    }
+    func updateUIView(_ sw: UISwitch, context: Context) {
+        context.coordinator.onFlip = onFlip
+        if sw.isOn != on { sw.setOn(on, animated: true) }   // re-sync to controlled state
+        sw.onTintColor = onTint
+        sw.thumbTintColor = thumbColor
+        sw.isEnabled = !disabled
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(onFlip: onFlip) }
+    final class Coordinator: NSObject {
+        var onFlip: () -> Void
+        init(onFlip: @escaping () -> Void) { self.onFlip = onFlip }
+        @objc func flipped(_ sw: UISwitch) { onFlip() }
+    }
+}
+
 // A UITextView wrapped for SwiftUI with a CLEAR background (TextEditor's own bg is
 // opaque on iOS 15 and can't be cleared reliably), so the field bg + rounded corners
 // from BoxStyle show through and a placeholder can sit behind it.
@@ -2412,16 +2443,18 @@ struct NodeView: View {
     func switchView(_ node: NodeData) -> some View {
         let on = node.style["on"] == "1"
         let action = node.action
-        let tint = node.style["bg"].map { hexColor($0) } ?? Color.accentColor
+        let onTint = node.style["bg"].map { UIColor(hexColor($0)) }
+        let thumb = node.style["swtc"].map { UIColor(hexColor($0)) }   // thumbColor (knob)
+        let disabled = node.style["dis"] == "1"
         // `bg` on a Switch is the on-TINT, not a background rectangle. Strip it before
-        // BoxStyle so decor() doesn't paint a box behind the native toggle.
+        // BoxStyle so decor() doesn't paint a box behind the native toggle. Back it with a
+        // real UISwitch (SwiftUI's Toggle renders as one on iOS anyway) so thumbColor works.
         var layout = node.style; layout["bg"] = nil
-        return Toggle("", isOn: Binding(get: { on }, set: { _ in
-            if !action.isEmpty { scene.dispatch(action) }
-        }))
-        .labelsHidden()
-        .tint(tint)
-        .modifier(BoxStyle(s: layout, parentRow: parentRow, parentStretch: parentStretch))
+        return ChuksUISwitch(on: on, onTint: onTint, thumbColor: thumb, disabled: disabled,
+                             onFlip: { if !action.isEmpty { scene.dispatch(action) } })
+            .fixedSize()
+            .opacity(disabled ? 0.5 : 1.0)
+            .modifier(BoxStyle(s: layout, parentRow: parentRow, parentStretch: parentStretch))
     }
 
     // A native indeterminate spinner. `w` is the target diameter (the default
