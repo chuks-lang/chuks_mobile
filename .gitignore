@@ -31,3 +31,7 @@ docs/
 # Example / demo entries — local scratch for docshots + manual testing, not part
 # of the shippable package (the starter template lives under template/).
 examples/
+
+# Staging for packages that will graduate to their own repos (e.g. @chuks/filters).
+# Kept local until ported out; not shipped as part of @chuks/mobile.
+packages/

@@ -43,17 +43,21 @@ var _pendingFx: []PendingFx = []        // effects to run after this render pass
 // Framework-internal: called before a component renders to set its identity.
 export function hookEnter(path: string): void { _path = path; _slot = 0; _fxSlot = 0 }
 
-// A handle to one state cell. Read with get() (cast to your type), write set(v).
-export class Cell {
+// A typed handle to one state cell. `Cell<T>` is purely a handle: the value lives
+// in the shared `_cells` store, so T only types the get/set surface (get() returns
+// T, no cast). Read with get(), write set(v). Inference usually fills T from the
+// initial value (useState(0) -> Cell<int>); annotate or pass an explicit type arg
+// for empty collections (useState<[]string>([]) -> Cell<[]string>).
+export class Cell<T> {
     var k: string
     constructor(k: string) { this.k = k }
-    public get(): any { return _cells.getOr(this.k, null) }
+    public get(): T { return _cells.getOr(this.k, null) }
     // Only update a cell that still exists. While the component is mounted useState
     // seeds it, so set() works; after it unmounts hookSweep drops the cell, so set()
     // is a no-op instead of resurrecting a dead cell. This makes a late async/stream
     // callback firing into an unmounted component harmless (React's "setState on an
-    // unmounted component is a no-op") — the fire-after-unmount race lands here.
-    public set(v: any): void { if (_cells.has(this.k)) { _cells[this.k] = v } }
+    // unmounted component is a no-op"): the fire-after-unmount race lands here.
+    public set(v: T): void { if (_cells.has(this.k)) { _cells[this.k] = v } }
 }
 
 /**
@@ -62,17 +66,17 @@ export class Cell {
  * read `cell.get()` (cast to your type), write `cell.set(v)`.
  *
  * ```chuks
- * var count = useState(0)
- * var n: int = count.get()
+ * var count = useState(0)          // Cell<int> by inference
+ * var n: int = count.get()         // typed, no cast
  * Button({ onPress: function(): void { count.set(count.get() + 1) } }, string(n))
  * ```
  */
-export function useState(initial: any): Cell {
+export function useState<T>(initial: T): Cell<T> {
     var k: string = _path + "#" + string(_slot)
     _slot = _slot + 1
     _seen[k] = true
     if (!_cells.has(k)) { _cells[k] = initial }
-    return new Cell(k)
+    return new Cell<T>(k)
 }
 
 /**
@@ -84,11 +88,11 @@ export function useState(initial: any): Cell {
  * var open = useKeyedState("row:" + string(id), false)
  * ```
  */
-export function useKeyedState(key: string, initial: any): Cell {
+export function useKeyedState<T>(key: string, initial: T): Cell<T> {
     var k: string = "key:" + key
     _seen[k] = true
     if (!_cells.has(k)) { _cells[k] = initial }
-    return new Cell(k)
+    return new Cell<T>(k)
 }
 
 // Framework-internal: begin a render pass (clear the visited sets + effect queue).
