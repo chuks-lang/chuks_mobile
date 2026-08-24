@@ -238,6 +238,9 @@ export class Node {
     var onError: any
     var onEnd: any
     var onProgress: any
+    // Slider: fires once when the drag gesture ENDS (RN onSlidingComplete), with
+    // the final value; distinct from onChange which streams during the drag.
+    var onSlideDone: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -245,6 +248,7 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
+        this.onSlideDone = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -914,7 +918,10 @@ export function Toggle(p: map[string]Prop): Node {
  * value (as a string; parse with int()) as the user drags. Integer range, `min` >= 0.
  *
  * Props: `value` (int), `min` (int, default 0), `max` (int, default 100),
- *        `onChange` ((string) -> void), `color` (active-track/thumb tint hex), `h`.
+ *        `step` (int, snap to multiples; 0 = continuous),
+ *        `onChange` ((string) -> void, streams during drag),
+ *        `onSlidingComplete` ((string) -> void, fires once on release),
+ *        `color` (active-track/thumb tint hex), `h`.
  *
  * ```chuks
  * Slider({ value: vol.get(), min: 0, max: 100,
@@ -933,6 +940,8 @@ export function Slider(p: map[string]Prop): Node {
     applyLayout(s, p)
     const n: Node = mkSlider(s)
     applyEvents(n, p)                           // onChange(v) fires on drag
+    const sc: Prop? = p.get("onSlidingComplete")
+    if (sc != null) { n.onSlideDone = sc }      // fires once with the final value on release
     return n
 }
 /**
@@ -1581,6 +1590,7 @@ export class Reconciler {
         if (n.onError != null) { this.handlers[id + ":error"] = n.onError; this.emit("ME|" + id) }
         if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
+        if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1664,6 +1674,7 @@ export class Reconciler {
         if (next.onError != null) { this.handlers[id + ":error"] = next.onError }
         if (next.onEnd != null) { this.handlers[id + ":end"] = next.onEnd }
         if (next.onProgress != null) { this.handlers[id + ":progress"] = next.onProgress }
+        if (next.onSlideDone != null) { this.handlers[id + ":slidedone"] = next.onSlideDone }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)

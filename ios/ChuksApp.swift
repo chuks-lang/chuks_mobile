@@ -753,6 +753,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var switchActions: [UISwitch: String] = [:]
     var sliderActions: [UISlider: String] = [:]
     var sliderStep: [UISlider: Float] = [:]   // snap value to multiples of this (0 = continuous)
+    var sliderDoneAction: [UISlider: String] = [:]   // onSlidingComplete tag ("<id>:slidedone")
     var datePickerActions: [UIDatePicker: String] = [:]                   // DatePicker -> onChange action
     var datePickerModes: [UIDatePicker: String] = [:]                     // DatePicker -> "date"|"time"|"datetime"
     var gestureIds: Set<String> = []                                     // Gesture node ids
@@ -1226,6 +1227,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "ME" where f.count >= 2: mediaError[f[1]] = f[1] + ":error"              // Image onError
             case "MN" where f.count >= 2: mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
             case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
+            case "SC" where f.count >= 2: if let sl = views[f[1]] as? UISlider { sliderDoneAction[sl] = f[1] + ":slidedone" }   // Slider onSlidingComplete
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -1870,6 +1872,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let sl = UISlider()
             sl.isContinuous = true
             sl.addTarget(self, action: #selector(sliderChanged(_:)), for: .valueChanged)
+            sl.addTarget(self, action: #selector(sliderDone(_:)), for: [.touchUpInside, .touchUpOutside])
             v = sl
         case "DatePicker", "DatePickerInline":   // same UIDatePicker; the "dpd" style picks compact/inline/wheels
             let dp = UIDatePicker()
@@ -2281,7 +2284,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let b = views[k] as? UIButton { buttonActions[b] = nil }
             if let tf = views[k] as? UITextField { fieldActions[tf] = nil; fieldSubmit[tf] = nil; fieldFocus[tf] = nil; fieldBlur[tf] = nil; fieldMaxLen[tf] = nil }
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
-            if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil }
+            if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil; sliderDoneAction[sl] = nil }
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
@@ -2410,6 +2413,17 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         apply(s)
         relayout()
         headerText("slider \(action)=\(val)")
+    }
+
+    // Drag ended (finger lifted): fire onSlidingComplete once with the final value.
+    @objc func sliderDone(_ sl: UISlider) {
+        guard let action = sliderDoneAction[sl] else { return }
+        if let step = sliderStep[sl], step > 0 {   // report the snapped final value
+            sl.value = sl.minimumValue + (((sl.value - sl.minimumValue) / step).rounded() * step)
+        }
+        let val = String(Int(sl.value.rounded()))
+        guard let s = eInput(action, val) else { connected = false; return }
+        apply(s); relayout()
     }
 
     // A native value event from a DatePicker -> the engine, as an ISO string; the

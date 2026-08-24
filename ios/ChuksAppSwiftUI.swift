@@ -722,6 +722,7 @@ struct NodeData {
     var errorAction: String = ""
     var endAction: String = ""
     var progressAction: String = ""
+    var slideDoneAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -1052,6 +1053,7 @@ final class Scene: ObservableObject {
             case "ME" where f.count >= 2: nodes[f[1]]?.errorAction = f[1] + ":error"
             case "MN" where f.count >= 2: nodes[f[1]]?.endAction = f[1] + ":end"
             case "MP" where f.count >= 2: nodes[f[1]]?.progressAction = f[1] + ":progress"
+            case "SC" where f.count >= 2: nodes[f[1]]?.slideDoneAction = f[1] + ":slidedone"   // Slider onSlidingComplete
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -1798,12 +1800,13 @@ func swAutocap(_ v: String?) -> TextInputAutocapitalization {
 struct ChuksSlider: View {
     @ObservedObject var scene: Scene
     let action: String
+    let doneAction: String
     let style: [String: String]
     let parentRow: Bool
     let parentStretch: Bool
     @State private var value: Double
-    init(scene: Scene, action: String, style: [String: String], parentRow: Bool, parentStretch: Bool) {
-        self.scene = scene; self.action = action; self.style = style
+    init(scene: Scene, action: String, doneAction: String, style: [String: String], parentRow: Bool, parentStretch: Bool) {
+        self.scene = scene; self.action = action; self.doneAction = doneAction; self.style = style
         self.parentRow = parentRow; self.parentStretch = parentStretch
         let lo = Int(style["slmin"] ?? "0") ?? 0
         _value = State(initialValue: Double(Int(style["slv"] ?? "") ?? lo))
@@ -1813,7 +1816,11 @@ struct ChuksSlider: View {
         let hi = Double(Int(style["slmax"] ?? "100") ?? 100)
         let tint = style["fg"].map { hexColor($0) } ?? Color.accentColor
         let step = Double(Int(style["slstep"] ?? "0") ?? 0)
-        return Slider(value: $value, in: lo...max(lo + 1, hi), step: step > 0 ? step : 1)
+        // onEditingChanged(false) fires once when the drag ends: onSlidingComplete.
+        return Slider(value: $value, in: lo...max(lo + 1, hi), step: step > 0 ? step : 1,
+                      onEditingChanged: { editing in
+                          if !editing && !doneAction.isEmpty { scene.input(doneAction, String(Int(value.rounded()))) }
+                      })
             .tint(tint)
             .onChange(of: value) { nv in if !action.isEmpty { scene.input(action, String(Int(nv.rounded()))) } }
             .modifier(BoxStyle(s: style, parentRow: parentRow, parentStretch: parentStretch))
@@ -2241,7 +2248,7 @@ struct NodeView: View {
         case "Input":  inputView(node)
         case "TextArea": ChuksTextArea(scene: scene, placeholder: node.text, action: node.action, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Switch": switchView(node)
-        case "Slider": ChuksSlider(scene: scene, action: node.action, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
+        case "Slider": ChuksSlider(scene: scene, action: node.action, doneAction: node.slideDoneAction, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Select": ChuksSelect(scene: scene, action: node.action, options: node.text.components(separatedBy: "\t"), sel: Int(node.style["seli"] ?? "0") ?? 0, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "DatePicker", "DatePickerInline": ChuksDatePicker(scene: scene, action: node.action, value: node.text, mode: node.style["dp"] ?? "date", style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Menu": ChuksMenu(scene: scene, action: node.action, label: node.text.components(separatedBy: "\t").first ?? "Menu", items: Array(node.text.components(separatedBy: "\t").dropFirst()), style: node.style, parentRow: parentRow, parentStretch: parentStretch)
