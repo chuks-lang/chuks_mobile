@@ -42,6 +42,7 @@ export class Style {
     var font: string    // custom font family (e.g. an icon font); "" = system
     var vid: string     // video filename for a Video node
     var swOn: int       // Switch on-state: 1 = on, 0 = off (-1 = not a Switch)
+    var swThumb: string // Switch thumb color (hex, e.g. "FFFFFF"); "" = platform default
     var press: int      // Pressable active opacity 0-100 while held (-1 = no press feedback)
     var sec: int        // Input secure-entry (password): 1 = masked (-1 = normal)
     var sbHide: int     // StatusBar hidden: 1 hide, 0 show (-1 = not a StatusBar)
@@ -101,7 +102,7 @@ export class Style {
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
         this.bw = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
-        this.swOn = -1; this.press = -1; this.sec = -1
+        this.swOn = -1; this.swThumb = ""; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
         this.slval = -1; this.slmin = 0; this.slmax = 100; this.slstep = 0
@@ -178,6 +179,7 @@ export class Style {
         if (this.hitSlop >= 0) { s = s + "hitslop=" + string(this.hitSlop) + ";" }
         if (this.spinner >= 0) { s = s + "spin=" + string(this.spinner) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
+        if (this.swThumb != "") { s = s + "swtc=" + this.swThumb + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
         if (this.sbHide >= 0) { s = s + "sbh=" + string(this.sbHide) + ";" }
@@ -241,6 +243,10 @@ export class Node {
     // Slider: fires once when the drag gesture ENDS (RN onSlidingComplete), with
     // the final value; distinct from onChange which streams during the drag.
     var onSlideDone: any
+    // Scroll container: onScroll streams the scroll offset (logical points) as the
+    // user scrolls; scrollTo imperatively scrolls to an offset (>= 0 = active).
+    var onScroll: any
+    var scrollTo: int
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -248,7 +254,7 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
-        this.onSlideDone = null
+        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -692,7 +698,8 @@ export function TextInput(p: map[string]Prop): Node {
  * the switch always reflects Chuks state, never drifts. `bg` is the on-tint (the
  * track color when on); omit for the platform default.
  *
- * Props: `on` (bool), `onPress` (() -> void), `bg` (on-tint hex).
+ * Props: `on` (bool), `onPress` (() -> void), `bg` (on-tint hex),
+ *        `thumbColor` (knob color hex), `disabled` (bool: dim + block taps).
  *
  * ```chuks
  * Toggle({ on: enabled, onPress: function(): void { enabled = !enabled }, bg: ACCENT })
@@ -726,25 +733,45 @@ export function SafeAreaView(p: map[string]Prop, kids: []Node): Node {
 function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
 
 /**
- * A vertical scroll container: children stack top-to-bottom and scroll when they
- * overflow. Grows to fill its parent's main axis. For long UNIFORM lists prefer
- * `List` (which virtualizes); use `Scroll` for a bounded set of mixed content.
+ * A scroll container: children stack and scroll when they overflow. Grows to fill
+ * its parent's main axis. For long UNIFORM lists prefer `List` (which virtualizes);
+ * use `Scroll` for a bounded set of mixed content. Vertical by default; pass
+ * `horizontal: true` for a left-to-right carousel of mixed content.
  *
- *     Scroll({}, [ Text(...), Card(...), Button(...) ])
+ * Props: `horizontal` (bool), `onRefresh` (() -> void) + `refreshing` (vertical only),
+ * `stickBottom` (bool, vertical only), plus any layout/style prop.
+ *
+ * Like every scroll container, wrap the content in a SINGLE child (a Column for
+ * vertical, a Row for horizontal); the host scroll view hosts exactly one child.
+ *
+ *     Scroll({}, [ Column({ gap: 12 }, [ Text(...), Card(...), Button(...) ]) ])
+ *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
  */
 export function Scroll(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "col"; s.grow = 1; s.basis = 0
+    // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
+    // HScroll (same control horizontal Lists use); children lay out in a row and the
+    // content is measured wide, not clamped to the viewport. Vertical is the default.
+    const horizontal: bool = pBool(p, "horizontal", false)
+    const s: Style = new Style()
+    if (horizontal) { s.dir = "row"; s.horiz = 1 } else { s.dir = "col" }
+    s.grow = 1; s.basis = 0
     applyLayout(s, p)
     // Pull-to-refresh: `onRefresh` fires when the user pulls down at the top; the
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
-    const orf: Prop? = p.get("onRefresh")
+    // Vertical only (a horizontal carousel has no pull-to-refresh).
+    const orf: Prop? = horizontal ? null : p.get("onRefresh")
     if (orf != null) { s.rfsh = pBool(p, "refreshing", false) ? 1 : 0 }
     // stickBottom: a chat transcript stays pinned to the newest message. The host keeps the
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
-    if (pBool(p, "stickBottom", false)) { s.stick = 1 }
-    const n: Node = new Node("Scroll", s, "", kids)
+    if (!horizontal && pBool(p, "stickBottom", false)) { s.stick = 1 }
+    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", kids)
     if (orf != null) { n.onPress = orf }
+    // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
+    // an offset (logical points) and re-fires whenever the value changes.
+    const osc: Prop? = p.get("onScroll")
+    if (osc != null) { n.onScroll = osc }
+    n.scrollTo = pInt(p, "scrollTo", -1)
     return n
 }
 /**
@@ -871,16 +898,26 @@ export function Modal(p: map[string]Prop, kids: []Node): Node {
 /**
  * A NATIVE alert / confirm dialog (UIAlertController / SwiftUI .alert / AlertDialog).
  * Declarative like Modal: the parent owns `visible` and passes it; the host presents
- * the OS alert when it flips true. `confirmText` is the primary button; a non-empty
- * `cancelText` adds a second (cancel) button. `onConfirm` / `onCancel` fire on tap.
- * Renders nothing inline.
+ * the OS alert when it flips true. Renders nothing inline.
+ *
+ * Three shapes, from a shared builder:
+ *  - Simple confirm: `confirmText` is the primary button; a non-empty `cancelText`
+ *    adds a cancel button; `destructive: true` reddens the confirm button.
+ *    `onConfirm` / `onCancel` fire on tap.
+ *  - Multi-button: pass `buttons` as a pipe-separated string ("Save|Discard|Cancel").
+ *    Prefix a label with `!` for a destructive (red) button or `~` for a cancel-style
+ *    button. `onButton` fires with the tapped index (as a string; parse with int()).
+ *  - Prompt: `prompt: true` adds a text field (`placeholder`, `promptValue` seed the
+ *    it); on confirm, `onSubmit` fires with the entered text.
  *
  * Props: `visible` (bool), `title`, `message`, `confirmText` ("OK"), `cancelText`
- * ("" = single-button), `onConfirm` (() -> void), `onCancel` (() -> void).
+ * ("" = single-button), `destructive` (bool), `buttons` (pipe string), `prompt` (bool),
+ * `placeholder`, `promptValue`, `onConfirm` (() -> void), `onCancel` (() -> void),
+ * `onButton` ((string) -> void), `onSubmit` ((string) -> void).
  *
  * ```chuks
  * Alert({ visible: confirming.get(), title: "Delete?", message: "This can't be undone.",
- *         confirmText: "Delete", cancelText: "Cancel",
+ *         confirmText: "Delete", cancelText: "Cancel", destructive: true,
  *         onConfirm: function(): void { doDelete(); confirming.set(false) },
  *         onCancel:  function(): void { confirming.set(false) } })
  * ```
@@ -890,23 +927,59 @@ export function Alert(p: map[string]Prop): Node {
     s.avis = pBool(p, "visible", false) ? 1 : 0
     const title: string = pStr(p, "title", "")
     const message: string = pStr(p, "message", "")
-    const confirm: string = pStr(p, "confirmText", "OK")
-    const cancel: string = pStr(p, "cancelText", "")     // "" = single-button alert
-    const joined: string = title + "\t" + message + "\t" + confirm + "\t" + cancel
+    const isPrompt: bool = pBool(p, "prompt", false)
+    const placeholder: string = pStr(p, "placeholder", "")
+    const promptValue: string = pStr(p, "promptValue", "")
+    const buttonsProp: string = pStr(p, "buttons", "")
+    // Build the button list in tap-index order. The user API takes `buttons` as a
+    // pipe-separated string; internally each button is its own trailing TAB field (the
+    // mutation protocol splits ops on '|', so a '|' in the text truncates it). Multi-
+    // button: index -> onButton. Simple: [~cancel, confirm] or [confirm], so index
+    // 0/last map to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
+    var buttonList: []string = []
+    var confirmIdx: int = -1
+    var cancelIdx: int = -1
+    if (buttonsProp != "") {
+        buttonList = buttonsProp.split("|")
+    } else {
+        const confirm: string = pStr(p, "confirmText", "OK")
+        const cancel: string = pStr(p, "cancelText", "")
+        const confirmLabel: string = (pBool(p, "destructive", false) ? "!" : "") + confirm
+        if (cancel != "") { buttonList = ["~" + cancel, confirmLabel]; cancelIdx = 0; confirmIdx = 1 }
+        else { buttonList = [confirmLabel]; confirmIdx = 0 }
+    }
+    var joined: string = title + "\t" + message + "\t" + (isPrompt ? "1" : "0") + "\t" + placeholder + "\t" + promptValue
+    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + buttonList[bi] }
     const n: Node = mkAlert(s, joined)
-    // The host reports a button tap as "1" (confirm) or "0" (cancel); route to the callbacks.
-    // The closure body is a single call: locals declared inside a captured closure
-    // miscompile under AOT, so callOpt (a top-level helper) holds the const + call.
+    // The host reports the tapped button INDEX ("0","1",...), plus "\t<text>" for a
+    // prompt. routeAlert (top-level, so its locals don't sit inside the captured
+    // closure and miscompile under AOT) dispatches to the right callback.
+    const ob: Prop? = p.get("onButton")
     const oc: Prop? = p.get("onConfirm")
     const ox: Prop? = p.get("onCancel")
-    n.onChange = function(v: string): void { if (v == "1") { callOpt(oc) } else { callOpt(ox) } }
+    const os: Prop? = p.get("onSubmit")
+    n.onChange = function(v: string): void { routeAlert(v, ob, oc, ox, os, confirmIdx, cancelIdx) }
     return n
+}
+// Route an Alert button tap. `v` is "<idx>" or "<idx>\t<promptText>". Multi-button
+// alerts fire onButton(idx); simple/prompt alerts map idx to onConfirm/onCancel and
+// pass the prompt text to onSubmit. Top-level (not a closure) so its locals are safe.
+function routeAlert(v: string, ob: Prop?, oc: Prop?, ox: Prop?, os: Prop?, confirmIdx: int, cancelIdx: int): void {
+    const tab: int = v.indexOf("\t")
+    const idxStr: string = tab >= 0 ? v.slice(0, tab) : v
+    const text: string = tab >= 0 ? v.slice(tab + 1) : ""
+    if (ob != null) { const f: any = ob; f(idxStr); return }
+    const idx: int = int(idxStr)
+    if (idx == confirmIdx) { if (os != null) { const g: any = os; g(text) } callOpt(oc) }
+    else if (idx == cancelIdx) { callOpt(ox) }
 }
 // Invoke an optional Prop closure (a () -> void callback), if present.
 function callOpt(cb: Prop?): void { if (cb != null) { const f: any = cb; f() } }
 export function Toggle(p: map[string]Prop): Node {
     const s: Style = new Style()
     s.swOn = pBool(p, "on", false) ? 1 : 0
+    s.swThumb = pStr(p, "thumbColor", "")                                          // thumb (knob) color
+    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     applyLayout(s, p)
     const n: Node = mkSwitch(s)
     applyEvents(n, p)
@@ -1434,6 +1507,7 @@ export class Reconciler {
     var listScrollIdx: map[string]int // List id -> last scrollToIndex target emitted (fire on change)
     var listScrollEnd: map[string]int // List id -> last scrollToEnd nonce emitted (fire on change)
     var listScrollPos: map[string]int // List id -> last scroll offset reported to its onScroll
+    var scrollToPos: map[string]int  // Scroll id -> last scrollTo target emitted (fire on change)
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
@@ -1444,6 +1518,7 @@ export class Reconciler {
         this.listRefreshing = {}; this.listEmpty = {}; this.listContentH = -1
         this.listHeaderShown = {}; this.listFooterShown = {}
         this.listScrollIdx = {}; this.listScrollEnd = {}; this.listScrollPos = {}
+        this.scrollToPos = {}
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1591,6 +1666,7 @@ export class Reconciler {
         if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
         if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
+        if (n.onScroll != null) { this.handlers[id + ":scroll"] = n.onScroll; this.emit("SS|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1675,6 +1751,12 @@ export class Reconciler {
         if (next.onEnd != null) { this.handlers[id + ":end"] = next.onEnd }
         if (next.onProgress != null) { this.handlers[id + ":progress"] = next.onProgress }
         if (next.onSlideDone != null) { this.handlers[id + ":slidedone"] = next.onSlideDone }
+        if (next.onScroll != null) { this.handlers[id + ":scroll"] = next.onScroll }
+        // scrollTo: imperatively scroll when the target changes (reuses the List LS op).
+        if (next.scrollTo >= 0 && next.scrollTo != this.scrollToPos.getOr(id, -1)) {
+            this.scrollToPos[id] = next.scrollTo
+            this.emit("LS|" + id + "|" + string(next.scrollTo))
+        }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)

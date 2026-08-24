@@ -754,6 +754,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var sliderActions: [UISlider: String] = [:]
     var sliderStep: [UISlider: Float] = [:]   // snap value to multiples of this (0 = continuous)
     var sliderDoneAction: [UISlider: String] = [:]   // onSlidingComplete tag ("<id>:slidedone")
+    var scrollOnScroll: [UIScrollView: String] = [:] // Scroll onScroll tag ("<id>:scroll")
+    var scrollLastPos: [UIScrollView: Int] = [:]     // last reported scroll offset (pt), to dedupe
     var datePickerActions: [UIDatePicker: String] = [:]                   // DatePicker -> onChange action
     var datePickerModes: [UIDatePicker: String] = [:]                     // DatePicker -> "date"|"time"|"datetime"
     var gestureIds: Set<String> = []                                     // Gesture node ids
@@ -984,6 +986,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         defer { inViewportSync = false }
         if pushViewport() { relayout() }
         if !perfActive { headerText("scroll \(Int(sv.contentOffset.y))pt") }
+        // Scroll onScroll: report the offset along the scrolling axis (points) when it changes.
+        if let tag = scrollOnScroll[sv] {
+            let horiz = sv.contentSize.width > sv.bounds.width + 1
+            let pts = Int((horiz ? sv.contentOffset.x : sv.contentOffset.y).rounded())
+            if scrollLastPos[sv] != pts {
+                scrollLastPos[sv] = pts
+                if let s = eInput(tag, String(pts)) { apply(s); relayout() } else { connected = false }
+            }
+        }
     }
 
     // ── Perf harness ───────────────────────────────────────────────────────
@@ -1214,7 +1225,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             switch op {
             case "C" where f.count >= 3: make(f[1], f[2])
             case "S" where f.count >= 3: style(f[1], f[2])
-            case "P" where f.count >= 3: setText(f[1], f[2])
+            case "P" where f.count >= 3: setText(f[1], f[2...].joined(separator: "|"))   // rejoin: text may contain '|'
             case "V" where f.count >= 3: setFieldValue(f[1], f[2...].joined(separator: "|"))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
@@ -1228,6 +1239,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "MN" where f.count >= 2: mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
             case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
             case "SC" where f.count >= 2: if let sl = views[f[1]] as? UISlider { sliderDoneAction[sl] = f[1] + ":slidedone" }   // Slider onSlidingComplete
+            case "SS" where f.count >= 2: if let sc = views[f[1]] as? UIScrollView { scrollOnScroll[sc] = f[1] + ":scroll" }   // Scroll onScroll
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -2017,6 +2029,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "dis":   // disabled: dim + block interaction (checked at fire time, since bindAction re-enables interaction)
                 v.alpha = (val == "1") ? 0.4 : 1.0
                 if let b = v as? UIButton { b.isEnabled = (val != "1") }
+                if let sw = v as? UISwitch { sw.isEnabled = (val != "1") }   // native block: a disabled toggle won't flip
+                if let sl = v as? UISlider { sl.isEnabled = (val != "1") }
                 if val == "1" { disabledIds.insert(id) } else { disabledIds.remove(id) }
             case "sec": (v as? UITextField)?.isSecureTextEntry = (val == "1")   // password field
             case "kbt": if let tf = field {
@@ -2081,6 +2095,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                           }
             case "avis":  if val == "1" { presentAlert(id) } else { dismissAlert(id) }
             case "bg":  if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) } else { v.backgroundColor = hexColor(val) }
+            case "swtc": (v as? UISwitch)?.thumbTintColor = hexColor(val)   // Switch thumb (knob) color
             case "fg":  label?.textColor = hexColor(val); btn?.setTitleColor(hexColor(val), for: .normal)
                         field?.textColor = hexColor(val); imgView?.tintColor = hexColor(val)
                         (v as? UIActivityIndicatorView)?.color = hexColor(val)
@@ -2285,6 +2300,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let tf = views[k] as? UITextField { fieldActions[tf] = nil; fieldSubmit[tf] = nil; fieldFocus[tf] = nil; fieldBlur[tf] = nil; fieldMaxLen[tf] = nil }
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
             if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil; sliderDoneAction[sl] = nil }
+            if let sc = views[k] as? UIScrollView { scrollOnScroll[sc] = nil; scrollLastPos[sc] = nil }
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
@@ -2569,15 +2585,28 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if presentedAlert == id { return }
         DispatchQueue.main.async {
             guard self.alertIds.contains(id), self.presentedAlert == nil else { return }
+            // Encoding: title, message, promptFlag, placeholder, promptValue, buttonsPipe.
             let f = self.alertData[id] ?? []
             let title = f.count > 0 ? f[0] : "", msg = f.count > 1 ? f[1] : ""
-            let confirm = f.count > 2 ? f[2] : "OK", cancel = f.count > 3 ? f[3] : ""
+            let isPrompt = f.count > 2 && f[2] == "1"
+            let placeholder = f.count > 3 ? f[3] : "", promptValue = f.count > 4 ? f[4] : ""
             let ac = UIAlertController(title: title.isEmpty ? nil : title,
                                        message: msg.isEmpty ? nil : msg, preferredStyle: .alert)
-            if !cancel.isEmpty {
-                ac.addAction(UIAlertAction(title: cancel, style: .cancel) { _ in self.presentedAlert = nil; self.alertDispatch(id, "0") })
+            if isPrompt {
+                ac.addTextField { tf in tf.placeholder = placeholder; tf.text = promptValue }
             }
-            ac.addAction(UIAlertAction(title: confirm, style: .default) { _ in self.presentedAlert = nil; self.alertDispatch(id, "1") })
+            // Fields from index 5 on are the buttons, in tap-index order; "!"=destructive, "~"=cancel.
+            let labels = f.count > 5 ? Array(f[5...]) : ["OK"]
+            for (i, raw) in labels.enumerated() {
+                var label = raw, style: UIAlertAction.Style = .default
+                if label.hasPrefix("!") { style = .destructive; label.removeFirst() }
+                else if label.hasPrefix("~") { style = .cancel; label.removeFirst() }
+                ac.addAction(UIAlertAction(title: label, style: style) { _ in
+                    self.presentedAlert = nil
+                    let text = isPrompt ? (ac.textFields?.first?.text ?? "") : ""
+                    self.alertDispatch(id, isPrompt ? "\(i)\t\(text)" : "\(i)")
+                })
+            }
             self.presentedAlert = id
             self.present(ac, animated: true)
         }

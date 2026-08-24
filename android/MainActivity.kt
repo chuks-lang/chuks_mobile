@@ -129,6 +129,9 @@ class MainActivity : Activity() {
     private val sliderMin = HashMap<String, Int>()        // Slider id -> min, to offset the SeekBar's 0-based progress
     private val sliderStep = HashMap<String, Int>()       // Slider id -> step (snap to multiples; 0 = continuous)
     private val sliderDone = HashMap<String, String>()    // Slider id -> onSlidingComplete tag ("<id>:slidedone")
+    private val switchThumb = HashMap<String, Int>()      // Switch id -> thumb color (so bg's white default doesn't clobber thumbColor)
+    private val scrollOnScroll = HashMap<String, String>() // Scroll id -> onScroll tag ("<id>:scroll")
+    private val scrollLastPos = HashMap<String, Int>()     // Scroll id -> last reported offset (logical pts), to dedupe
     private val selectIds = HashSet<String>()             // Select node ids (PopupMenu buttons)
     private val selectOptions = HashMap<String, List<String>>()  // id -> option labels
     private val selectSel = HashMap<String, Int>()        // id -> chosen index
@@ -394,6 +397,16 @@ class MainActivity : Activity() {
         }
     }
 
+    // Scroll onScroll: report the offset (px -> logical points) when it changes, if the
+    // Scroll node opted in via SS. Deduped so an idle relayout doesn't re-fire.
+    private fun reportScroll(id: String, offsetPx: Int) {
+        val tag = scrollOnScroll[id] ?: return
+        val pts = Math.round(offsetPx / resources.displayMetrics.density)
+        if (scrollLastPos[id] == pts) return
+        scrollLastPos[id] = pts
+        hostInput(tag, pts.toString())
+    }
+
     // ---- viewport / scroll -------------------------------------------------
     private fun pushViewport(): Boolean {
         val sc = listScroll ?: return false
@@ -419,7 +432,7 @@ class MainActivity : Activity() {
             when (f.getOrNull(0)) {
                 "C" -> if (f.size >= 3) make(f[1], f[2])
                 "S" -> if (f.size >= 3) style(f[1], f[2])
-                "P" -> if (f.size >= 3) setText(f[1], f[2])
+                "P" -> if (f.size >= 3) setText(f[1], f.drop(2).joinToString("|"))   // rejoin: text may contain '|'
                 "V" -> if (f.size >= 3) setFieldValue(f[1], f.drop(2).joinToString("|"))   // controlled value (may contain '|')
                 "T" -> if (f.size >= 3) bindAction(f[1], f[2])
                 "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
@@ -432,6 +445,7 @@ class MainActivity : Activity() {
                 "ME" -> if (f.size >= 2) mediaError[f[1]] = f[1] + ":error"              // Image onError
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
                 "SC" -> if (f.size >= 2) sliderDone[f[1]] = f[1] + ":slidedone"          // Slider onSlidingComplete
+                "SS" -> if (f.size >= 2) scrollOnScroll[f[1]] = f[1] + ":scroll"         // Scroll onScroll
                 "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
@@ -1405,13 +1419,13 @@ class MainActivity : Activity() {
             }
             "Scroll" -> SnapScrollView(this).also { sc ->
                 sc.isFillViewport = false
-                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility() }
+                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
                 listScroll = sc; scrollId = id; listHoriz = false }
             "HScroll" -> HorizontalScrollView(this).also { sc ->   // horizontal list (carousel)
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
-                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout() }
+                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
                 listScroll = sc; scrollId = id; listHoriz = true }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
                 it.setBackgroundColor(Color.argb(128, 0, 0, 0))
@@ -1448,6 +1462,7 @@ class MainActivity : Activity() {
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
+    private val explicitHeight = HashSet<String>()       // ids with an explicit `h`; a Button then keeps it instead of self-measuring
     private val iconFonts = HashMap<String, android.graphics.Typeface>()   // custom fonts by name, cached
     private fun iconFont(name: String): android.graphics.Typeface =
         iconFonts.getOrPut(name) { android.graphics.Typeface.createFromAsset(assets, "$name.ttf") }
@@ -1459,7 +1474,7 @@ class MainActivity : Activity() {
         // this id first. Node ids are reused when a screen swaps in place; without
         // this a previous bordered/filled element leaves its border/bg under the new
         // one (e.g. a stray outline around a row that later holds a Switch).
-        bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id)
+        bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
@@ -1482,7 +1497,7 @@ class MainActivity : Activity() {
                     // A HorizontalScrollView measures its child with UNSPECIFIED width, so force
                     // the content to its true (wide) width via minimumWidth, mirroring `h` below.
                     v.minimumWidth = dpf(f).toInt() }
-                "h" -> { N.ySetF(n, 6, dpf(f))
+                "h" -> { N.ySetF(n, 6, dpf(f)); explicitHeight.add(id)
                     // A ScrollView measures its child with UNSPECIFIED height, so a
                     // FrameLayout content sizes to its (windowed) children and ignores the
                     // Yoga height — collapsing the scroll range. minimumHeight forces the
@@ -1497,8 +1512,12 @@ class MainActivity : Activity() {
                 "on" -> (v as? Switch)?.isChecked = (vl == "1")
                 "bg" -> if (v is Switch) {
                     v.trackTintList = ColorStateList.valueOf(Color.parseColor("#$vl"))   // on-track = primary
-                    v.thumbTintList = ColorStateList.valueOf(Color.WHITE)                // white thumb, like iOS
+                    v.thumbTintList = ColorStateList.valueOf(switchThumb[id] ?: Color.WHITE)   // white thumb, like iOS (unless thumbColor set)
                 } else bgColor[id] = Color.parseColor("#$vl")
+                "swtc" -> if (v is Switch) {                                              // Switch thumb (knob) color
+                    val c = Color.parseColor("#$vl"); switchThumb[id] = c
+                    v.thumbTintList = ColorStateList.valueOf(c)
+                }
                 "r" -> bgRadius[id] = dpf(f)
                 "bw" -> borderW[id] = dpf(f)
                 "bc" -> borderC[id] = Color.parseColor("#$vl")
@@ -1936,7 +1955,7 @@ class MainActivity : Activity() {
             return
         }
         when (val v = views[id]) {
-            is Button -> v.text = t
+            is Button -> { v.text = t; measureButton(id, v) }
             is EditText -> v.hint = t
             is TextView -> { v.text = t; measureText(id, v) }
         }
@@ -2034,6 +2053,19 @@ class MainActivity : Activity() {
             N.ySetF(n, 5, tv.measuredWidth.toFloat())
             N.ySetF(n, 6, tv.measuredHeight.toFloat())
         }
+    }
+
+    // A Button self-sizes its HEIGHT to its label (like iOS). Button subclasses
+    // TextView but is handled before the TextView branch in setText, so it never ran
+    // measureText and — with no explicit `h` — collapsed to 0-tall. Measure the
+    // intrinsic height and set ONLY the Yoga height, leaving width auto so a Button
+    // in a column still stretches full-width via align-stretch. Explicit `h` wins.
+    private fun measureButton(id: String, b: Button) {
+        if (explicitHeight.contains(id)) return
+        val n = ynodes[id] ?: return
+        val unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        b.measure(unspec, unspec)
+        N.ySetF(n, 6, b.measuredHeight.toFloat())
     }
 
     // A vector drawing surface: parses the ";"-joined shape descriptors and draws them
@@ -2449,7 +2481,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
@@ -2512,23 +2544,87 @@ class MainActivity : Activity() {
         hostEvent(action)
     }
 
-    // Present a native AlertDialog for an Alert node (title/message/buttons from alertData).
+    // Hardware / gesture back: if a Modal is open, dismiss it (fire its onDismiss) and
+    // consume the press, matching iOS's expectation that back closes the top sheet
+    // first. Only when no Modal is showing does back fall through to the default
+    // (finish the activity).
+    override fun onBackPressed() {
+        val mid = activeModal
+        if (mid != null && views[mid]?.visibility == View.VISIBLE) {
+            modalActions[mid]?.let { fire(it) }   // parent flips `visible` false; the re-render hides it
+            return
+        }
+        super.onBackPressed()
+    }
+
+    // Present a native AlertDialog for an Alert node. Encoding:
+    // title, message, promptFlag, placeholder, promptValue, buttonsPipe.
     private fun presentAlert(id: String) {
         if (presentedAlertId == id) return
         val f = alertData[id] ?: return
         val title = f.getOrNull(0) ?: ""; val msg = f.getOrNull(1) ?: ""
-        val confirm = f.getOrNull(2) ?: "OK"; val cancel = f.getOrNull(3) ?: ""
+        val isPrompt = (f.getOrNull(2) ?: "0") == "1"
+        val placeholder = f.getOrNull(3) ?: ""; val promptValue = f.getOrNull(4) ?: ""
+        // Fields from index 5 on are the buttons; "!"=destructive, "~"=cancel style.
+        val labels = if (f.size > 5) f.subList(5, f.size) else listOf("OK")
+        val cleaned = labels.map { when { it.startsWith("!") || it.startsWith("~") -> it.substring(1); else -> it } }
+        val destructive = labels.map { it.startsWith("!") }
+        val cancelIdx = labels.indexOfFirst { it.startsWith("~") }   // -1 if none
         val b = android.app.AlertDialog.Builder(this)
         if (title.isNotEmpty()) b.setTitle(title)
-        if (msg.isNotEmpty()) b.setMessage(msg)
-        b.setPositiveButton(confirm) { _, _ -> presentedAlertId = null; alertDispatch(id, "1") }
-        if (cancel.isNotEmpty()) {
-            b.setNegativeButton(cancel) { _, _ -> presentedAlertId = null; alertDispatch(id, "0") }
-            b.setOnCancelListener { presentedAlertId = null; alertDispatch(id, "0") }   // back / tap-outside = cancel
-        } else b.setCancelable(false)
+        if (msg.isNotEmpty() && !isPrompt) b.setMessage(msg)
+
+        // Prompt: an EditText inside a padded container (also carries the message above it).
+        var promptField: android.widget.EditText? = null
+        if (isPrompt) {
+            val box = LinearLayout(this); box.orientation = LinearLayout.VERTICAL
+            box.setPadding(dp(20), dp(8), dp(20), 0)
+            if (msg.isNotEmpty()) box.addView(TextView(this).also { it.text = msg; it.setPadding(0, 0, 0, dp(8)) })
+            val et = android.widget.EditText(this); et.hint = placeholder; et.setText(promptValue)
+            box.addView(et); promptField = et; b.setView(box)
+        }
+
+        fun report(which: Int) {
+            presentedAlertId = null
+            val text = promptField?.text?.toString() ?: ""
+            alertDispatch(id, if (isPrompt) "$which\t$text" else "$which")
+        }
+
+        if (cleaned.size > 3 && !isPrompt) {
+            // More buttons than the 3 native slots: a selectable list reports its index.
+            b.setItems(cleaned.toTypedArray()) { _, which -> report(which) }
+        } else {
+            // Map tap-index -> native slots. 1: positive[0]. 2: negative[0],positive[1].
+            // 3: negative[0],neutral[1],positive[2]. Index in the callback is the tap-index.
+            when (cleaned.size) {
+                1 -> b.setPositiveButton(cleaned[0]) { _, _ -> report(0) }
+                2 -> { b.setNegativeButton(cleaned[0]) { _, _ -> report(0) }
+                       b.setPositiveButton(cleaned[1]) { _, _ -> report(1) } }
+                else -> { b.setNegativeButton(cleaned[0]) { _, _ -> report(0) }
+                          b.setNeutralButton(cleaned[1]) { _, _ -> report(1) }
+                          b.setPositiveButton(cleaned[2]) { _, _ -> report(2) } }
+            }
+        }
+        if (cancelIdx >= 0) b.setOnCancelListener { report(cancelIdx) }   // back / tap-outside = the cancel button
+        else b.setCancelable(false)
+
         val d = b.create()
         presentedAlertId = id; presentedAlertDialog = d
         d.show()
+        // Redden destructive buttons after show() (AlertDialog has no destructive style).
+        // Map each tap-index to its native slot for the 1..3-button layouts.
+        if (cleaned.size <= 3 || isPrompt) {
+            val red = Color.parseColor("#DC2626")
+            for (i in cleaned.indices) {
+                if (!destructive.getOrElse(i) { false }) continue
+                val slot = when {
+                    cleaned.size == 1 -> android.app.AlertDialog.BUTTON_POSITIVE
+                    cleaned.size == 2 -> if (i == 0) android.app.AlertDialog.BUTTON_NEGATIVE else android.app.AlertDialog.BUTTON_POSITIVE
+                    else -> if (i == 0) android.app.AlertDialog.BUTTON_NEGATIVE else if (i == 1) android.app.AlertDialog.BUTTON_NEUTRAL else android.app.AlertDialog.BUTTON_POSITIVE
+                }
+                d.getButton(slot)?.setTextColor(red)
+            }
+        }
     }
     private fun dismissAlert(id: String) {
         if (presentedAlertId == id) { presentedAlertId = null; presentedAlertDialog?.dismiss(); presentedAlertDialog = null }

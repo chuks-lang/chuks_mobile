@@ -723,11 +723,15 @@ struct NodeData {
     var endAction: String = ""
     var progressAction: String = ""
     var slideDoneAction: String = ""
+    var scrollAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
+struct AlertButtonInfo { let label: String; let role: ButtonRole?; let index: Int }
 struct AlertInfo {
-    let id: String, title: String, message: String, confirm: String, cancel: String
+    let id: String, title: String, message: String
+    let isPrompt: Bool, placeholder: String, promptValue: String
+    let buttons: [AlertButtonInfo]
 }
 
 // Permission (F2): map each framework's status enum to the cross-platform grant
@@ -936,6 +940,7 @@ final class Scene: ObservableObject {
     // identical target (e.g. scrollToEnd bumped again) still re-fires the scroll.
     @Published var scrollTargets: [String: CGFloat] = [:]
     @Published var scrollNonce: [String: Int] = [:]
+    var scrollReported: [String: Int] = [:]   // Scroll id -> last onScroll offset dispatched (dedupe; not UI state)
 
     private var booted = false
     // True once a /mount has actually produced a node tree. Until then the DEV watcher
@@ -1040,7 +1045,7 @@ final class Scene: ObservableObject {
             case "S" where f.count >= 3:
                 nodes[f[1]]?.style = parseStyle(f[2])
                 if nodes[f[1]]?.kind == "StatusBar" { applyStatusBar(nodes[f[1]]!.style) }
-            case "P" where f.count >= 3: nodes[f[1]]?.text = f[2]
+            case "P" where f.count >= 3: nodes[f[1]]?.text = f[2...].joined(separator: "|")   // rejoin: text may contain '|'
             case "V" where f.count >= 3: nodes[f[1]]?.val = f[2...].joined(separator: "|"); nodes[f[1]]?.hasVal = true
             case "T" where f.count >= 3: nodes[f[1]]?.action = f[2]
             case "TS" where f.count >= 2: nodes[f[1]]?.submitAction = f[1] + ":submit"
@@ -1054,6 +1059,7 @@ final class Scene: ObservableObject {
             case "MN" where f.count >= 2: nodes[f[1]]?.endAction = f[1] + ":end"
             case "MP" where f.count >= 2: nodes[f[1]]?.progressAction = f[1] + ":progress"
             case "SC" where f.count >= 2: nodes[f[1]]?.slideDoneAction = f[1] + ":slidedone"   // Slider onSlidingComplete
+            case "SS" where f.count >= 2: nodes[f[1]]?.scrollAction = f[1] + ":scroll"         // Scroll onScroll
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -1827,6 +1833,37 @@ struct ChuksSlider: View {
     }
 }
 
+// A UIKit UISwitch wrapped for SwiftUI. SwiftUI's own Toggle renders as a UISwitch on
+// iOS but exposes no thumb-color API, so we back the switch with a real UISwitch to
+// support thumbColor (plus on-tint and disabled) at full parity with the UIKit host.
+// Controlled: `on` always reflects Chuks state; a user flip fires onFlip (which
+// dispatches), and the re-render re-syncs isOn.
+struct ChuksUISwitch: UIViewRepresentable {
+    let on: Bool
+    let onTint: UIColor?
+    let thumbColor: UIColor?
+    let disabled: Bool
+    let onFlip: () -> Void
+    func makeUIView(context: Context) -> UISwitch {
+        let sw = UISwitch()
+        sw.addTarget(context.coordinator, action: #selector(Coordinator.flipped(_:)), for: .valueChanged)
+        return sw
+    }
+    func updateUIView(_ sw: UISwitch, context: Context) {
+        context.coordinator.onFlip = onFlip
+        if sw.isOn != on { sw.setOn(on, animated: true) }   // re-sync to controlled state
+        sw.onTintColor = onTint
+        sw.thumbTintColor = thumbColor
+        sw.isEnabled = !disabled
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(onFlip: onFlip) }
+    final class Coordinator: NSObject {
+        var onFlip: () -> Void
+        init(onFlip: @escaping () -> Void) { self.onFlip = onFlip }
+        @objc func flipped(_ sw: UISwitch) { onFlip() }
+    }
+}
+
 // A UITextView wrapped for SwiftUI with a CLEAR background (TextEditor's own bg is
 // opaque on iOS 15 and can't be cleared reliably), so the field bg + rounded corners
 // from BoxStyle show through and a placeholder can sit behind it.
@@ -2163,6 +2200,11 @@ struct ChuksScroll: View {
                 ScrollOffsetReader(horizontal: horiz) { off in
                     if horiz { scene.viewport(Int32(max(0, off)), Int32(outer.size.width), Int32(max(0, outer.size.height))) }
                     else { scene.viewport(Int32(max(0, off)), Int32(outer.size.height), Int32(max(0, outer.size.width))) }
+                    // Scroll onScroll: report the offset (points) when it changes, if opted in.
+                    if let tag = scene.nodes[id]?.scrollAction, !tag.isEmpty {
+                        let pts = Int(max(0, off).rounded())
+                        if scene.scrollReported[id] != pts { scene.scrollReported[id] = pts; scene.input(tag, String(pts)) }
+                    }
                 }.frame(width: 0, height: 0)
                 // scrollToIndex/scrollToEnd: drive the underlying UIScrollView's offset.
                 ScrollSetter(y: scene.scrollTargets[id], nonce: scene.scrollNonce[id] ?? 0, horizontal: horiz)
@@ -2412,16 +2454,18 @@ struct NodeView: View {
     func switchView(_ node: NodeData) -> some View {
         let on = node.style["on"] == "1"
         let action = node.action
-        let tint = node.style["bg"].map { hexColor($0) } ?? Color.accentColor
+        let onTint = node.style["bg"].map { UIColor(hexColor($0)) }
+        let thumb = node.style["swtc"].map { UIColor(hexColor($0)) }   // thumbColor (knob)
+        let disabled = node.style["dis"] == "1"
         // `bg` on a Switch is the on-TINT, not a background rectangle. Strip it before
-        // BoxStyle so decor() doesn't paint a box behind the native toggle.
+        // BoxStyle so decor() doesn't paint a box behind the native toggle. Back it with a
+        // real UISwitch (SwiftUI's Toggle renders as one on iOS anyway) so thumbColor works.
         var layout = node.style; layout["bg"] = nil
-        return Toggle("", isOn: Binding(get: { on }, set: { _ in
-            if !action.isEmpty { scene.dispatch(action) }
-        }))
-        .labelsHidden()
-        .tint(tint)
-        .modifier(BoxStyle(s: layout, parentRow: parentRow, parentStretch: parentStretch))
+        return ChuksUISwitch(on: on, onTint: onTint, thumbColor: thumb, disabled: disabled,
+                             onFlip: { if !action.isEmpty { scene.dispatch(action) } })
+            .fixedSize()
+            .opacity(disabled ? 0.5 : 1.0)
+            .modifier(BoxStyle(s: layout, parentRow: parentRow, parentStretch: parentStretch))
     }
 
     // A native indeterminate spinner. `w` is the target diameter (the default
@@ -2501,7 +2545,15 @@ struct NodeView: View {
         let hasMainSize = isRow ? (numOf(s["w"]) != nil) : (numOf(s["h"]) != nil)
         let grows = (numOf(s["g"]) ?? 0) > 0
         let a = s["a"]
-        let crossStretch = (a == nil || a == "stretch")
+        // A content-sized COLUMN inside a ROW (a chat bubble in a justify Row: no
+        // width, no grow) must NOT stretch its children to full width. Its own width is
+        // content-sized (a row doesn't give a child a definite width), but align-stretch
+        // would put .frame(maxWidth:.infinity) on the child, and SwiftUI fills all
+        // available space rather than the flexbox content width — ballooning the bubble.
+        // Only this case is suppressed; a column in a column (cards, the header/screen
+        // chain) keeps stretching, and a column in a row with grow/explicit-w does too.
+        let contentSizedColInRow = !isRow && parentRow && numOf(s["w"]) == nil && !grows
+        let crossStretch = (a == nil || a == "stretch") && !contentSizedColInRow
         let kids = node.children
         let hasGrowChild = kids.contains { (numOf(scene.nodes[$0]?.style["g"]) ?? 0) > 0 }
         // This container fills its own main axis (has room to distribute) if it has a
@@ -2550,6 +2602,7 @@ struct NodeView: View {
 // ================= app entry (SwiftUI lifecycle, no AppDelegate) =================
 struct RootView: View {
     @ObservedObject var scene: Scene
+    @State private var alertText = ""   // the prompt Alert's text field
     // The true OS appearance — readable as long as we DON'T force preferredColorScheme
     // (we only force it once the user overrides), so live OS changes stay detectable.
     @Environment(\.colorScheme) private var osScheme
@@ -2557,10 +2610,21 @@ struct RootView: View {
     private var alertInfo: AlertInfo? {
         guard let id = scene.nodes.first(where: { $0.value.kind == "Alert" && $0.value.style["avis"] == "1" })?.key,
               let n = scene.nodes[id] else { return nil }
+        // Encoding: title, message, promptFlag, placeholder, promptValue, then one
+        // TAB field per button (in tap-index order).
         let f = n.text.components(separatedBy: "\t")
+        let rawButtons = f.count > 5 ? Array(f[5...]) : ["OK"]
+        let buttons = rawButtons.enumerated().map { (i, raw) -> AlertButtonInfo in
+            var label = raw; var role: ButtonRole? = nil
+            if label.hasPrefix("!") { role = .destructive; label.removeFirst() }
+            else if label.hasPrefix("~") { role = .cancel; label.removeFirst() }
+            return AlertButtonInfo(label: label, role: role, index: i)
+        }
         return AlertInfo(id: id,
                          title: f.count > 0 ? f[0] : "", message: f.count > 1 ? f[1] : "",
-                         confirm: f.count > 2 ? f[2] : "OK", cancel: f.count > 3 ? f[3] : "")
+                         isPrompt: f.count > 2 && f[2] == "1",
+                         placeholder: f.count > 3 ? f[3] : "", promptValue: f.count > 4 ? f[4] : "",
+                         buttons: buttons)
     }
     var body: some View {
         // The app's root background IS the theme signal: it flips 0B1120 -> F6F7F9
@@ -2616,11 +2680,19 @@ struct RootView: View {
         .alert(alertInfo?.title ?? "",
                isPresented: Binding(get: { alertInfo != nil }, set: { _ in }),
                presenting: alertInfo) { info in
-            Button(info.confirm) { scene.input(info.id, "1") }
-            if !info.cancel.isEmpty { Button(info.cancel, role: .cancel) { scene.input(info.id, "0") } }
+            if info.isPrompt { TextField(info.placeholder, text: $alertText) }
+            ForEach(info.buttons, id: \.index) { btn in
+                Button(btn.label, role: btn.role) {
+                    scene.input(info.id, info.isPrompt ? "\(btn.index)\t\(alertText)" : "\(btn.index)")
+                }
+            }
         } message: { info in
             Text(info.message)
         }
+        // Seed the prompt field with promptValue each time an alert appears (onChange
+        // covers the normal flow; onAppear covers an alert already visible at launch).
+        .onChange(of: alertInfo?.id) { _ in alertText = alertInfo?.promptValue ?? "" }
+        .onAppear { if let pv = alertInfo?.promptValue, !pv.isEmpty { alertText = pv } }
     }
 
     // The overlay for a visible Modal: a dimmed scrim (tap dismisses) with the modal's
