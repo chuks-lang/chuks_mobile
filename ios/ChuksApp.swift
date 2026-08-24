@@ -1153,6 +1153,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         return true
     }
+    // A continuous Gesture recognizer inside a Scroll should WIN over the scroll: the
+    // scroll's pan waits for ours to fail, so a drag that starts on the Gesture drags it
+    // instead of scrolling (a drag elsewhere never involves ours, so the scroll is normal).
+    // Delegate-driven (called at recognition time), so no attach-order race.
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+        // g is one of OUR Gesture recognizers (delegate === self). If `other` is an
+        // enclosing scroll's pan, return true so the scroll must wait for ours to fail.
+        return (g is UIPanGestureRecognizer) && (other.view is UIScrollView)
+    }
 
     // Keyboard avoidance (adjust-resize): shrink the app's usable height by the keyboard
     // height and relayout, so bottom-anchored content (a chat input bar) sits above the
@@ -2512,7 +2521,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     private func gPhase(_ s: UIGestureRecognizer.State) -> Int { s == .began ? 0 : (s == .changed ? 1 : 2) }
     @objc func handlePan(_ g: UIPanGestureRecognizer) {
-        let t = g.translation(in: g.view), v = g.velocity(in: g.view)
+        // Measure in the window, not g.view: inside a Scroll the view's own coordinate
+        // space can shift and zero out translation(in: g.view).
+        let t = g.translation(in: g.view?.window), v = g.velocity(in: g.view?.window)
         dispatchGesture(g.view, "pan:\(gPhase(g.state)),\(Int(t.x)),\(Int(t.y)),\(Int(v.x)),\(Int(v.y))")
     }
     @objc func handlePinch(_ g: UIPinchGestureRecognizer) {
