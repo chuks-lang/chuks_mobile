@@ -1580,6 +1580,7 @@ class MainActivity : Activity() {
                 "dis" -> { v.alpha = if (vl == "1") 0.4f else 1f; v.isEnabled = (vl != "1")            // disabled: dim + block
                     if (vl == "1") disabledIds.add(id) else disabledIds.remove(id) }
                 "tint" -> (v as? ImageView)?.let { val c = Color.parseColor("#" + vl); imageTint[id] = c; it.setColorFilter(c) }   // Image tintColor
+                "filt" -> (v as? ImageView)?.let { val m = photoMatrix(vl); if (m != null) it.colorFilter = android.graphics.ColorMatrixColorFilter(m) else it.clearColorFilter() }   // Image photo filter
                 "seek" -> videoPlayers[id]?.let { mp ->                                                // Video seek (seconds)
                     val secs = f.toInt()
                     if (videoSeek[id] != secs) { videoSeek[id] = secs; try { mp.seekTo(secs * 1000) } catch (e: Exception) {} } }
@@ -2066,6 +2067,23 @@ class MainActivity : Activity() {
         val unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         b.measure(unspec, unspec)
         N.ySetF(n, 6, b.measuredHeight.toFloat())
+    }
+
+    // Image `filter`: a GPU photo-filter preset as a ColorMatrix applied to the ImageView
+    // (drawn on the hardware layer). null = no filter (normal/none). Mirrors the iOS CIFilter set.
+    private fun photoMatrix(preset: String): android.graphics.ColorMatrix? {
+        val cm = android.graphics.ColorMatrix()
+        when (preset) {
+            "mono" -> cm.setSaturation(0f)
+            "noir" -> { cm.setSaturation(0f); cm.postConcat(android.graphics.ColorMatrix(floatArrayOf(1.5f,0f,0f,0f,-40f, 0f,1.5f,0f,0f,-40f, 0f,0f,1.5f,0f,-40f, 0f,0f,0f,1f,0f))) }
+            "sepia" -> { cm.setSaturation(0f); cm.postConcat(android.graphics.ColorMatrix(floatArrayOf(1f,0f,0f,0f,40f, 0f,1f,0f,0f,20f, 0f,0f,1f,0f,-20f, 0f,0f,0f,1f,0f))) }
+            "vivid" -> cm.setSaturation(1.6f)
+            "cool" -> cm.set(floatArrayOf(0.9f,0f,0f,0f,0f, 0f,1f,0f,0f,0f, 0f,0f,1.18f,0f,0f, 0f,0f,0f,1f,0f))
+            "warm" -> cm.set(floatArrayOf(1.18f,0f,0f,0f,0f, 0f,1.02f,0f,0f,0f, 0f,0f,0.85f,0f,0f, 0f,0f,0f,1f,0f))
+            "fade" -> { cm.setSaturation(0.72f); cm.postConcat(android.graphics.ColorMatrix(floatArrayOf(1f,0f,0f,0f,22f, 0f,1f,0f,0f,22f, 0f,0f,1f,0f,22f, 0f,0f,0f,1f,0f))) }
+            else -> return null
+        }
+        return cm
     }
 
     // A vector drawing surface: parses the ";"-joined shape descriptors and draws them

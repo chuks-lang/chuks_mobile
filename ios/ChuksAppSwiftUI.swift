@@ -384,12 +384,33 @@ struct ChuksVideo: UIViewRepresentable {
     }
 }
 
+// A GPU photo-filter preset via Core Image (shared by both hosts' Image `filter`).
+let sharedCIContext = CIContext()
+func photoFiltered(_ img: UIImage, _ preset: String) -> UIImage {
+    if preset.isEmpty || preset == "normal" || preset == "none" { return img }
+    guard let ci = CIImage(image: img) else { return img }
+    var out: CIImage? = nil
+    switch preset {
+    case "mono":  out = ci.applyingFilter("CIPhotoEffectMono")
+    case "noir":  out = ci.applyingFilter("CIPhotoEffectNoir")
+    case "sepia": out = ci.applyingFilter("CISepiaTone", parameters: [kCIInputIntensityKey: 0.9])
+    case "vivid": out = ci.applyingFilter("CIPhotoEffectChrome")
+    case "fade":  out = ci.applyingFilter("CIPhotoEffectFade")
+    case "cool":  out = ci.applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 9000, y: 0)])
+    case "warm":  out = ci.applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 4200, y: 0)])
+    default: return img
+    }
+    guard let o = out, let cg = sharedCIContext.createCGImage(o, from: ci.extent) else { return img }
+    return UIImage(cgImage: cg)
+}
+
 // A remote image backed by ChuksImageLoader (bounded LRU + disk + off-main decode), so a
 // recycled feed cell repaints instantly from cache instead of re-downloading like AsyncImage.
 struct ChuksCachedImage: UIViewRepresentable {
     let url: String
     let contentMode: UIView.ContentMode
     var tint: Color? = nil
+    var filter: String = ""
     var onLoad: (() -> Void)? = nil
     var onError: (() -> Void)? = nil
     func makeUIView(context: Context) -> UIImageView {
@@ -399,19 +420,21 @@ struct ChuksCachedImage: UIViewRepresentable {
         iv.contentMode = contentMode
         if let t = tint { iv.tintColor = UIColor(t) }
         let tmpl = tint != nil
-        if context.coordinator.loaded == url { return }   // already resolved this url
+        if context.coordinator.loaded == url && context.coordinator.filter == filter { return }   // already resolved this url+filter
+        context.coordinator.filter = filter
+        let fx: (UIImage) -> UIImage = { tmpl ? $0.withRenderingMode(.alwaysTemplate) : photoFiltered($0, filter) }
         if let cached = ChuksImageLoader.shared.cached(url) {
-            iv.image = tmpl ? cached.withRenderingMode(.alwaysTemplate) : cached
+            iv.image = fx(cached)
             context.coordinator.loaded = url; DispatchQueue.main.async { onLoad?() }; return
         }
         let wanted = url.hashValue; iv.tag = wanted; iv.image = nil
         ChuksImageLoader.shared.load(url) { img in
-            if iv.tag == wanted { iv.image = tmpl ? img.withRenderingMode(.alwaysTemplate) : img }
+            if iv.tag == wanted { iv.image = fx(img) }
             context.coordinator.loaded = url; onLoad?()
         } fail: { context.coordinator.loaded = url; onError?() }
     }
     func makeCoordinator() -> C { C() }
-    final class C { var loaded = "" }
+    final class C { var loaded = ""; var filter = "" }
 }
 
 // A native web view (WKWebView) loading a URL from the node's text channel.
@@ -2398,7 +2421,7 @@ struct NodeView: View {
             let load = node.loadAction, err = node.errorAction
             ZStack {
                 if s["spin"] == "1" { ProgressView() }   // loading spinner behind the image (covered once it loads)
-                ChuksCachedImage(url: node.text, contentMode: cm, tint: tint,
+                ChuksCachedImage(url: node.text, contentMode: cm, tint: tint, filter: s["filt"] ?? "",
                                  onLoad: load.isEmpty ? nil : { self.scene.dispatch(load) },
                                  onError: err.isEmpty ? nil : { self.scene.dispatch(err) })
             }
@@ -2409,15 +2432,16 @@ struct NodeView: View {
         } else if node.text.hasPrefix("file://"),
                   let ui = UIImage(contentsOfFile: String(node.text.dropFirst(7))) {   // picked/captured local file
             let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
-            Image(uiImage: ui).resizable().aspectRatio(contentMode: mode)
+            Image(uiImage: photoFiltered(ui, s["filt"] ?? "")).resizable().aspectRatio(contentMode: mode)
                 .frame(width: numOf(s["w"]), height: numOf(s["h"]))
                 .clipped()
+                .blur(radius: numOf(s["blur"]) ?? 0)
                 .cornerRadius(numOf(s["r"]) ?? 0)
         } else if !node.text.isEmpty,
                   let url = Bundle.main.url(forResource: node.text, withExtension: nil),
                   let ui = UIImage(contentsOfFile: url.path) {   // bundled local asset (e.g. chuks-logo.png)
             let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
-            Image(uiImage: ui).resizable().aspectRatio(contentMode: mode)
+            Image(uiImage: photoFiltered(ui, s["filt"] ?? "")).resizable().aspectRatio(contentMode: mode)
                 .frame(width: numOf(s["w"]), height: numOf(s["h"]))
                 .clipped()
                 .cornerRadius(numOf(s["r"]) ?? 0)

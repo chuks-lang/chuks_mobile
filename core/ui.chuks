@@ -87,6 +87,7 @@ export class Style {
     var ellip: string   // Text truncation: "tail"|"head"|"middle"|"clip" ("" = tail default)
     var disabled: int   // interactive controls: 1 = disabled (dimmed, no press); -1 = enabled
     var tint: string    // Image tintColor (hex): recolor a template image ("" = none)
+    var imgFilter: string // Image photo filter preset (mono|sepia|vivid|cool|warm|noir|fade; "" = none)
     var seekTo: int     // Video: seek to this time in seconds when it changes (-1 = no seek)
     var vidCtrls: int   // Video: 1 = show native playback controls (-1 = none)
     var vidVol: int     // Video volume 0-100 (-1 = default, honors `muted`)
@@ -113,7 +114,7 @@ export class Style {
         this.kbType = ""; this.retKey = ""; this.editable = -1; this.autoFocus = -1
         this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1; this.horiz = -1
         this.nlines = -1; this.ellip = ""; this.disabled = -1
-        this.tint = ""; this.seekTo = -1; this.vidCtrls = -1
+        this.tint = ""; this.imgFilter = ""; this.seekTo = -1; this.vidCtrls = -1
         this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
         this.selectable = -1; this.hitSlop = -1; this.spinner = -1
     }
@@ -169,6 +170,7 @@ export class Style {
         if (this.ellip != "") { s = s + "ellip=" + this.ellip + ";" }
         if (this.disabled >= 0) { s = s + "dis=" + string(this.disabled) + ";" }
         if (this.tint != "") { s = s + "tint=" + this.tint + ";" }
+        if (this.imgFilter != "") { s = s + "filt=" + this.imgFilter + ";" }
         if (this.seekTo >= 0) { s = s + "seek=" + string(this.seekTo) + ";" }
         if (this.vidCtrls >= 0) { s = s + "vctrl=" + string(this.vidCtrls) + ";" }
         if (this.vidVol >= 0) { s = s + "vvol=" + string(this.vidVol) + ";" }
@@ -548,10 +550,13 @@ export function Icon(p: map[string]Prop): Node {
  * (For a local SF Symbol icon use `Icon`/`name` instead.) The URL rides the text
  * channel, so it may not contain a newline or "|".
  *
- * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color).
+ * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color),
+ *   `tintColor`, `blurRadius`, `spinner`, and `filter` — a GPU photo-filter preset
+ *   (`mono` | `noir` | `sepia` | `vivid` | `cool` | `warm` | `fade`; `normal` = none),
+ *   applied natively via Core Image (iOS) / a ColorMatrix on the hardware layer (Android).
  *
  * ```chuks
- * Image({ src: "https://picsum.photos/200", w: 96, h: 96, radius: 12 })
+ * Image({ src: "https://picsum.photos/200", w: 96, h: 96, radius: 12, filter: "vivid" })
  * ```
  */
 export function Image(p: map[string]Prop): Node {
@@ -560,6 +565,7 @@ export function Image(p: map[string]Prop): Node {
     s.bg = pStr(p, "bg", "")
     s.tint = pStr(p, "tintColor", "")                     // recolor a template image
     s.blur = pInt(p, "blurRadius", -1)                    // blur the image (px)
+    s.imgFilter = pStr(p, "filter", "")                   // photo filter preset (mono|sepia|vivid|cool|warm|noir|fade)
     if (pBool(p, "spinner", false)) { s.spinner = 1 }     // show a loading spinner until it loads
     if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
     applyLayout(s, p)

@@ -794,6 +794,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var mediaProgress: [String: String] = [:]                             // id -> onProgress action (Video)
     var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
     var imageBlur: [String: CGFloat] = [:]                                // id -> Image blur radius (px)
+    var imageFilter: [String: String] = [:]                              // id -> Image photo-filter preset
+    var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter swap re-applies from the original
     var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
     var videoPosters: [String: UIImageView] = [:]                        // id -> poster overlay (until first frame)
     var posterObs: [String: NSKeyValueObservation] = [:]                 // id -> readyForDisplay observation
@@ -1785,10 +1787,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // remote Image URL
         if let iv = views[id] as? UIImageView, t.hasPrefix("file://") {   // picked/captured local file
             iv.image = UIImage(contentsOfFile: String(t.dropFirst(7)))
+            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id)
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
             if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
+            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id)
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = bgImageViews[id], !t.isEmpty {            // bundled ImageBackground asset
@@ -2183,6 +2187,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "vrate": if let p = videoPlayers[id], p.rate != 0 { p.rate = f / 100 }   // playback speed while playing
             case "ldelay": pressLongDelay[id] = TimeInterval(f) / 1000       // onLongPress hold time (ms)
             case "blur": if let iv = v as? UIImageView { imageBlur[id] = CGFloat(f); applyBlur(iv, id) }   // Image blur (px)
+            case "filt": if let iv = v as? UIImageView { imageFilter[id] = val; applyFilter(iv, id) }      // Image photo filter
             case "sel": if let l = v as? SelectableLabel { l.selectable = (val == "1"); if val == "1" { l.enableSelection() } }   // Text selectable
             case "hitslop": if let h = v as? HitSlopView { h.hitSlop = CGFloat(f) }   // Pressable enlarged tap area
             case "spin": if val == "1", let iv = v as? UIImageView, iv.image == nil { showImageSpinner(id, iv) }   // Image loading spinner
@@ -2631,12 +2636,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
-        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); applyBlur(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
         ChuksImageLoader.shared.load(urlStr) { [weak self] img in
             guard let self = self else { return }
-            if iv.tag == wanted { iv.image = self.tinted(img, id); self.applyBlur(iv, id) }
+            if iv.tag == wanted { iv.image = self.tinted(img, id); self.imageOriginal[id] = nil; self.applyFilter(iv, id); self.applyBlur(iv, id) }
             self.hideImageSpinner(id)
             self.fireMedia(self.mediaLoad[id])
         } fail: { [weak self] in self?.hideImageSpinner(id); self?.fireMedia(self?.mediaError[id]) }
@@ -2659,6 +2664,29 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
               let filter = CIFilter(name: "CIGaussianBlur") else { return }
         filter.setValue(ci, forKey: kCIInputImageKey); filter.setValue(r, forKey: kCIInputRadiusKey)
         guard let out = filter.outputImage, let cg = ciContext.createCGImage(out, from: ci.extent) else { return }
+        iv.image = UIImage(cgImage: cg)
+    }
+    // Image `filter`: a GPU photo-filter preset via Core Image (CIPhotoEffect family +
+    // temperature). Re-applies from the pre-filter original so switching presets doesn't
+    // stack (needed for a capture filter picker).
+    func applyFilter(_ iv: UIImageView, _ id: String) {
+        let name = imageFilter[id] ?? ""
+        if name.isEmpty || name == "normal" || name == "none" { if let orig = imageOriginal[id] { iv.image = orig }; return }
+        let base = imageOriginal[id] ?? iv.image
+        if imageOriginal[id] == nil, let b = base { imageOriginal[id] = b }
+        guard let img = base, let ci = CIImage(image: img) else { return }
+        var out: CIImage? = nil
+        switch name {
+        case "mono":  out = ci.applyingFilter("CIPhotoEffectMono")
+        case "noir":  out = ci.applyingFilter("CIPhotoEffectNoir")
+        case "sepia": out = ci.applyingFilter("CISepiaTone", parameters: [kCIInputIntensityKey: 0.9])
+        case "vivid": out = ci.applyingFilter("CIPhotoEffectChrome")
+        case "fade":  out = ci.applyingFilter("CIPhotoEffectFade")
+        case "cool":  out = ci.applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 9000, y: 0)])
+        case "warm":  out = ci.applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 4200, y: 0)])
+        default: return
+        }
+        guard let o = out, let cg = ciContext.createCGImage(o, from: ci.extent) else { return }
         iv.image = UIImage(cgImage: cg)
     }
     let ciContext = CIContext()
