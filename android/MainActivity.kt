@@ -127,6 +127,8 @@ class MainActivity : Activity() {
     private var sheetHandle: View? = null                // host-drawn grab handle pill
     private var shownSheet: String? = null               // sheet currently on screen (null = none); a change drives the slide-up
     private val sliderMin = HashMap<String, Int>()        // Slider id -> min, to offset the SeekBar's 0-based progress
+    private val sliderStep = HashMap<String, Int>()       // Slider id -> step (snap to multiples; 0 = continuous)
+    private val sliderDone = HashMap<String, String>()    // Slider id -> onSlidingComplete tag ("<id>:slidedone")
     private val selectIds = HashSet<String>()             // Select node ids (PopupMenu buttons)
     private val selectOptions = HashMap<String, List<String>>()  // id -> option labels
     private val selectSel = HashMap<String, Int>()        // id -> chosen index
@@ -139,6 +141,7 @@ class MainActivity : Activity() {
     private val contextMenuData = HashMap<String, List<String>>()  // id -> [item0, item1, ...]
     private val mapIds = HashSet<String>()                 // Map node ids (an OSM web view)
     private val gestureIds = HashSet<String>()             // Gesture node ids (GestureDetector wrappers)
+    private val gestureCont = HashMap<String, String>()    // id -> enabled continuous recognizers ("pan,pinch,rotate")
     private val cameraIds = HashSet<String>()              // CameraView node ids (Camera2 preview on a TextureView)
     private var cameraController: CameraController? = null  // the live CameraView session (for camera.capturePreview)
     private var bleManager: BleManager? = null             // BLE central (lazy)
@@ -321,6 +324,27 @@ class MainActivity : Activity() {
         N.tick(); applyDrain(); relayout()
     }
 
+    // Per-frame animation driver (FA|1 / FA|0). Android's frame cadence is otherwise a
+    // 400ms Handler; decay/spring physics needs vsync, so a Choreographer callback ticks
+    // the engine every frame while physics is live and stops when the engine emits FA|0.
+    private var frameActiveFlag = false
+    private var frameScheduled = false
+    private val frameCallback = object : android.view.Choreographer.FrameCallback {
+        override fun doFrame(ns: Long) {
+            frameScheduled = false
+            if (!frameActiveFlag) return
+            pumpWake()
+            if (frameActiveFlag) { frameScheduled = true; android.view.Choreographer.getInstance().postFrameCallback(this) }
+        }
+    }
+    private fun setFrameDriver(on: Boolean) {
+        frameActiveFlag = on
+        if (on && !frameScheduled) {
+            frameScheduled = true
+            android.view.Choreographer.getInstance().postFrameCallback(frameCallback)
+        }
+    }
+
     private fun dp(v: Int) = (v * density).toInt()
     private fun dpf(v: Float) = v * density
 
@@ -407,10 +431,12 @@ class MainActivity : Activity() {
                 "ML" -> if (f.size >= 2) mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
                 "ME" -> if (f.size >= 2) mediaError[f[1]] = f[1] + ":error"              // Image onError
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
+                "SC" -> if (f.size >= 2) sliderDone[f[1]] = f[1] + ":slidedone"          // Slider onSlidingComplete
                 "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
+                "FA" -> if (f.size >= 2) setFrameDriver(f[1] == "1")   // per-frame physics on/off
                 "X" -> if (f.size >= 3) {
                     // Async host->engine command: X|token|capability|args. Run AFTER this
                     // applyDrain() (main-looper post), so a sync capability's resolve()
@@ -1177,7 +1203,7 @@ class MainActivity : Activity() {
                 it.settings.domStorageEnabled = true
             }
             "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics / SwiftUI Canvas)
-            "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press (iOS: UIGestureRecognizers)
+            "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press + continuous pan/pinch/rotate
                 gestureIds.add(id)
                 val detector = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
                     override fun onDown(e: MotionEvent) = true
@@ -1189,7 +1215,61 @@ class MainActivity : Activity() {
                     override fun onDoubleTap(e: MotionEvent): Boolean { dispatchGesture(g, "doubletap"); return true }
                     override fun onLongPress(e: MotionEvent) { dispatchGesture(g, "longpress") }
                 })
-                g.setOnTouchListener { _, ev -> detector.onTouchEvent(ev); true }
+                // Continuous state, per Gesture view (physical px -> logical via /density, matching tx units).
+                var panSX = 0f; var panSY = 0f
+                var vt: android.view.VelocityTracker? = null
+                var scaleAcc = 1f
+                var rotStart = 0f
+                val scaleDet = android.view.ScaleGestureDetector(this, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                    override fun onScaleBegin(d: android.view.ScaleGestureDetector): Boolean { scaleAcc = 1f; return true }
+                    override fun onScale(d: android.view.ScaleGestureDetector): Boolean {
+                        if (gestureCont[id]?.contains("pinch") == true) { scaleAcc *= d.scaleFactor; dispatchGesture(g, "pinch:1,${(scaleAcc * 100).toInt()},0") }
+                        return true
+                    }
+                    override fun onScaleEnd(d: android.view.ScaleGestureDetector) {
+                        if (gestureCont[id]?.contains("pinch") == true) dispatchGesture(g, "pinch:2,${(scaleAcc * 100).toInt()},0")
+                    }
+                })
+                g.setOnTouchListener { _, ev ->
+                    detector.onTouchEvent(ev)
+                    val cont = gestureCont[id] ?: ""
+                    if (cont.contains("pinch") || cont.contains("rotate")) scaleDet.onTouchEvent(ev)
+                    if (cont.isNotEmpty()) {
+                        when (ev.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> {
+                                g.parent?.requestDisallowInterceptTouchEvent(true)   // win over a parent Scroll
+                                panSX = ev.x; panSY = ev.y
+                                vt = android.view.VelocityTracker.obtain(); vt?.addMovement(ev)
+                                if (cont.contains("pan")) dispatchGesture(g, "pan:0,0,0,0,0")
+                            }
+                            MotionEvent.ACTION_POINTER_DOWN -> if (cont.contains("rotate") && ev.pointerCount >= 2) {
+                                rotStart = Math.toDegrees(Math.atan2((ev.getY(1) - ev.getY(0)).toDouble(), (ev.getX(1) - ev.getX(0)).toDouble())).toFloat()
+                            }
+                            MotionEvent.ACTION_MOVE -> {
+                                vt?.addMovement(ev)
+                                if (cont.contains("pan") && ev.pointerCount == 1) {
+                                    val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
+                                    dispatchGesture(g, "pan:1,$dx,$dy,0,0")
+                                }
+                                if (cont.contains("rotate") && ev.pointerCount >= 2) {
+                                    val ang = Math.toDegrees(Math.atan2((ev.getY(1) - ev.getY(0)).toDouble(), (ev.getX(1) - ev.getX(0)).toDouble())).toFloat()
+                                    dispatchGesture(g, "rotate:1,${(ang - rotStart).toInt()},0")
+                                }
+                            }
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                                if (cont.contains("pan")) {
+                                    vt?.addMovement(ev); vt?.computeCurrentVelocity(1000)
+                                    val vx = ((vt?.xVelocity ?: 0f) / density).toInt(); val vy = ((vt?.yVelocity ?: 0f) / density).toInt()
+                                    val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
+                                    dispatchGesture(g, "pan:2,$dx,$dy,$vx,$vy")
+                                }
+                                if (cont.contains("rotate")) dispatchGesture(g, "rotate:2,0,0")
+                                vt?.recycle(); vt = null
+                            }
+                        }
+                    }
+                    true
+                }
             }
             "Image" -> ImageView(this).also { it.scaleType = ImageView.ScaleType.CENTER_CROP }   // remote URL image (SF Symbols are iOS-only)
             "ImageBackground" -> FrameLayout(this).also { box ->
@@ -1284,10 +1364,19 @@ class MainActivity : Activity() {
                         if (!fromUser) return                       // ignore programmatic setProgress (the controlled sync)
                         val action = sb.getTag(TAG) as? String ?: return
                         val min = sliderMin[id] ?: 0
-                        hostInput(action, (progress + min).toString())
+                        val step = sliderStep[id] ?: 0
+                        val p = if (step > 0) Math.round(progress.toFloat() / step) * step else progress
+                        if (step > 0 && p != progress) s.progress = p   // snap the thumb (re-fire is fromUser=false, ignored)
+                        hostInput(action, (p + min).toString())
                     }
                     override fun onStartTrackingTouch(s: SeekBar) {}
-                    override fun onStopTrackingTouch(s: SeekBar) {}
+                    override fun onStopTrackingTouch(s: SeekBar) {
+                        val done = sliderDone[id] ?: return          // onSlidingComplete: fire once on release
+                        val min = sliderMin[id] ?: 0
+                        val step = sliderStep[id] ?: 0
+                        val p = if (step > 0) Math.round(s.progress.toFloat() / step) * step else s.progress
+                        hostInput(done, (p + min).toString())
+                    }
                 })
             }
             // Android's idiomatic date/time UI is a modal Material dialog, so both the
@@ -1428,6 +1517,7 @@ class MainActivity : Activity() {
                 "slv" -> slV = f.toInt()                 // Slider: current value
                 "slmin" -> slMin = f.toInt()             // Slider: min
                 "slmax" -> slMax = f.toInt()             // Slider: max
+                "slstep" -> sliderStep[id] = f.toInt()   // Slider: snap step
                 "seli" -> if (selectIds.contains(id)) { selectSel[id] = f.toInt(); (v as? Button)?.text = selectLabel(id) }
                 "dp" -> if (datePickerIds.contains(id)) { datePickerModes[id] = vl; (v as? Button)?.text = dateLabel(id) }
                 "avis" -> if (vl == "1") root.post { presentAlert(id) } else dismissAlert(id)   // defer present until the batch applies
@@ -1793,6 +1883,10 @@ class MainActivity : Activity() {
     }
 
     private fun setText(id: String, t: String) {
+        if (gestureIds.contains(id)) {                       // a Gesture's "text" is its continuous-recognizer list
+            gestureCont[id] = t
+            return
+        }
         if (selectIds.contains(id)) {                        // a Select's "text" is its tab-joined options
             selectOptions[id] = t.split("\t")
             (views[id] as? Button)?.text = selectLabel(id)
@@ -2355,7 +2449,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 

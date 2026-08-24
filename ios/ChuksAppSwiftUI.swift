@@ -722,6 +722,7 @@ struct NodeData {
     var errorAction: String = ""
     var endAction: String = ""
     var progressAction: String = ""
+    var slideDoneAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -911,8 +912,18 @@ func chuksWakeThunk() {
     }
 }
 
+// NSObject target for the per-frame CADisplayLink (Scene is an ObservableObject, not
+// an NSObject, so it can't be a display-link target directly).
+final class FrameProxy: NSObject {
+    weak var scene: Scene?
+    @objc func tick() { scene?.pumpWake() }
+}
+
 final class Scene: ObservableObject {
     @Published var nodes: [String: NodeData] = [:]
+    // True while a continuous Gesture pan is dragging: an enclosing ChuksScroll freezes
+    // (.scrollDisabled) so the drag moves the Gesture instead of scrolling the list.
+    @Published var gestureDragging = false
     // Whether the app is still tracking the OS appearance (false once the user picks a
     // theme by hand). Drives whether RootView forces preferredColorScheme.
     @Published var followSystem = true
@@ -954,6 +965,24 @@ final class Scene: ObservableObject {
     func pumpWake() {
         if DEV_MODE { return }
         apply(Engine.tick())
+    }
+
+    // Per-frame animation driver (FA|1 / FA|0). SwiftUI has no heartbeat of its own, so
+    // decay/spring physics needs a CADisplayLink; it ticks the engine every frame while
+    // physics is live and stops when the engine emits FA|0. Scene isn't an NSObject, so
+    // the link targets a small NSObject proxy.
+    var frameDriver: CADisplayLink?
+    var frameProxy: FrameProxy?
+    func setFrameDriver(_ on: Bool) {
+        if on {
+            if frameDriver == nil {
+                let px = FrameProxy(); px.scene = self; frameProxy = px
+                let dl = CADisplayLink(target: px, selector: #selector(FrameProxy.tick))
+                dl.add(to: .main, forMode: .common); frameDriver = dl
+            }
+        } else {
+            frameDriver?.invalidate(); frameDriver = nil; frameProxy = nil
+        }
     }
 
     // Mount from a fresh /mount and record whether it produced anything. Clearing first
@@ -1024,6 +1053,7 @@ final class Scene: ObservableObject {
             case "ME" where f.count >= 2: nodes[f[1]]?.errorAction = f[1] + ":error"
             case "MN" where f.count >= 2: nodes[f[1]]?.endAction = f[1] + ":end"
             case "MP" where f.count >= 2: nodes[f[1]]?.progressAction = f[1] + ":progress"
+            case "SC" where f.count >= 2: nodes[f[1]]?.slideDoneAction = f[1] + ":slidedone"   // Slider onSlidingComplete
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -1036,6 +1066,7 @@ final class Scene: ObservableObject {
                     nodes[parent]!.children = kids
                 }
             case "R" where f.count >= 2: removeSubtree(f[1])
+            case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             case "X" where f.count >= 3:
                 // Async host->engine command: X|token|capability|args. Run it AFTER
                 // this apply() finishes (main.async), so a synchronous capability's
@@ -1769,12 +1800,13 @@ func swAutocap(_ v: String?) -> TextInputAutocapitalization {
 struct ChuksSlider: View {
     @ObservedObject var scene: Scene
     let action: String
+    let doneAction: String
     let style: [String: String]
     let parentRow: Bool
     let parentStretch: Bool
     @State private var value: Double
-    init(scene: Scene, action: String, style: [String: String], parentRow: Bool, parentStretch: Bool) {
-        self.scene = scene; self.action = action; self.style = style
+    init(scene: Scene, action: String, doneAction: String, style: [String: String], parentRow: Bool, parentStretch: Bool) {
+        self.scene = scene; self.action = action; self.doneAction = doneAction; self.style = style
         self.parentRow = parentRow; self.parentStretch = parentStretch
         let lo = Int(style["slmin"] ?? "0") ?? 0
         _value = State(initialValue: Double(Int(style["slv"] ?? "") ?? lo))
@@ -1783,7 +1815,12 @@ struct ChuksSlider: View {
         let lo = Double(Int(style["slmin"] ?? "0") ?? 0)
         let hi = Double(Int(style["slmax"] ?? "100") ?? 100)
         let tint = style["fg"].map { hexColor($0) } ?? Color.accentColor
-        return Slider(value: $value, in: lo...max(lo + 1, hi), step: 1)
+        let step = Double(Int(style["slstep"] ?? "0") ?? 0)
+        // onEditingChanged(false) fires once when the drag ends: onSlidingComplete.
+        return Slider(value: $value, in: lo...max(lo + 1, hi), step: step > 0 ? step : 1,
+                      onEditingChanged: { editing in
+                          if !editing && !doneAction.isEmpty { scene.input(doneAction, String(Int(value.rounded()))) }
+                      })
             .tint(tint)
             .onChange(of: value) { nv in if !action.isEmpty { scene.input(action, String(Int(nv.rounded()))) } }
             .modifier(BoxStyle(s: style, parentRow: parentRow, parentStretch: parentStretch))
@@ -2103,6 +2140,13 @@ struct ScrollPaging: ViewModifier {
 // A Chuks List/Scroll: a ScrollView whose child is the fixed-height content node
 // (its items are absolutely positioned). It reports the visible window (offset +
 // height) to the engine, which mounts/recycles rows to match (virtualization).
+extension View {
+    // .scrollDisabled is iOS 16+; no-op on older OS (the scroll-conflict fix needs 16+).
+    @ViewBuilder func scrollDisabledCompat(_ disabled: Bool) -> some View {
+        if #available(iOS 16.0, *) { self.scrollDisabled(disabled) } else { self }
+    }
+}
+
 struct ChuksScroll: View {
     @ObservedObject var scene: Scene
     let id: String
@@ -2127,6 +2171,7 @@ struct ChuksScroll: View {
                     NodeView(scene: scene, id: cid, parentRow: false, parentStretch: true)
                 }
             }
+            .scrollDisabledCompat(scene.gestureDragging)   // frozen while a child Gesture pan drags
             .modifier(ScrollPaging(enabled: style["paging"] == "1"))   // snap per screen (video feeds)
             .modifier(StickBottom(enabled: style["stick"] == "1"))     // pin to newest (chat)
             .onAppear {
@@ -2186,7 +2231,10 @@ struct NodeView: View {
             } else {
                 // Button/Input/Switch wire their own action; any other actioned node
                 // (a View tab-bar item, chip, tappable card/row, pressable Text) gets a tap gesture.
-                let tap = (disabled || node.kind == "Button" || node.kind == "Input" || node.kind == "Switch") ? "" : node.action
+                // Gesture handles its own recognizers in render(); an outer auto-tap here
+                // would both conflict with its drag/pan and spuriously fire the value-channel
+                // binding via dispatch(). Exclude it (like Button/Input/Switch).
+                let tap = (disabled || node.kind == "Button" || node.kind == "Input" || node.kind == "Switch" || node.kind == "Gesture") ? "" : node.action
                 render(node).modifier(TapAction(action: tap, scene: scene))
             }
         }
@@ -2200,7 +2248,7 @@ struct NodeView: View {
         case "Input":  inputView(node)
         case "TextArea": ChuksTextArea(scene: scene, placeholder: node.text, action: node.action, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Switch": switchView(node)
-        case "Slider": ChuksSlider(scene: scene, action: node.action, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
+        case "Slider": ChuksSlider(scene: scene, action: node.action, doneAction: node.slideDoneAction, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Select": ChuksSelect(scene: scene, action: node.action, options: node.text.components(separatedBy: "\t"), sel: Int(node.style["seli"] ?? "0") ?? 0, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "DatePicker", "DatePickerInline": ChuksDatePicker(scene: scene, action: node.action, value: node.text, mode: node.style["dp"] ?? "date", style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Menu": ChuksMenu(scene: scene, action: node.action, label: node.text.components(separatedBy: "\t").first ?? "Menu", items: Array(node.text.components(separatedBy: "\t").dropFirst()), style: node.style, parentRow: parentRow, parentStretch: parentStretch)
@@ -2209,14 +2257,43 @@ struct NodeView: View {
                 Button { if !node.action.isEmpty { scene.input(node.action, String(i)) } } label: { Text(node.text.components(separatedBy: "\t")[i]) }
             }
         }
-        case "Gesture": container(node)
-            .onTapGesture(count: 2) { if !node.action.isEmpty { scene.input(node.action, "doubletap") } }
-            .onLongPressGesture(minimumDuration: 0.5) { if !node.action.isEmpty { scene.input(node.action, "longpress") } }
-            .gesture(DragGesture(minimumDistance: 24).onEnded { val in
-                let dx = val.translation.width, dy = val.translation.height
-                let dir = abs(dx) > abs(dy) ? (dx < 0 ? "left" : "right") : (dy < 0 ? "up" : "down")
-                if !node.action.isEmpty { scene.input(node.action, "swipe:\(dir)") }
-            })
+        case "Gesture":
+            // IMPORTANT: gesture closures must look the node up LIVE via scene.nodes[id],
+            // not capture `node`. SwiftUI creates the gesture once (at first render, when
+            // node.text/action are still empty pre-P|/T|) and keeps it across re-renders,
+            // so a captured `node` stays stale — the dispatch guard then never passes.
+            if node.text.isEmpty {   // discrete: swipe / double-tap / long-press
+                container(node)
+                    .onTapGesture(count: 2) { if let a = scene.nodes[id]?.action, !a.isEmpty { scene.input(a, "doubletap") } }
+                    .onLongPressGesture(minimumDuration: 0.5) { if let a = scene.nodes[id]?.action, !a.isEmpty { scene.input(a, "longpress") } }
+                    .gesture(DragGesture(minimumDistance: 24).onEnded { val in
+                        let dx = val.translation.width, dy = val.translation.height
+                        let dir = abs(dx) > abs(dy) ? (dx < 0 ? "left" : "right") : (dy < 0 ? "up" : "down")
+                        if let a = scene.nodes[id]?.action, !a.isEmpty { scene.input(a, "swipe:\(dir)") }
+                    })
+            } else {                 // continuous: pan / pinch / rotate (node.text lists them)
+                container(node)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0)
+                        .onChanged { val in
+                            guard let n = scene.nodes[id], n.text.contains("pan"), !n.action.isEmpty else { return }
+                            if !scene.gestureDragging { scene.gestureDragging = true }   // freeze an enclosing scroll
+                            scene.input(n.action, "pan:1,\(Int(val.translation.width)),\(Int(val.translation.height)),0,0")
+                        }
+                        .onEnded { val in
+                            if scene.gestureDragging { scene.gestureDragging = false }    // re-enable scrolling
+                            guard let n = scene.nodes[id], n.text.contains("pan"), !n.action.isEmpty else { return }
+                            let vx = Int(val.predictedEndTranslation.width - val.translation.width)
+                            let vy = Int(val.predictedEndTranslation.height - val.translation.height)
+                            scene.input(n.action, "pan:2,\(Int(val.translation.width)),\(Int(val.translation.height)),\(vx),\(vy)")
+                        })
+                    .simultaneousGesture(MagnificationGesture()
+                        .onChanged { s in guard let n = scene.nodes[id], n.text.contains("pinch"), !n.action.isEmpty else { return }; scene.input(n.action, "pinch:1,\(Int(s * 100)),0") }
+                        .onEnded { s in guard let n = scene.nodes[id], n.text.contains("pinch"), !n.action.isEmpty else { return }; scene.input(n.action, "pinch:2,\(Int(s * 100)),0") })
+                    .simultaneousGesture(RotationGesture()
+                        .onChanged { a in guard let n = scene.nodes[id], n.text.contains("rotate"), !n.action.isEmpty else { return }; scene.input(n.action, "rotate:1,\(Int(a.degrees)),0") }
+                        .onEnded { a in guard let n = scene.nodes[id], n.text.contains("rotate"), !n.action.isEmpty else { return }; scene.input(n.action, "rotate:2,\(Int(a.degrees)),0") })
+            }
         case "Map": ChuksMap(spec: node.text).modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "Canvas": ChuksCanvas(shapes: node.text, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Spinner": spinnerView(node)

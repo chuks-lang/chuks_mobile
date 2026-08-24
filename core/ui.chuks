@@ -53,6 +53,7 @@ export class Style {
     var slval: int      // Slider current value (-1 = not a Slider); min/max travel with it
     var slmin: int      // Slider minimum (>= 0)
     var slmax: int      // Slider maximum
+    var slstep: int     // Slider step: snap value to multiples of this (0 = continuous)
     var seli: int       // Select selected option index (-1 = not a Select)
     var avis: int       // Alert visible: 1 shown, 0 hidden (-1 = not an Alert)
     var resize: string  // Image resize mode: "cover" | "contain" | "center" ("" = default)
@@ -103,7 +104,7 @@ export class Style {
         this.swOn = -1; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
-        this.slval = -1; this.slmin = 0; this.slmax = 100
+        this.slval = -1; this.slmin = 0; this.slmax = 100; this.slstep = 0
         this.seli = -1; this.avis = -1; this.resize = ""; this.prog = -1; this.rfsh = -1
         this.dpmode = ""; this.dpdisp = ""
         this.tx = 0; this.ty = 0; this.rot = 0; this.scl = 100; this.animMs = -1; this.animEz = ""
@@ -185,10 +186,11 @@ export class Style {
         if (this.sbNavColor != "") { s = s + "sbnavcolor=" + this.sbNavColor + ";" }
         if (this.mvis >= 0) { s = s + "mvis=" + string(this.mvis) + ";" }
         if (this.mpos != "") { s = s + "mpos=" + this.mpos + ";" }
-        if (this.slval >= 0) {                       // a Slider: value + range travel together
+        if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
+            s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
+            s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
+            if (this.slstep > 0) { s = s + "slstep=" + string(this.slstep) + ";" }
             s = s + "slv=" + string(this.slval) + ";"
-            s = s + "slmin=" + string(this.slmin) + ";"
-            s = s + "slmax=" + string(this.slmax) + ";"
         }
         if (this.seli >= 0) { s = s + "seli=" + string(this.seli) + ";" }
         if (this.avis >= 0) { s = s + "avis=" + string(this.avis) + ";" }
@@ -236,6 +238,9 @@ export class Node {
     var onError: any
     var onEnd: any
     var onProgress: any
+    // Slider: fires once when the drag gesture ENDS (RN onSlidingComplete), with
+    // the final value; distinct from onChange which streams during the drag.
+    var onSlideDone: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -243,6 +248,7 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
+        this.onSlideDone = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -912,7 +918,10 @@ export function Toggle(p: map[string]Prop): Node {
  * value (as a string; parse with int()) as the user drags. Integer range, `min` >= 0.
  *
  * Props: `value` (int), `min` (int, default 0), `max` (int, default 100),
- *        `onChange` ((string) -> void), `color` (active-track/thumb tint hex), `h`.
+ *        `step` (int, snap to multiples; 0 = continuous),
+ *        `onChange` ((string) -> void, streams during drag),
+ *        `onSlidingComplete` ((string) -> void, fires once on release),
+ *        `color` (active-track/thumb tint hex), `h`.
  *
  * ```chuks
  * Slider({ value: vol.get(), min: 0, max: 100,
@@ -925,11 +934,14 @@ export function Slider(p: map[string]Prop): Node {
     s.slmax = pInt(p, "max", 100)
     s.slval = pInt(p, "value", s.slmin)
     if (s.slval < 0) { s.slval = 0 }            // keep the serialization sentinel valid
+    s.slstep = pInt(p, "step", 0)               // snap to multiples of step (0 = continuous)
     s.h = pInt(p, "h", 40)
     s.fg = pStr(p, "color", "")                 // optional active-track / thumb tint
     applyLayout(s, p)
     const n: Node = mkSlider(s)
     applyEvents(n, p)                           // onChange(v) fires on drag
+    const sc: Prop? = p.get("onSlidingComplete")
+    if (sc != null) { n.onSlideDone = sc }      // fires once with the final value on release
     return n
 }
 /**
@@ -1170,8 +1182,86 @@ export function Gesture(p: map[string]Prop, kids: []Node): Node {
     const s: Style = new Style()
     applyLayout(s, p)
     const n: Node = new Node("Gesture", s, "", kids)
-    const og: Prop? = p.get("onGesture"); if (og != null) { n.onChange = og }   // fires via the value channel
+    const og: Prop? = p.get("onGesture")      // discrete: swipe/doubletap/longpress
+    const onPan: Prop? = p.get("onPan")        // continuous, each a function(v: string): void
+    const onPinch: Prop? = p.get("onPinch")
+    const onRotate: Prop? = p.get("onRotate")
+    // Tell the host which CONTINUOUS recognizers to attach (text channel, comma list).
+    // Attaching only the requested ones avoids fighting a Scroll and skips the discrete
+    // swipe recognizer when pan is on (they both track drags).
+    var cont: string = ""
+    if (onPan != null) { cont = cont == "" ? "pan" : cont + ",pan" }
+    if (onPinch != null) { cont = cont == "" ? "pinch" : cont + ",pinch" }
+    if (onRotate != null) { cont = cont == "" ? "rotate" : cont + ",rotate" }
+    n.text = cont
+    // One value-channel binding routes every gesture string by its prefix to the right
+    // callback. Continuous streams ("pan:..."/"pinch:..."/"rotate:...") and discrete
+    // ("swipe:left"/"doubletap"/"longpress") all arrive here.
+    if (og != null || onPan != null || onPinch != null || onRotate != null) {
+        n.onChange = function(v: string): void {
+            if (_prefix(v, "pan:")) { _callStr(onPan, v) }
+            else if (_prefix(v, "pinch:")) { _callStr(onPinch, v) }
+            else if (_prefix(v, "rotate:")) { _callStr(onRotate, v) }
+            else { _callStr(og, v) }
+        }
+    }
     return n
+}
+// Does `s` start with `p`? (Chuks has no startsWith; slice-compare instead.)
+function _prefix(s: string, p: string): bool { return s.length >= p.length && s.slice(0, p.length) == p }
+// Call an optional `function(v: string): void` (held as any) with a string arg.
+function _callStr(cb: any, v: string): void { if (cb != null) { const f: any = cb; f(v) } }
+
+// ---- continuous-gesture decoders ------------------------------------------
+// The host streams a continuous gesture as an encoded value string; these parse it
+// into a typed event. phase: 0 = begin, 1 = change, 2 = end. Pan dx/dy are the
+// translation (px) from the gesture's start; vx/vy the release velocity (px/s).
+// Pinch scale / Rotate deg are the factor*100 (100 = 1.0) / degrees from start.
+export class PanEvent {
+    var phase: int
+    var dx: int
+    var dy: int
+    var vx: int
+    var vy: int
+    constructor() { this.phase = 0; this.dx = 0; this.dy = 0; this.vx = 0; this.vy = 0 }
+}
+export class PinchEvent {
+    var phase: int
+    var scale: int   // factor as a percent, 100 = 1.0
+    var vscale: int
+    constructor() { this.phase = 0; this.scale = 100; this.vscale = 0 }
+}
+export class RotateEvent {
+    var phase: int
+    var deg: int     // rotation from the gesture start, in degrees
+    var vdeg: int
+    constructor() { this.phase = 0; this.deg = 0; this.vdeg = 0 }
+}
+function _afterColon(v: string): []string {
+    const ci: int = v.indexOf(":")
+    if (ci < 0) { return [] }
+    return v.slice(ci + 1, v.length).split(",")
+}
+/** Decode a "pan:phase,dx,dy,vx,vy" value string from Gesture.onPan. */
+export function decodePan(v: string): PanEvent {
+    const e: PanEvent = new PanEvent()
+    const f: []string = _afterColon(v)
+    if (f.length >= 5) { e.phase = int(f[0]); e.dx = int(f[1]); e.dy = int(f[2]); e.vx = int(f[3]); e.vy = int(f[4]) }
+    return e
+}
+/** Decode a "pinch:phase,scale,vscale" value string from Gesture.onPinch. */
+export function decodePinch(v: string): PinchEvent {
+    const e: PinchEvent = new PinchEvent()
+    const f: []string = _afterColon(v)
+    if (f.length >= 3) { e.phase = int(f[0]); e.scale = int(f[1]); e.vscale = int(f[2]) }
+    return e
+}
+/** Decode a "rotate:phase,deg,vdeg" value string from Gesture.onRotate. */
+export function decodeRotate(v: string): RotateEvent {
+    const e: RotateEvent = new RotateEvent()
+    const f: []string = _afterColon(v)
+    if (f.length >= 3) { e.phase = int(f[0]); e.deg = int(f[1]); e.vdeg = int(f[2]) }
+    return e
 }
 /**
  * A page's root column: its children fill the screen top-to-bottom. Every
@@ -1500,6 +1590,7 @@ export class Reconciler {
         if (n.onError != null) { this.handlers[id + ":error"] = n.onError; this.emit("ME|" + id) }
         if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
+        if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1583,6 +1674,7 @@ export class Reconciler {
         if (next.onError != null) { this.handlers[id + ":error"] = next.onError }
         if (next.onEnd != null) { this.handlers[id + ":end"] = next.onEnd }
         if (next.onProgress != null) { this.handlers[id + ":progress"] = next.onProgress }
+        if (next.onSlideDone != null) { this.handlers[id + ":slidedone"] = next.onSlideDone }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)
@@ -2096,9 +2188,18 @@ function runAsyncQueue(): void {
 // a no-op and the host's idle heartbeat drains the queue instead.
 function wakeHost(): void { host.wake() }
 
+// The per-frame animation stepper. core/animated.chuks wires this (via setFrameStepper)
+// the first time an app starts a physics animation (decay/spring); until then it is a
+// no-op, so a program with no per-frame physics pays nothing. Returns the count of
+// values still animating. When that count crosses 0<->N, App.tick emits FA|1 / FA|0 so
+// the host runs its display-link only while physics is live.
+var _frameStepper: any = null
+export function setFrameStepper(fn: any): void { _frameStepper = fn }
+
 export class App {
     var recon: Reconciler
-    constructor() { this.recon = new Reconciler(); HOST = this }
+    var prevFrameActive: int      // last per-frame stepper count (for FA| edge detection)
+    constructor() { this.recon = new Reconciler(); this.prevFrameActive = 0; HOST = this }
     // ---- hooks you override ----
     // One-time initialization with a size hint `n` (e.g. seed data). Optional.
     public setup(_n: int): void { }
@@ -2136,8 +2237,19 @@ export class App {
         }
         return this.recon.count()
     }
-    // Advance one frame: onTick() then re-render. Returns the mutation count.
-    public tick(): int { runAsyncQueue(); this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    // Advance one frame: step per-frame physics, then onTick() + re-render. Emits
+    // FA|1 / FA|0 when physics starts / stops so the host runs a display-link only
+    // while it is live. Returns the mutation count.
+    public tick(): int {
+        runAsyncQueue()
+        this.recon.begin()
+        var active: int = 0                            // advance decay/spring values (updates their cur)
+        if (_frameStepper != null) { const f: any = _frameStepper; active = int(f()) }
+        if ((active > 0) != (this.prevFrameActive > 0)) { this.recon.emit("FA|" + (active > 0 ? "1" : "0")) }
+        this.prevFrameActive = active
+        hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        return this.recon.count()
+    }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
         runAsyncQueue()

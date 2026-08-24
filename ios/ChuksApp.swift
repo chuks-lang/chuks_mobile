@@ -729,6 +729,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                                                       // Without this the two call each other until the stack overflows.
     // Perf harness: auto-scroll the feed while a CADisplayLink measures real frame times.
     var displayLink: CADisplayLink?
+    // Per-frame animation driver: ticks the engine every display frame while physics
+    // (decay/spring) is live. Gated by FA|1 / FA|0 in the mutation stream, so it runs
+    // only during an animation, never idle.
+    var frameDriver: CADisplayLink?
     var perfActive = false
     var perfLastTs: CFTimeInterval = 0
     var perfFrames = 0, perfJanky = 0, perfMaxPlayers = 0
@@ -748,6 +752,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var fieldMaxLen: [UITextField: Int] = [:]      // maxLength (enforced in shouldChangeCharacters)
     var switchActions: [UISwitch: String] = [:]
     var sliderActions: [UISlider: String] = [:]
+    var sliderStep: [UISlider: Float] = [:]   // snap value to multiples of this (0 = continuous)
+    var sliderDoneAction: [UISlider: String] = [:]   // onSlidingComplete tag ("<id>:slidedone")
     var datePickerActions: [UIDatePicker: String] = [:]                   // DatePicker -> onChange action
     var datePickerModes: [UIDatePicker: String] = [:]                     // DatePicker -> "date"|"time"|"datetime"
     var gestureIds: Set<String> = []                                     // Gesture node ids
@@ -1084,6 +1090,21 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if !s.isEmpty { apply(s); relayout() }
     }
 
+    // Start/stop the per-frame animation driver (FA|1 / FA|0). While on, a CADisplayLink
+    // ticks the engine every display frame so decay/spring physics advance at 60fps; the
+    // engine emits FA|0 when it settles, which stops the link here.
+    func setFrameDriver(_ on: Bool) {
+        if on {
+            if frameDriver == nil {
+                let dl = CADisplayLink(target: self, selector: #selector(frameTick))
+                dl.add(to: .main, forMode: .common); frameDriver = dl
+            }
+        } else {
+            frameDriver?.invalidate(); frameDriver = nil
+        }
+    }
+    @objc func frameTick() { pumpWake() }
+
     // Tear down the view + Yoga trees and rebuild from a fresh mount stream. Used
     // on hot reload: the host process stays alive, only the tree is rebuilt.
     func remount(_ mountStream: String) {
@@ -1133,6 +1154,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Let the dismiss tap coexist with node onPress taps and the scroll gestures.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         return true
+    }
+    // A continuous Gesture recognizer inside a Scroll should WIN over the scroll: the
+    // scroll's pan waits for ours to fail, so a drag that starts on the Gesture drags it
+    // instead of scrolling (a drag elsewhere never involves ours, so the scroll is normal).
+    // Delegate-driven (called at recognition time), so no attach-order race.
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+        // g is one of OUR Gesture recognizers (delegate === self). If `other` is an
+        // enclosing scroll's pan, return true so the scroll must wait for ours to fail.
+        return (g is UIPanGestureRecognizer) && (other.view is UIScrollView)
     }
 
     // Keyboard avoidance (adjust-resize): shrink the app's usable height by the keyboard
@@ -1197,9 +1227,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "ME" where f.count >= 2: mediaError[f[1]] = f[1] + ":error"              // Image onError
             case "MN" where f.count >= 2: mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
             case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
+            case "SC" where f.count >= 2: if let sl = views[f[1]] as? UISlider { sliderDoneAction[sl] = f[1] + ":slidedone" }   // Slider onSlidingComplete
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
+            case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             case "X" where f.count >= 3:
                 // Async host->engine command: X|token|capability|args. Run AFTER this
                 // apply() finishes (main.async), so a sync capability's resolve() doesn't
@@ -1716,6 +1748,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func setText(_ id: String, _ t: String) {
+        if gestureIds.contains(id) {   // a Gesture's "text" is its continuous-recognizer list ("pan,pinch,rotate")
+            attachContinuousGestures(id, t)
+            return
+        }
         if let vv = views[id] as? VideoView {   // a Video's "text" is an optional poster URL shown until the first frame
             if !t.isEmpty && videoPosters[id] == nil {
                 let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
@@ -1836,6 +1872,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let sl = UISlider()
             sl.isContinuous = true
             sl.addTarget(self, action: #selector(sliderChanged(_:)), for: .valueChanged)
+            sl.addTarget(self, action: #selector(sliderDone(_:)), for: [.touchUpInside, .touchUpOutside])
             v = sl
         case "DatePicker", "DatePickerInline":   // same UIDatePicker; the "dpd" style picks compact/inline/wheels
             let dp = UIDatePicker()
@@ -2027,6 +2064,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                           }
             case "slmin": (v as? UISlider)?.minimumValue = f
             case "slmax": (v as? UISlider)?.maximumValue = f
+            case "slstep": if let sl = v as? UISlider { sliderStep[sl] = f }
+
             case "slv":   if let sl = v as? UISlider, !sl.isTracking { sl.setValue(f, animated: false) }  // don't fight an active drag
             case "seli":  if selectIds.contains(id) { selectSel[id] = Int(val) ?? 0; rebuildSelectMenu(id) }
             case "dp":    if let dp = v as? UIDatePicker {
@@ -2245,11 +2284,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let b = views[k] as? UIButton { buttonActions[b] = nil }
             if let tf = views[k] as? UITextField { fieldActions[tf] = nil; fieldSubmit[tf] = nil; fieldFocus[tf] = nil; fieldBlur[tf] = nil; fieldMaxLen[tf] = nil }
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
-            if let sl = views[k] as? UISlider { sliderActions[sl] = nil }
+            if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil; sliderDoneAction[sl] = nil }
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
-            if gestureIds.contains(k) { gestureIds.remove(k); gestureActions[k] = nil }
+            if gestureIds.contains(k) { gestureIds.remove(k); gestureActions[k] = nil; gestureContAttached.remove(k) }
             if menuIds.contains(k) { menuIds.remove(k); menuData[k] = nil; menuActions[k] = nil }
             if contextMenuIds.contains(k) { contextMenuIds.remove(k); contextMenuData[k] = nil; contextMenuActions[k] = nil }
             if alertIds.contains(k) { alertIds.remove(k); alertData[k] = nil; alertActions[k] = nil; if presentedAlert == k { presentedAlert = nil } }
@@ -2366,11 +2405,25 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // int value; the controlled re-render syncs the thumb back (guarded by isTracking).
     @objc func sliderChanged(_ sl: UISlider) {
         guard let action = sliderActions[sl] else { return }
+        if let step = sliderStep[sl], step > 0 {   // snap the thumb + value to step multiples
+            sl.value = sl.minimumValue + (((sl.value - sl.minimumValue) / step).rounded() * step)
+        }
         let val = String(Int(sl.value.rounded()))
         guard let s = eInput(action, val) else { connected = false; return }
         apply(s)
         relayout()
         headerText("slider \(action)=\(val)")
+    }
+
+    // Drag ended (finger lifted): fire onSlidingComplete once with the final value.
+    @objc func sliderDone(_ sl: UISlider) {
+        guard let action = sliderDoneAction[sl] else { return }
+        if let step = sliderStep[sl], step > 0 {   // report the snapped final value
+            sl.value = sl.minimumValue + (((sl.value - sl.minimumValue) / step).rounded() * step)
+        }
+        let val = String(Int(sl.value.rounded()))
+        guard let s = eInput(action, val) else { connected = false; return }
+        apply(s); relayout()
     }
 
     // A native value event from a DatePicker -> the engine, as an ISO string; the
@@ -2467,6 +2520,39 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     @objc func handleDoubleTap(_ g: UITapGestureRecognizer) { dispatchGesture(g.view, "doubletap") }
     @objc func handleLongPress(_ g: UILongPressGestureRecognizer) { if g.state == .began { dispatchGesture(g.view, "longpress") } }
+
+    // Attach the requested CONTINUOUS recognizers (pan/pinch/rotate) to a Gesture view,
+    // once. They stream an encoded value string every move; pinch+rotate recognize
+    // simultaneously (via the delegate) so a two-finger transform reports both.
+    var gestureContAttached: Set<String> = []
+    func attachContinuousGestures(_ id: String, _ list: String) {
+        guard !list.isEmpty, !gestureContAttached.contains(id), let gv = views[id] else { return }
+        gestureContAttached.insert(id)
+        let kinds = list.components(separatedBy: ",")
+        if kinds.contains("pan") {
+            let g = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:))); g.delegate = self; gv.addGestureRecognizer(g)
+        }
+        if kinds.contains("pinch") {
+            let g = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:))); g.delegate = self; gv.addGestureRecognizer(g)
+        }
+        if kinds.contains("rotate") {
+            let g = UIRotationGestureRecognizer(target: self, action: #selector(handleRotate(_:))); g.delegate = self; gv.addGestureRecognizer(g)
+        }
+    }
+    private func gPhase(_ s: UIGestureRecognizer.State) -> Int { s == .began ? 0 : (s == .changed ? 1 : 2) }
+    @objc func handlePan(_ g: UIPanGestureRecognizer) {
+        // Measure in the window, not g.view: inside a Scroll the view's own coordinate
+        // space can shift and zero out translation(in: g.view).
+        let t = g.translation(in: g.view?.window), v = g.velocity(in: g.view?.window)
+        dispatchGesture(g.view, "pan:\(gPhase(g.state)),\(Int(t.x)),\(Int(t.y)),\(Int(v.x)),\(Int(v.y))")
+    }
+    @objc func handlePinch(_ g: UIPinchGestureRecognizer) {
+        dispatchGesture(g.view, "pinch:\(gPhase(g.state)),\(Int(g.scale * 100)),\(Int(g.velocity * 100))")
+    }
+    @objc func handleRotate(_ g: UIRotationGestureRecognizer) {
+        let deg = g.rotation * 180.0 / .pi, vdeg = g.velocity * 180.0 / .pi
+        dispatchGesture(g.view, "rotate:\(gPhase(g.state)),\(Int(deg)),\(Int(vdeg))")
+    }
 
     // A native edit on a multiline TextArea -> the engine; toggles the placeholder.
     func textViewDidChange(_ tv: UITextView) {

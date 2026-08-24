@@ -26,7 +26,7 @@
 // hex); cross-fade with opacity instead.
 
 import { useState, Cell } from "./state.chuks";
-import { dispatchAsync } from "./ui.chuks";
+import { dispatchAsync, setFrameStepper } from "./ui.chuks";
 import { host } from "std/host";
 import { time } from "std/time";
 
@@ -34,45 +34,182 @@ import { time } from "std/time";
 // settling time). timing() takes an explicit duration.
 var _SPRING_MS: int = 400
 
+// Physics tuning for the per-frame decay/spring stepper (see Animated.stepPhysics).
+var _DECAY: float = 3.5     // fling deceleration (higher = stops sooner)
+var _STIFF: float = 180.0   // spring stiffness
+var _DAMP: float = 22.0     // spring damping (near-critical for a soft settle)
+var _V_EPS: float = 4.0     // velocity below this (units/s) counts as stopped
+var _X_EPS: float = 0.5     // distance below this (units) counts as arrived
+
+function _fabs(x: float): float { if (x < 0.0) { return 0.0 - x } return x }
+function _round(x: float): int { if (x >= 0.0) { return int(x + 0.5) } return int(x - 0.5) }
+
+// ---- hex color helpers (for interpolateColor) ------------------------------
+var _HEXD: string = "0123456789abcdef"
+function _nib(c: string): int {
+    var i: int = _HEXD.indexOf(c)
+    if (i >= 0) { return i }
+    i = "0123456789ABCDEF".indexOf(c)   // accept upper-case hex too
+    if (i >= 0) { return i }
+    return 0
+}
+// Parse the two hex digits of a "RRGGBB" string at byte offset `at` -> 0..255.
+function _hex2(s: string, at: int): int { return _nib(s.slice(at, at + 1)) * 16 + _nib(s.slice(at + 1, at + 2)) }
+// Format 0..255 as two lower-case hex digits.
+function _toHex2(v: int): string {
+    var x: int = v; if (x < 0) { x = 0 }; if (x > 255) { x = 255 }
+    return _HEXD.slice(x / 16, x / 16 + 1) + _HEXD.slice(x % 16, x % 16 + 1)
+}
+// Blend two "RRGGBB" colors, t = 0..100 (0 = c0, 100 = c1). Returns "rrggbb".
+function _blendHex(c0: string, c1: string, t: int): string {
+    const r: int = _hex2(c0, 0) + (_hex2(c1, 0) - _hex2(c0, 0)) * t / 100
+    const g: int = _hex2(c0, 2) + (_hex2(c1, 2) - _hex2(c0, 2)) * t / 100
+    const b: int = _hex2(c0, 4) + (_hex2(c1, 4) - _hex2(c0, 4)) * t / 100
+    return _toHex2(r) + _toHex2(g) + _toHex2(b)
+}
+
 // Ask the host to render promptly so a target moved from an effect or a background
 // task paints this frame. Inside an event dispatch the surrounding re-render already
 // picks the new target up; this extra wake is a cheap no-op there.
 function _requestFrame(): void { host.wake() }
+
+// ---- per-frame animation registry ------------------------------------------
+// Values with active physics (decay/spring). The frame driver calls stepAnimations()
+// once per frame (via the core frame-stepper hook); the engine emits FA|1 / FA|0 when
+// this set becomes non-empty / empty so the host runs a display-link only while needed.
+var _active: []Animated = []
+var _stepperWired: bool = false
+
+// Register `a` as physics-active (idempotent) and make sure the core frame-stepper
+// hook points at stepAnimations, then ask for a frame to get the loop going.
+function _startPhysics(a: Animated): void {
+    if (!_stepperWired) { setFrameStepper(stepAnimations); _stepperWired = true }
+    var i: int = 0
+    while (i < _active.length) { if (_active[i] == a) { _requestFrame(); return } i = i + 1 }
+    _active.push(a)
+    _requestFrame()
+}
+
+// Step every active value one frame; drop the ones that settled. Returns the number
+// still animating (0 => the driver stops). Called by the engine each tick().
+export function stepAnimations(): int {
+    if (_active.length == 0) { return 0 }
+    const now: int = time.now()
+    var keep: []Animated = []
+    var i: int = 0
+    while (i < _active.length) {
+        const a: Animated = _active[i]
+        if (a.stepPhysics(now)) { keep.push(a) }
+        i = i + 1
+    }
+    _active = keep
+    return _active.length
+}
 
 /**
  * An animated numeric value. Persist it with useAnimated() so it survives renders;
  * read value()/dur()/easing() into a node's props and move it with timing()/spring().
  */
 export class Animated {
-    var cur: int        // current target value
+    var cur: int        // current value (what feeds a prop)
     var ms: int         // active transition duration ms (-1 = snap, no animation)
     var ez: string      // "" ease | "linear" | "spring"
-    constructor(initial: int) { this.cur = initial; this.ms = -1; this.ez = "" }
+    // Per-frame physics (decay / velocity-spring). mode "" = idle: the value is
+    // static or host-tweened; "decay"/"spring" = the engine steps it every frame.
+    var mode: string    // "" | "decay" | "spring"
+    var pos: float      // continuous position (cur is int(pos) while physics runs)
+    var velF: float     // velocity in units per second
+    var spTarget: float // spring rest target
+    var lastMs: int     // time.now() of the last physics step (for dt)
+    constructor(initial: int) {
+        this.cur = initial; this.ms = -1; this.ez = ""
+        this.mode = ""; this.pos = 0.0; this.velF = 0.0; this.spTarget = 0.0; this.lastMs = 0
+    }
 
-    // The current target -- feed this into opacity / tx / ty / rotate / scale.
+    // The current value -- feed this into opacity / tx / ty / rotate / scale.
     public value(): int { return this.cur }
     // The active transition duration -- feed into the `anim` prop (-1 = snap).
     public dur(): int { return this.ms }
     // The active easing -- feed into the `easing` prop.
     public easing(): string { return this.ez }
 
-    // Jump to `v` immediately, with no animation.
-    public setValue(v: int): void { this.cur = v; this.ms = -1; this.ez = ""; _requestFrame() }
+    // Jump to `v` immediately, with no animation (and cancel any physics).
+    public setValue(v: int): void { this.mode = ""; this.cur = v; this.ms = -1; this.ez = ""; _requestFrame() }
 
     // Animate toward `to` over `duration` ms. `easing` is "" (ease-in-out),
     // "linear", or "spring". The host runs the interpolation natively.
     public timing(to: int, duration: int, easing: string): void {
-        this.cur = to; this.ms = duration; this.ez = easing; _requestFrame()
+        this.mode = ""; this.cur = to; this.ms = duration; this.ez = easing; _requestFrame()
     }
 
     // Spring toward `to` with the platform's spring curve (a soft overshoot).
     public spring(to: int): void { this.timing(to, _SPRING_MS, "spring") }
+
+    // ---- per-frame physics (needs the frame driver; see stepAnimations) ----
+    // Fling: coast from the current value at `velocity` units/sec, decelerating to
+    // a stop. Use the velocity a pan/pinch reports on release.
+    public decay(velocity: int): void {
+        this.mode = "decay"; this.ms = -1; this.ez = ""
+        this.pos = float(this.cur); this.velF = float(velocity); this.lastMs = 0
+        _startPhysics(this)
+    }
+    // Velocity spring: settle to `target`, entering with `velocity` units/sec (e.g.
+    // a snap-back after a drag, carrying the drag's momentum). Real spring physics,
+    // unlike spring() which hands a fixed-duration curve to the host.
+    public springTo(target: int, velocity: int): void {
+        this.mode = "spring"; this.ms = -1; this.ez = ""
+        this.pos = float(this.cur); this.spTarget = float(target); this.velF = float(velocity); this.lastMs = 0
+        _startPhysics(this)
+    }
+    // Stop any running physics, leaving the value where it is.
+    public stopPhysics(): void { this.mode = "" }
+
+    // Advance the physics one frame given the current time (ms). Returns true while
+    // still animating, false once it has settled (mode cleared). Called by the frame
+    // driver, never by app code.
+    public stepPhysics(nowMs: int): bool {
+        if (this.mode == "") { return false }
+        if (this.lastMs == 0) { this.lastMs = nowMs; return true }   // first frame: seed dt
+        var dt: float = float(nowMs - this.lastMs) / 1000.0
+        this.lastMs = nowMs
+        if (dt <= 0.0) { return true }
+        if (dt > 0.05) { dt = 0.05 }                                 // clamp a stalled frame
+        if (this.mode == "decay") {
+            this.velF = this.velF * (1.0 - _DECAY * dt)
+            this.pos = this.pos + this.velF * dt
+            this.cur = _round(this.pos)
+            if (_fabs(this.velF) < _V_EPS) { this.mode = ""; return false }
+            return true
+        }
+        // spring
+        var accel: float = (0.0 - _STIFF) * (this.pos - this.spTarget) - _DAMP * this.velF
+        this.velF = this.velF + accel * dt
+        this.pos = this.pos + this.velF * dt
+        this.cur = _round(this.pos)
+        if (_fabs(this.pos - this.spTarget) < _X_EPS && _fabs(this.velF) < _V_EPS) {
+            this.cur = _round(this.spTarget); this.mode = ""; return false
+        }
+        return true
+    }
 
     // Derive a value that maps this one's [inA, inB] range onto [outA, outB]
     // (linear, clamped at the ends). inA must be <= inB. The derived value carries
     // this value's active duration/easing, so bound props tween together.
     public interpolate(inA: int, inB: int, outA: int, outB: int): AnimatedInterp {
         return new AnimatedInterp(this, inA, inB, outA, outB)
+    }
+    // Multi-point (piecewise-linear) interpolation: map this value through the segments
+    // defined by `inRange` (ascending) onto `outRange` (same length), clamped at the ends.
+    // e.g. interpolateN([0,50,100],[0,200,0]) peaks in the middle. Recomputed each frame,
+    // so it shines when the source is driven per-frame (physics / a gesture).
+    public interpolateN(inRange: []int, outRange: []int): AnimatedInterpN {
+        return new AnimatedInterpN(this, inRange, outRange)
+    }
+    // Color interpolation: map this value through `inRange` (ascending) onto `colors`
+    // (same length, each "RRGGBB" hex, no leading #), blending between adjacent colors.
+    // value() returns a hex string to feed into a `bg`/`color` prop.
+    public interpolateColor(inRange: []int, colors: []string): AnimatedColor {
+        return new AnimatedColor(this, inRange, colors)
     }
 }
 
@@ -103,6 +240,64 @@ export class AnimatedInterp {
     }
     public dur(): int { return this.src.ms }
     public easing(): string { return this.src.ez }
+}
+
+/** Piecewise-linear multi-point interpolation of an Animated (see interpolateN). */
+export class AnimatedInterpN {
+    var src: Animated
+    var inR: []int
+    var outR: []int
+    constructor(src: Animated, inR: []int, outR: []int) { this.src = src; this.inR = inR; this.outR = outR }
+    public value(): int {
+        const v: int = this.src.cur
+        const n: int = this.inR.length
+        if (n == 0) { return 0 }
+        if (n == 1) { return this.outR[0] }
+        if (v <= this.inR[0]) { return this.outR[0] }
+        if (v >= this.inR[n - 1]) { return this.outR[n - 1] }
+        var i: int = 0
+        while (i < n - 1) {
+            const a: int = this.inR[i]
+            const b: int = this.inR[i + 1]
+            if (v >= a && v <= b) {
+                const span: int = b - a
+                if (span == 0) { return this.outR[i] }
+                return this.outR[i] + ((v - a) * (this.outR[i + 1] - this.outR[i])) / span
+            }
+            i = i + 1
+        }
+        return this.outR[n - 1]
+    }
+    public dur(): int { return this.src.ms }
+    public easing(): string { return this.src.ez }
+}
+
+/** Color interpolation of an Animated: value() is a blended "rrggbb" hex (see interpolateColor). */
+export class AnimatedColor {
+    var src: Animated
+    var inR: []int
+    var cols: []string
+    constructor(src: Animated, inR: []int, cols: []string) { this.src = src; this.inR = inR; this.cols = cols }
+    public value(): string {
+        const v: int = this.src.cur
+        const n: int = this.inR.length
+        if (n == 0) { return "000000" }
+        if (n == 1) { return this.cols[0] }
+        if (v <= this.inR[0]) { return this.cols[0] }
+        if (v >= this.inR[n - 1]) { return this.cols[n - 1] }
+        var i: int = 0
+        while (i < n - 1) {
+            const a: int = this.inR[i]
+            const b: int = this.inR[i + 1]
+            if (v >= a && v <= b) {
+                const span: int = b - a
+                const t: int = span == 0 ? 0 : ((v - a) * 100) / span
+                return _blendHex(this.cols[i], this.cols[i + 1], t)
+            }
+            i = i + 1
+        }
+        return this.cols[n - 1]
+    }
 }
 
 /**
