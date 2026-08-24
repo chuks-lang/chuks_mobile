@@ -920,6 +920,9 @@ final class FrameProxy: NSObject {
 
 final class Scene: ObservableObject {
     @Published var nodes: [String: NodeData] = [:]
+    // True while a continuous Gesture pan is dragging: an enclosing ChuksScroll freezes
+    // (.scrollDisabled) so the drag moves the Gesture instead of scrolling the list.
+    @Published var gestureDragging = false
     // Whether the app is still tracking the OS appearance (false once the user picks a
     // theme by hand). Drives whether RootView forces preferredColorScheme.
     @Published var followSystem = true
@@ -2129,6 +2132,13 @@ struct ScrollPaging: ViewModifier {
 // A Chuks List/Scroll: a ScrollView whose child is the fixed-height content node
 // (its items are absolutely positioned). It reports the visible window (offset +
 // height) to the engine, which mounts/recycles rows to match (virtualization).
+extension View {
+    // .scrollDisabled is iOS 16+; no-op on older OS (the scroll-conflict fix needs 16+).
+    @ViewBuilder func scrollDisabledCompat(_ disabled: Bool) -> some View {
+        if #available(iOS 16.0, *) { self.scrollDisabled(disabled) } else { self }
+    }
+}
+
 struct ChuksScroll: View {
     @ObservedObject var scene: Scene
     let id: String
@@ -2153,6 +2163,7 @@ struct ChuksScroll: View {
                     NodeView(scene: scene, id: cid, parentRow: false, parentStretch: true)
                 }
             }
+            .scrollDisabledCompat(scene.gestureDragging)   // frozen while a child Gesture pan drags
             .modifier(ScrollPaging(enabled: style["paging"] == "1"))   // snap per screen (video feeds)
             .modifier(StickBottom(enabled: style["stick"] == "1"))     // pin to newest (chat)
             .onAppear {
@@ -2255,12 +2266,14 @@ struct NodeView: View {
             } else {                 // continuous: pan / pinch / rotate (node.text lists them)
                 container(node)
                     .contentShape(Rectangle())
-                    .simultaneousGesture(DragGesture(minimumDistance: 0)
+                    .gesture(DragGesture(minimumDistance: 0)
                         .onChanged { val in
                             guard let n = scene.nodes[id], n.text.contains("pan"), !n.action.isEmpty else { return }
+                            if !scene.gestureDragging { scene.gestureDragging = true }   // freeze an enclosing scroll
                             scene.input(n.action, "pan:1,\(Int(val.translation.width)),\(Int(val.translation.height)),0,0")
                         }
                         .onEnded { val in
+                            if scene.gestureDragging { scene.gestureDragging = false }    // re-enable scrolling
                             guard let n = scene.nodes[id], n.text.contains("pan"), !n.action.isEmpty else { return }
                             let vx = Int(val.predictedEndTranslation.width - val.translation.width)
                             let vy = Int(val.predictedEndTranslation.height - val.translation.height)
