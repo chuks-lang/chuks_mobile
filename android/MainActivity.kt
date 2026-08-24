@@ -1449,6 +1449,7 @@ class MainActivity : Activity() {
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
+    private val explicitHeight = HashSet<String>()       // ids with an explicit `h`; a Button then keeps it instead of self-measuring
     private val iconFonts = HashMap<String, android.graphics.Typeface>()   // custom fonts by name, cached
     private fun iconFont(name: String): android.graphics.Typeface =
         iconFonts.getOrPut(name) { android.graphics.Typeface.createFromAsset(assets, "$name.ttf") }
@@ -1460,7 +1461,7 @@ class MainActivity : Activity() {
         // this id first. Node ids are reused when a screen swaps in place; without
         // this a previous bordered/filled element leaves its border/bg under the new
         // one (e.g. a stray outline around a row that later holds a Switch).
-        bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id)
+        bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
@@ -1483,7 +1484,7 @@ class MainActivity : Activity() {
                     // A HorizontalScrollView measures its child with UNSPECIFIED width, so force
                     // the content to its true (wide) width via minimumWidth, mirroring `h` below.
                     v.minimumWidth = dpf(f).toInt() }
-                "h" -> { N.ySetF(n, 6, dpf(f))
+                "h" -> { N.ySetF(n, 6, dpf(f)); explicitHeight.add(id)
                     // A ScrollView measures its child with UNSPECIFIED height, so a
                     // FrameLayout content sizes to its (windowed) children and ignores the
                     // Yoga height — collapsing the scroll range. minimumHeight forces the
@@ -1941,7 +1942,7 @@ class MainActivity : Activity() {
             return
         }
         when (val v = views[id]) {
-            is Button -> v.text = t
+            is Button -> { v.text = t; measureButton(id, v) }
             is EditText -> v.hint = t
             is TextView -> { v.text = t; measureText(id, v) }
         }
@@ -2039,6 +2040,19 @@ class MainActivity : Activity() {
             N.ySetF(n, 5, tv.measuredWidth.toFloat())
             N.ySetF(n, 6, tv.measuredHeight.toFloat())
         }
+    }
+
+    // A Button self-sizes its HEIGHT to its label (like iOS). Button subclasses
+    // TextView but is handled before the TextView branch in setText, so it never ran
+    // measureText and — with no explicit `h` — collapsed to 0-tall. Measure the
+    // intrinsic height and set ONLY the Yoga height, leaving width auto so a Button
+    // in a column still stretches full-width via align-stretch. Explicit `h` wins.
+    private fun measureButton(id: String, b: Button) {
+        if (explicitHeight.contains(id)) return
+        val n = ynodes[id] ?: return
+        val unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        b.measure(unspec, unspec)
+        N.ySetF(n, 6, b.measuredHeight.toFloat())
     }
 
     // A vector drawing surface: parses the ";"-joined shape descriptors and draws them
@@ -2454,7 +2468,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
