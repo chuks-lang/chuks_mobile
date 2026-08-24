@@ -729,24 +729,39 @@ export function SafeAreaView(p: map[string]Prop, kids: []Node): Node {
 function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
 
 /**
- * A vertical scroll container: children stack top-to-bottom and scroll when they
- * overflow. Grows to fill its parent's main axis. For long UNIFORM lists prefer
- * `List` (which virtualizes); use `Scroll` for a bounded set of mixed content.
+ * A scroll container: children stack and scroll when they overflow. Grows to fill
+ * its parent's main axis. For long UNIFORM lists prefer `List` (which virtualizes);
+ * use `Scroll` for a bounded set of mixed content. Vertical by default; pass
+ * `horizontal: true` for a left-to-right carousel of mixed content.
  *
- *     Scroll({}, [ Text(...), Card(...), Button(...) ])
+ * Props: `horizontal` (bool), `onRefresh` (() -> void) + `refreshing` (vertical only),
+ * `stickBottom` (bool, vertical only), plus any layout/style prop.
+ *
+ * Like every scroll container, wrap the content in a SINGLE child (a Column for
+ * vertical, a Row for horizontal); the host scroll view hosts exactly one child.
+ *
+ *     Scroll({}, [ Column({ gap: 12 }, [ Text(...), Card(...), Button(...) ]) ])
+ *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
  */
 export function Scroll(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "col"; s.grow = 1; s.basis = 0
+    // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
+    // HScroll (same control horizontal Lists use); children lay out in a row and the
+    // content is measured wide, not clamped to the viewport. Vertical is the default.
+    const horizontal: bool = pBool(p, "horizontal", false)
+    const s: Style = new Style()
+    if (horizontal) { s.dir = "row"; s.horiz = 1 } else { s.dir = "col" }
+    s.grow = 1; s.basis = 0
     applyLayout(s, p)
     // Pull-to-refresh: `onRefresh` fires when the user pulls down at the top; the
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
-    const orf: Prop? = p.get("onRefresh")
+    // Vertical only (a horizontal carousel has no pull-to-refresh).
+    const orf: Prop? = horizontal ? null : p.get("onRefresh")
     if (orf != null) { s.rfsh = pBool(p, "refreshing", false) ? 1 : 0 }
     // stickBottom: a chat transcript stays pinned to the newest message. The host keeps the
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
-    if (pBool(p, "stickBottom", false)) { s.stick = 1 }
-    const n: Node = new Node("Scroll", s, "", kids)
+    if (!horizontal && pBool(p, "stickBottom", false)) { s.stick = 1 }
+    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", kids)
     if (orf != null) { n.onPress = orf }
     return n
 }
