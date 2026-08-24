@@ -911,6 +911,13 @@ func chuksWakeThunk() {
     }
 }
 
+// NSObject target for the per-frame CADisplayLink (Scene is an ObservableObject, not
+// an NSObject, so it can't be a display-link target directly).
+final class FrameProxy: NSObject {
+    weak var scene: Scene?
+    @objc func tick() { scene?.pumpWake() }
+}
+
 final class Scene: ObservableObject {
     @Published var nodes: [String: NodeData] = [:]
     // Whether the app is still tracking the OS appearance (false once the user picks a
@@ -954,6 +961,24 @@ final class Scene: ObservableObject {
     func pumpWake() {
         if DEV_MODE { return }
         apply(Engine.tick())
+    }
+
+    // Per-frame animation driver (FA|1 / FA|0). SwiftUI has no heartbeat of its own, so
+    // decay/spring physics needs a CADisplayLink; it ticks the engine every frame while
+    // physics is live and stops when the engine emits FA|0. Scene isn't an NSObject, so
+    // the link targets a small NSObject proxy.
+    var frameDriver: CADisplayLink?
+    var frameProxy: FrameProxy?
+    func setFrameDriver(_ on: Bool) {
+        if on {
+            if frameDriver == nil {
+                let px = FrameProxy(); px.scene = self; frameProxy = px
+                let dl = CADisplayLink(target: px, selector: #selector(FrameProxy.tick))
+                dl.add(to: .main, forMode: .common); frameDriver = dl
+            }
+        } else {
+            frameDriver?.invalidate(); frameDriver = nil; frameProxy = nil
+        }
     }
 
     // Mount from a fresh /mount and record whether it produced anything. Clearing first
@@ -1036,6 +1061,7 @@ final class Scene: ObservableObject {
                     nodes[parent]!.children = kids
                 }
             case "R" where f.count >= 2: removeSubtree(f[1])
+            case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             case "X" where f.count >= 3:
                 // Async host->engine command: X|token|capability|args. Run it AFTER
                 // this apply() finishes (main.async), so a synchronous capability's

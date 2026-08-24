@@ -2096,9 +2096,18 @@ function runAsyncQueue(): void {
 // a no-op and the host's idle heartbeat drains the queue instead.
 function wakeHost(): void { host.wake() }
 
+// The per-frame animation stepper. core/animated.chuks wires this (via setFrameStepper)
+// the first time an app starts a physics animation (decay/spring); until then it is a
+// no-op, so a program with no per-frame physics pays nothing. Returns the count of
+// values still animating. When that count crosses 0<->N, App.tick emits FA|1 / FA|0 so
+// the host runs its display-link only while physics is live.
+var _frameStepper: any = null
+export function setFrameStepper(fn: any): void { _frameStepper = fn }
+
 export class App {
     var recon: Reconciler
-    constructor() { this.recon = new Reconciler(); HOST = this }
+    var prevFrameActive: int      // last per-frame stepper count (for FA| edge detection)
+    constructor() { this.recon = new Reconciler(); this.prevFrameActive = 0; HOST = this }
     // ---- hooks you override ----
     // One-time initialization with a size hint `n` (e.g. seed data). Optional.
     public setup(_n: int): void { }
@@ -2136,8 +2145,19 @@ export class App {
         }
         return this.recon.count()
     }
-    // Advance one frame: onTick() then re-render. Returns the mutation count.
-    public tick(): int { runAsyncQueue(); this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    // Advance one frame: step per-frame physics, then onTick() + re-render. Emits
+    // FA|1 / FA|0 when physics starts / stops so the host runs a display-link only
+    // while it is live. Returns the mutation count.
+    public tick(): int {
+        runAsyncQueue()
+        this.recon.begin()
+        var active: int = 0                            // advance decay/spring values (updates their cur)
+        if (_frameStepper != null) { const f: any = _frameStepper; active = int(f()) }
+        if ((active > 0) != (this.prevFrameActive > 0)) { this.recon.emit("FA|" + (active > 0 ? "1" : "0")) }
+        this.prevFrameActive = active
+        hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        return this.recon.count()
+    }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
         runAsyncQueue()

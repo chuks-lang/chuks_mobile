@@ -321,6 +321,27 @@ class MainActivity : Activity() {
         N.tick(); applyDrain(); relayout()
     }
 
+    // Per-frame animation driver (FA|1 / FA|0). Android's frame cadence is otherwise a
+    // 400ms Handler; decay/spring physics needs vsync, so a Choreographer callback ticks
+    // the engine every frame while physics is live and stops when the engine emits FA|0.
+    private var frameActiveFlag = false
+    private var frameScheduled = false
+    private val frameCallback = object : android.view.Choreographer.FrameCallback {
+        override fun doFrame(ns: Long) {
+            frameScheduled = false
+            if (!frameActiveFlag) return
+            pumpWake()
+            if (frameActiveFlag) { frameScheduled = true; android.view.Choreographer.getInstance().postFrameCallback(this) }
+        }
+    }
+    private fun setFrameDriver(on: Boolean) {
+        frameActiveFlag = on
+        if (on && !frameScheduled) {
+            frameScheduled = true
+            android.view.Choreographer.getInstance().postFrameCallback(frameCallback)
+        }
+    }
+
     private fun dp(v: Int) = (v * density).toInt()
     private fun dpf(v: Float) = v * density
 
@@ -411,6 +432,7 @@ class MainActivity : Activity() {
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
+                "FA" -> if (f.size >= 2) setFrameDriver(f[1] == "1")   // per-frame physics on/off
                 "X" -> if (f.size >= 3) {
                     // Async host->engine command: X|token|capability|args. Run AFTER this
                     // applyDrain() (main-looper post), so a sync capability's resolve()

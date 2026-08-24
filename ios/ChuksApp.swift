@@ -729,6 +729,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                                                       // Without this the two call each other until the stack overflows.
     // Perf harness: auto-scroll the feed while a CADisplayLink measures real frame times.
     var displayLink: CADisplayLink?
+    // Per-frame animation driver: ticks the engine every display frame while physics
+    // (decay/spring) is live. Gated by FA|1 / FA|0 in the mutation stream, so it runs
+    // only during an animation, never idle.
+    var frameDriver: CADisplayLink?
     var perfActive = false
     var perfLastTs: CFTimeInterval = 0
     var perfFrames = 0, perfJanky = 0, perfMaxPlayers = 0
@@ -1084,6 +1088,21 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if !s.isEmpty { apply(s); relayout() }
     }
 
+    // Start/stop the per-frame animation driver (FA|1 / FA|0). While on, a CADisplayLink
+    // ticks the engine every display frame so decay/spring physics advance at 60fps; the
+    // engine emits FA|0 when it settles, which stops the link here.
+    func setFrameDriver(_ on: Bool) {
+        if on {
+            if frameDriver == nil {
+                let dl = CADisplayLink(target: self, selector: #selector(frameTick))
+                dl.add(to: .main, forMode: .common); frameDriver = dl
+            }
+        } else {
+            frameDriver?.invalidate(); frameDriver = nil
+        }
+    }
+    @objc func frameTick() { pumpWake() }
+
     // Tear down the view + Yoga trees and rebuild from a fresh mount stream. Used
     // on hot reload: the host process stays alive, only the tree is rebuilt.
     func remount(_ mountStream: String) {
@@ -1200,6 +1219,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
+            case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             case "X" where f.count >= 3:
                 // Async host->engine command: X|token|capability|args. Run AFTER this
                 // apply() finishes (main.async), so a sync capability's resolve() doesn't
