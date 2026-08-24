@@ -1214,7 +1214,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             switch op {
             case "C" where f.count >= 3: make(f[1], f[2])
             case "S" where f.count >= 3: style(f[1], f[2])
-            case "P" where f.count >= 3: setText(f[1], f[2])
+            case "P" where f.count >= 3: setText(f[1], f[2...].joined(separator: "|"))   // rejoin: text may contain '|'
             case "V" where f.count >= 3: setFieldValue(f[1], f[2...].joined(separator: "|"))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }

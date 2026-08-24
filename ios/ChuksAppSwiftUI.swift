@@ -1043,7 +1043,7 @@ final class Scene: ObservableObject {
             case "S" where f.count >= 3:
                 nodes[f[1]]?.style = parseStyle(f[2])
                 if nodes[f[1]]?.kind == "StatusBar" { applyStatusBar(nodes[f[1]]!.style) }
-            case "P" where f.count >= 3: nodes[f[1]]?.text = f[2]
+            case "P" where f.count >= 3: nodes[f[1]]?.text = f[2...].joined(separator: "|")   // rejoin: text may contain '|'
             case "V" where f.count >= 3: nodes[f[1]]?.val = f[2...].joined(separator: "|"); nodes[f[1]]?.hasVal = true
             case "T" where f.count >= 3: nodes[f[1]]?.action = f[2]
             case "TS" where f.count >= 2: nodes[f[1]]?.submitAction = f[1] + ":submit"

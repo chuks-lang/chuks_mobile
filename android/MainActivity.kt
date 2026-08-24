@@ -420,7 +420,7 @@ class MainActivity : Activity() {
             when (f.getOrNull(0)) {
                 "C" -> if (f.size >= 3) make(f[1], f[2])
                 "S" -> if (f.size >= 3) style(f[1], f[2])
-                "P" -> if (f.size >= 3) setText(f[1], f[2])
+                "P" -> if (f.size >= 3) setText(f[1], f.drop(2).joinToString("|"))   // rejoin: text may contain '|'
                 "V" -> if (f.size >= 3) setFieldValue(f[1], f.drop(2).joinToString("|"))   // controlled value (may contain '|')
                 "T" -> if (f.size >= 3) bindAction(f[1], f[2])
                 "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
