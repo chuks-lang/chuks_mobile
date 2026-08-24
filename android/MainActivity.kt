@@ -74,7 +74,7 @@ object N {
     external fun setup(n: Int)
     external fun mount(): Int
     external fun tick(): Int
-    external fun viewport(top: Int, h: Int): Int
+    external fun viewport(top: Int, h: Int, w: Int): Int
     external fun event(action: String): Int
     external fun input(action: String, value: String): Int
     external fun resolve(token: String, payload: String): Int   // F3: async capability result
@@ -93,6 +93,19 @@ object N {
     external fun yCalc(node: Long, w: Float, h: Float)
     external fun yGet(node: Long, which: Int): Float
     external fun ySetF(node: Long, key: Int, v: Float)
+
+    // Host wake: registers a native callback (jni.cpp) that a background Chuks task
+    // fires when it posts work to the render thread. onNativeWake is called FROM that
+    // native trampoline on the task's own thread; it hops to the UI thread and runs
+    // the activity's pump. Coalesced so a burst of messages schedules one tick.
+    external fun setWake()
+    var onWake: (() -> Unit)? = null
+    private val wakeHandler = Handler(Looper.getMainLooper())
+    private val wakeScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+    @JvmStatic fun onNativeWake() {
+        if (wakeScheduled.getAndSet(true)) return
+        wakeHandler.post { wakeScheduled.set(false); onWake?.invoke() }
+    }
 }
 
 class MainActivity : Activity() {
@@ -101,8 +114,11 @@ class MainActivity : Activity() {
     private var density = 1f
 
     private lateinit var root: FrameLayout
-    private var listScroll: ScrollView? = null
+    private var listScroll: FrameLayout? = null   // a ScrollView (vertical) or HorizontalScrollView (carousel)
+    private var listHoriz = false                 // the tracked list scrolls horizontally (report x, not y)
     private var scrollId = ""
+    private var stickBottomOn = false   // Scroll stickBottom: keep pinned to newest (chat)
+    private var stickPrevH = 0          // previous content height, to tell if the user was at the bottom
     private val modalIds = HashSet<String>()             // Modal node ids (full-screen overlays)
     private var activeModal: String? = null              // the currently-visible Modal
     private val sheetModals = HashSet<String>()          // Modal ids with position=bottom (draggable sheets)
@@ -131,9 +147,18 @@ class MainActivity : Activity() {
     private val alertIds = HashSet<String>()              // Alert node ids (native AlertDialog)
     private val alertData = HashMap<String, List<String>>()  // id -> [title, message, confirm, cancel]
     private val alertActions = HashMap<String, String>()  // id -> button-dispatch action
+    private val fieldSubmit = HashMap<android.widget.EditText, String>()  // onSubmit tag (IME action / enter)
+    private val fieldFocus = HashMap<android.widget.EditText, String>()   // onFocus tag
+    private val fieldBlur = HashMap<android.widget.EditText, String>()    // onBlur tag
+    private var fieldSelfSet = false                                      // guard: a controlled value.set is not a user edit
     private var presentedAlertId: String? = null          // Alert id currently on screen
     private var presentedAlertDialog: android.app.AlertDialog? = null
-    private val imageCache = HashMap<String, android.graphics.Bitmap>()  // URL -> decoded bitmap
+    // Bounded in-memory LRU (1/8 of the app heap) so a big image feed can't blow memory.
+    private val imageMem = object : android.util.LruCache<String, android.graphics.Bitmap>(
+        (Runtime.getRuntime().maxMemory() / 1024 / 8).toInt()) {
+        override fun sizeOf(key: String, b: android.graphics.Bitmap): Int = b.byteCount / 1024
+    }
+    private val imgDir by lazy { java.io.File(cacheDir, "imgcache").apply { mkdirs() } }  // disk cache (survives relaunch)
     private val bgImageViews = HashMap<String, ImageView>()              // ImageBackground id -> its backing image view
     private var refreshAction = ""                                       // Scroll onRefresh action
     private var refreshSpinner: ProgressBar? = null                      // pull-to-refresh spinner (overlaid on root)
@@ -213,9 +238,19 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         density = resources.displayMetrics.density
+        // Keyboard avoidance: adjustResize shrinks the window content when the keyboard
+        // shows, so a bottom input bar rises above it (set here too, not only in the
+        // manifest, in case the manifest is regenerated from app.json).
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
+        // Re-layout when the root's own size changes (keyboard show/hide, rotation): the
+        // Chuks tree is laid out to root.height, so the shrink reflows content above the
+        // keyboard. Child layout changes don't resize root, so this never loops.
+        root.addOnLayoutChangeListener { _, l, t, r, bo, ol, ot, or2, ob ->
+            if ((bo - t) != (ob - ot) || (r - l) != (or2 - ol)) { relayout(); pushViewport() }
+        }
         intent?.data?.let { lastUrl = it.toString() }   // deep link that launched the app
 
         // DEV hot reload: assets/chuks-dev.txt (written by a DEV=1 build) points at the
@@ -262,7 +297,12 @@ class MainActivity : Activity() {
                 }
             }.apply { isDaemon = true; start() }
         } else {
-            // tick timer
+            // Host wake: a spawned Chuks task that posts to the render thread fires this so
+            // we tick immediately instead of waiting for the 400ms heartbeat below.
+            N.onWake = { pumpWake() }
+            N.setWake()
+            // tick timer (idle heartbeat / fallback; the wake drives prompt paints, this
+            // covers any host without a wake and background state that changed with no wake)
             val ticker = object : Runnable {
                 override fun run() {
                     frame++
@@ -274,18 +314,74 @@ class MainActivity : Activity() {
         }
     }
 
+    // Called on the UI thread when a background Chuks task posted work (via the wake
+    // callback). Ticking drains the engine's async queue and re-renders.
+    private fun pumpWake() {
+        if (devMode) return
+        N.tick(); applyDrain(); relayout()
+    }
+
     private fun dp(v: Int) = (v * density).toInt()
     private fun dpf(v: Float) = v * density
+
+    // List scrollToIndex/scrollToEnd: smooth-scroll the list's ScrollView to content-offset y
+    // (Chuks logical points -> px), clamped. Posted so the content-size/layout emitted in the
+    // same batch settles first (otherwise the max scroll range is stale).
+    // onProgress: poll the MediaPlayer's position (MediaPlayer has no periodic callback) and fire
+    // when the whole second changes, clamped to the clip length. Re-posts itself while the video
+    // and its onProgress handler live; only one poller per id.
+    private fun startProgressPoll(id: String) {
+        if (progressPollers.containsKey(id)) return
+        val h = Handler(Looper.getMainLooper())
+        val r = object : Runnable {
+            override fun run() {
+                val a = mediaProgress[id]
+                if (a == null) { progressPollers.remove(id); return }   // onProgress gone (node unmounted): stop
+                val mp = videoPlayers[id]                                // may be null transiently (attaches after layout)
+                if (mp != null) try {
+                    val sec = mp.currentPosition / 1000
+                    val dur = mp.duration / 1000
+                    if (sec >= 0 && (dur <= 0 || sec <= dur + 1) && videoLastSec[id] != sec) {
+                        videoLastSec[id] = sec; hostInput(a, sec.toString())
+                    }
+                } catch (e: Exception) {}
+                h.postDelayed(this, 250)
+            }
+        }
+        progressPollers[id] = r
+        h.postDelayed(r, 250)
+    }
+
+    private fun scrollListTo(id: String, y: Int) {
+        val vv = views[id] ?: return
+        if (vv is HorizontalScrollView) {   // horizontal list: y is really the x offset
+            vv.post {
+                val child = if (vv.childCount > 0) vv.getChildAt(0) else null
+                val maxX = if (child != null) (child.width - vv.width).coerceAtLeast(0) else Int.MAX_VALUE
+                vv.smoothScrollTo(dp(y).coerceIn(0, maxX), 0)
+            }
+            return
+        }
+        val sc = vv as? ScrollView ?: return
+        sc.post {
+            val child = if (sc.childCount > 0) sc.getChildAt(0) else null
+            val maxY = if (child != null) (child.height - sc.height).coerceAtLeast(0) else Int.MAX_VALUE
+            sc.smoothScrollTo(0, dp(y).coerceIn(0, maxY))
+        }
+    }
 
     // ---- viewport / scroll -------------------------------------------------
     private fun pushViewport(): Boolean {
         val sc = listScroll ?: return false
-        val h = sc.height
-        if (h <= 0) return false
-        val topDp = (sc.scrollY / density).toInt()
-        val hDp = (h / density).toInt()
-        if (devMode) { applyStream(devBlocking("/viewport", "$topDp $hDp")); return true }
-        if (N.viewport(topDp, hDp) > 0) { applyDrain(); return true }
+        // Horizontal list: report the x-offset + width as the scroll window (main axis) and the
+        // height as the cross size. Vertical list reports y + height + width.
+        val mainExtent = if (listHoriz) sc.width else sc.height
+        if (mainExtent <= 0) return false
+        val topDp = ((if (listHoriz) sc.scrollX else sc.scrollY) / density).toInt()
+        val hDp = (mainExtent / density).toInt()
+        val wDp = ((if (listHoriz) sc.height else sc.width) / density).toInt()
+        if (devMode) { applyStream(devBlocking("/viewport", "$topDp $hDp $wDp")); return true }
+        if (N.viewport(topDp, hDp, wDp) > 0) { applyDrain(); return true }
         return false
     }
 
@@ -300,7 +396,19 @@ class MainActivity : Activity() {
                 "C" -> if (f.size >= 3) make(f[1], f[2])
                 "S" -> if (f.size >= 3) style(f[1], f[2])
                 "P" -> if (f.size >= 3) setText(f[1], f[2])
+                "V" -> if (f.size >= 3) setFieldValue(f[1], f.drop(2).joinToString("|"))   // controlled value (may contain '|')
                 "T" -> if (f.size >= 3) bindAction(f[1], f[2])
+                "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
+                "TF" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldFocus[it] = f[1] + ":focus" }
+                "TB" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldBlur[it] = f[1] + ":blur" }
+                "TL" -> if (f.size >= 2) longPressActions[f[1]] = f[1] + ":longpress"   // Pressable onLongPress
+                "TPI" -> if (f.size >= 2) pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
+                "TPO" -> if (f.size >= 2) pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
+                "ML" -> if (f.size >= 2) mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
+                "ME" -> if (f.size >= 2) mediaError[f[1]] = f[1] + ":error"              // Image onError
+                "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
+                "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
+                "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
                 "X" -> if (f.size >= 3) {
@@ -1052,6 +1160,7 @@ class MainActivity : Activity() {
         val v: View = when (kind) {
             "Text" -> TextView(this).also { it.gravity = Gravity.CENTER_VERTICAL }
             "Video" -> TextureView(this).also { it.isOpaque = false }   // MediaPlayer target (iOS: AVPlayerLayer)
+            "VideoControls" -> TextureView(this).also { it.isOpaque = false; videoControlsIds.add(id) }   // + native MediaController
             "CameraView" -> TextureView(this).also {                     // Camera2 preview (iOS: AVCaptureVideoPreviewLayer)
                 it.isOpaque = true
                 cameraIds.add(id)
@@ -1092,16 +1201,21 @@ class MainActivity : Activity() {
             }
             "Button" -> Button(this).also { it.setPadding(0, 0, 0, 0); it.gravity = Gravity.CENTER
                 it.setOnClickListener { fire((it as View).getTag(TAG) as? String ?: "") } }
-            "Input" -> EditText(this).also {
-                it.setSingleLine(); it.setPadding(dp(10), 0, dp(10), 0)
-                it.addTextChangedListener(object : TextWatcher {
+            "Input" -> EditText(this).also { ed ->
+                ed.setSingleLine(); ed.setPadding(dp(10), 0, dp(10), 0)
+                ed.addTextChangedListener(object : TextWatcher {
                     override fun afterTextChanged(s: Editable?) {}
                     override fun beforeTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
                     override fun onTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {
-                        val action = it.getTag(TAG) as? String ?: return
-                        applyStream(engInput(action, it.text.toString()))
-                        listScroll?.scrollTo(0, 0); relayout()
-                    } }) }
+                        if (fieldSelfSet) return   // a controlled value.set, not a user edit
+                        val action = ed.getTag(TAG) as? String ?: return
+                        applyStream(engInput(action, ed.text.toString()))
+                        relayout()
+                    } })
+                ed.setOnEditorActionListener { _, _, _ -> fieldSubmit[ed]?.let { hostEvent(it) }; true }   // onSubmit (IME action)
+                ed.onFocusChangeListener = View.OnFocusChangeListener { _, has ->
+                    if (has) fieldFocus[ed]?.let { hostEvent(it) } else fieldBlur[ed]?.let { hostEvent(it) }
+                } }
             "Alert" -> View(this).also { alertIds.add(id) }   // invisible placeholder; the OS dialog shows on avis=1
             "TextArea" -> EditText(this).also {
                 it.setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -1200,11 +1314,16 @@ class MainActivity : Activity() {
                 sw.measure(spec, spec)
                 N.ySetF(n, 5, sw.measuredWidth.toFloat()); N.ySetF(n, 6, sw.measuredHeight.toFloat())
             }
-            "Scroll" -> ScrollView(this).also { sc ->
+            "Scroll" -> SnapScrollView(this).also { sc ->
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility() }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
-                listScroll = sc; scrollId = id }
+                listScroll = sc; scrollId = id; listHoriz = false }
+            "HScroll" -> HorizontalScrollView(this).also { sc ->   // horizontal list (carousel)
+                sc.isFillViewport = false
+                sc.isHorizontalScrollBarEnabled = false
+                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout() }
+                listScroll = sc; scrollId = id; listHoriz = true }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
                 it.setBackgroundColor(Color.argb(128, 0, 0, 0))
                 it.visibility = View.GONE                // shown when mvis=1
@@ -1221,6 +1340,22 @@ class MainActivity : Activity() {
     private val bgRadius = HashMap<String, Float>()
     private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a translucent frosted panel
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
+    private val longPressActions = HashMap<String, String>()   // id -> onLongPress action
+    private val pressInActions = HashMap<String, String>()     // id -> onPressIn action
+    private val pressOutActions = HashMap<String, String>()    // id -> onPressOut action
+    private val disabledIds = HashSet<String>()                // ids whose disabled=1 (block fire)
+    private val longDelayMs = HashMap<String, Long>()          // id -> onLongPress hold time (ms)
+    private val mediaLoad = HashMap<String, String>()          // id -> onLoad action (Image)
+    private val mediaError = HashMap<String, String>()         // id -> onError action (Image)
+    private val mediaEnd = HashMap<String, String>()           // id -> onEnd action (Video)
+    private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
+    private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
+    private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
+    private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
+    private val videoControlsIds = HashSet<String>()           // ids that show a native MediaController
+    private val videoMediaControllers = HashMap<String, android.widget.MediaController>()  // id -> attached controller
+    private val videoLastSec = HashMap<String, Int>()          // id -> last whole second reported to onProgress
+    private val progressPollers = HashMap<String, Runnable>()  // id -> the active progress poll Runnable
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
@@ -1254,7 +1389,10 @@ class MainActivity : Activity() {
                 "a" -> N.ySetF(n, 2, align(vl))
                 "g" -> N.ySetF(n, 3, f)
                 "basis" -> N.ySetF(n, 4, dpf(f))
-                "w" -> { N.ySetF(n, 5, dpf(f)); textWidthPx[id] = dpf(f) }   // record so Text wraps to this width
+                "w" -> { N.ySetF(n, 5, dpf(f)); textWidthPx[id] = dpf(f)   // record so Text wraps to this width
+                    // A HorizontalScrollView measures its child with UNSPECIFIED width, so force
+                    // the content to its true (wide) width via minimumWidth, mirroring `h` below.
+                    v.minimumWidth = dpf(f).toInt() }
                 "h" -> { N.ySetF(n, 6, dpf(f))
                     // A ScrollView measures its child with UNSPECIFIED height, so a
                     // FrameLayout content sizes to its (windowed) children and ignores the
@@ -1306,13 +1444,86 @@ class MainActivity : Activity() {
                     (if (vl == "right") Gravity.END else if (vl == "center") Gravity.CENTER else Gravity.START) or Gravity.CENTER_VERTICAL
                 "font" -> customFont = vl
                 "vid" -> videoWanted[id] = vl   // a Video node wants this clip; a player is attached only while it's on screen (see updateVideoVisibility)
+                "vplay" -> {                    // controllable playback: vplay=0 pauses (feed cells drive this)
+                    val want = vl != "0"; videoPlayPref[id] = want
+                    videoPlayers[id]?.let { try { if (want) it.start() else if (it.isPlaying) it.pause() } catch (e: Exception) {} }
+                }
+                "vmute" -> {
+                    val muted = vl != "0"; videoMutePref[id] = muted
+                    videoPlayers[id]?.setVolume(if (muted) 0f else 1f, if (muted) 0f else 1f)
+                }
+                "vloop" -> {
+                    val lp = vl != "0"; videoLoopPref[id] = lp
+                    videoPlayers[id]?.let { try { it.isLooping = lp } catch (e: Exception) {} }
+                }
+                "vfit" -> {}                    // cover is the default; contain reserved for a later slice
+                "paging" -> (v as? SnapScrollView)?.pageSnap = (vl == "1")   // List/Scroll snap-per-screen
+                "stick" -> if (v is ScrollView) stickBottomOn = (vl == "1")   // Scroll stickBottom (chat)
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
+                "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (UIKit/SwiftUI do), an explicit `ellip` overrides
+                    it.maxLines = f.toInt()
+                    if (it.ellipsize == null) it.ellipsize = android.text.TextUtils.TruncateAt.END
+                    measureText(id, it) }
+                "ellip" -> (v as? TextView)?.let {                                                    // Text truncation mode
+                    it.ellipsize = when (vl) { "head" -> android.text.TextUtils.TruncateAt.START
+                        "middle" -> android.text.TextUtils.TruncateAt.MIDDLE
+                        "clip" -> null; else -> android.text.TextUtils.TruncateAt.END } }
+                "dis" -> { v.alpha = if (vl == "1") 0.4f else 1f; v.isEnabled = (vl != "1")            // disabled: dim + block
+                    if (vl == "1") disabledIds.add(id) else disabledIds.remove(id) }
+                "tint" -> (v as? ImageView)?.let { val c = Color.parseColor("#" + vl); imageTint[id] = c; it.setColorFilter(c) }   // Image tintColor
+                "seek" -> videoPlayers[id]?.let { mp ->                                                // Video seek (seconds)
+                    val secs = f.toInt()
+                    if (videoSeek[id] != secs) { videoSeek[id] = secs; try { mp.seekTo(secs * 1000) } catch (e: Exception) {} } }
+                "vvol" -> videoPlayers[id]?.let { try { it.setVolume(f / 100f, f / 100f) } catch (e: Exception) {} }   // Video volume 0-100
+                "vrate" -> videoPlayers[id]?.let { mp -> try {                                          // playback speed percent
+                    if (mp.isPlaying) mp.playbackParams = mp.playbackParams.setSpeed(f / 100f) } catch (e: Exception) {} }
+                "ldelay" -> longDelayMs[id] = f.toLong()                                                // onLongPress hold time (ms)
+                "sel" -> (v as? TextView)?.setTextIsSelectable(vl == "1")                                // Text selectable
+                "hitslop" -> { val slop = dp(f.toInt()); v.post {                                        // enlarge the tap area
+                    (v.parent as? View)?.let { p -> val r = android.graphics.Rect(); v.getHitRect(r)
+                        r.inset(-slop, -slop); p.touchDelegate = android.view.TouchDelegate(r, v) } } }
+                "blur" -> imageBlur[id] = f   // Image blurRadius; applied to the bitmap when it loads (below)
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
                     if (vl == "1") {
                         it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
                         it.transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
                     }
                 }
+                "kbt" -> (v as? EditText)?.let {
+                    val it2 = android.text.InputType.TYPE_CLASS_TEXT
+                    it.inputType = when (vl) {
+                        "email" -> android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+                        "number" -> android.text.InputType.TYPE_CLASS_NUMBER
+                        "decimal" -> android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+                        "phone" -> android.text.InputType.TYPE_CLASS_PHONE
+                        "url" -> android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
+                        else -> it2 }
+                    it.setSingleLine()
+                }
+                "ret" -> (v as? EditText)?.let {
+                    it.imeOptions = when (vl) {
+                        "send" -> android.view.inputmethod.EditorInfo.IME_ACTION_SEND
+                        "search" -> android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+                        "next" -> android.view.inputmethod.EditorInfo.IME_ACTION_NEXT
+                        "go" -> android.view.inputmethod.EditorInfo.IME_ACTION_GO
+                        else -> android.view.inputmethod.EditorInfo.IME_ACTION_DONE }
+                }
+                "edit" -> (v as? EditText)?.let { it.isEnabled = (vl == "1"); it.isFocusable = (vl == "1"); it.isFocusableInTouchMode = (vl == "1") }
+                "afoc" -> if (vl == "1") (v as? EditText)?.let { it.post { it.requestFocus(); (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)?.showSoftInput(it, 0) } }
+                "acap" -> (v as? EditText)?.let {
+                    val base = it.inputType and android.text.InputType.TYPE_MASK_FLAGS.inv()
+                    val cap = when (vl) {
+                        "sentences" -> android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                        "words" -> android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS
+                        "characters" -> android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+                        else -> 0 }
+                    it.inputType = base or cap
+                }
+                "acor" -> (v as? EditText)?.let {
+                    it.inputType = if (vl == "1") it.inputType or android.text.InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
+                                   else it.inputType and android.text.InputType.TYPE_TEXT_FLAG_AUTO_CORRECT.inv()
+                }
+                "maxlen" -> (v as? EditText)?.let { val n = vl.toIntOrNull() ?: -1; if (n >= 0) it.filters = arrayOf(android.text.InputFilter.LengthFilter(n)) }
                 "sbh" -> setStatusBarHidden(vl == "1")   // StatusBar: hide/show
                 "sbstyle" -> setStatusBarStyle(vl)       // StatusBar: light/dark icons
                 "sbcolor" -> setStatusBarColor(vl)       // StatusBar: background color
@@ -1416,6 +1627,9 @@ class MainActivity : Activity() {
     private val videoSizes = HashMap<MediaPlayer, Pair<Int, Int>>()   // player -> native video size
     private val videoAlive = HashSet<MediaPlayer>()                   // every live player (attached + pooled); its size IS the decoder count
     private val videoWanted = HashMap<String, String>()              // id -> asset for every mounted Video node (on- or off-screen)
+    private val videoPlayPref = HashMap<String, Boolean>()           // id -> controllable playing (default true); a feed cell drives this
+    private val videoMutePref = HashMap<String, Boolean>()           // id -> muted (default true)
+    private val videoLoopPref = HashMap<String, Boolean>()           // id -> loop (default true)
     private val visRect = android.graphics.Rect()
 
     // Decode only the videos actually on screen. The virtualized window mounts a
@@ -1435,6 +1649,31 @@ class MainActivity : Activity() {
         }
     }
 
+    // Video `controls`: Android's native MediaController (play/pause, scrubber, seek buttons)
+    // anchored to the video; it pops up on tap and auto-hides. (The richer fullscreen/PiP/subtitle
+    // menus that AVPlayerViewController gives on iOS would need ExoPlayer's PlayerView on Android.)
+    private fun attachMediaController(id: String, tv: TextureView, mp: MediaPlayer) {
+        if (videoMediaControllers.containsKey(id)) return
+        val ctrl = object : android.widget.MediaController.MediaPlayerControl {
+            override fun start() { try { mp.start() } catch (e: Exception) {} }
+            override fun pause() { try { mp.pause() } catch (e: Exception) {} }
+            override fun getDuration() = try { mp.duration } catch (e: Exception) { 0 }
+            override fun getCurrentPosition() = try { mp.currentPosition } catch (e: Exception) { 0 }
+            override fun seekTo(pos: Int) { try { mp.seekTo(pos) } catch (e: Exception) {} }
+            override fun isPlaying() = try { mp.isPlaying } catch (e: Exception) { false }
+            override fun getBufferPercentage() = 0
+            override fun canPause() = true
+            override fun canSeekBackward() = true
+            override fun canSeekForward() = true
+            override fun getAudioSessionId() = try { mp.audioSessionId } catch (e: Exception) { 0 }
+        }
+        val mc = android.widget.MediaController(this)
+        mc.setMediaPlayer(ctrl); mc.setAnchorView(tv); mc.isEnabled = true
+        tv.setOnClickListener { mc.show() }
+        videoMediaControllers[id] = mc
+        tv.post { mc.show(0) }   // show once, sticky, until first tap toggles it
+    }
+
     private fun attachVideo(id: String, asset: String) {
         if (videoPlayers.containsKey(id)) return
         val tv = views[id] as? TextureView ?: return
@@ -1450,15 +1689,23 @@ class MainActivity : Activity() {
             try {
                 if (asset.startsWith("http")) {
                     mp.setDataSource(asset)                  // remote URL
+                } else if (asset.startsWith("file://")) {
+                    mp.setDataSource(asset.substring(7))     // captured / downloaded file
                 } else {
                     val afd = assets.openFd(asset)           // bundled asset
                     mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
                     afd.close()
                 }
             } catch (e: Exception) { videoAlive.remove(mp); mp.release(); return }
-            mp.isLooping = true
-            mp.setVolume(0f, 0f)
-            mp.setOnPreparedListener { videoReady.add(it); it.start() }
+            mp.isLooping = videoLoopPref[id] ?: true
+            val muted0 = videoMutePref[id] ?: true; mp.setVolume(if (muted0) 0f else 1f, if (muted0) 0f else 1f)
+            mp.setOnPreparedListener { videoReady.add(it); if (videoPlayPref[id] != false) it.start()
+                if (videoControlsIds.contains(id)) attachMediaController(id, tv, it) }
+            // onEnd: MediaPlayer only fires completion when NOT looping. Fire onEnd for the id
+            // currently showing this (pooled) player.
+            mp.setOnCompletionListener { player ->
+                videoPlayers.entries.firstOrNull { it.value === player }?.key?.let { curId -> mediaEnd[curId]?.let { fire(it) } }
+            }
             mp.setOnVideoSizeChangedListener { _, w, h -> if (w > 0 && h > 0) { videoSizes[mp] = Pair(w, h); applyCover(tv, mp) } }
             // A decoder that fails (routine on the emulator's ~2-decoder ceiling)
             // must free its slot at once, or dead players pile up and clog the cap
@@ -1468,6 +1715,13 @@ class MainActivity : Activity() {
         videoPlayers[id] = mp
         videoKey[id] = asset
         bindSurface(tv, mp)
+        // Apply this node's control prefs. loop/mute are safe in any state; a reused player
+        // is already prepared so honor its play state now (a new one starts in onPrepared).
+        try { mp.isLooping = videoLoopPref[id] ?: true } catch (e: Exception) {}
+        val muted = videoMutePref[id] ?: true; try { mp.setVolume(if (muted) 0f else 1f, if (muted) 0f else 1f) } catch (e: Exception) {}
+        if (reused != null) {
+            try { if (videoPlayPref[id] == false) { if (mp.isPlaying) mp.pause() } else mp.start() } catch (e: Exception) {}
+        }
     }
 
     private fun bindSurface(tv: TextureView, mp: MediaPlayer) {
@@ -1525,6 +1779,19 @@ class MainActivity : Activity() {
         }
     }
 
+    // A controlled TextInput's value. Set the native text ONLY when it differs (the field
+    // is controlled, so the same value re-emits every keystroke) to avoid fighting the user;
+    // fieldSelfSet stops the TextWatcher from reporting this programmatic change as an edit.
+    private fun setFieldValue(id: String, value: String) {
+        val ed = views[id] as? android.widget.EditText ?: return
+        if (ed.text.toString() != value) {
+            fieldSelfSet = true
+            ed.setText(value)
+            ed.setSelection(value.length)   // cursor to end
+            fieldSelfSet = false
+        }
+    }
+
     private fun setText(id: String, t: String) {
         if (selectIds.contains(id)) {                        // a Select's "text" is its tab-joined options
             selectOptions[id] = t.split("\t")
@@ -1558,16 +1825,20 @@ class MainActivity : Activity() {
         (views[id] as? DrawCanvas)?.let { it.shapes = t; return }               // Canvas shape list
         (views[id] as? android.webkit.WebView)?.let { it.loadUrl(t); return }   // WebView URL
         if (t.startsWith("http")) {                                           // remote image / background URL
-            (bgImageViews[id] ?: views[id] as? ImageView)?.let { loadRemoteImage(t, it); return }
+            (bgImageViews[id] ?: views[id] as? ImageView)?.let { loadRemoteImage(t, it, id); return }
         }
         if (t.startsWith("file://")) {                                        // picked/captured local file
             (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->
-                try { iv.setImageBitmap(android.graphics.BitmapFactory.decodeFile(t.substring(7))) } catch (e: Exception) {}
+                var ok = false
+                try { iv.setImageBitmap(android.graphics.BitmapFactory.decodeFile(t.substring(7))); ok = true } catch (e: Exception) {}
+                (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
                 return
             }
         }
         (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->            // bundled local asset (e.g. chuks-logo.png)
-            if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) } } catch (e: Exception) {}
+            var ok = false
+            if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) }; ok = true } catch (e: Exception) {}
+            (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
             return
         }
         when (val v = views[id]) {
@@ -1875,6 +2146,33 @@ class MainActivity : Activity() {
         }
     }
 
+    // A ScrollView that snaps to the nearest full-screen page when paging is on (video feeds).
+    // Pure-platform (no androidx ViewPager2): after a drag/fling settles, smooth-scroll to the
+    // nearest multiple of the viewport height. Off by default = a normal ScrollView.
+    inner class SnapScrollView(ctx: Context) : ScrollView(ctx) {
+        var pageSnap = false
+        private var lastY = -1
+        private val settle = object : Runnable {
+            override fun run() {
+                if (!pageSnap) return
+                if (scrollY == lastY) {
+                    val ph = height
+                    if (ph > 0) {
+                        val target = Math.round(scrollY.toFloat() / ph) * ph
+                        if (target != scrollY) smoothScrollTo(0, target)
+                    }
+                } else { lastY = scrollY; postDelayed(this, 80) }
+            }
+        }
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            val handled = super.onTouchEvent(ev)
+            if (pageSnap && (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL)) {
+                lastY = -1; removeCallbacks(settle); postDelayed(settle, 80)
+            }
+            return handled
+        }
+    }
+
     private fun bytesToHex(b: ByteArray?): String {
         if (b == null) return ""
         val sb = StringBuilder(b.size * 2)
@@ -2055,7 +2353,7 @@ class MainActivity : Activity() {
         ynodes[id]?.let { val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
-        videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it) }
+        videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
         views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
@@ -2076,21 +2374,41 @@ class MainActivity : Activity() {
                 val ao = pressOpacity[id]
                 if (ao != null) {
                     // Pressable: dim on touch-down, restore on release/cancel, fire only
-                    // if released inside (TouchableOpacity). Instant, no round-trip.
+                    // if released inside (TouchableOpacity). Instant, no round-trip. Also
+                    // dispatches onPressIn/onPressOut and onLongPress (after a hold).
                     v.isClickable = true
+                    val longRunnable = arrayOfNulls<Runnable>(1)
+                    val longFired = booleanArrayOf(false)
                     v.setOnTouchListener { view, ev ->
+                        if (disabledIds.contains(id)) return@setOnTouchListener true   // disabled: swallow, no fire
                         when (ev.action) {
-                            MotionEvent.ACTION_DOWN -> { view.animate().alpha(ao).setDuration(90).start(); true }
-                            MotionEvent.ACTION_UP -> {
-                                view.animate().alpha(1f).setDuration(90).start()
-                                if (ev.x >= 0 && ev.y >= 0 && ev.x <= view.width && ev.y <= view.height) fire(action)
+                            MotionEvent.ACTION_DOWN -> {
+                                view.animate().alpha(ao).setDuration(90).start()
+                                pressInActions[id]?.let { fire(it) }
+                                longPressActions[id]?.let { lp ->
+                                    longFired[0] = false
+                                    val r = Runnable { longFired[0] = true; fire(lp) }
+                                    longRunnable[0] = r; view.postDelayed(r, longDelayMs[id] ?: 500L)
+                                }
                                 true
                             }
-                            MotionEvent.ACTION_CANCEL -> { view.animate().alpha(1f).setDuration(90).start(); true }
+                            MotionEvent.ACTION_UP -> {
+                                view.animate().alpha(1f).setDuration(90).start()
+                                longRunnable[0]?.let { view.removeCallbacks(it) }
+                                pressOutActions[id]?.let { fire(it) }
+                                if (!longFired[0] && ev.x >= 0 && ev.y >= 0 && ev.x <= view.width && ev.y <= view.height) fire(action)
+                                true
+                            }
+                            MotionEvent.ACTION_CANCEL -> {
+                                view.animate().alpha(1f).setDuration(90).start()
+                                longRunnable[0]?.let { view.removeCallbacks(it) }
+                                pressOutActions[id]?.let { fire(it) }
+                                true
+                            }
                             else -> false
                         }
                     }
-                } else { v.isClickable = true; v.setOnClickListener { fire(action) } }
+                } else { v.isClickable = true; v.setOnClickListener { if (!disabledIds.contains(id)) fire(action) } }
             }
         }
     }
@@ -2175,17 +2493,60 @@ class MainActivity : Activity() {
 
     // Fetch a remote image off the main thread (cached), then set it. Tag-guarded so a
     // recycled ImageView doesn't get a late bitmap for a URL it no longer wants.
-    private fun loadRemoteImage(url: String, iv: ImageView) {
-        imageCache[url]?.let { iv.setImageBitmap(it); return }
+    // Keep the on-disk image cache bounded (oldest-first eviction) so it can't grow forever.
+    private fun trimImgDir() {
+        try {
+            val files = imgDir.listFiles() ?: return
+            var total = files.sumOf { it.length() }
+            val cap = 100L * 1024 * 1024   // 100MB
+            if (total <= cap) return
+            for (fl in files.sortedBy { it.lastModified() }) {
+                if (total <= cap) break
+                total -= fl.length(); fl.delete()
+            }
+        } catch (e: Exception) {}
+    }
+    // blurRadius: a cheap, all-versions Gaussian-ish blur (downscale then bilinear upscale),
+    // so it works below API 31 where RenderEffect isn't available.
+    private fun blurBitmap(src: android.graphics.Bitmap, radius: Float): android.graphics.Bitmap {
+        if (radius <= 0f) return src
+        // Downscale hard then bilinear-upscale to approximate a Gaussian; two passes smooth out
+        // the blockiness and deepen the blur so it reads like iOS's CIGaussianBlur.
+        var out = src
+        for (i in 0 until 3) {
+            val scale = radius.coerceIn(2f, 30f)
+            val w = (src.width / scale).toInt().coerceAtLeast(1)
+            val h = (src.height / scale).toInt().coerceAtLeast(1)
+            val small = android.graphics.Bitmap.createScaledBitmap(out, w, h, true)
+            out = android.graphics.Bitmap.createScaledBitmap(small, src.width, src.height, true)
+        }
+        return out
+    }
+    private fun bmpFor(bmp: android.graphics.Bitmap, id: String): android.graphics.Bitmap {
+        val r = imageBlur[id] ?: return bmp
+        return if (r > 0f) blurBitmap(bmp, r) else bmp
+    }
+
+    private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {
+        // Feed-grade: memory LRU -> disk cache -> network, decoded off the main thread, with
+        // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
+        imageMem.get(url)?.let { iv.setImageBitmap(bmpFor(it, id)); mediaLoad[id]?.let { a -> fire(a) }; return }
         iv.setTag(TAG, url)
         Thread {
             try {
-                val bmp = java.net.URL(url).openStream().use { android.graphics.BitmapFactory.decodeStream(it) }
-                if (bmp != null) {
-                    imageCache[url] = bmp
-                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmp) }
+                val key = Integer.toHexString(url.hashCode())
+                val f = java.io.File(imgDir, key)
+                var bmp = if (f.exists()) android.graphics.BitmapFactory.decodeFile(f.absolutePath) else null
+                if (bmp == null) {
+                    val bytes = java.net.URL(url).openStream().use { it.readBytes() }
+                    bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    if (bmp != null) try { f.outputStream().use { os -> bmp!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os) }; trimImgDir() } catch (e: Exception) {}
                 }
-            } catch (e: Exception) { /* leave the placeholder */ }
+                if (bmp != null) {
+                    imageMem.put(url, bmp)
+                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmpFor(bmp!!, id)); mediaLoad[id]?.let { a -> fire(a) } }
+                } else iv.post { mediaError[id]?.let { a -> fire(a) } }
+            } catch (e: Exception) { iv.post { mediaError[id]?.let { a -> fire(a) } } }
         }.start()
     }
 
@@ -2212,6 +2573,10 @@ class MainActivity : Activity() {
             val lp = FrameLayout.LayoutParams(N.yGet(node, 2).toInt(), N.yGet(node, 3).toInt())
             lp.leftMargin = N.yGet(node, 0).toInt()
             lp.topMargin = N.yGet(node, 1).toInt()
+            // A horizontal list's content node has an explicit WIDTH but no height (its cells
+            // are abs), so Yoga gives it height 0 and Android would clip the cells. Fill it to
+            // the scroll's own height (the cross axis); it scrolls sideways only.
+            if (listHoriz && id == contentId) { lp.height = listScroll?.height ?: lp.height }
             v.layoutParams = lp
         }
         // place the whole Chuks app just below the top inset
@@ -2228,6 +2593,15 @@ class MainActivity : Activity() {
             }
         } else clearSheetChrome()
         root.requestLayout()
+        // stickBottom (chat): after layout settles, keep the transcript pinned to the newest
+        // message if the user was already at the bottom (new message, or the keyboard shrinking).
+        if (stickBottomOn) (listScroll as? ScrollView)?.let { sc -> sc.post {
+            val child = if (sc.childCount > 0) sc.getChildAt(0) else null
+            val newH = child?.height ?: 0
+            val wasAtBottom = sc.scrollY + sc.height >= stickPrevH - dp(20)
+            if (wasAtBottom && newH > sc.height) sc.smoothScrollTo(0, newH - sc.height)
+            stickPrevH = newH
+        } }
         root.post { updateVideoVisibility() }   // recompute on-screen videos once positions settle
     }
 

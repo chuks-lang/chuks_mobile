@@ -51,6 +51,7 @@ OUTABS="$(cd "$OUT" && pwd)"   # absolute; the c-archive is compiled inside the 
 SWIFT_OPT="-O"; [ "${FAST:-0}" = "1" ] && SWIFT_OPT="-Onone"
 DEV_FLAG=""; [ "${DEV:-0}" = "1" ] && DEV_FLAG="-D DEV"
 BENCH_FLAG=""; [ "${BENCHMARK:-0}" = "1" ] && BENCH_FLAG="-D BENCHMARK"
+SAN_FLAG=""; [ "${ASAN:-0}" = "1" ] && SAN_FLAG="-sanitize=address -g"   # AddressSanitizer diagnostic build
 
 # Target: the booted simulator (default) or a paired physical device (IOS_TARGET=device).
 # A device build compiles against the iphoneos SDK and is code-signed before install.
@@ -106,7 +107,7 @@ else
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
         "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
-        -framework UIKit -framework Foundation $PREVIEW_FW -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
+        -framework UIKit -framework Foundation $PREVIEW_FW -parse-as-library $SWIFT_OPT $SAN_FLAG $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
         -o "$OUT/$APPNAME"
 fi
 

@@ -27,7 +27,34 @@
       },
       "declaredDomains": [],
       "acceptedAt": "2026-08-22T10:02:09Z"
+    },
+    "@chuks/websocket@1.1.1": {
+      "version": "1.1.1",
+      "commitSha": "ce45a93dd046e566efe35a998b330d5598ab457b",
+      "contentHash": "8fe33a6221c0873e88c75e80b5950eaecf673769542013196a98a4228a695434",
+      "permissions": {
+        "chuksArrow": false,
+        "chuksToC": false,
+        "chuksToRust": false,
+        "crypto.hash": true,
+        "crypto.sign": false,
+        "db.access": false,
+        "env.read": false,
+        "env.write": false,
+        "fs.delete": false,
+        "fs.read": false,
+        "fs.write": false,
+        "install.scripts": false,
+        "net.bind": true,
+        "net.outbound": true,
+        "proc.exec": false,
+        "proc.exit": false,
+        "sys.info": false,
+        "sys.paths": false
+      },
+      "declaredDomains": [],
+      "acceptedAt": "2026-08-23T14:54:47Z"
     }
   },
-  "__signature": "hmac-sha256:7onbUug36dcaZUr994uYLHdpSwjCiMgKCzZECX+sXrM="
+  "__signature": "hmac-sha256:dohkqaq/U+VonM4apbz95lajvGDBsV3uYgiFpaQZReQ="
 }

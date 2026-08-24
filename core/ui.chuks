@@ -9,6 +9,7 @@
 // shared mutable state.
 
 import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells } from "./state.chuks";
+import { host } from "std/host";
 
 // ---- Style: a compact subset of the flexbox + visual model -----------------
 export class Style {
@@ -65,6 +66,34 @@ export class Style {
     var scl: int        // transform scale as a percent (100 = 1.0)
     var animMs: int     // transition duration in ms for opacity/transform changes (-1 = no animation)
     var animEz: string  // transition easing: "" (ease) | "linear" | "spring"
+    var vidPlay: int    // Video playback: 1 play, 0 pause (default 1 = autoplay, backward-compatible)
+    var vidLoop: int    // Video loop: 1 loop, 0 play once (default 1)
+    var vidMute: int    // Video muted: 1 muted, 0 with sound (default 1)
+    var vidFit: string  // Video resize: "" (cover) | "contain"
+    var paging: int     // Scroll/List paging: 1 = snap per screen (full-cell), -1 = normal scroll
+    // TextInput config ("" / -1 = not set, keep the host default)
+    var kbType: string  // keyboard: "email"|"number"|"decimal"|"phone"|"url" ("" = default)
+    var retKey: string  // return key: "done"|"send"|"search"|"next"|"go" ("" = default)
+    var editable: int   // 0 = not editable, 1 = editable (-1 = default editable)
+    var autoFocus: int  // 1 = focus on mount (-1 = no)
+    var autoCap: string // "none"|"sentences"|"words"|"characters" ("" = default)
+    var autoCorr: int   // 0 = off, 1 = on (-1 = default)
+    var maxLen: int     // max characters (-1 = unlimited)
+    var stick: int      // Scroll: 1 = stick to bottom (chat) when content grows / keyboard opens (-1 = no)
+    var horiz: int      // Scroll/List: 1 = scroll horizontally (a carousel); -1 = vertical (default)
+    var nlines: int     // Text: max lines before truncation (-1 = unlimited / wrap freely)
+    var ellip: string   // Text truncation: "tail"|"head"|"middle"|"clip" ("" = tail default)
+    var disabled: int   // interactive controls: 1 = disabled (dimmed, no press); -1 = enabled
+    var tint: string    // Image tintColor (hex): recolor a template image ("" = none)
+    var seekTo: int     // Video: seek to this time in seconds when it changes (-1 = no seek)
+    var vidCtrls: int   // Video: 1 = show native playback controls (-1 = none)
+    var vidVol: int     // Video volume 0-100 (-1 = default, honors `muted`)
+    var vidRate: int    // Video playback rate as a percent (100 = 1x; -1 = default)
+    var blur: int       // Image blur radius in px (-1 = none)
+    var longDelay: int  // Pressable onLongPress delay in ms (-1 = default 500)
+    var selectable: int // Text: 1 = user can select/copy the text (-1 = no)
+    var hitSlop: int    // Pressable: extra tappable px beyond the visual bounds (-1 = none)
+    var spinner: int    // Image: 1 = show a loading spinner until the image loads (-1 = no)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
@@ -78,6 +107,13 @@ export class Style {
         this.seli = -1; this.avis = -1; this.resize = ""; this.prog = -1; this.rfsh = -1
         this.dpmode = ""; this.dpdisp = ""
         this.tx = 0; this.ty = 0; this.rot = 0; this.scl = 100; this.animMs = -1; this.animEz = ""
+        this.vidPlay = -1; this.vidLoop = -1; this.vidMute = -1; this.vidFit = ""; this.paging = -1
+        this.kbType = ""; this.retKey = ""; this.editable = -1; this.autoFocus = -1
+        this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1; this.horiz = -1
+        this.nlines = -1; this.ellip = ""; this.disabled = -1
+        this.tint = ""; this.seekTo = -1; this.vidCtrls = -1
+        this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
+        this.selectable = -1; this.hitSlop = -1; this.spinner = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -111,6 +147,35 @@ export class Style {
         if (this.wrap != "") { s = s + "wrap=" + this.wrap + ";" }
         if (this.font != "") { s = s + "font=" + this.font + ";" }
         if (this.vid != "") { s = s + "vid=" + this.vid + ";" }
+        // Video-only: always emit when set (>=0) so toggling `playing` back on re-applies
+        // (a removed key would never resume). -1 = not a Video, stays out of every other style.
+        if (this.vidPlay >= 0) { s = s + "vplay=" + string(this.vidPlay) + ";" }
+        if (this.vidLoop >= 0) { s = s + "vloop=" + string(this.vidLoop) + ";" }
+        if (this.vidMute >= 0) { s = s + "vmute=" + string(this.vidMute) + ";" }
+        if (this.vidFit != "") { s = s + "vfit=" + this.vidFit + ";" }
+        if (this.paging >= 0) { s = s + "paging=" + string(this.paging) + ";" }
+        if (this.kbType != "") { s = s + "kbt=" + this.kbType + ";" }
+        if (this.retKey != "") { s = s + "ret=" + this.retKey + ";" }
+        if (this.editable >= 0) { s = s + "edit=" + string(this.editable) + ";" }
+        if (this.autoFocus >= 0) { s = s + "afoc=" + string(this.autoFocus) + ";" }
+        if (this.autoCap != "") { s = s + "acap=" + this.autoCap + ";" }
+        if (this.autoCorr >= 0) { s = s + "acor=" + string(this.autoCorr) + ";" }
+        if (this.maxLen >= 0) { s = s + "maxlen=" + string(this.maxLen) + ";" }
+        if (this.stick >= 0) { s = s + "stick=" + string(this.stick) + ";" }
+        if (this.horiz >= 0) { s = s + "horiz=" + string(this.horiz) + ";" }
+        if (this.nlines >= 0) { s = s + "nlines=" + string(this.nlines) + ";" }
+        if (this.ellip != "") { s = s + "ellip=" + this.ellip + ";" }
+        if (this.disabled >= 0) { s = s + "dis=" + string(this.disabled) + ";" }
+        if (this.tint != "") { s = s + "tint=" + this.tint + ";" }
+        if (this.seekTo >= 0) { s = s + "seek=" + string(this.seekTo) + ";" }
+        if (this.vidCtrls >= 0) { s = s + "vctrl=" + string(this.vidCtrls) + ";" }
+        if (this.vidVol >= 0) { s = s + "vvol=" + string(this.vidVol) + ";" }
+        if (this.vidRate >= 0) { s = s + "vrate=" + string(this.vidRate) + ";" }
+        if (this.blur >= 0) { s = s + "blur=" + string(this.blur) + ";" }
+        if (this.longDelay >= 0) { s = s + "ldelay=" + string(this.longDelay) + ";" }
+        if (this.selectable >= 0) { s = s + "sel=" + string(this.selectable) + ";" }
+        if (this.hitSlop >= 0) { s = s + "hitslop=" + string(this.hitSlop) + ";" }
+        if (this.spinner >= 0) { s = s + "spin=" + string(this.spinner) + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
         if (this.sec >= 0) { s = s + "sec=" + string(this.sec) + ";" }
@@ -155,10 +220,29 @@ export class Node {
     var comp: any        // kind=="Comp": the component render fn () -> Node (lazy)
     var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
     var ckey: string     // kind=="Comp": explicit identity key (KeyedComp); "" = use path
+    // Controlled TextInput: `hasVal` marks the field controlled, `val` is its text.
+    // onSubmit/onFocus/onBlur are the extra input events (kept `any` like onPress).
+    var hasVal: bool
+    var val: string
+    var onSubmit: any
+    var onFocus: any
+    var onBlur: any
+    // Pressable/Button gesture events (kept `any` like onPress).
+    var onLongPress: any
+    var onPressIn: any
+    var onPressOut: any
+    // Media events (Image/Video): load/error/end are one-shot; progress streams a time value.
+    var onLoad: any
+    var onError: any
+    var onEnd: any
+    var onProgress: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
         this.comp = null; this.produced = null; this.ckey = ""
+        this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
+        this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
+        this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -226,7 +310,7 @@ export unionType Prop = int | string | bool | function(): void | function(v: str
 // List-specific signatures, so they get their own union, distinct from Prop. The
 // last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
 // item(s,r,top)->Node; its header(s,top)->Node reuses (int,int)->Node above.
-export unionType ListProp = int | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node
+export unionType ListProp = int | bool | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void | function(): void | function(top: int): Node
 
 // ---- Named-prop component builders (the JSX-like API) ----------------------
 // Compose with named props + children + closures:
@@ -255,8 +339,23 @@ export function safeTop(): int { return _safeTop }
 export function safeRight(): int { return _safeRight }
 export function safeBottom(): int { return _safeBottom }
 export function safeLeft(): int { return _safeLeft }
+// The scroll viewport height (points) the host last reported. This is the REAL height a
+// paging List pages by (screen minus safe areas / chrome), so a full-screen feed should
+// size its cells to this, NOT to DeviceInfo.screen (that mismatch offsets every page).
+var _vpH: int = 0
+export function viewportHeight(): int { return _vpH }
+// The cross-axis viewport size the host reports alongside the scroll window: the list's
+// WIDTH for a vertical list (used to size grid columns for `numColumns`), or its height for
+// a horizontal list. 0 until the host first reports it.
+var _vpW: int = 0
+export function viewportWidth(): int { return _vpW }
 // Read an int config value `k` from a List's ListProp map, or `def` if absent.
 function lpInt(d: map[string]ListProp, k: string, def: int): int { const v: ListProp? = d.get(k); if (v != null) { return int(v) } return def }
+// Read a BOOLEAN config value `k` (e.g. `horizontal`, `inverted`, `paging`). Accepts a real
+// `bool` (the preferred form: `horizontal: true`) and, for back-compat, any non-zero int as
+// true — so `horizontal: 5` reads as true rather than silently falling through to false the
+// way a `== 1` check would.
+function lpBool(d: map[string]ListProp, k: string, def: bool): bool { const v: ListProp? = d.get(k); if (v != null) { return int(v) != 0 } return def }
 // Copy the layout/visual props onto a Style. Each pInt/pStr defaults to the
 // Style's current value, so an absent prop leaves whatever the builder preset.
 function applyLayout(s: Style, p: map[string]Prop): void {
@@ -274,7 +373,7 @@ function applyLayout(s: Style, p: map[string]Prop): void {
     s.fs = pInt(p, "size", s.fs)
     s.fw = pStr(p, "weight", s.fw)
     s.ta = pStr(p, "ta", s.ta)
-    const abs: Prop? = p.get("abs"); if (abs != null) { s.pos = "abs" }
+    if (pBool(p, "abs", false)) { s.pos = "abs" }   // absolute positioning (top/left/right)
     s.top = pInt(p, "top", s.top)
     s.left = pInt(p, "left", s.left)
     s.right = pInt(p, "right", s.right)
@@ -299,6 +398,16 @@ function applyLayout(s: Style, p: map[string]Prop): void {
 function applyEvents(n: Node, p: map[string]Prop): void {
     const op: Prop? = p.get("onPress"); if (op != null) { n.onPress = op }
     const oc: Prop? = p.get("onChange"); if (oc != null) { n.onChange = oc }
+    const ol: Prop? = p.get("onLongPress"); if (ol != null) { n.onLongPress = ol }
+    const oi: Prop? = p.get("onPressIn"); if (oi != null) { n.onPressIn = oi }
+    const oo: Prop? = p.get("onPressOut"); if (oo != null) { n.onPressOut = oo }
+}
+// Wire media events (Image/Video): onLoad/onError/onEnd fire once; onProgress streams a time.
+function applyMediaEvents(n: Node, p: map[string]Prop): void {
+    const ld: Prop? = p.get("onLoad"); if (ld != null) { n.onLoad = ld }
+    const er: Prop? = p.get("onError"); if (er != null) { n.onError = er }
+    const en: Prop? = p.get("onEnd"); if (en != null) { n.onEnd = en }
+    const pr: Prop? = p.get("onProgress"); if (pr != null) { n.onProgress = pr }
 }
 /**
  * A horizontal row (flex-direction: row): lays its children left-to-right.
@@ -360,7 +469,12 @@ export function View(p: map[string]Prop, kids: []Node): Node {
  */
 export function Text(p: map[string]Prop, t: string): Node {
     const s: Style = new Style(); applyLayout(s, p)
-    return mkText(s, t)
+    s.nlines = pInt(p, "numberOfLines", -1)          // cap lines (truncates the overflow)
+    s.ellip = pStr(p, "ellipsizeMode", "")           // "tail"|"head"|"middle"|"clip"
+    if (pBool(p, "selectable", false)) { s.selectable = 1 }   // user can select/copy the text
+    const n: Node = mkText(s, t)
+    applyEvents(n, p)                                 // onPress makes the text tappable (a link)
+    return n
 }
 /**
  * A circular icon backed by an SF Symbol.
@@ -381,10 +495,32 @@ export function Text(p: map[string]Prop, t: string): Node {
  * Video({ src: "sample.mp4", h: 320, radius: 12 })
  * ```
  */
+/**
+ * A video surface. Controllable like RN's Video so you can compose a feed: put one in
+ * each cell of a paging List and drive `playing` from the visible index.
+ * Props: `src` (bundled name, "file://…", or http(s) URL), `playing` (default true),
+ * `loop` (default true), `muted` (default true), `resizeMode` ("cover" | "contain").
+ */
 export function Video(p: map[string]Prop): Node {
     const s: Style = new Style(); applyLayout(s, p)
     s.vid = pStr(p, "src", "")
-    return new Node("Video", s, "", [])
+    // Always set (default on) so these are emitted for every Video and stay controllable.
+    s.vidPlay = pBool(p, "playing", true) ? 1 : 0
+    s.vidLoop = pBool(p, "loop", true) ? 1 : 0
+    s.vidMute = pBool(p, "muted", true) ? 1 : 0
+    s.vidFit = pStr(p, "resizeMode", "cover")
+    s.seekTo = pInt(p, "seek", -1)                        // seek to N seconds when this changes
+    s.vidVol = pInt(p, "volume", -1)                      // 0-100
+    s.vidRate = pInt(p, "rate", -1)                       // playback speed percent (100 = 1x)
+    const controls: bool = pBool(p, "controls", false)
+    if (p.get("controls") != null) { s.vidCtrls = controls ? 1 : 0 }
+    // A video with `controls` renders the platform's full native player UI (transport, scrubber,
+    // fullscreen, AirPlay, PiP, subtitle/audio menus), so it's a distinct kind the host maps to
+    // AVPlayerViewController / VideoPlayer / a MediaController-backed view.
+    // The node text carries an optional `poster` image URL shown until the first frame plays.
+    const n: Node = new Node(controls ? "VideoControls" : "Video", s, pStr(p, "poster", ""), [])
+    applyMediaEvents(n, p)                                // onLoad / onEnd / onProgress
+    return n
 }
 export function Icon(p: map[string]Prop): Node {
     const s: Style = new Style()
@@ -410,9 +546,14 @@ export function Image(p: map[string]Prop): Node {
     const s: Style = new Style()
     s.resize = pStr(p, "resize", "cover")
     s.bg = pStr(p, "bg", "")
+    s.tint = pStr(p, "tintColor", "")                     // recolor a template image
+    s.blur = pInt(p, "blurRadius", -1)                    // blur the image (px)
+    if (pBool(p, "spinner", false)) { s.spinner = 1 }     // show a loading spinner until it loads
     if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
     applyLayout(s, p)
-    return new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
+    const n: Node = new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
+    applyMediaEvents(n, p)                                // onLoad / onError
+    return n
 }
 /**
  * A container whose BACKGROUND is a remote image, with `kids` rendered on top
@@ -477,6 +618,7 @@ export function CameraView(p: map[string]Prop): Node {
  */
 export function Button(p: map[string]Prop, t: string): Node {
     const s: Style = new Style(); s.fw = "bold"; applyLayout(s, p)
+    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     const n: Node = mkButton(s, t); applyEvents(n, p); return n
 }
 /**
@@ -499,11 +641,18 @@ export function Pill(p: map[string]Prop, t: string): Node {
  * A single-line text field. Pass `onChange` as a (string) -> void closure that
  * receives the current text on every edit. Renders as a light field by default.
  *
- * Props: `placeholder`, `onChange`, `bg` (default white "FFFFFF"), `color`, `h`.
+ * Props: `placeholder`, `value` (controlled), `onChange` ((string) -> void),
+ * `onSubmit` (() -> void, return key), `onFocus`, `onBlur`, `keyboardType`
+ * ("email"|"number"|"decimal"|"phone"|"url"), `returnKeyType`
+ * ("done"|"send"|"search"|"next"|"go"), `secure`, `multiline`, `editable` (default
+ * true), `autoFocus`, `maxLength`, `autoCapitalize` ("none"|"sentences"|"words"|
+ * "characters"), `autoCorrect`, `bg`, `color`, `h`.
  *
  * ```chuks
- * TextInput({ placeholder: "Filter services",
- *             onChange: function(v: string): void { self.setQuery(v) } })
+ * // Controlled: the field always shows `draft`; clear it by setting draft to "".
+ * TextInput({ value: draft.get(), keyboardType: "email", returnKeyType: "send",
+ *             onChange: function(v: string): void { draft.set(v) },
+ *             onSubmit: function(): void { send() } })
  * ```
  */
 export function TextInput(p: map[string]Prop): Node {
@@ -512,8 +661,21 @@ export function TextInput(p: map[string]Prop): Node {
     s.h = pInt(p, "h", multi ? 96 : 44); s.bg = pStr(p, "bg", "FFFFFF"); s.radius = 10
     s.fg = pStr(p, "color", "111318"); s.fs = 15; applyLayout(s, p)
     if (pBool(p, "secure", false)) { s.sec = 1 }    // password field: mask input
+    s.kbType = pStr(p, "keyboardType", "")
+    s.retKey = pStr(p, "returnKeyType", "")
+    if (p.get("editable") != null) { s.editable = pBool(p, "editable", true) ? 1 : 0 }
+    if (p.get("autoFocus") != null) { s.autoFocus = pBool(p, "autoFocus", false) ? 1 : 0 }
+    s.autoCap = pStr(p, "autoCapitalize", "")
+    if (p.get("autoCorrect") != null) { s.autoCorr = pBool(p, "autoCorrect", true) ? 1 : 0 }
+    s.maxLen = pInt(p, "maxLength", -1)
     // multiline swaps the native widget (UITextView / TextEditor / multiline EditText)
     const n: Node = multi ? mkTextArea(s, pStr(p, "placeholder", "")) : mkInput(s, pStr(p, "placeholder", ""))
+    // Controlled value: mark it so the reconciler emits the V| channel and the host
+    // mirrors the field to it (only when it differs, so the cursor never jumps).
+    if (p.get("value") != null) { n.hasVal = true; n.val = pStr(p, "value", "") }
+    n.onSubmit = p.get("onSubmit")
+    n.onFocus = p.get("onFocus")
+    n.onBlur = p.get("onBlur")
     applyEvents(n, p); return n
 }
 /**
@@ -571,6 +733,10 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
     const orf: Prop? = p.get("onRefresh")
     if (orf != null) { s.rfsh = pBool(p, "refreshing", false) ? 1 : 0 }
+    // stickBottom: a chat transcript stays pinned to the newest message. The host keeps the
+    // scroll at the bottom when content grows or the keyboard opens, unless the user has
+    // scrolled up to read history.
+    if (pBool(p, "stickBottom", false)) { s.stick = 1 }
     const n: Node = new Node("Scroll", s, "", kids)
     if (orf != null) { n.onPress = orf }
     return n
@@ -592,9 +758,12 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
 export function Pressable(p: map[string]Prop, kids: []Node): Node {
     const s: Style = new Style(); s.dir = "col"
     s.press = pInt(p, "activeOpacity", 60)
+    s.longDelay = pInt(p, "delayLongPress", -1)           // onLongPress hold time (ms)
+    s.hitSlop = pInt(p, "hitSlop", -1)                    // extra tappable px beyond the bounds
+    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     applyLayout(s, p)
     const n: Node = mkView(s, kids)
-    applyEvents(n, p)
+    applyEvents(n, p)   // onPress + onLongPress + onPressIn/onPressOut
     return n
 }
 /**
@@ -1035,6 +1204,11 @@ export function Screen(p: map[string]Prop, kids: []Node): Node {
  *   - `gap`       vertical gap between rows
  *   - `pad`       top/bottom padding (optional)
  *   - `buffer`    extra rows kept above/below the window (optional, default 3)
+ *   - `paging`    snap one full screen per swipe (video feeds)
+ *   - `onVisible` (rank: int) -> void    the centered row changed (autoplay-follows-visible)
+ *   - `onEndReached` () -> void + `endThreshold` (rows)   fire near the end (infinite scroll)
+ *   - `onRefresh` () -> void + `refreshing` (bool)        pull-to-refresh + its spinner
+ *   - `empty`     (height: int) -> Node                   shown (filling the viewport) when count == 0
  *
  * Identity comes from `key()` (NOT the rank), so a row's views and state survive
  * when a filter moves it to a different position.
@@ -1148,22 +1322,38 @@ export class Reconciler {
     var handlers: map[string]any    // node id -> onPress/onChange closure (events)
     var vpTop: int                  // viewport (set by the host each scroll) for List windowing
     var vpH: int
+    var vpW: int                    // cross-axis viewport size (list width for a vertical list; grid columns)
     var rootPrev: Node?             // last rendered root, for diffing
     var itemNodes: map[string]Node  // List cell id -> last node it showed (for reconcile prev)
     var mounted: []string           // List cell ids in use this frame
     var listCount: int              // last content count (to re-emit content height only on change)
+    var listContentH: int           // last content height emitted (re-emit when it changes: count/header/footer)
+    var listHeaderShown: map[string]bool  // List id -> header node currently mounted
+    var listFooterShown: map[string]bool  // List id -> footer node currently mounted
     var cellRank: map[string]int    // recycling: cell id -> the row rank it currently shows (-1 = free)
     var poolSize: int               // recycling: how many pool cells have been created
     var pending: map[string]any     // async bridge: token -> result closure (survives frames, unlike handlers)
     var pendingErr: map[string]any  // async bridge: token -> OPTIONAL error closure (host reports a failure)
     var streamTokens: map[string]bool // async bridge: token -> true if a STREAM (fires repeatedly; not dropped on fire)
     var tokenSeq: int               // async bridge: monotonic token counter
+    var listVisible: map[string]int // List id -> last centered row index reported to its onVisible
+    var pendingVisible: []any       // onVisible closures queued this frame, fired after render (see flushVisible)
+    var listEndFired: map[string]int // List id -> count at which onEndReached last fired (fire once per count)
+    var listRefreshing: map[string]int // List id -> last refreshing flag emitted (diff the spinner)
+    var listEmpty: map[string]bool   // List id -> whether the empty-state node is currently mounted
+    var listScrollIdx: map[string]int // List id -> last scrollToIndex target emitted (fire on change)
+    var listScrollEnd: map[string]int // List id -> last scrollToEnd nonce emitted (fire on change)
+    var listScrollPos: map[string]int // List id -> last scroll offset reported to its onScroll
     constructor() {
         this.lines = []; this.handlers = {}
-        this.vpTop = 0; this.vpH = 0; this.rootPrev = null
+        this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
         this.cellRank = {}; this.poolSize = 0
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
+        this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
+        this.listRefreshing = {}; this.listEmpty = {}; this.listContentH = -1
+        this.listHeaderShown = {}; this.listFooterShown = {}
+        this.listScrollIdx = {}; this.listScrollEnd = {}; this.listScrollPos = {}
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1183,7 +1373,18 @@ export class Reconciler {
     // Join the buffered mutations into the newline-delimited stream the host applies.
     public drain(): string { return this.lines.join("\n") }
     // Record the visible scroll window used by reconcileList to pick the mount range.
-    public setViewport(top: int, h: int): void { this.vpTop = top; this.vpH = h }
+    public setViewport(top: int, h: int, w: int): void { this.vpTop = top; this.vpH = h; if (w > 0) { this.vpW = w } }
+    // Fire any onVisible callbacks queued during this render (a paging List's centered row
+    // changed). Called AFTER renderRoot so the closures can setState safely; returns true if
+    // any fired, so the caller re-renders to reflect the new state (e.g. play the settled cell).
+    public flushVisible(): bool {
+        if (this.pendingVisible.length == 0) { return false }
+        const cbs: []any = this.pendingVisible
+        this.pendingVisible = []
+        var i: int = 0
+        while (i < cbs.length) { const cb: any = cbs[i]; cb(); i = i + 1 }
+        return true
+    }
     // Reconcile the whole app tree from the root; the app calls this after any
     // state change and the memoization makes everything unchanged bail.
     public renderRoot(next: Node): void {
@@ -1288,6 +1489,17 @@ export class Reconciler {
         if (n.onPress != null) { this.handlers[id] = n.onPress; this.emit("T|" + id + "|" + id) }
         else if (n.onChange != null) { this.handlers[id] = n.onChange; this.emit("T|" + id + "|" + id) }
         else if (n.action != "") { this.emit("T|" + id + "|" + n.action) }
+        // Extra TextInput events, each a separate binding keyed by "<id>:<event>".
+        if (n.onSubmit != null) { this.handlers[id + ":submit"] = n.onSubmit; this.emit("TS|" + id) }
+        if (n.onFocus != null) { this.handlers[id + ":focus"] = n.onFocus; this.emit("TF|" + id) }
+        if (n.onBlur != null) { this.handlers[id + ":blur"] = n.onBlur; this.emit("TB|" + id) }
+        if (n.onLongPress != null) { this.handlers[id + ":longpress"] = n.onLongPress; this.emit("TL|" + id) }
+        if (n.onPressIn != null) { this.handlers[id + ":pressin"] = n.onPressIn; this.emit("TPI|" + id) }
+        if (n.onPressOut != null) { this.handlers[id + ":pressout"] = n.onPressOut; this.emit("TPO|" + id) }
+        if (n.onLoad != null) { this.handlers[id + ":load"] = n.onLoad; this.emit("ML|" + id) }
+        if (n.onError != null) { this.handlers[id + ":error"] = n.onError; this.emit("ME|" + id) }
+        if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
+        if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1311,6 +1523,7 @@ export class Reconciler {
         const st: string = n.style.str()
         if (st != "") { this.emit("S|" + id + "|" + st) }
         if (n.text != "") { this.emit("P|" + id + "|" + n.text) }
+        if (n.hasVal) { this.emit("V|" + id + "|" + n.val) }   // controlled TextInput value
         this.bindEvents(n, id)
         this.emit("I|" + id + "|" + parent + "|" + string(index))
         for (var i: int = 0; i < n.kids.length; i = i + 1) {
@@ -1344,6 +1557,7 @@ export class Reconciler {
         if (next.kind == "List") { this.reconcileList(prev, next, id, parent, index); return }
         if (next.kind == "SectionList") { this.reconcileSectionList(prev, next, id, parent, index); return }
         if (p.text != next.text) { this.emit("P|" + id + "|" + next.text) }
+        if (next.hasVal && (!p.hasVal || p.val != next.val)) { this.emit("V|" + id + "|" + next.val) }
         const ps: string = p.style.str()
         const ns: string = next.style.str()
         if (ps != ns) { this.emit("S|" + id + "|" + ns) }
@@ -1359,6 +1573,16 @@ export class Reconciler {
         // the closure is recreated each render; rebind it (tag/id unchanged)
         if (next.onPress != null) { this.handlers[id] = next.onPress }
         else if (next.onChange != null) { this.handlers[id] = next.onChange }
+        if (next.onSubmit != null) { this.handlers[id + ":submit"] = next.onSubmit }
+        if (next.onFocus != null) { this.handlers[id + ":focus"] = next.onFocus }
+        if (next.onBlur != null) { this.handlers[id + ":blur"] = next.onBlur }
+        if (next.onLongPress != null) { this.handlers[id + ":longpress"] = next.onLongPress }
+        if (next.onPressIn != null) { this.handlers[id + ":pressin"] = next.onPressIn }
+        if (next.onPressOut != null) { this.handlers[id + ":pressout"] = next.onPressOut }
+        if (next.onLoad != null) { this.handlers[id + ":load"] = next.onLoad }
+        if (next.onError != null) { this.handlers[id + ":error"] = next.onError }
+        if (next.onEnd != null) { this.handlers[id + ":end"] = next.onEnd }
+        if (next.onProgress != null) { this.handlers[id + ":progress"] = next.onProgress }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)
@@ -1379,6 +1603,8 @@ export class Reconciler {
     // rest. Item identity comes from key(rank), so a row survives when a filter
     // moves it to a different rank (its id "c<key>" is stable, only its top moves).
     reconcileList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        const d0: map[string]ListProp = next.data
+        if (lpBool(d0, "horizontal", false)) { this.reconcileHList(prev, next, id, parent, index); return }
         const d: map[string]ListProp = next.data
         const count: int = lpInt(d, "count", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
@@ -1388,30 +1614,64 @@ export class Reconciler {
         const buffer: int = lpInt(d, "buffer", 3)
         const itemFn: any = d.get("item")
         const contentId: string = id + ".0"
-        const contentH: int = pad + count * stride + pad
+        // Optional header/footer offset the rows. headerH/footerH default 0, so a feed
+        // without them lays out exactly as before (the video feed is unaffected).
+        const headerH: int = lpInt(d, "headerHeight", 0)
+        const footerH: int = lpInt(d, "footerHeight", 0)
+        const rowsTop: int = pad + headerH               // where the first row sits
+        // inverted (chat): row 0 sits at the BOTTOM and later rows stack upward, so a
+        // freshly-appended row 0 (newest) shows at the bottom. `invBase` is row 0's top;
+        // top(r) = invBase - r*stride. Default off, so a feed lays out exactly as before.
+        const inverted: bool = lpBool(d, "inverted", false)
+        // numColumns (grid): pack `ncol` cells per row across the list WIDTH (reported by the
+        // host as vpW). The reconciler computes each cell's column width + x and overrides them
+        // on the item node, so the app's item builder need not know the layout. ncol defaults
+        // to 1 (a plain list); grids are non-inverted, so inverted forces ncol back to 1.
+        const ncol0: int = lpInt(d, "numColumns", 1)
+        const ncol: int = (inverted || ncol0 < 1) ? 1 : ncol0
+        const gridRows: int = (count + ncol - 1) / ncol   // rows of `ncol` cells; == count when ncol==1
+        var colW: int = 0
+        if (ncol > 1 && this.vpW > 0) { colW = (this.vpW - 2 * pad - (ncol - 1) * gap) / ncol }
+        const contentH: int = rowsTop + gridRows * stride + footerH + pad
+        const invBase: int = contentH - pad - footerH - rowH
 
         if (prev == null) {
             // fresh mount (first render, or remount after a page swap tore this List
             // down): start from a clean pool so stale cells can't suppress mounts.
             this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
             const listS: Style = new Style(); listS.grow = 1; listS.basis = 0
+            if (lpBool(d, "paging", false)) { listS.paging = 1 }   // snap per screen (video feeds)
             this.emit("C|" + id + "|Scroll"); this.emit("S|" + id + "|" + listS.str())
             this.emit("I|" + id + "|" + parent + "|" + string(index))
             const cS: Style = new Style(); cS.h = contentH
             this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
             this.emit("I|" + contentId + "|" + id + "|0")
-            this.listCount = count
-        } else if (count != this.listCount) {
+            this.listCount = count; this.listContentH = contentH
+        } else if (contentH != this.listContentH) {   // count, header, or footer changed the height
             const cS: Style = new Style(); cS.h = contentH
             this.emit("S|" + contentId + "|" + cS.str())
-            this.listCount = count
+            this.listCount = count; this.listContentH = contentH
         }
 
-        var r0: int = (this.vpTop - pad) / stride - buffer
-        if (r0 < 0) { r0 = 0 }
-        var r1: int = (this.vpTop + this.vpH - pad) / stride + buffer + 1
+        // Which rows fall in the viewport (± buffer). Inverted flips the mapping: top
+        // decreases as r grows, so the near/far viewport edges swap which r they bound.
+        // Window on GRID ROWS (each holds `ncol` cells), then expand to item ranks. For a plain
+        // list ncol==1, so a grid row is a row and this is unchanged.
+        var gr0: int = 0
+        var gr1: int = 0
+        if (inverted) {
+            gr0 = (invBase - (this.vpTop + this.vpH)) / stride - buffer
+            gr1 = (invBase - this.vpTop) / stride + buffer + 1
+        } else {
+            gr0 = (this.vpTop - rowsTop) / stride - buffer
+            gr1 = (this.vpTop + this.vpH - rowsTop) / stride + buffer + 1
+        }
+        if (gr0 < 0) { gr0 = 0 }
+        if (gr1 > gridRows) { gr1 = gridRows }
+        if (gr1 < gr0) { gr1 = gr0 }
+        var r0: int = gr0 * ncol
+        var r1: int = gr1 * ncol
         if (r1 > count) { r1 = count }
-        if (r1 < r0) { r1 = r0 }
 
         // ---- VIEW RECYCLING (the FlashList trick) --------------------------------
         // A fixed POOL of cell views ("<content>.cell<i>"). On scroll we don't destroy
@@ -1436,8 +1696,17 @@ export class Reconciler {
             if (kept != null) { cid = kept }                  // this row is already on a cell: reuse in place
             else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }   // recycle a leaving cell
             else { cid = contentId + ".cell" + string(this.poolSize); this.poolSize = this.poolSize + 1 }  // grow the pool
-            const top: int = pad + r * stride
+            const gridRow: int = r / ncol
+            const top: int = inverted ? invBase - r * stride : rowsTop + gridRow * stride
             const node: Node = itemFn(r, top)
+            // Grid: the list owns each cell's column x + width; override them on the node so the
+            // app's item builder stays layout-agnostic. `right` is cleared so width wins.
+            if (ncol > 1 && colW > 0) {
+                const col: int = r % ncol
+                node.style.left = pad + col * (colW + gap)
+                node.style.w = colW
+                node.style.right = -1
+            }
             const pn: Node? = this.itemNodes.get(cid)         // the node this cell last showed (null on first use)
             this.reconcile(pn, node, cid, contentId, 0)       // diff -> minimal S|/P|, no C|/R| when recycling
             this.itemNodes[cid] = node
@@ -1448,6 +1717,234 @@ export class Reconciler {
         // stale top — reusable next frame. They keep their cellRank, so if that rank
         // scrolls back in they're kept in place. No churn.
         this.mounted = newMounted
+
+        // onVisible: report the centered row (the one under the middle of the viewport) when
+        // it changes, so a feed can set that cell's Video playing = true. Queued, not called
+        // inline, so the closure's setState runs after this render (see flushVisible).
+        const vf: any = d.get("onVisible")
+        if (vf != null && count > 0 && stride > 0) {
+            var centered: int = inverted ? (invBase - (this.vpTop + this.vpH / 2)) / stride : (this.vpTop + this.vpH / 2 - rowsTop) / stride
+            if (centered < 0) { centered = 0 }
+            if (centered >= count) { centered = count - 1 }
+            if (centered != this.listVisible.getOr(id, -1)) {
+                this.listVisible[id] = centered
+                const idx: int = centered
+                this.pendingVisible.push(function(): void { vf(idx) })
+            }
+        }
+        // onEndReached: infinite scroll. Fire when the last visible row reaches within
+        // `endThreshold` of the end. Fired once per `count` (recorded in listEndFired), so a
+        // steady view at the bottom doesn't spam it; when the app appends data (count grows)
+        // it can fire again. Queued like onVisible so its setState runs after this render.
+        const ef: any = d.get("onEndReached")
+        if (ef != null && count > 0 && stride > 0) {
+            const threshold: int = lpInt(d, "endThreshold", 0)
+            // The "end" is the far edge of the data: the bottom row normally, or the TOP row
+            // when inverted (a chat scrolling up to load older messages). In a grid the last
+            // visible GRID ROW covers up to `ncol` ranks, so convert to the last visible rank.
+            const lastGridRow: int = inverted ? (invBase - this.vpTop) / stride : (this.vpTop + this.vpH - rowsTop) / stride
+            const lastVisible: int = ncol > 1 ? (lastGridRow + 1) * ncol - 1 : lastGridRow
+            if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
+                this.listEndFired[id] = count
+                this.pendingVisible.push(function(): void { ef() })
+            }
+        }
+        // onRefresh: pull-to-refresh on the List's own scroll (reuses the Scroll path). The
+        // parent owns `refreshing` and clears it when the work is done to stop the spinner.
+        const rf: any = d.get("onRefresh")
+        if (rf != null) {
+            this.handlers[id] = rf
+            const refreshing: int = lpBool(d, "refreshing", false) ? 1 : 0
+            const prevR: int = this.listRefreshing.getOr(id, -2)
+            if (prevR == -2) { this.emit("T|" + id + "|" + id) }   // enable the refresh control once
+            if (refreshing != prevR) {
+                this.listRefreshing[id] = refreshing
+                const rS: Style = new Style(); rS.rfsh = refreshing
+                this.emit("S|" + id + "|" + rS.str())
+            }
+        }
+        // empty: when there are no rows, render the empty-state node (filled to the viewport
+        // height) in place of the list; remove it once rows arrive.
+        const emptyFn: any = d.get("empty")
+        const emptyId: string = contentId + ".empty"
+        if (count == 0 && emptyFn != null) {
+            const enode: Node = emptyFn(this.vpH)
+            const pe: Node? = this.itemNodes.get(emptyId)
+            this.reconcile(pe, enode, emptyId, contentId, 0)
+            this.itemNodes[emptyId] = enode
+        } else if (this.itemNodes.has(emptyId)) {
+            this.emit("R|" + emptyId); this.itemNodes.delete(emptyId)
+        }
+        // header / footer: absolutely-positioned nodes above the rows (top = pad) and below
+        // them (top = rowsTop + count*stride). The app positions its node with abs+top like a row.
+        const headerFn: any = d.get("header")
+        const headerId: string = contentId + ".header"
+        if (headerFn != null) {
+            const hnode: Node = headerFn(pad)
+            this.reconcile(this.itemNodes.get(headerId), hnode, headerId, contentId, 0)
+            this.itemNodes[headerId] = hnode; this.listHeaderShown[id] = true
+        } else if (this.listHeaderShown.getOr(id, false)) {
+            this.emit("R|" + headerId); this.itemNodes.delete(headerId); this.listHeaderShown[id] = false
+        }
+        const footerFn: any = d.get("footer")
+        const footerId: string = contentId + ".footer"
+        if (footerFn != null) {
+            const fnode: Node = footerFn(rowsTop + count * stride)
+            this.reconcile(this.itemNodes.get(footerId), fnode, footerId, contentId, 0)
+            this.itemNodes[footerId] = fnode; this.listFooterShown[id] = true
+        } else if (this.listFooterShown.getOr(id, false)) {
+            this.emit("R|" + footerId); this.itemNodes.delete(footerId); this.listFooterShown[id] = false
+        }
+        // scrollToIndex / scrollToEnd: imperative-style scroll via the declarative model. The
+        // host scrolls the list to a content-offset (LS|id|y), animated. scrollToIndex brings
+        // that row to the top (below the header); it re-fires when the value changes. scrollToEnd
+        // is a NONCE (bump it to re-pin to newest, e.g. on each appended chat message) and scrolls
+        // to the very bottom using the just-computed contentH, so it lands after any new rows.
+        const sti: int = lpInt(d, "scrollToIndex", -1)
+        if (sti >= 0 && sti != this.listScrollIdx.getOr(id, -999)) {
+            this.listScrollIdx[id] = sti
+            const stiY: int = inverted ? invBase - sti * stride : rowsTop + sti * stride
+            this.emit("LS|" + id + "|" + string(stiY))
+        }
+        const ste: int = lpInt(d, "scrollToEnd", 0)
+        if (ste != this.listScrollEnd.getOr(id, 0)) {
+            this.listScrollEnd[id] = ste
+            var endY: int = contentH - this.vpH
+            if (endY < 0) { endY = 0 }
+            this.emit("LS|" + id + "|" + string(endY))
+        }
+        // inverted: on first mount, land at the bottom (row 0 = newest). Tracked via
+        // listScrollEnd so we don't re-scroll every frame; the app bumps `scrollToEnd` to
+        // re-pin to newest after that. (contentH - vpH; the host clamps to the real max.)
+        if (inverted && prev == null) {
+            this.listScrollEnd[id] = lpInt(d, "scrollToEnd", 0)
+            var invY: int = contentH - this.vpH
+            if (invY < 0) { invY = 0 }
+            this.emit("LS|" + id + "|" + string(invY))
+        }
+        // onScroll: report the scroll offset (points) whenever it changes, so an app can drive
+        // a parallax header, a scroll-to-top button, etc. Queued like onVisible (fired after
+        // render); opt-in, so a list without onScroll pays nothing.
+        const osf: any = d.get("onScroll")
+        if (osf != null && this.vpTop != this.listScrollPos.getOr(id, -1)) {
+            this.listScrollPos[id] = this.vpTop
+            const off: int = this.vpTop
+            this.pendingVisible.push(function(): void { osf(off) })
+        }
+    }
+
+    // A HORIZONTAL virtualized list (a carousel / story reel). Same windowed cell-recycling
+    // as reconcileList, but the main axis is x: the host scrolls sideways and reports its
+    // x-offset + width as the scroll window (vpTop/vpH), so the windowing math is unchanged;
+    // only the layout flips. Cells fill the list HEIGHT (the app sizes the cross axis) and the
+    // reconciler places each at its x (left) with a fixed `itemWidth`.
+    reconcileHList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        const d: map[string]ListProp = next.data
+        const count: int = lpInt(d, "count", 0)
+        const itemW: int = lpInt(d, "itemWidth", 0)
+        const gap: int = lpInt(d, "gap", 0)
+        const pad: int = lpInt(d, "pad", 0)
+        const stride: int = itemW + gap
+        const buffer: int = lpInt(d, "buffer", 3)
+        const itemFn: any = d.get("item")
+        const contentId: string = id + ".0"
+        const leftStart: int = pad
+        const contentW: int = leftStart + count * stride + pad
+
+        if (prev == null) {
+            this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
+            const listS: Style = new Style(); listS.grow = 1; listS.basis = 0; listS.horiz = 1
+            if (lpBool(d, "paging", false)) { listS.paging = 1 }   // snap one item per screen
+            // A distinct kind so a host that needs a different scroll class for the x-axis
+            // (Android's HorizontalScrollView) creates the right view; the `horiz` style tells
+            // the others (UIKit/SwiftUI reuse their vertical scroll view on the x-axis).
+            this.emit("C|" + id + "|HScroll"); this.emit("S|" + id + "|" + listS.str())
+            this.emit("I|" + id + "|" + parent + "|" + string(index))
+            const cS: Style = new Style(); cS.w = contentW           // content is WIDE; height fills
+            this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
+            this.emit("I|" + contentId + "|" + id + "|0")
+            this.listCount = count; this.listContentH = contentW
+        } else if (contentW != this.listContentH) {
+            const cS: Style = new Style(); cS.w = contentW
+            this.emit("S|" + contentId + "|" + cS.str())
+            this.listCount = count; this.listContentH = contentW
+        }
+
+        var c0: int = (this.vpTop - leftStart) / stride - buffer
+        if (c0 < 0) { c0 = 0 }
+        var c1: int = (this.vpTop + this.vpH - leftStart) / stride + buffer + 1
+        if (c1 > count) { c1 = count }
+        if (c1 < c0) { c1 = c0 }
+
+        var freeCells: []string = []
+        var rankCell: map[string]string = {}
+        for (var i: int = 0; i < this.poolSize; i = i + 1) {
+            const cid: string = contentId + ".cell" + string(i)
+            const cr: int = this.cellRank.getOr(cid, -1)
+            if (cr >= c0 && cr < c1) { rankCell[string(cr)] = cid } else { freeCells.push(cid) }
+        }
+
+        const newMounted: []string = []
+        var fi: int = 0
+        for (var c: int = c0; c < c1; c = c + 1) {
+            var cid: string = ""
+            const kept: string? = rankCell.get(string(c))
+            if (kept != null) { cid = kept }
+            else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }
+            else { cid = contentId + ".cell" + string(this.poolSize); this.poolSize = this.poolSize + 1 }
+            const left: int = leftStart + c * stride
+            const node: Node = itemFn(c, pad)                 // pass the cross-axis top (pad); we own x
+            node.style.left = left; node.style.w = itemW; node.style.right = -1
+            const pn: Node? = this.itemNodes.get(cid)
+            this.reconcile(pn, node, cid, contentId, 0)
+            this.itemNodes[cid] = node
+            this.cellRank[cid] = c
+            newMounted.push(cid)
+        }
+        this.mounted = newMounted
+
+        // onVisible: the item under the horizontal center.
+        const vf: any = d.get("onVisible")
+        if (vf != null && count > 0 && stride > 0) {
+            var centered: int = (this.vpTop + this.vpH / 2 - leftStart) / stride
+            if (centered < 0) { centered = 0 }
+            if (centered >= count) { centered = count - 1 }
+            if (centered != this.listVisible.getOr(id, -1)) {
+                this.listVisible[id] = centered
+                const idx: int = centered
+                this.pendingVisible.push(function(): void { vf(idx) })
+            }
+        }
+        // onEndReached: near the right edge.
+        const ef: any = d.get("onEndReached")
+        if (ef != null && count > 0 && stride > 0) {
+            const threshold: int = lpInt(d, "endThreshold", 0)
+            const lastVisible: int = (this.vpTop + this.vpH - leftStart) / stride
+            if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
+                this.listEndFired[id] = count
+                this.pendingVisible.push(function(): void { ef() })
+            }
+        }
+        // scrollToIndex / scrollToEnd along x (reuses the LS command; host reports/moves x).
+        const sti: int = lpInt(d, "scrollToIndex", -1)
+        if (sti >= 0 && sti != this.listScrollIdx.getOr(id, -999)) {
+            this.listScrollIdx[id] = sti
+            this.emit("LS|" + id + "|" + string(leftStart + sti * stride))
+        }
+        const ste: int = lpInt(d, "scrollToEnd", 0)
+        if (ste != this.listScrollEnd.getOr(id, 0)) {
+            this.listScrollEnd[id] = ste
+            var endX: int = contentW - this.vpH
+            if (endX < 0) { endX = 0 }
+            this.emit("LS|" + id + "|" + string(endX))
+        }
+        // onScroll: report the x offset when it changes.
+        const osf: any = d.get("onScroll")
+        if (osf != null && this.vpTop != this.listScrollPos.getOr(id, -1)) {
+            this.listScrollPos[id] = this.vpTop
+            const off: int = this.vpTop
+            this.pendingVisible.push(function(): void { osf(off) })
+        }
     }
 
     // Like reconcileList but SECTIONED: sections each contribute a header (headerH)
@@ -1548,6 +2045,57 @@ export class Reconciler {
 // can reach the reconciler to enqueue an async command. One app instance exists.
 var HOST: App? = null
 
+// ─── Background → render-thread dispatch ─────────────────────────────────────
+// Chuks is multithreaded: a spawned task (a WebSocket read pump, a download, a
+// timer) runs on its own coroutine and must NOT touch useState or the reconciler
+// directly (those are only safe on the render thread, and the cell map is not
+// locked). Instead it hands a closure to dispatchAsync(); the closure is queued
+// under a lock and RUN on the render thread at the start of the next host entry
+// point, where mutating state is safe. wakeHost() asks the native host to tick
+// immediately so the closure paints within a frame instead of waiting for the
+// idle heartbeat.
+@threadSafe
+class AsyncQueue {
+    var _q: []function(): void
+    constructor() { this._q = [] }
+    public post(fn: function(): void): void {
+        lock (this) { this._q.push(fn) }
+        wakeHost()
+    }
+    // Atomically swap out the pending closures; they are run OUTSIDE the lock (by
+    // runAsyncQueue) so a closure that posts again cannot deadlock on the
+    // non-reentrant lock.
+    public take(): []function(): void {
+        var out: []function(): void = []
+        lock (this) { out = this._q; this._q = [] }
+        return out
+    }
+    public pending(): int { var n: int = 0; lock (this) { n = this._q.length }; return n }
+}
+
+var ASYNC: AsyncQueue = new AsyncQueue()
+
+// Hand a result back to the render thread from a spawned task. The closure runs on
+// the render thread at the next host entry point, so it may safely touch useState:
+//   c.onMessage(function(m: string): void { dispatchAsync(function(): void { msgs.set(...) }) })
+export function dispatchAsync(fn: function(): void): void { ASYNC.post(fn) }
+
+// Queued-closure count (host heartbeat gating / diagnostics).
+export function asyncPending(): int { return ASYNC.pending() }
+
+// Run all queued closures on the CURRENT (render) thread, before the render that
+// follows, so their state changes are reflected this frame.
+function runAsyncQueue(): void {
+    var fns: []function(): void = ASYNC.take()
+    var i: int = 0
+    while (i < fns.length) { fns[i](); i = i + 1 }
+}
+
+// Ask the native host to call tick() promptly. Wired to the C-ABI wake callback via
+// a runtime builtin; until that lands (and on hosts that never register one) this is
+// a no-op and the host's idle heartbeat drains the queue instead.
+function wakeHost(): void { host.wake() }
+
 export class App {
     var recon: Reconciler
     constructor() { this.recon = new Reconciler(); HOST = this }
@@ -1569,39 +2117,54 @@ export class App {
     // Render the tree and emit the initial mutation stream. Returns mutation count.
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
     // reconnected by identity, and freed when a component leaves the tree.
-    public mount(): int { this.recon.begin(); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    public mount(): int { runAsyncQueue(); this.recon.begin(); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
     // Full re-mount: re-emit the entire current tree (state preserved). The dev server
     // calls this on every /mount so any host that connects or relaunches gets a complete
     // tree, not an empty diff against a tree it never received. Not called in production.
     public remount(): int { this.recon.forgetCommitted(); return this.mount() }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
-    public setViewport(top: int, h: int): int {
-        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+    public setViewport(top: int, h: int, w: int): int {
+        runAsyncQueue()
+        if (h > 0) { _vpH = h }   // expose the real viewport height (viewportHeight()) for full-screen feeds
+        if (w > 0) { _vpW = w }   // expose the list width (viewportWidth()) for grid column sizing
+        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h, w); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
+        // then re-render (WITHOUT begin, so the windowing mutations above are kept) so the newly
+        // visible cell's state change (e.g. Video playing) lands in the same frame.
+        if (this.recon.flushVisible()) {
+            hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        }
+        return this.recon.count()
     }
     // Advance one frame: onTick() then re-render. Returns the mutation count.
-    public tick(): int { this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    public tick(): int { runAsyncQueue(); this.recon.begin(); hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // A native input change arrived for node `tag`: fire its onChange(value), then re-render.
     public dispatchInput(tag: string, value: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // A native async result arrived for `token` (F3): fire the registered callback
     // with `payload`, then re-render. Mirrors dispatch, but keyed by an async token
     // rather than a UI node id.
     public resolve(token: string, payload: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // The host reports that `token` is dead (user dismissed the picker, native op
     // ended with no result). Drop it and re-render. Mirrors resolve, without a fire.
     public cancelToken(token: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // The host reports a FAILURE for `token` (permission denied, hardware missing,
     // native error). Fire the request's error callback and re-render.
     public failToken(token: string, message: string): int {
+        runAsyncQueue()
         this.recon.begin(); this.recon.failToken(token, message); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // Return the pending mutation stream as text and hand it to the host.

@@ -15,7 +15,7 @@ extern "C" {
 JNIEXPORT void  JNICALL J(setup)(JNIEnv* e, jobject, jint n) { chuks_set_count(n); }
 JNIEXPORT jint  JNICALL J(mount)(JNIEnv* e, jobject) { return chuks_mount(); }
 JNIEXPORT jint  JNICALL J(tick)(JNIEnv* e, jobject) { return chuks_tick(); }
-JNIEXPORT jint  JNICALL J(viewport)(JNIEnv* e, jobject, jint t, jint h) { return chuks_setViewport(t, h); }
+JNIEXPORT jint  JNICALL J(viewport)(JNIEnv* e, jobject, jint t, jint h, jint w) { return chuks_setViewport(t, h, w); }
 JNIEXPORT jstring JNICALL J(drain)(JNIEnv* e, jobject) {
     char* s = chuks_drain();
     jstring r = e->NewStringUTF(s);
@@ -65,6 +65,37 @@ JNIEXPORT void JNICALL J(setPlatform)(JNIEnv* e, jobject, jstring os, jstring ve
     e->ReleaseStringUTFChars(os, co);
     e->ReleaseStringUTFChars(ver, cv);
     e->ReleaseStringUTFChars(model, cm);
+}
+
+// ---- host wake ----
+// A background Chuks task calls host.wake() when it posts work to the render
+// thread; the engine invokes this trampoline (on the task's own thread). Attach
+// to the JVM and call the Kotlin static N.onNativeWake(), which hops to the UI
+// thread and ticks. Registered once from Kotlin via setWake().
+static JavaVM*   gWakeJVM   = nullptr;
+static jclass    gWakeClass = nullptr;   // global ref to com/chuks/app/N
+static jmethodID gWakeMid   = nullptr;   // onNativeWake()V (static)
+
+static void chuks_wake_trampoline() {
+    if (!gWakeJVM || !gWakeClass || !gWakeMid) return;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (gWakeJVM->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (gWakeJVM->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        attached = true;
+    }
+    env->CallStaticVoidMethod(gWakeClass, gWakeMid);
+    if (attached) gWakeJVM->DetachCurrentThread();
+}
+
+JNIEXPORT void JNICALL J(setWake)(JNIEnv* e, jobject) {
+    e->GetJavaVM(&gWakeJVM);
+    jclass cls = e->FindClass("com/chuks/app/N");
+    if (cls) {
+        gWakeClass = (jclass)e->NewGlobalRef(cls);
+        gWakeMid = e->GetStaticMethodID(gWakeClass, "onNativeWake", "()V");
+    }
+    chuks_set_wake(reinterpret_cast<void*>(chuks_wake_trampoline));
 }
 
 // ---- Yoga (handle-based) ----

@@ -12,6 +12,7 @@ import UIKit
 import MapKit
 import Foundation
 import AVFoundation
+import AVKit
 import WebKit
 import Photos
 import PhotosUI
@@ -26,6 +27,42 @@ import Security
 import Network
 import CoreBluetooth
 import CoreNFC
+
+// ===== Feed-grade image cache (shared by both iOS hosts) =====
+// Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
+// (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
+// re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
+// uncached SwiftUI AsyncImage.
+final class ChuksImageLoader {
+    static let shared = ChuksImageLoader()
+    private let mem = NSCache<NSString, UIImage>()
+    private let session: URLSession
+    init() {
+        mem.countLimit = 200                 // secondary bound
+        mem.totalCostLimit = 128 << 20       // primary bound: 128MB of decoded pixels, byte-accurate
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 20
+        c.requestCachePolicy = .returnCacheDataElseLoad
+        c.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 256 << 20, diskPath: "chuks-img")
+        session = URLSession(configuration: c)
+    }
+    func cached(_ url: String) -> UIImage? { mem.object(forKey: url as NSString) }
+    // done() is always called on the main thread with the decoded image.
+    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void, fail: (() -> Void)? = nil) {
+        if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
+        guard let url = URL(string: urlStr) else { DispatchQueue.main.async { fail?() }; return }
+        session.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data, let raw = UIImage(data: data) else { DispatchQueue.main.async { fail?() }; return }
+            // Thread-safe off-main decode (UIGraphicsImageRenderer is UIKit and NOT thread-safe
+            // off main — it corrupts UIKit state and crashes text drawing). preparingForDisplay
+            // is the designed-for-background decode API.
+            let img = raw.preparingForDisplay() ?? raw
+            let cost = Int(img.size.width * img.size.height * img.scale * img.scale) * 4  // ~bytes of the decoded bitmap
+            self?.mem.setObject(img, forKey: urlStr as NSString, cost: cost)
+            DispatchQueue.main.async { done(img) }
+        }.resume()
+    }
+}
 
 // ===== Bluetooth LE (CoreBluetooth) + NFC (CoreNFC): shared by both iOS hosts =====
 // Decoupled from the host via onResolve/onFail closures (set to the host's resolve/fail).
@@ -218,38 +255,163 @@ final class LoopingPlayerView: UIView {
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
     private var player: AVPlayer?
     private var looper: NSObjectProtocol?
+    private var statusObs: NSKeyValueObservation?
     private var currentSrc = ""
-    func configure(_ src: String) {
-        guard src != currentSrc, !src.isEmpty else { return }
-        // http(s) URL -> remote; otherwise a bundled asset (e.g. clip.mp4).
-        let url: URL? = src.hasPrefix("http") ? URL(string: src) : Bundle.main.url(forResource: src, withExtension: nil)
-        guard let url = url else { return }
-        teardown()
-        currentSrc = src
-        let item = AVPlayerItem(url: url)
-        let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
-        looper = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
-                                                        object: item, queue: .main) { [weak p] _ in
-            p?.seek(to: .zero); p?.play()
+    private var url: URL?
+    private var loop = true
+    private var wantPlaying = true
+    private var wantMuted = true
+    private var retries = 0
+    var onEnd: (() -> Void)?
+    var onProgress: ((Int) -> Void)?
+    var posterURL = ""
+    private var posterView: UIImageView?
+    private var readyObs: NSKeyValueObservation?
+    private var lastSeek = -1
+    private var lastSec = -1
+    private var progressObs: Any?
+    // Controllable like RN's Video: `playing`/`loop`/`muted`/`fit` apply on every update, so a
+    // recycled feed cell can pause/resume by flipping `playing`. Only a src change rebuilds the item.
+    func configure(_ src: String, playing: Bool, loop: Bool, muted: Bool, fit: String, seekTo: Int = -1, vol: Int = -1, rate: Int = -1) {
+        self.loop = loop; self.wantPlaying = playing; self.wantMuted = muted
+        if !posterURL.isEmpty && posterView == nil {   // poster shown until the first frame is ready
+            let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
+            iv.frame = bounds; iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            addSubview(iv); posterView = iv
+            ChuksImageLoader.shared.load(posterURL) { [weak iv] img in iv?.image = img }
+            readyObs = playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
+                if layer.isReadyForDisplay { self?.posterView?.removeFromSuperview(); self?.posterView = nil; self?.readyObs = nil }
+            }
         }
-        playerLayer.player = p
-        playerLayer.videoGravity = .resizeAspectFill
-        p.play(); player = p
+        playerLayer.videoGravity = (fit == "contain") ? .resizeAspect : .resizeAspectFill
+        if src != currentSrc, !src.isEmpty {
+            // http(s) -> remote; file:// -> a captured/downloaded file; else a bundled asset.
+            let u: URL? = src.hasPrefix("http") ? URL(string: src)
+                        : src.hasPrefix("file://") ? URL(fileURLWithPath: String(src.dropFirst(7)))
+                        : Bundle.main.url(forResource: src, withExtension: nil)
+            if let u = u { currentSrc = src; url = u; retries = 0; loadItem() }
+        }
+        player?.isMuted = muted
+        if vol >= 0 { player?.volume = Float(vol) / 100 }
+        if playing { player?.play(); if rate >= 0 { player?.rate = Float(rate) / 100 } } else { player?.pause() }
+        if seekTo >= 0 && seekTo != lastSeek { lastSeek = seekTo; player?.seek(to: CMTime(seconds: Double(seekTo), preferredTimescale: 600)) }
+    }
+    private func loadItem() {
+        guard let u = url else { return }
+        teardown()
+        let item = AVPlayerItem(url: u)
+        let p = AVPlayer(playerItem: item); p.actionAtItemEnd = .none
+        looper = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
+                                                        object: item, queue: .main) { [weak self, weak p] _ in
+            if self?.loop == true { p?.seek(to: .zero); p?.play() }
+            else { self?.onEnd?() }   // reached the end (not looping): onEnd
+        }
+        // Self-heal a failed load: a transient "network down" (the sim hits this at launch, and
+        // Self-heal a FAILED load: a transient network error leaves the item .failed and the
+        // card black forever, so recreate it with a short backoff a few times. (This does not
+        // touch a slow-but-still-loading item, so it never interrupts a working slow connection.)
+        statusObs = item.observe(\.status, options: [.new]) { [weak self] it, _ in
+            guard let self = self, it.status == .failed, self.retries < 5 else { return }
+            self.retries += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4 * Double(self.retries)) { [weak self] in self?.loadItem() }
+        }
+        playerLayer.player = p; player = p
+        p.isMuted = wantMuted
+        // onProgress: report the whole second while it plays (dedup + clamp to the clip length).
+        if onProgress != nil {
+            lastSec = -1
+            progressObs = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self, weak p] _ in
+                guard let self = self, let p = p else { return }
+                let sec = Int(p.currentTime().seconds)
+                let dur = p.currentItem?.duration.seconds ?? 0
+                if sec < 0 || (dur.isFinite && Double(sec) > dur + 1) { return }
+                if self.lastSec == sec { return }
+                self.lastSec = sec; self.onProgress?(sec)
+            }
+        }
+        if wantPlaying { p.play() }
     }
     private func teardown() {
         player?.pause()
+        statusObs?.invalidate(); statusObs = nil
+        if let o = progressObs { player?.removeTimeObserver(o); progressObs = nil }
         if let l = looper { NotificationCenter.default.removeObserver(l); looper = nil }
         player = nil; playerLayer.player = nil
     }
     deinit { teardown() }
 }
 
+// Video `controls`: Apple's complete native player UI (transport, scrubber, fullscreen, AirPlay,
+// PiP, subtitle/audio menus) via AVPlayerViewController. The VC persists across re-renders so the
+// player isn't recreated each frame.
+struct ChuksControlsVideo: UIViewControllerRepresentable {
+    let src: String
+    let fit: String
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController(); vc.showsPlaybackControls = true
+        vc.videoGravity = fit == "contain" ? .resizeAspect : .resizeAspectFill
+        vc.view.backgroundColor = .black; vc.view.clipsToBounds = true
+        let u: URL? = src.hasPrefix("http") ? URL(string: src)
+                    : src.hasPrefix("file://") ? URL(fileURLWithPath: String(src.dropFirst(7)))
+                    : Bundle.main.url(forResource: src, withExtension: nil)
+        if let u = u { vc.player = AVPlayer(url: u); vc.player?.play() }
+        return vc
+    }
+    func updateUIViewController(_ vc: AVPlayerViewController, context: Context) {
+        vc.videoGravity = fit == "contain" ? .resizeAspect : .resizeAspectFill
+    }
+}
+
 struct ChuksVideo: UIViewRepresentable {
     let src: String
+    let playing: Bool
+    let loop: Bool
+    let muted: Bool
+    let fit: String
+    var seekTo: Int = -1
+    var vol: Int = -1
+    var rate: Int = -1
+    var onEnd: (() -> Void)? = nil
+    var onProgress: ((Int) -> Void)? = nil
+    var poster: String = ""
     func makeUIView(context: Context) -> LoopingPlayerView {
-        let v = LoopingPlayerView(); v.clipsToBounds = true; v.configure(src); return v
+        let v = LoopingPlayerView(); v.clipsToBounds = true; v.onEnd = onEnd; v.onProgress = onProgress; v.posterURL = poster
+        v.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo, vol: vol, rate: rate); return v
     }
-    func updateUIView(_ uiView: LoopingPlayerView, context: Context) { uiView.configure(src) }
+    func updateUIView(_ uiView: LoopingPlayerView, context: Context) {
+        uiView.onEnd = onEnd; uiView.onProgress = onProgress
+        uiView.configure(src, playing: playing, loop: loop, muted: muted, fit: fit, seekTo: seekTo, vol: vol, rate: rate)
+    }
+}
+
+// A remote image backed by ChuksImageLoader (bounded LRU + disk + off-main decode), so a
+// recycled feed cell repaints instantly from cache instead of re-downloading like AsyncImage.
+struct ChuksCachedImage: UIViewRepresentable {
+    let url: String
+    let contentMode: UIView.ContentMode
+    var tint: Color? = nil
+    var onLoad: (() -> Void)? = nil
+    var onError: (() -> Void)? = nil
+    func makeUIView(context: Context) -> UIImageView {
+        let iv = UIImageView(); iv.contentMode = contentMode; iv.clipsToBounds = true; return iv
+    }
+    func updateUIView(_ iv: UIImageView, context: Context) {
+        iv.contentMode = contentMode
+        if let t = tint { iv.tintColor = UIColor(t) }
+        let tmpl = tint != nil
+        if context.coordinator.loaded == url { return }   // already resolved this url
+        if let cached = ChuksImageLoader.shared.cached(url) {
+            iv.image = tmpl ? cached.withRenderingMode(.alwaysTemplate) : cached
+            context.coordinator.loaded = url; DispatchQueue.main.async { onLoad?() }; return
+        }
+        let wanted = url.hashValue; iv.tag = wanted; iv.image = nil
+        ChuksImageLoader.shared.load(url) { img in
+            if iv.tag == wanted { iv.image = tmpl ? img.withRenderingMode(.alwaysTemplate) : img }
+            context.coordinator.loaded = url; onLoad?()
+        } fail: { context.coordinator.loaded = url; onError?() }
+    }
+    func makeCoordinator() -> C { C() }
+    final class C { var loaded = "" }
 }
 
 // A native web view (WKWebView) loading a URL from the node's text channel.
@@ -440,9 +602,9 @@ enum Engine {
             chuks_fail(UnsafeMutablePointer(mutating: a), UnsafeMutablePointer(mutating: b)) } }
         return drain()
     }
-    static func viewport(_ top: Int32, _ h: Int32) -> String {
-        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h)") ?? "" }
-        _ = chuks_setViewport(top, h); return drain()
+    static func viewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String {
+        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h) \(w)") ?? "" }
+        _ = chuks_setViewport(top, h, w); return drain()
     }
     // Dark-mode sync: report the OS appearance (no render), and query whether the app
     // is still following it. setColorScheme updates the theme; the caller re-renders.
@@ -546,6 +708,20 @@ struct NodeData {
     var style: [String: String] = [:]
     var children: [String] = []
     var action: String = ""
+    // Controlled TextInput: `val` is the text, `hasVal` marks it controlled; the extra
+    // input events carry their dispatch tags.
+    var val: String = ""
+    var hasVal: Bool = false
+    var submitAction: String = ""
+    var focusAction: String = ""
+    var blurAction: String = ""
+    var longPressAction: String = ""
+    var pressInAction: String = ""
+    var pressOutAction: String = ""
+    var loadAction: String = ""
+    var errorAction: String = ""
+    var endAction: String = ""
+    var progressAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -713,6 +889,28 @@ final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
 }
 let notifDelegate = NotifDelegate()
 
+// ── Host wake ────────────────────────────────────────────────────────────────
+// The engine calls this (from a background task, via the chuks_set_wake C
+// callback) when a spawned Chuks task has posted work to the render thread. It is
+// @convention(c): no captures, so it reaches the live Scene through a file global
+// and hops to the main thread. Coalesced: a burst of messages schedules at most
+// one pending main-thread pump. This is what gives the SwiftUI host prompt
+// background-to-UI updates (it has no idle heartbeat of its own).
+private weak var gWakeScene: Scene?
+private let gWakeLock = NSLock()
+private var gWakeScheduled = false
+
+func chuksWakeThunk() {
+    gWakeLock.lock()
+    if gWakeScheduled { gWakeLock.unlock(); return }
+    gWakeScheduled = true
+    gWakeLock.unlock()
+    DispatchQueue.main.async {
+        gWakeLock.lock(); gWakeScheduled = false; gWakeLock.unlock()
+        gWakeScene?.pumpWake()
+    }
+}
+
 final class Scene: ObservableObject {
     @Published var nodes: [String: NodeData] = [:]
     // Whether the app is still tracking the OS appearance (false once the user picks a
@@ -723,6 +921,10 @@ final class Scene: ObservableObject {
     @Published var sbHidden = false
     @Published var sbStyle = ""
     @Published var sbColor = ""   // status-bar background color (hex); "" = none
+    // List scrollToIndex/scrollToEnd: target content-offset y per list id, plus a nonce so an
+    // identical target (e.g. scrollToEnd bumped again) still re-fires the scroll.
+    @Published var scrollTargets: [String: CGFloat] = [:]
+    @Published var scrollNonce: [String: Int] = [:]
 
     private var booted = false
     // True once a /mount has actually produced a node tree. Until then the DEV watcher
@@ -737,7 +939,21 @@ final class Scene: ObservableObject {
         UNUserNotificationCenter.current().delegate = notifDelegate  // foreground banners
         Engine.setup(0); Engine.setPlatform(); Engine.setColorScheme(osDark)
         mountFresh()
+        // Register the host wake: a spawned Chuks task that posts to the render thread
+        // (dispatchAsync) fires this so we tick + re-render immediately. The SwiftUI host
+        // has no idle heartbeat, so without this a background message would only paint on
+        // the next user event.
+        gWakeScene = self
+        chuks_set_wake(unsafeBitCast(chuksWakeThunk as (@convention(c) () -> Void), to: UnsafeMutableRawPointer.self))
         if DEV_MODE { startDevWatch() }
+    }
+
+    // Called on the main thread when a background Chuks task posted work (via the wake
+    // callback). Ticking drains the engine's async queue and re-renders. Skipped in DEV,
+    // where the engine is driven over HTTP and this in-process path is not the app.
+    func pumpWake() {
+        if DEV_MODE { return }
+        apply(Engine.tick())
     }
 
     // Mount from a fresh /mount and record whether it produced anything. Clearing first
@@ -771,7 +987,7 @@ final class Scene: ObservableObject {
     }
     func dispatch(_ tag: String) { apply(Engine.dispatch(tag)); syncFollow() }
     func input(_ tag: String, _ v: String) { apply(Engine.input(tag, v)) }
-    func viewport(_ top: Int32, _ h: Int32) { apply(Engine.viewport(top, h)) }
+    func viewport(_ top: Int32, _ h: Int32, _ w: Int32) { apply(Engine.viewport(top, h, w)) }
     // The OS appearance changed while following it: update the theme and re-render.
     func osChanged(dark: Bool) { Engine.setColorScheme(dark); apply(Engine.tick()); syncFollow() }
     func syncFollow() { let f = Engine.colorSchemeFollows(); if f != followSystem { followSystem = f } }
@@ -796,7 +1012,21 @@ final class Scene: ObservableObject {
                 nodes[f[1]]?.style = parseStyle(f[2])
                 if nodes[f[1]]?.kind == "StatusBar" { applyStatusBar(nodes[f[1]]!.style) }
             case "P" where f.count >= 3: nodes[f[1]]?.text = f[2]
+            case "V" where f.count >= 3: nodes[f[1]]?.val = f[2...].joined(separator: "|"); nodes[f[1]]?.hasVal = true
             case "T" where f.count >= 3: nodes[f[1]]?.action = f[2]
+            case "TS" where f.count >= 2: nodes[f[1]]?.submitAction = f[1] + ":submit"
+            case "TF" where f.count >= 2: nodes[f[1]]?.focusAction = f[1] + ":focus"
+            case "TB" where f.count >= 2: nodes[f[1]]?.blurAction = f[1] + ":blur"
+            case "TL" where f.count >= 2: nodes[f[1]]?.longPressAction = f[1] + ":longpress"
+            case "TPI" where f.count >= 2: nodes[f[1]]?.pressInAction = f[1] + ":pressin"
+            case "TPO" where f.count >= 2: nodes[f[1]]?.pressOutAction = f[1] + ":pressout"
+            case "ML" where f.count >= 2: nodes[f[1]]?.loadAction = f[1] + ":load"
+            case "ME" where f.count >= 2: nodes[f[1]]?.errorAction = f[1] + ":error"
+            case "MN" where f.count >= 2: nodes[f[1]]?.endAction = f[1] + ":end"
+            case "MP" where f.count >= 2: nodes[f[1]]?.progressAction = f[1] + ":progress"
+            case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
+                scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
+                scrollNonce[f[1], default: 0] += 1
             case "I" where f.count >= 4:
                 let id = f[1], parent = f[2], idx = Int(f[3]) ?? 0
                 if parent != "root", nodes[parent] != nil {
@@ -1362,9 +1592,28 @@ struct BoxStyle: ViewModifier {
         // rows collapsed to invisible content-width pills.)
         if s["pos"] == "abs" {
             let h = numOf(s["h"])
-            v = AnyView(v.frame(maxWidth: .infinity, minHeight: h, maxHeight: h))
-            v = decor(v)
             let top = numOf(s["top"]) ?? 0, left = numOf(s["left"]) ?? 0, right = numOf(s["right"]) ?? 0
+            // Fixed-width abs cell (e.g. a `numColumns` grid column): size to w and place its
+            // left edge at `left`. Without an explicit width, fall back to the full-width row
+            // (inset by left/right) that a single-column feed uses.
+            if let w = numOf(s["w"]) {
+                v = AnyView(v.frame(width: w, height: h))
+                v = decor(v)
+                return AnyView(v.frame(maxWidth: .infinity, alignment: .leading).offset(x: left, y: top))
+            }
+            // Align the content to match Yoga (UIKit/Android): without this the content is
+            // content-sized and SwiftUI's default .center frame alignment centers it (a `justify:
+            // start` row rendered centered instead of left). `justify` is the MAIN axis (default
+            // start) and `align` the CROSS axis (default center); which is horizontal vs vertical
+            // flips with `d` (row vs column). 0=start/leading/top, 1=center, 2=end/trailing/bottom.
+            let idx: (String?, Int) -> Int = { v, def in v == "center" ? 1 : (v == "end" ? 2 : (v == "start" ? 0 : def)) }
+            let mainI = idx(s["j"], 0), crossI = idx(s["a"], 1)
+            let hI = s["d"] == "row" ? mainI : crossI
+            let vI = s["d"] == "row" ? crossI : mainI
+            let ha: HorizontalAlignment = hI == 1 ? .center : (hI == 2 ? .trailing : .leading)
+            let va: VerticalAlignment = vI == 1 ? .center : (vI == 2 ? .bottom : .top)
+            v = AnyView(v.frame(maxWidth: .infinity, minHeight: h, maxHeight: h, alignment: Alignment(horizontal: ha, vertical: va)))
+            v = decor(v)
             return AnyView(v.padding(.leading, left).padding(.trailing, right).offset(y: top))
         }
         // grow along the parent's main axis
@@ -1413,20 +1662,43 @@ struct PressAction: ViewModifier {
     let action: String
     let activeOpacity: Double
     let scene: Scene
+    var longPress = ""
+    var pressIn = ""
+    var pressOut = ""
+    var disabled = false
+    var longDelay = 0.5
     @State private var pressed = false
+    @State private var longFired = false
+    @State private var longTask: DispatchWorkItem? = nil
     func body(content: Content) -> some View {
-        content
+        if disabled {
+            return AnyView(content.contentShape(Rectangle()).opacity(0.4))
+        }
+        return AnyView(content
             .contentShape(Rectangle())
             .opacity(pressed ? activeOpacity : 1.0)
             .animation(.easeOut(duration: 0.09), value: pressed)
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
-                    .onChanged { _ in pressed = true }
+                    .onChanged { _ in
+                        if pressed { return }        // .onChanged fires repeatedly; act on the first
+                        pressed = true
+                        if !pressIn.isEmpty { scene.dispatch(pressIn) }
+                        if !longPress.isEmpty {      // fire onLongPress after the hold delay
+                            longFired = false
+                            let task = DispatchWorkItem { longFired = true; scene.dispatch(longPress) }
+                            longTask = task
+                            DispatchQueue.main.asyncAfter(deadline: .now() + longDelay, execute: task)
+                        }
+                    }
                     .onEnded { _ in
                         pressed = false
-                        if !action.isEmpty { scene.dispatch(action) }
+                        longTask?.cancel(); longTask = nil
+                        if !pressOut.isEmpty { scene.dispatch(pressOut) }
+                        if !action.isEmpty && !longFired { scene.dispatch(action) }
+                        longFired = false
                     }
-            )
+            ))
     }
 }
 
@@ -1438,23 +1710,57 @@ struct ChuksInput: View {
     let placeholder: String
     let action: String
     let style: [String: String]
+    let value: String
+    let hasVal: Bool
+    let submitAction: String
+    let focusAction: String
+    let blurAction: String
     let parentRow: Bool
     let parentStretch: Bool
     @State private var text: String = ""
-    var body: some View {
-        Group {
-            if style["sec"] == "1" { SecureField(placeholder, text: $text) }   // password field
-            else { TextField(placeholder, text: $text) }
-        }
-            .onChange(of: text) { newVal in if !action.isEmpty { scene.input(action, newVal) } }
+    @FocusState private var focused: Bool
+    @ViewBuilder private var field: some View {
+        if style["sec"] == "1" { SecureField(placeholder, text: $text) }   // password field
+        else { TextField(placeholder, text: $text) }
+    }
+    private var configured: some View {
+        field
+            .focused($focused)
+            .disabled(style["edit"] == "0")
+            .keyboardType(swKeyboardType(style["kbt"]))
             .textFieldStyle(.plain)
-            .autocorrectionDisabled(true)
-            .textInputAutocapitalization(.never)
-            .submitLabel(.done)
+            .autocorrectionDisabled(style["acor"] != "1")
+            .textInputAutocapitalization(swAutocap(style["acap"]))
+            .submitLabel(swSubmitLabel(style["ret"]))
             .font(textFont(style))
             .foregroundColor(style["fg"].map { hexColor($0) } ?? .primary)
+    }
+    var body: some View {
+        configured
+            .onAppear { if hasVal { text = value } }
+            // Controlled: mirror the engine value into the field (only when it differs,
+            // so typing doesn't fight the binding); report edits back to the engine.
+            .onChange(of: value) { nv in if hasVal && text != nv { text = nv } }
+            .onChange(of: text) { newVal in if !action.isEmpty { scene.input(action, newVal) } }
+            .onChange(of: focused) { f in
+                if f { if !focusAction.isEmpty { scene.dispatch(focusAction) } }
+                else { if !blurAction.isEmpty { scene.dispatch(blurAction) } }
+            }
+            .onSubmit { if !submitAction.isEmpty { scene.dispatch(submitAction) } }
             .modifier(BoxStyle(s: style, parentRow: parentRow, parentStretch: parentStretch))
     }
+}
+
+func swKeyboardType(_ v: String?) -> UIKeyboardType {
+    switch v { case "email": return .emailAddress; case "number": return .numberPad; case "decimal": return .decimalPad
+    case "phone": return .phonePad; case "url": return .URL; default: return .default }
+}
+func swSubmitLabel(_ v: String?) -> SubmitLabel {
+    switch v { case "send": return .send; case "search": return .search; case "next": return .next
+    case "go": return .go; case "done": return .done; default: return .done }
+}
+func swAutocap(_ v: String?) -> TextInputAutocapitalization {
+    switch v { case "sentences": return .sentences; case "words": return .words; case "characters": return .characters; default: return .never }
 }
 
 // A native value slider that owns its value across re-renders (stable @State,
@@ -1721,7 +2027,9 @@ struct ChuksMenu: View {
 // a fast/programmatic scroll of a very tall List content) — the List's windowing
 // depends on getting the offset on every frame of a fling.
 struct ScrollOffsetReader: UIViewRepresentable {
+    let horizontal: Bool
     let onOffset: (CGFloat) -> Void
+    init(horizontal: Bool = false, onOffset: @escaping (CGFloat) -> Void) { self.horizontal = horizontal; self.onOffset = onOffset }
     func makeUIView(context: Context) -> UIView {
         let v = UIView(frame: .zero)
         DispatchQueue.main.async { context.coordinator.attach(from: v) }
@@ -1730,12 +2038,13 @@ struct ScrollOffsetReader: UIViewRepresentable {
     func updateUIView(_ uiView: UIView, context: Context) {
         DispatchQueue.main.async { context.coordinator.attach(from: uiView) }
     }
-    func makeCoordinator() -> Coordinator { Coordinator(onOffset) }
+    func makeCoordinator() -> Coordinator { Coordinator(horizontal, onOffset) }
     final class Coordinator: NSObject {
+        let horizontal: Bool
         let onOffset: (CGFloat) -> Void
         weak var scrollView: UIScrollView?
         var obs: NSKeyValueObservation?
-        init(_ cb: @escaping (CGFloat) -> Void) { onOffset = cb }
+        init(_ h: Bool, _ cb: @escaping (CGFloat) -> Void) { horizontal = h; onOffset = cb }
         func attach(from v: UIView) {
             guard scrollView == nil else { return }
             var s = v.superview
@@ -1743,11 +2052,51 @@ struct ScrollOffsetReader: UIViewRepresentable {
             if let sv = s as? UIScrollView {
                 scrollView = sv
                 obs = sv.observe(\.contentOffset, options: [.initial, .new]) { [weak self] sv, _ in
-                    self?.onOffset(sv.contentOffset.y)
+                    self?.onOffset(self?.horizontal == true ? sv.contentOffset.x : sv.contentOffset.y)
                 }
             }
         }
         deinit { obs?.invalidate() }
+    }
+}
+
+// scrollToIndex/scrollToEnd for a List: a zero-size probe placed INSIDE the scroll content
+// (so its superview chain reaches the UIScrollView). When the nonce changes, it sets the
+// underlying scroll view's contentOffset (clamped, animated). Same UIScrollView-walk trick
+// as ScrollOffsetReader — reliable where a pure-SwiftUI scrollTo is not.
+struct ScrollSetter: UIViewRepresentable {
+    let y: CGFloat?
+    let nonce: Int
+    var horizontal: Bool = false
+    func makeUIView(context: Context) -> UIView { UIView(frame: .zero) }
+    func updateUIView(_ v: UIView, context: Context) {
+        guard let y = y, context.coordinator.lastNonce != nonce else { return }
+        context.coordinator.lastNonce = nonce
+        let horizontal = self.horizontal
+        DispatchQueue.main.async {
+            var s = v.superview
+            while let cur = s, !(cur is UIScrollView) { s = cur.superview }
+            guard let sv = s as? UIScrollView else { return }
+            if horizontal {
+                let maxX = max(0, sv.contentSize.width - sv.bounds.width)
+                sv.setContentOffset(CGPoint(x: min(max(0, y), maxX), y: 0), animated: true)
+            } else {
+                let maxY = max(0, sv.contentSize.height - sv.bounds.height)
+                sv.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: true)
+            }
+        }
+    }
+    func makeCoordinator() -> C { C() }
+    final class C { var lastNonce = -1 }
+}
+
+// Snap-per-screen paging for a Scroll/List (video feeds). iOS 17+ pages by the viewport
+// height via scrollTargetBehavior; older iOS falls back to normal scrolling.
+struct ScrollPaging: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled, #available(iOS 17.0, *) { content.scrollTargetBehavior(.paging) }
+        else { content }
     }
 }
 
@@ -1761,17 +2110,29 @@ struct ChuksScroll: View {
     let parentRow: Bool
     let parentStretch: Bool
     var body: some View {
-        GeometryReader { outer in
-            ScrollView {
+        let horiz = style["horiz"] == "1"
+        return GeometryReader { outer in
+            // A horizontal list reports its x-offset + width as the scroll window (main axis)
+            // and its height as the cross size; a vertical list reports y + height + width.
+            ScrollView(horiz ? .horizontal : .vertical) {
                 // probe the underlying UIScrollView for its live contentOffset
-                ScrollOffsetReader { off in
-                    scene.viewport(Int32(max(0, off)), Int32(outer.size.height))
+                ScrollOffsetReader(horizontal: horiz) { off in
+                    if horiz { scene.viewport(Int32(max(0, off)), Int32(outer.size.width), Int32(max(0, outer.size.height))) }
+                    else { scene.viewport(Int32(max(0, off)), Int32(outer.size.height), Int32(max(0, outer.size.width))) }
                 }.frame(width: 0, height: 0)
+                // scrollToIndex/scrollToEnd: drive the underlying UIScrollView's offset.
+                ScrollSetter(y: scene.scrollTargets[id], nonce: scene.scrollNonce[id] ?? 0, horizontal: horiz)
+                    .frame(width: 0, height: 0)
                 ForEach(scene.nodes[id]?.children ?? [], id: \.self) { cid in
                     NodeView(scene: scene, id: cid, parentRow: false, parentStretch: true)
                 }
             }
-            .onAppear { scene.viewport(0, Int32(outer.size.height)) }
+            .modifier(ScrollPaging(enabled: style["paging"] == "1"))   // snap per screen (video feeds)
+            .modifier(StickBottom(enabled: style["stick"] == "1"))     // pin to newest (chat)
+            .onAppear {
+                if horiz { scene.viewport(0, Int32(outer.size.width), Int32(max(0, outer.size.height))) }
+                else { scene.viewport(0, Int32(outer.size.height), Int32(max(0, outer.size.width))) }
+            }
             // Pull-to-refresh when the Scroll has an onRefresh (its style carries `rfsh`).
             .refreshable {
                 guard style["rfsh"] != nil, let action = scene.nodes[id]?.action, !action.isEmpty else { return }
@@ -1780,6 +2141,17 @@ struct ChuksScroll: View {
             }
         }
         .modifier(BoxStyle(s: style, parentRow: parentRow, parentStretch: parentStretch))
+    }
+}
+
+// Chat stick-to-bottom: anchor the scroll to the bottom so new messages appear at the
+// bottom and the view stays pinned there (iOS 17+; a no-op on older, where the content
+// still scrolls, just without the auto-pin).
+struct StickBottom: ViewModifier {
+    let enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled, #available(iOS 17.0, *) { content.defaultScrollAnchor(.bottom) }
+        else { content }
     }
 }
 
@@ -1799,15 +2171,22 @@ struct NodeView: View {
 
     var body: some View {
         if let node = scene.nodes[id] {
-            // A Pressable (press-feedback hint) gets instant press dim + onPress.
+            let disabled = node.style["dis"] == "1"
+            let slop = numOf(node.style["hitslop"]) ?? 0   // enlarge the tappable area beyond the bounds
+            // A Pressable (press-feedback hint) gets instant press dim + onPress + gesture events.
             if let po = node.style["press"] {
-                render(node).modifier(PressAction(action: node.action,
+                render(node).padding(-slop).contentShape(Rectangle()).padding(slop).modifier(PressAction(action: node.action,
                                                   activeOpacity: Double(numOf(po) ?? 60) / 100.0,
-                                                  scene: scene))
+                                                  scene: scene,
+                                                  longPress: node.longPressAction,
+                                                  pressIn: node.pressInAction,
+                                                  pressOut: node.pressOutAction,
+                                                  disabled: disabled,
+                                                  longDelay: (numOf(node.style["ldelay"]).map { Double($0) / 1000 }) ?? 0.5))
             } else {
                 // Button/Input/Switch wire their own action; any other actioned node
-                // (a View tab-bar item, chip, tappable card/row) gets a tap gesture.
-                let tap = (node.kind == "Button" || node.kind == "Input" || node.kind == "Switch") ? "" : node.action
+                // (a View tab-bar item, chip, tappable card/row, pressable Text) gets a tap gesture.
+                let tap = (disabled || node.kind == "Button" || node.kind == "Input" || node.kind == "Switch") ? "" : node.action
                 render(node).modifier(TapAction(action: tap, scene: scene))
             }
         }
@@ -1845,10 +2224,12 @@ struct NodeView: View {
         case "StatusBar": Color.clear.frame(width: 0, height: 0)   // directive only; config read in apply()
         case "Modal": Color.clear.frame(width: 0, height: 0)       // rendered in the overlay by RootView, not inline
         case "Video":  videoView(node)
+        case "VideoControls": ChuksControlsVideo(src: node.style["vid"] ?? "", fit: node.style["vfit"] ?? "")
+            .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "CameraView": ChuksCamera(facing: node.text, scene: scene).modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "WebView": webView(node)
         case "ImageBackground": imageBackgroundView(node)
-        case "Scroll": ChuksScroll(scene: scene, id: id, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
+        case "Scroll", "HScroll": ChuksScroll(scene: scene, id: id, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         default:       container(node)   // "View" and anything structural
         }
     }
@@ -1861,40 +2242,51 @@ struct NodeView: View {
         let align: TextAlignment = ta == "center" ? .center : (ta == "right" ? .trailing : .leading)
         // a grown text box aligns its text left/center/right per ta (default left)
         let boxAlign: Alignment = ta == "center" ? .center : (ta == "right" ? .trailing : .leading)
-        return Text(node.text).font(textFont(s)).foregroundColor(color).multilineTextAlignment(align)
+        // numberOfLines caps the lines; ellipsizeMode picks how the overflow truncates.
+        let nlines = s["nlines"].flatMap { Int($0) }
+        let trunc: Text.TruncationMode = s["ellip"] == "head" ? .head : (s["ellip"] == "middle" ? .middle : .tail)
+        let base = Text(node.text).font(textFont(s)).foregroundColor(color).multilineTextAlignment(align)
+            .lineLimit(nlines)
+            .truncationMode(trunc)
             .modifier(BoxStyle(s: s, parentRow: parentRow, align: boxAlign, parentStretch: parentStretch))
-            // A label is not interactive, but a grown label (`.frame(maxWidth:.infinity)`,
-            // e.g. a NavBar title) still occupies its full frame for hit-testing and can
-            // swallow taps meant for a sibling button (the theme toggle). Make labels
-            // tap-transparent; a genuinely tappable text still receives taps via the
-            // TapAction wrapper's contentShape applied outside in NodeView.body.
-            .allowsHitTesting(false)
+            // A plain label is tap-transparent so a grown label (`.frame(maxWidth:.infinity)`,
+            // e.g. a NavBar title) doesn't swallow taps meant for a sibling button. A pressable
+            // Text (onPress -> node.action set) or a selectable one must stay hittable.
+            .allowsHitTesting(!node.action.isEmpty || s["sel"] == "1")
+        return s["sel"] == "1" ? AnyView(base.textSelection(.enabled)) : AnyView(base)   // select/copy
     }
 
     func buttonView(_ node: NodeData) -> some View {
         let s = node.style
         let color = s["fg"].map { hexColor($0) } ?? Color.white
         let action = node.action
+        let disabled = s["dis"] == "1"
         return Button(action: { if !action.isEmpty { scene.dispatch(action) } }) {
             Text(node.text).font(textFont(s)).foregroundColor(color)
                 .frame(maxWidth: numOf(s["g"]) != nil ? .infinity : nil)
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.4 : 1.0)   // dim when disabled
         .modifier(BoxStyle(s: s, parentRow: parentRow, parentStretch: parentStretch))
     }
 
     @ViewBuilder func imageView(_ node: NodeData) -> some View {
         let s = node.style
-        if node.text.hasPrefix("http") {                     // remote (network) image
-            let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
-            AsyncImage(url: URL(string: node.text)) { img in
-                img.resizable().aspectRatio(contentMode: mode)
-            } placeholder: {
-                s["bg"].map { hexColor($0) } ?? Color.gray.opacity(0.15)
+        if node.text.hasPrefix("http") {                     // remote (network) image (cached)
+            let cm: UIView.ContentMode = s["rmode"] == "contain" ? .scaleAspectFit : .scaleAspectFill
+            let tint = s["tint"].map { hexColor($0) }
+            let load = node.loadAction, err = node.errorAction
+            ZStack {
+                if s["spin"] == "1" { ProgressView() }   // loading spinner behind the image (covered once it loads)
+                ChuksCachedImage(url: node.text, contentMode: cm, tint: tint,
+                                 onLoad: load.isEmpty ? nil : { self.scene.dispatch(load) },
+                                 onError: err.isEmpty ? nil : { self.scene.dispatch(err) })
             }
-            .frame(width: numOf(s["w"]), height: numOf(s["h"]))
-            .clipped()
-            .cornerRadius(numOf(s["r"]) ?? 0)
+                .frame(width: numOf(s["w"]), height: numOf(s["h"]))
+                .clipped()
+                .blur(radius: numOf(s["blur"]) ?? 0)   // blurRadius
+                .cornerRadius(numOf(s["r"]) ?? 0)
         } else if node.text.hasPrefix("file://"),
                   let ui = UIImage(contentsOfFile: String(node.text.dropFirst(7))) {   // picked/captured local file
             let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
@@ -1922,20 +2314,19 @@ struct NodeView: View {
     // A container whose background is a remote image, children on top.
     func imageBackgroundView(_ node: NodeData) -> some View {
         let s = node.style
-        let mode: ContentMode = s["rmode"] == "contain" ? .fit : .fill
+        let cm: UIView.ContentMode = s["rmode"] == "contain" ? .scaleAspectFit : .scaleAspectFill
         return container(node).background(
-            AsyncImage(url: URL(string: node.text)) { img in
-                img.resizable().aspectRatio(contentMode: mode)
-            } placeholder: { Color.gray.opacity(0.15) }
-                .clipped()
+            ChuksCachedImage(url: node.text, contentMode: cm).clipped()
         ).cornerRadius(numOf(s["r"]) ?? 0)
     }
 
     func inputView(_ node: NodeData) -> some View {
         // Uncontrolled like the UIKit host: the field owns its text (its own @State),
         // reports every change to the engine, and node.text is the placeholder.
-        ChuksInput(scene: scene, placeholder: node.text, action: node.action,
-                   style: node.style, parentRow: parentRow, parentStretch: parentStretch)
+        ChuksInput(scene: scene, placeholder: node.text, action: node.action, style: node.style,
+                   value: node.val, hasVal: node.hasVal, submitAction: node.submitAction,
+                   focusAction: node.focusAction, blurAction: node.blurAction,
+                   parentRow: parentRow, parentStretch: parentStretch)
     }
 
     // A native SwiftUI Toggle. Controlled: `isOn` reads the Chuks state (style "on");
@@ -1969,7 +2360,19 @@ struct NodeView: View {
     }
 
     func videoView(_ node: NodeData) -> some View {
-        ChuksVideo(src: node.style["vid"] ?? "")
+        let s = node.style
+        let end = node.endAction, prog = node.progressAction
+        return ChuksVideo(src: s["vid"] ?? "",
+                          playing: s["vplay"] != "0",   // default = playing
+                          loop: s["vloop"] != "0",
+                          muted: s["vmute"] != "0",
+                          fit: s["vfit"] ?? "",
+                          seekTo: s["seek"].flatMap { Int($0) } ?? -1,
+                          vol: s["vvol"].flatMap { Int($0) } ?? -1,
+                          rate: s["vrate"].flatMap { Int($0) } ?? -1,
+                          onEnd: end.isEmpty ? nil : { self.scene.dispatch(end) },
+                          onProgress: prog.isEmpty ? nil : { sec in self.scene.input(prog, "\(sec)") },
+                          poster: node.text)
             .modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
     }
 
@@ -2094,9 +2497,11 @@ struct RootView: View {
             ZStack(alignment: .topLeading) {
                 hexColor(appBg).ignoresSafeArea()
                 if scene.nodes["app"] != nil {
+                    // NB: do NOT ignoresSafeArea(.keyboard) here — that disables SwiftUI's
+                    // automatic keyboard avoidance, which is what lifts a bottom input bar
+                    // above the keyboard. It only shrinks the layout while a field is focused.
                     NodeView(scene: scene, id: "app")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .ignoresSafeArea(.keyboard, edges: .bottom)
                 }
                 if !scene.sbColor.isEmpty {   // StatusBar color: fill the top safe area
                     hexColor(scene.sbColor)

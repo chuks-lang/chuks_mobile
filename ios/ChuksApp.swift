@@ -11,6 +11,7 @@
 
 import UIKit
 import AVFoundation
+import AVKit
 import WebKit
 import MapKit
 import Photos
@@ -26,6 +27,42 @@ import Security
 import Network
 import CoreBluetooth
 import CoreNFC
+
+// ===== Feed-grade image cache (shared by both iOS hosts) =====
+// Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
+// (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
+// re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
+// uncached SwiftUI AsyncImage.
+final class ChuksImageLoader {
+    static let shared = ChuksImageLoader()
+    private let mem = NSCache<NSString, UIImage>()
+    private let session: URLSession
+    init() {
+        mem.countLimit = 200                 // secondary bound
+        mem.totalCostLimit = 128 << 20       // primary bound: 128MB of decoded pixels, byte-accurate
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 20
+        c.requestCachePolicy = .returnCacheDataElseLoad
+        c.urlCache = URLCache(memoryCapacity: 16 << 20, diskCapacity: 256 << 20, diskPath: "chuks-img")
+        session = URLSession(configuration: c)
+    }
+    func cached(_ url: String) -> UIImage? { mem.object(forKey: url as NSString) }
+    // done() is always called on the main thread with the decoded image.
+    func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void, fail: (() -> Void)? = nil) {
+        if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
+        guard let url = URL(string: urlStr) else { DispatchQueue.main.async { fail?() }; return }
+        session.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data, let raw = UIImage(data: data) else { DispatchQueue.main.async { fail?() }; return }
+            // Thread-safe off-main decode (UIGraphicsImageRenderer is UIKit and NOT thread-safe
+            // off main — it corrupts UIKit state and crashes text drawing). preparingForDisplay
+            // is the designed-for-background decode API.
+            let img = raw.preparingForDisplay() ?? raw
+            let cost = Int(img.size.width * img.size.height * img.scale * img.scale) * 4  // ~bytes of the decoded bitmap
+            self?.mem.setObject(img, forKey: urlStr as NSString, cost: cost)
+            DispatchQueue.main.async { done(img) }
+        }.resume()
+    }
+}
 
 // ===== Bluetooth LE (CoreBluetooth) + NFC (CoreNFC): shared by both iOS hosts =====
 // Decoupled from the host via onResolve/onFail closures (set to the host's resolve/fail).
@@ -227,6 +264,34 @@ func physFootprintMB() -> Double {
 final class VideoView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+}
+
+// A UILabel that can be selected/copied (Text `selectable`). It becomes first responder on a
+// long-press and shows the system Copy menu; with `selectable` off it's an ordinary label.
+final class SelectableLabel: UILabel {
+    var selectable = false
+    override var canBecomeFirstResponder: Bool { selectable }
+    func enableSelection() {
+        guard gestureRecognizers?.isEmpty ?? true else { return }
+        isUserInteractionEnabled = true
+        addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(showCopy(_:))))
+    }
+    @objc private func showCopy(_ g: UILongPressGestureRecognizer) {
+        guard selectable, g.state == .began, becomeFirstResponder() else { return }
+        let menu = UIMenuController.shared
+        menu.showMenu(from: self, rect: bounds)
+    }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { action == #selector(copy(_:)) }
+    override func copy(_ sender: Any?) { UIPasteboard.general.string = text; UIMenuController.shared.hideMenu() }
+}
+
+// A view that also accepts touches within `hitSlop` px beyond its bounds (Pressable `hitSlop`).
+final class HitSlopView: UIView {
+    var hitSlop: CGFloat = 0
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if hitSlop <= 0 { return super.point(inside: point, with: event) }
+        return bounds.insetBy(dx: -hitSlop, dy: -hitSlop).contains(point)
+    }
 }
 
 // A UIView whose backing layer IS the camera preview layer, so it tracks the view frame.
@@ -611,6 +676,27 @@ final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
 }
 let notifDelegate = NotifDelegate()
 
+// ── Host wake ────────────────────────────────────────────────────────────────
+// The engine calls this (from a background goroutine, via the chuks_set_wake C
+// callback) when a spawned Chuks task has posted work to the render thread. It is
+// @convention(c): no captures, so it reaches the live controller through a file
+// global and hops to the main thread. Coalesced: a burst of messages schedules at
+// most one pending main-thread pump.
+private weak var gChuksWakeVC: CardsVC?
+private let gWakeLock = NSLock()
+private var gWakeScheduled = false
+
+func chuksWakeThunk() {
+    gWakeLock.lock()
+    if gWakeScheduled { gWakeLock.unlock(); return }
+    gWakeScheduled = true
+    gWakeLock.unlock()
+    DispatchQueue.main.async {
+        gWakeLock.lock(); gWakeScheduled = false; gWakeLock.unlock()
+        gChuksWakeVC?.pumpWake()
+    }
+}
+
 final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate {
     let N: Int32 = 1000
 
@@ -622,6 +708,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
     var scrollId = ""
+    var listHoriz = false            // the tracked list scrolls horizontally (report x, not y)
+    var stickBottomOn = false        // Scroll stickBottom: keep pinned to newest (chat)
+    var stickPrevH: CGFloat = 0      // previous content height, to tell if the user was at the bottom
     var contentId = ""
 
     let header = UILabel()                              // host diagnostics only (not app UI)
@@ -633,13 +722,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var videoPlayerKey: [String: String] = [:]        // node id -> resource key (for pooling)
     var videoPool: [String: [AVPlayer]] = [:]         // idle, still-primed players by resource
     var videoObs: [ObjectIdentifier: NSObjectProtocol] = [:]  // player -> loop observer (persists across reuse)
+    var videoNoLoop = Set<ObjectIdentifier>()         // players whose Video set loop=false (checked in the end observer)
     let videoPoolCap = 16                             // bound idle players kept warm
+    var inViewportSync = false                        // reentrancy guard: relayout() sets contentSize, which can
+                                                      // clamp the offset and re-fire scrollViewDidScroll synchronously.
+                                                      // Without this the two call each other until the stack overflows.
     // Perf harness: auto-scroll the feed while a CADisplayLink measures real frame times.
     var displayLink: CADisplayLink?
     var perfActive = false
     var perfLastTs: CFTimeInterval = 0
     var perfFrames = 0, perfJanky = 0, perfMaxPlayers = 0
     var perfMaxFrame: Double = 0, perfSumTime: Double = 0
+    var perfLog: [String] = []                        // every velocity's result line, for on-screen + file readout
     // Velocity sweep: ramp the fling speed to find the breaking point.
     let perfVels: [CGFloat] = [120, 180, 240, 300, 360, 480]
     var perfVelIdx = 0
@@ -648,6 +742,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var perfWarmup = 150        // unmeasured frames to prime players + steady state
     var buttonActions: [UIButton: String] = [:]
     var fieldActions: [UITextField: String] = [:]
+    var fieldSubmit: [UITextField: String] = [:]   // onSubmit tag (return key)
+    var fieldFocus: [UITextField: String] = [:]    // onFocus tag (began editing)
+    var fieldBlur: [UITextField: String] = [:]     // onBlur tag (ended editing)
+    var fieldMaxLen: [UITextField: Int] = [:]      // maxLength (enforced in shouldChangeCharacters)
     var switchActions: [UISwitch: String] = [:]
     var sliderActions: [UISlider: String] = [:]
     var datePickerActions: [UIDatePicker: String] = [:]                   // DatePicker -> onChange action
@@ -675,7 +773,27 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var alertActions: [String: String] = [:]                             // id -> button-dispatch action
     var presentedAlert: String? = nil                                    // the Alert id currently on screen
     var pressOpacity: [String: CGFloat] = [:]                              // id -> Pressable active alpha (0-1)
-    var pressGestures: [UILongPressGestureRecognizer: (String, CGFloat)] = [:]   // gesture -> (action, alpha)
+    var pressGestures: [UILongPressGestureRecognizer: (String, CGFloat, String)] = [:]   // gesture -> (action, alpha, id)
+    var longPressActions: [String: String] = [:]                          // id -> onLongPress action
+    var pressInActions: [String: String] = [:]                            // id -> onPressIn action
+    var pressOutActions: [String: String] = [:]                           // id -> onPressOut action
+    var pressLongTimers: [ObjectIdentifier: Timer] = [:]                  // gesture -> pending long-press timer
+    var pressLongFired = Set<ObjectIdentifier>()                          // gestures whose long-press already fired
+    var disabledIds = Set<String>()                                       // ids whose disabled=1 (block fire)
+    var mediaLoad: [String: String] = [:]                                 // id -> onLoad action (Image/Video)
+    var mediaError: [String: String] = [:]                                // id -> onError action (Image)
+    var mediaEnd: [String: String] = [:]                                  // id -> onEnd action (Video)
+    var mediaProgress: [String: String] = [:]                             // id -> onProgress action (Video)
+    var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
+    var imageBlur: [String: CGFloat] = [:]                                // id -> Image blur radius (px)
+    var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
+    var videoPosters: [String: UIImageView] = [:]                        // id -> poster overlay (until first frame)
+    var posterObs: [String: NSKeyValueObservation] = [:]                 // id -> readyForDisplay observation
+    var pressLongDelay: [String: TimeInterval] = [:]                      // id -> onLongPress hold time (s)
+    var videoSeek: [String: Int] = [:]                                    // id -> last-applied seek (seconds)
+    var videoTimeObservers: [String: Any] = [:]                           // id -> periodic time observer token
+    var videoLastSec: [String: Int] = [:]                                 // id -> last whole second reported to onProgress
+    var videoCtrlVCs: [String: AVPlayerViewController] = [:]              // id -> native player+controls VC (controls: true)
     var modalIds: Set<String> = []                                        // Modal node ids (full-screen overlays)
     var activeModal: String? = nil                                        // the currently-visible Modal
     var sheetModals: Set<String> = []                                     // Modal ids with position=bottom (draggable sheets)
@@ -701,9 +819,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if DEV_MODE { return devHTTP("/tick", "") }
         _ = chuks_tick(); return drainStr()
     }
-    func eViewport(_ top: Int32, _ h: Int32) -> String? {
-        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h)") }
-        _ = chuks_setViewport(top, h); return drainStr()
+    func eViewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String? {
+        if DEV_MODE { return devHTTP("/viewport", "\(top) \(h) \(w)") }
+        _ = chuks_setViewport(top, h, w); return drainStr()
     }
     // Report the OS appearance to the engine (updates the theme unless the user has
     // overridden). No render here — the caller mounts/ticks afterwards.
@@ -775,7 +893,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
         NotificationCenter.default.addObserver(self, selector: #selector(kbShow(_:)),
             name: UIResponder.keyboardWillShowNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(kbHide),
+        NotificationCenter.default.addObserver(self, selector: #selector(kbHide(_:)),
             name: UIResponder.keyboardWillHideNotification, object: nil)
 
         // Tap anywhere outside a text field to dismiss the keyboard. cancelsTouchesInView
@@ -796,6 +914,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // on a blank screen with no recovery (AOT is in-process, so it never hits this).
         if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
         // (dev: if the server isn't up yet / returned empty, step() reconnects + remounts)
+
+        // Register the host wake: a spawned Chuks task that posts to the render thread
+        // (dispatchAsync) fires this so we tick immediately instead of on the heartbeat.
+        gChuksWakeVC = self
+        chuks_set_wake(unsafeBitCast(chuksWakeThunk as (@convention(c) () -> Void), to: UnsafeMutableRawPointer.self))
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.step() }
         // Auto-start the perf harness after a warmup (benchmark builds only — otherwise
@@ -836,14 +959,23 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     @discardableResult
     func pushViewport() -> Bool {
         guard let sc = listScroll else { return false }
-        let h = Int32(sc.bounds.height); if h <= 0 { return false }
-        let top = Int32(max(0, sc.contentOffset.y))
-        guard let s = eViewport(top, h) else { connected = false; return false }
+        // The main axis is x for a horizontal list: report its x-offset + width as the scroll
+        // window, and the height as the cross size. Vertical lists report y + height + width.
+        let mainExtent = Int32(listHoriz ? sc.bounds.width : sc.bounds.height); if mainExtent <= 0 { return false }
+        let top = Int32(max(0, listHoriz ? sc.contentOffset.x : sc.contentOffset.y))
+        let cross = Int32(max(0, listHoriz ? sc.bounds.height : sc.bounds.width))
+        guard let s = eViewport(top, mainExtent, cross) else { connected = false; return false }
         if !s.isEmpty { apply(s); return true }
         return false
     }
 
     func scrollViewDidScroll(_ sv: UIScrollView) {
+        // relayout() below can nudge contentSize/offset and re-enter this delegate synchronously.
+        // Skip the re-entrant call: the outer relayout already positioned for the current offset,
+        // and the next real scroll frame picks up any newer offset. Prevents unbounded recursion.
+        if inViewportSync { return }
+        inViewportSync = true
+        defer { inViewportSync = false }
         if pushViewport() { relayout() }
         if !perfActive { headerText("scroll \(Int(sv.contentOffset.y))pt") }
     }
@@ -909,7 +1041,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let avg = Double(n) / max(0.0001, perfSumTime)
         let msg = String(format: "BENCHMARK CHUKS vel=%d: avg %.0f fps | worst frame %.1f ms | janky(<50fps) %d/%d | %d video players peak | mem %.0f MB",
                          Int(vel), avg, perfMaxFrame * 1000, perfJanky, n, perfMaxPlayers, physFootprintMB())
-        print(msg); NSLog(msg); header.text = msg
+        print(msg); NSLog(msg); perfLog.append(msg)
+        header.numberOfLines = 0; header.text = perfLog.joined(separator: "\n")   // keep all lines on screen
         perfVelIdx += 1
         if perfVelIdx >= perfVels.count { stopPerf(); return }
         resetPhase()
@@ -917,6 +1050,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func stopPerf() {
         perfActive = false; displayLink?.invalidate(); displayLink = nil
         print("BENCHMARK CHUKS: sweep done")
+        // Persist to the app's Documents so the results can be pulled off a real device
+        // (headless syslog capture is unreliable on a locked/untrusted phone).
+        let out = (perfLog + ["sweep done"]).joined(separator: "\n") + "\n"
+        if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            try? out.write(to: dir.appendingPathComponent("bench_results.txt"), atomically: true, encoding: .utf8)
+        }
     }
 
     func step() {
@@ -936,6 +1075,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         headerText("frame \(frame): live")
     }
 
+    // Called on the main thread when a background Chuks task posted work (via the
+    // wake callback). A tick drains the engine's async queue and re-renders, so the
+    // result paints this frame instead of waiting for the 0.4s heartbeat.
+    func pumpWake() {
+        if DEV_MODE && !connected { return }   // let step() own the reconnect path
+        guard let s = eTick() else { return }
+        if !s.isEmpty { apply(s); relayout() }
+    }
+
     // Tear down the view + Yoga trees and rebuild from a fresh mount stream. Used
     // on hot reload: the host process stays alive, only the tree is rebuilt.
     func remount(_ mountStream: String) {
@@ -943,6 +1091,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let app = ynodes["app"] { YGNodeFreeRecursive(app) }   // frees the whole subtree
         views.removeAll(); ynodes.removeAll()
         taps.removeAll(); buttonActions.removeAll(); fieldActions.removeAll(); switchActions.removeAll(); sliderActions.removeAll()
+        fieldSubmit.removeAll(); fieldFocus.removeAll(); fieldBlur.removeAll(); fieldMaxLen.removeAll()
         selectIds.removeAll(); selectOptions.removeAll(); selectSel.removeAll(); selectActions.removeAll()
         textAreaActions.removeAll(); textAreaPlaceholders.removeAll()
         alertIds.removeAll(); alertData.removeAll(); alertActions.removeAll(); presentedAlert = nil
@@ -960,7 +1109,19 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     // return key dismisses the keyboard
-    func textFieldShouldReturn(_ tf: UITextField) -> Bool { tf.resignFirstResponder(); return true }
+    func textFieldShouldReturn(_ tf: UITextField) -> Bool {
+        if let t = fieldSubmit[tf] { fire(t) }   // onSubmit (return key)
+        tf.resignFirstResponder(); return true
+    }
+    func textFieldDidBeginEditing(_ tf: UITextField) { if let t = fieldFocus[tf] { fire(t) } }
+    func textFieldDidEndEditing(_ tf: UITextField) { if let t = fieldBlur[tf] { fire(t) } }
+    // Enforce maxLength on a single-line field.
+    func textField(_ tf: UITextField, shouldChangeCharactersIn range: NSRange, replacementString string: String) -> Bool {
+        guard let max = fieldMaxLen[tf], max >= 0 else { return true }
+        let cur = tf.text ?? ""
+        let next = (cur as NSString).replacingCharacters(in: range, with: string)
+        return next.count <= max
+    }
 
     // Dismiss the keyboard when tapping outside any field.
     @objc func dismissKeyboard() { view.endEditing(true) }
@@ -974,16 +1135,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return true
     }
 
+    // Keyboard avoidance (adjust-resize): shrink the app's usable height by the keyboard
+    // height and relayout, so bottom-anchored content (a chat input bar) sits above the
+    // keyboard and scrollable content fits the reduced area. Automatic for every app, no
+    // KeyboardAvoidingView needed. Animated to match the keyboard's own curve.
+    var kbHeight: CGFloat = 0
     @objc func kbShow(_ n: Notification) {
-        guard let sc = listScroll,
-              let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
-        let inset = max(0, end.height - view.safeAreaInsets.bottom)
-        sc.contentInset.bottom = inset
-        sc.verticalScrollIndicatorInsets.bottom = inset
+        guard let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
+        let h = max(0, end.height - view.safeAreaInsets.bottom)
+        if h == kbHeight { return }
+        kbHeight = h
+        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        UIView.animate(withDuration: dur) { self.relayout() }
     }
-    @objc func kbHide() {
-        listScroll?.contentInset.bottom = 0
-        listScroll?.verticalScrollIndicatorInsets.bottom = 0
+    @objc func kbHide(_ n: Notification) {
+        if kbHeight == 0 { return }
+        kbHeight = 0
+        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        UIView.animate(withDuration: dur) { self.relayout() }
     }
 
     // ---- apply a Chuks mutation stream to both trees -----------------------
@@ -1016,7 +1185,19 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "C" where f.count >= 3: make(f[1], f[2])
             case "S" where f.count >= 3: style(f[1], f[2])
             case "P" where f.count >= 3: setText(f[1], f[2])
+            case "V" where f.count >= 3: setFieldValue(f[1], f[2...].joined(separator: "|"))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
+            case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
+            case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }
+            case "TB" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldBlur[tf] = f[1] + ":blur" }
+            case "TL" where f.count >= 2: longPressActions[f[1]] = f[1] + ":longpress"   // Pressable onLongPress
+            case "TPI" where f.count >= 2: pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
+            case "TPO" where f.count >= 2: pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
+            case "ML" where f.count >= 2: mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
+            case "ME" where f.count >= 2: mediaError[f[1]] = f[1] + ":error"              // Image onError
+            case "MN" where f.count >= 2: mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
+            case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
+            case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
             case "X" where f.count >= 3:
@@ -1507,7 +1688,43 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         self.present(vc, animated: true)
     }
 
+    // A controlled TextInput's value. Set the native text ONLY when it differs, so
+    // re-emitting the same value (every keystroke, since the field is controlled) does
+    // not move the cursor. Clearing (value = "") resets the field.
+    func setFieldValue(_ id: String, _ value: String) {
+        if let tf = views[id] as? UITextField { if tf.text != value { tf.text = value } }
+        else if let tv = views[id] as? UITextView { if tv.text != value { tv.text = value } }
+    }
+
+    // List scrollToIndex/scrollToEnd: scroll the list's UIScrollView to content-offset y,
+    // clamped to the scrollable range. Deferred to the next runloop so the content-size /
+    // layout emitted in the same batch is applied before we scroll (otherwise maxOffset is
+    // stale). NOT animated on purpose: a big jump lands in an unmounted region, and the
+    // scrollViewDidScroll -> mount -> relayout that follows would cancel an in-flight animated
+    // scroll partway (a small already-mounted jump survives, a large one aborts near the top).
+    func scrollListTo(_ id: String, y: CGFloat) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, let sc = self.views[id] as? UIScrollView else { return }
+            if self.listHoriz && sc == self.listScroll {   // horizontal list: y is really the x offset
+                let maxX = max(0, sc.contentSize.width - sc.bounds.width)
+                sc.setContentOffset(CGPoint(x: min(max(0, y), maxX), y: 0), animated: false)
+            } else {
+                let maxY = max(0, sc.contentSize.height - sc.bounds.height)
+                sc.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: false)
+            }
+        }
+    }
+
     func setText(_ id: String, _ t: String) {
+        if let vv = views[id] as? VideoView {   // a Video's "text" is an optional poster URL shown until the first frame
+            if !t.isEmpty && videoPosters[id] == nil {
+                let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
+                iv.frame = vv.bounds; iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                vv.addSubview(iv); videoPosters[id] = iv
+                loadRemoteImage(t, into: iv)
+            }
+            return
+        }
         if selectIds.contains(id) {                                  // a Select's "text" is its tab-joined options
             selectOptions[id] = t.components(separatedBy: "\t")
             rebuildSelectMenu(id)
@@ -1516,12 +1733,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if menuIds.contains(id) { menuData[id] = t.components(separatedBy: "\t"); rebuildMenu(id); return }   // [label, items...]
         if contextMenuIds.contains(id) { contextMenuData[id] = t.components(separatedBy: "\t"); return }        // items
         if alertIds.contains(id) { alertData[id] = t.components(separatedBy: "\t"); return }   // Alert's tab-joined fields
-        if let iv = bgImageViews[id], t.hasPrefix("http") { loadRemoteImage(t, into: iv); return }   // ImageBackground URL
-        if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv); return }   // remote Image URL
-        if let iv = views[id] as? UIImageView, t.hasPrefix("file://") { iv.image = UIImage(contentsOfFile: String(t.dropFirst(7))); return }   // picked/captured local file
+        if let iv = bgImageViews[id], t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // ImageBackground URL
+        if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // remote Image URL
+        if let iv = views[id] as? UIImageView, t.hasPrefix("file://") {   // picked/captured local file
+            iv.image = UIImage(contentsOfFile: String(t.dropFirst(7)))
+            fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
+        }
         if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
             if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
-            return
+            fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = bgImageViews[id], !t.isEmpty {            // bundled ImageBackground asset
             if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
@@ -1559,7 +1779,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let n = YGNodeNewWithConfig(config)
         switch kind {
         case "Text":
-            let l = UILabel(); l.font = .systemFont(ofSize: 14); l.numberOfLines = 0; v = l   // 0 = wrap to as many lines as fit the measured (Yoga) width
+            let l = SelectableLabel(); l.font = .systemFont(ofSize: 14); l.numberOfLines = 0; v = l   // 0 = wrap to as many lines as fit the measured (Yoga) width
             YGNodeSetContext(n, Unmanaged.passUnretained(l).toOpaque())
             YGNodeSetMeasureFunc(n, measureText)
         case "Image":
@@ -1572,6 +1792,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             bgImageViews[id] = iv; v = box
         case "Video":
             let vv = VideoView(); vv.playerLayer.videoGravity = .resizeAspectFill; vv.clipsToBounds = true; v = vv
+        case "VideoControls":
+            // Apple's complete native player UI (transport, scrubber, fullscreen, AirPlay, PiP,
+            // subtitle/audio menus) via AVPlayerViewController — added as a child VC of the host.
+            let vc = AVPlayerViewController(); vc.showsPlaybackControls = true
+            vc.videoGravity = .resizeAspectFill   // cover (default resizeMode), no letterbox bars
+            vc.view.backgroundColor = .black; vc.view.clipsToBounds = true
+            addChild(vc); vc.didMove(toParent: self)
+            videoCtrlVCs[id] = vc; v = vc.view
         case "CameraView":
             let ctrl = cameraController ?? CameraController()
             cameraController = ctrl
@@ -1691,10 +1919,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             dt.numberOfTapsRequired = 2; gv.addGestureRecognizer(dt)
             gv.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:))))
             gestureIds.insert(id); v = gv
-        case "Scroll":
+        case "Scroll", "HScroll":   // one UIScrollView for both axes; the `horiz` style picks x vs y
             let sc = UIScrollView(); sc.delegate = self; sc.keyboardDismissMode = .onDrag
             sc.showsVerticalScrollIndicator = true
-            listScroll = sc; scrollId = id; v = sc
+            listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll"); v = sc   // horiz confirmed by the style too
         case "Modal":
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
             mv.isHidden = true                     // shown when mvis=1
@@ -1703,7 +1931,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let a = UIView(); a.isUserInteractionEnabled = false   // invisible placeholder; the OS alert shows on avis=1
             alertIds.insert(id); v = a
         default:
-            v = UIView()
+            v = HitSlopView()   // a plain container that can also carry a Pressable hitSlop
         }
         v.translatesAutoresizingMaskIntoConstraints = true   // we drive .frame directly
         views[id] = v
@@ -1740,7 +1968,35 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "p":   YGNodeStyleSetPadding(n, YGEdge.all, f)
             case "gap": YGNodeStyleSetGap(n, YGGutter.all, f)
             case "press": pressOpacity[id] = CGFloat(f) / 100     // Pressable active alpha
+            case "nlines": if let l = label { l.numberOfLines = Int(f); if let n = ynodes[id] { YGNodeMarkDirty(n) } }   // Text: cap lines
+            case "ellip": if let l = label {                       // Text truncation mode
+                switch val { case "head": l.lineBreakMode = .byTruncatingHead; case "middle": l.lineBreakMode = .byTruncatingMiddle
+                case "clip": l.lineBreakMode = .byClipping; default: l.lineBreakMode = .byTruncatingTail } }
+            case "tint": if let iv = v as? UIImageView {   // Image tintColor: template render + tint
+                let c = hexColor(val); imageTint[id] = c; iv.tintColor = c
+                if let img = iv.image { iv.image = img.withRenderingMode(.alwaysTemplate) } }
+            case "seek": if let vv = v as? VideoView { seekVideo(id, to: Int(f)) }   // Video seek (seconds)
+            case "vctrl": break   // handled by the VideoControls kind (native AVPlayerViewController)
+            case "dis":   // disabled: dim + block interaction (checked at fire time, since bindAction re-enables interaction)
+                v.alpha = (val == "1") ? 0.4 : 1.0
+                if let b = v as? UIButton { b.isEnabled = (val != "1") }
+                if val == "1" { disabledIds.insert(id) } else { disabledIds.remove(id) }
             case "sec": (v as? UITextField)?.isSecureTextEntry = (val == "1")   // password field
+            case "kbt": if let tf = field {
+                switch val { case "email": tf.keyboardType = .emailAddress; case "number": tf.keyboardType = .numberPad
+                case "decimal": tf.keyboardType = .decimalPad; case "phone": tf.keyboardType = .phonePad
+                case "url": tf.keyboardType = .URL; default: tf.keyboardType = .default } }
+            case "ret": if let tf = field {
+                switch val { case "done": tf.returnKeyType = .done; case "send": tf.returnKeyType = .send
+                case "search": tf.returnKeyType = .search; case "next": tf.returnKeyType = .next
+                case "go": tf.returnKeyType = .go; default: tf.returnKeyType = .default } }
+            case "edit": field?.isEnabled = (val == "1")
+            case "afoc": if val == "1", let tf = field { DispatchQueue.main.async { tf.becomeFirstResponder() } }
+            case "acap": if let tf = field {
+                switch val { case "none": tf.autocapitalizationType = .none; case "sentences": tf.autocapitalizationType = .sentences
+                case "words": tf.autocapitalizationType = .words; case "characters": tf.autocapitalizationType = .allCharacters; default: break } }
+            case "acor": field?.autocorrectionType = (val == "1") ? .yes : .no
+            case "maxlen": if let tf = field { fieldMaxLen[tf] = Int(val) ?? -1 }
             case "sbh": sbHiddenOverride = (val == "1"); setNeedsStatusBarAppearanceUpdate()
             case "sbstyle":
                 sbStyleOverride = (val == "light") ? .lightContent : (val == "dark" ? .darkContent : nil)
@@ -1802,6 +2058,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 (v as? UIImageView)?.contentMode = mode
                 bgImageViews[id]?.contentMode = mode
             case "vid":
+                // VideoControls: a standalone AVPlayer (not pooled) driven by the native UI. The
+                // pooled path below is skipped for it (its view isn't a VideoView).
+                if let vc = videoCtrlVCs[id], videoPlayers[id] == nil, !val.isEmpty {
+                    let url: URL? = val.hasPrefix("http") ? URL(string: val)
+                                  : val.hasPrefix("file://") ? URL(fileURLWithPath: String(val.dropFirst(7)))
+                                  : Bundle.main.url(forResource: val, withExtension: nil)
+                    if let url = url {
+                        let p = AVPlayer(url: url); vc.player = p; videoPlayers[id] = p; videoPlayerKey[id] = val; p.play()
+                    }
+                }
                 // Attach a muted, looping player when a Video node mounts. Reuse an
                 // idle player from the pool (its item + loop observer are still primed)
                 // instead of rebuilding an AVPlayerItem/AVPlayer on the main thread --
@@ -1811,21 +2077,64 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     var player: AVPlayer? = nil
                     if var idle = videoPool[val], !idle.isEmpty {
                         player = idle.removeLast(); videoPool[val] = idle       // reuse (no alloc)
-                    } else if let url = (val.hasPrefix("http") ? URL(string: val) : Bundle.main.url(forResource: val, withExtension: nil)) {
-                        let item = AVPlayerItem(url: url)
-                        let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
-                        let obs = NotificationCenter.default.addObserver(
-                            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak p] _ in
-                                p?.seek(to: .zero); p?.play()
+                    } else {
+                        // http(s) -> remote; file:// -> captured/downloaded; else a bundled asset.
+                        let url: URL? = val.hasPrefix("http") ? URL(string: val)
+                                      : val.hasPrefix("file://") ? URL(fileURLWithPath: String(val.dropFirst(7)))
+                                      : Bundle.main.url(forResource: val, withExtension: nil)
+                        if let url = url {
+                            let item = AVPlayerItem(url: url)
+                            let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
+                            let obs = NotificationCenter.default.addObserver(
+                                forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self, weak p] _ in
+                                    guard let self = self, let p = p else { return }
+                                    if !self.videoNoLoop.contains(ObjectIdentifier(p)) { p.seek(to: .zero); p.play() }
+                                    else if let id = self.videoPlayers.first(where: { $0.value === p })?.key {
+                                        self.fireMedia(self.mediaEnd[id])   // reached the end (not looping): onEnd
+                                    }
+                            }
+                            videoObs[ObjectIdentifier(p)] = obs
+                            player = p
                         }
-                        videoObs[ObjectIdentifier(p)] = obs
-                        player = p
                     }
                     if let player = player {
                         vv.playerLayer.player = player
                         videoPlayers[id] = player; videoPlayerKey[id] = val
-                        player.play()
+                        if mediaProgress[id] != nil { addVideoProgress(id) }   // onProgress may have registered already
+                        // poster: remove the overlay once the first frame is ready to display.
+                        if videoPosters[id] != nil {
+                            posterObs[id] = vv.playerLayer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] layer, _ in
+                                if layer.isReadyForDisplay { self?.videoPosters[id]?.removeFromSuperview(); self?.videoPosters[id] = nil; self?.posterObs[id] = nil }
+                            }
+                        }
+                        player.play()   // default autoplay; a later vplay=0 pauses it
                     }
+                }
+            case "vplay":   // controllable playback: vplay=0 pauses (feed cells drive this)
+                if let p = videoPlayers[id] { if val == "0" { p.pause() } else { p.play() } }
+            case "vmute":
+                videoPlayers[id]?.isMuted = (val != "0")
+            case "vfit":
+                (v as? VideoView)?.playerLayer.videoGravity = (val == "contain") ? .resizeAspect : .resizeAspectFill
+                videoCtrlVCs[id]?.videoGravity = (val == "contain") ? .resizeAspect : .resizeAspectFill
+            case "paging":   // List/Scroll snap-per-screen (video feeds)
+                (v as? UIScrollView)?.isPagingEnabled = (val == "1")
+            case "stick": if v is UIScrollView { stickBottomOn = (val == "1") }
+            case "horiz": if let sc = v as? UIScrollView {   // horizontal list (carousel): report x + scroll sideways
+                listHoriz = (val == "1")
+                sc.showsHorizontalScrollIndicator = false
+                sc.showsVerticalScrollIndicator = false
+            }
+            case "vvol": videoPlayers[id]?.volume = f / 100                 // Video volume 0-100
+            case "vrate": if let p = videoPlayers[id], p.rate != 0 { p.rate = f / 100 }   // playback speed while playing
+            case "ldelay": pressLongDelay[id] = TimeInterval(f) / 1000       // onLongPress hold time (ms)
+            case "blur": if let iv = v as? UIImageView { imageBlur[id] = CGFloat(f); applyBlur(iv, id) }   // Image blur (px)
+            case "sel": if let l = v as? SelectableLabel { l.selectable = (val == "1"); if val == "1" { l.enableSelection() } }   // Text selectable
+            case "hitslop": if let h = v as? HitSlopView { h.hitSlop = CGFloat(f) }   // Pressable enlarged tap area
+            case "spin": if val == "1", let iv = v as? UIImageView, iv.image == nil { showImageSpinner(id, iv) }   // Image loading spinner
+            case "vloop":
+                if let p = videoPlayers[id] {
+                    if val == "0" { videoNoLoop.insert(ObjectIdentifier(p)) } else { videoNoLoop.remove(ObjectIdentifier(p)) }
                 }
             case "r":   v.clipsToBounds = !hasShadow
                         // A huge radius (rounded-full) is a pill: clamp to height/2 in
@@ -1934,7 +2243,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let prefix = id + "."
         for k in views.keys.filter({ $0 == id || $0.hasPrefix(prefix) }) {
             if let b = views[k] as? UIButton { buttonActions[b] = nil }
-            if let tf = views[k] as? UITextField { fieldActions[tf] = nil }
+            if let tf = views[k] as? UITextField { fieldActions[tf] = nil; fieldSubmit[tf] = nil; fieldFocus[tf] = nil; fieldBlur[tf] = nil; fieldMaxLen[tf] = nil }
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
             if let sl = views[k] as? UISlider { sliderActions[sl] = nil }
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
@@ -1998,7 +2307,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let g = UILongPressGestureRecognizer(target: self, action: #selector(handlePress(_:)))
             g.minimumPressDuration = 0
             v.addGestureRecognizer(g)
-            pressGestures[g] = (action, ao)
+            pressGestures[g] = (action, ao, id)
             return
         }
         let g = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
@@ -2007,7 +2316,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     @objc func handleButton(_ b: UIButton) { if let a = buttonActions[b] { fire(a) } }
-    @objc func handleTap(_ g: UITapGestureRecognizer) { if let a = taps[g] { fire(a) } }
+    @objc func handleTap(_ g: UITapGestureRecognizer) { if let a = taps[g], !disabledIds.contains(a) { fire(a) } }
     // A native value event from a Switch node: dispatch, then the re-render syncs the
     // control back to Chuks state (the controlled pattern, like Input).
     @objc func handleSwitch(_ sw: UISwitch) { if let a = switchActions[sw] { fire(a) } }
@@ -2015,13 +2324,29 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // ended inside the view (TouchableOpacity semantics). minimumPressDuration=0 makes
     // .began fire the instant the finger lands.
     @objc func handlePress(_ g: UILongPressGestureRecognizer) {
-        guard let v = g.view, let (action, ao) = pressGestures[g] else { return }
+        guard let v = g.view, let (action, ao, id) = pressGestures[g] else { return }
+        if disabledIds.contains(id) { return }   // disabled Pressable: no dim, no fire
+        let gid = ObjectIdentifier(g)
         switch g.state {
         case .began:
             UIView.animate(withDuration: 0.09) { v.alpha = ao }
+            if let pin = pressInActions[id] { fire(pin) }
+            // onLongPress: after the delay, fire it and suppress the release's onPress.
+            if let lp = longPressActions[id] {
+                pressLongFired.remove(gid)
+                pressLongTimers[gid]?.invalidate()
+                pressLongTimers[gid] = Timer.scheduledTimer(withTimeInterval: pressLongDelay[id] ?? 0.5, repeats: false) { [weak self] _ in
+                    guard let self = self else { return }
+                    self.pressLongFired.insert(gid); self.fire(lp)
+                }
+            }
         case .ended, .cancelled, .failed:
             UIView.animate(withDuration: 0.09) { v.alpha = 1.0 }
-            if g.state == .ended && v.bounds.contains(g.location(in: v)) { fire(action) }
+            pressLongTimers[gid]?.invalidate(); pressLongTimers[gid] = nil
+            if let po = pressOutActions[id] { fire(po) }
+            // Fire onPress only on a real release inside, and not if a long-press already fired.
+            if g.state == .ended && v.bounds.contains(g.location(in: v)) && !pressLongFired.contains(gid) { fire(action) }
+            pressLongFired.remove(gid)
         default: break
         }
     }
@@ -2188,17 +2513,42 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         c.timeoutIntervalForRequest = 20
         return URLSession(configuration: c)
     }()
-    func loadRemoteImage(_ urlStr: String, into iv: UIImageView) {
-        if let cached = CardsVC.imageCache[urlStr] { iv.image = cached; return }
-        guard let url = URL(string: urlStr) else { return }
+    func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
+        // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
+        // recycled cell never gets a late image for a URL it no longer shows.
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); applyBlur(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
-        CardsVC.imageSession.dataTask(with: url) { data, _, _ in
-            guard let data = data, let img = UIImage(data: data) else { return }
-            CardsVC.imageCache[urlStr] = img
-            DispatchQueue.main.async { if iv.tag == wanted { iv.image = img } }
-        }.resume()
+        ChuksImageLoader.shared.load(urlStr) { [weak self] img in
+            guard let self = self else { return }
+            if iv.tag == wanted { iv.image = self.tinted(img, id); self.applyBlur(iv, id) }
+            self.hideImageSpinner(id)
+            self.fireMedia(self.mediaLoad[id])
+        } fail: { [weak self] in self?.hideImageSpinner(id); self?.fireMedia(self?.mediaError[id]) }
     }
+    // Image loading spinner: a centered activity indicator over the image view until it loads.
+    func showImageSpinner(_ id: String, _ iv: UIImageView) {
+        if imageSpinners[id] != nil { return }
+        let sp = UIActivityIndicatorView(style: .medium); sp.color = .lightGray
+        sp.translatesAutoresizingMaskIntoConstraints = false; sp.startAnimating()
+        iv.addSubview(sp)
+        NSLayoutConstraint.activate([sp.centerXAnchor.constraint(equalTo: iv.centerXAnchor), sp.centerYAnchor.constraint(equalTo: iv.centerYAnchor)])
+        imageSpinners[id] = sp
+    }
+    func hideImageSpinner(_ id: String) { imageSpinners[id]?.removeFromSuperview(); imageSpinners[id] = nil }
+    // Render as a template (for tintColor) when the node has a tint, else leave the image as-is.
+    func tinted(_ img: UIImage?, _ id: String) -> UIImage? { imageTint[id] != nil ? img?.withRenderingMode(.alwaysTemplate) : img }
+    // Image blurRadius: Gaussian-blur the current image in place (cropped to the original extent).
+    func applyBlur(_ iv: UIImageView, _ id: String) {
+        guard let r = imageBlur[id], r > 0, let img = iv.image, let ci = CIImage(image: img),
+              let filter = CIFilter(name: "CIGaussianBlur") else { return }
+        filter.setValue(ci, forKey: kCIInputImageKey); filter.setValue(r, forKey: kCIInputRadiusKey)
+        guard let out = filter.outputImage, let cg = ciContext.createCGImage(out, from: ci.extent) else { return }
+        iv.image = UIImage(cgImage: cg)
+    }
+    let ciContext = CIContext()
+    // Dispatch a media event action (onLoad/onError/onEnd) if one is registered for the node.
+    func fireMedia(_ action: String?) { if let a = action { DispatchQueue.main.async { [weak self] in self?.fire(a) } } }
 
     // Pull-to-refresh fired: run onRefresh (synchronous — its state change re-renders),
     // then end the spinner. (A controlled `refreshing` flag can also drive it via rfsh.)
@@ -2213,6 +2563,34 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         apply(s)
         relayout()
         headerText("action \(action)")
+    }
+    // A native event carrying a value (onProgress time, etc.) -> the engine, then apply.
+    func fireValue(_ action: String, _ value: String) {
+        guard let s = eInput(action, value) else { connected = false; return }
+        apply(s); relayout()
+    }
+    // Video seek: jump to `seconds` when it changes (a controlled prop). Tracked per id so a
+    // style re-emit that didn't change the seek target doesn't re-seek.
+    func seekVideo(_ id: String, to seconds: Int) {
+        if videoSeek[id] == seconds { return }
+        videoSeek[id] = seconds
+        videoPlayers[id]?.seek(to: CMTime(seconds: Double(seconds), preferredTimescale: 600))
+    }
+    // onProgress: attach a periodic observer, but fire only when the WHOLE SECOND changes and
+    // stays within the clip (throttles the re-render to ~1/sec and never reports a stray time
+    // past the end). One observer per id.
+    func addVideoProgress(_ id: String) {
+        guard let p = videoPlayers[id], videoTimeObservers[id] == nil else { return }
+        let tok = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { [weak self, weak p] _ in
+            guard let self = self, let p = p, let a = self.mediaProgress[id] else { return }
+            let sec = Int(p.currentTime().seconds)
+            let dur = p.currentItem?.duration.seconds ?? 0
+            if sec < 0 || (dur.isFinite && Double(sec) > dur + 1) { return }   // ignore out-of-range ticks
+            if self.videoLastSec[id] == sec { return }                        // dedup to whole seconds
+            self.videoLastSec[id] = sec
+            self.fireValue(a, "\(sec)")
+        }
+        videoTimeObservers[id] = tok
     }
 
     func justify(_ v: String) -> YGJustify {
@@ -2234,7 +2612,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // since a hidden header has a .zero frame.
         let topY = BENCHMARK_MODE ? header.frame.maxY + 6 : insets.top
         let W = Float(view.bounds.width - insets.left - insets.right)
-        let H = Float(view.bounds.height - topY - insets.bottom)
+        let H = Float(view.bounds.height - topY - insets.bottom - kbHeight)   // shrink for the keyboard
         if W <= 0 || H <= 0 { return }
         YGNodeStyleSetWidth(app, W); YGNodeStyleSetHeight(app, H)
         YGNodeCalculateLayout(app, W, H, YGDirection.LTR)
@@ -2271,9 +2649,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         } else {
             clearSheetChrome()
         }
-        // the scroll's content size comes from its content node's laid-out size
+        // the scroll's content size comes from its content node's laid-out size. A horizontal
+        // list's content node has an explicit WIDTH but no height (its rows are abs), so pin the
+        // content height to the scroll's own height — it scrolls sideways only, rows never clip.
         if let sc = listScroll, let cn = ynodes[contentId] {
-            sc.contentSize = CGSize(width: CGFloat(YGNodeLayoutGetWidth(cn)), height: CGFloat(YGNodeLayoutGetHeight(cn)))
+            let cw = CGFloat(YGNodeLayoutGetWidth(cn)), chh = CGFloat(YGNodeLayoutGetHeight(cn))
+            sc.contentSize = CGSize(width: cw, height: listHoriz ? sc.bounds.height : chh)
+            // stickBottom (chat): if the user was at the bottom before this layout, stay pinned
+            // to the new bottom (a new message, or the keyboard opening and shrinking the view).
+            if stickBottomOn {
+                let newH = sc.contentSize.height
+                let wasAtBottom = sc.contentOffset.y + sc.bounds.height >= stickPrevH - 40
+                if wasAtBottom && newH > sc.bounds.height {
+                    sc.setContentOffset(CGPoint(x: 0, y: newH - sc.bounds.height), animated: false)
+                }
+                stickPrevH = newH
+            }
         }
     }
 
