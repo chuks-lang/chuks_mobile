@@ -1170,8 +1170,86 @@ export function Gesture(p: map[string]Prop, kids: []Node): Node {
     const s: Style = new Style()
     applyLayout(s, p)
     const n: Node = new Node("Gesture", s, "", kids)
-    const og: Prop? = p.get("onGesture"); if (og != null) { n.onChange = og }   // fires via the value channel
+    const og: Prop? = p.get("onGesture")      // discrete: swipe/doubletap/longpress
+    const onPan: Prop? = p.get("onPan")        // continuous, each a function(v: string): void
+    const onPinch: Prop? = p.get("onPinch")
+    const onRotate: Prop? = p.get("onRotate")
+    // Tell the host which CONTINUOUS recognizers to attach (text channel, comma list).
+    // Attaching only the requested ones avoids fighting a Scroll and skips the discrete
+    // swipe recognizer when pan is on (they both track drags).
+    var cont: string = ""
+    if (onPan != null) { cont = cont == "" ? "pan" : cont + ",pan" }
+    if (onPinch != null) { cont = cont == "" ? "pinch" : cont + ",pinch" }
+    if (onRotate != null) { cont = cont == "" ? "rotate" : cont + ",rotate" }
+    n.text = cont
+    // One value-channel binding routes every gesture string by its prefix to the right
+    // callback. Continuous streams ("pan:..."/"pinch:..."/"rotate:...") and discrete
+    // ("swipe:left"/"doubletap"/"longpress") all arrive here.
+    if (og != null || onPan != null || onPinch != null || onRotate != null) {
+        n.onChange = function(v: string): void {
+            if (_prefix(v, "pan:")) { _callStr(onPan, v) }
+            else if (_prefix(v, "pinch:")) { _callStr(onPinch, v) }
+            else if (_prefix(v, "rotate:")) { _callStr(onRotate, v) }
+            else { _callStr(og, v) }
+        }
+    }
     return n
+}
+// Does `s` start with `p`? (Chuks has no startsWith; slice-compare instead.)
+function _prefix(s: string, p: string): bool { return s.length >= p.length && s.slice(0, p.length) == p }
+// Call an optional `function(v: string): void` (held as any) with a string arg.
+function _callStr(cb: any, v: string): void { if (cb != null) { const f: any = cb; f(v) } }
+
+// ---- continuous-gesture decoders ------------------------------------------
+// The host streams a continuous gesture as an encoded value string; these parse it
+// into a typed event. phase: 0 = begin, 1 = change, 2 = end. Pan dx/dy are the
+// translation (px) from the gesture's start; vx/vy the release velocity (px/s).
+// Pinch scale / Rotate deg are the factor*100 (100 = 1.0) / degrees from start.
+export class PanEvent {
+    var phase: int
+    var dx: int
+    var dy: int
+    var vx: int
+    var vy: int
+    constructor() { this.phase = 0; this.dx = 0; this.dy = 0; this.vx = 0; this.vy = 0 }
+}
+export class PinchEvent {
+    var phase: int
+    var scale: int   // factor as a percent, 100 = 1.0
+    var vscale: int
+    constructor() { this.phase = 0; this.scale = 100; this.vscale = 0 }
+}
+export class RotateEvent {
+    var phase: int
+    var deg: int     // rotation from the gesture start, in degrees
+    var vdeg: int
+    constructor() { this.phase = 0; this.deg = 0; this.vdeg = 0 }
+}
+function _afterColon(v: string): []string {
+    const ci: int = v.indexOf(":")
+    if (ci < 0) { return [] }
+    return v.slice(ci + 1, v.length).split(",")
+}
+/** Decode a "pan:phase,dx,dy,vx,vy" value string from Gesture.onPan. */
+export function decodePan(v: string): PanEvent {
+    const e: PanEvent = new PanEvent()
+    const f: []string = _afterColon(v)
+    if (f.length >= 5) { e.phase = int(f[0]); e.dx = int(f[1]); e.dy = int(f[2]); e.vx = int(f[3]); e.vy = int(f[4]) }
+    return e
+}
+/** Decode a "pinch:phase,scale,vscale" value string from Gesture.onPinch. */
+export function decodePinch(v: string): PinchEvent {
+    const e: PinchEvent = new PinchEvent()
+    const f: []string = _afterColon(v)
+    if (f.length >= 3) { e.phase = int(f[0]); e.scale = int(f[1]); e.vscale = int(f[2]) }
+    return e
+}
+/** Decode a "rotate:phase,deg,vdeg" value string from Gesture.onRotate. */
+export function decodeRotate(v: string): RotateEvent {
+    const e: RotateEvent = new RotateEvent()
+    const f: []string = _afterColon(v)
+    if (f.length >= 3) { e.phase = int(f[0]); e.deg = int(f[1]); e.vdeg = int(f[2]) }
+    return e
 }
 /**
  * A page's root column: its children fill the screen top-to-bottom. Every

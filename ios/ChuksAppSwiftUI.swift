@@ -2212,7 +2212,10 @@ struct NodeView: View {
             } else {
                 // Button/Input/Switch wire their own action; any other actioned node
                 // (a View tab-bar item, chip, tappable card/row, pressable Text) gets a tap gesture.
-                let tap = (disabled || node.kind == "Button" || node.kind == "Input" || node.kind == "Switch") ? "" : node.action
+                // Gesture handles its own recognizers in render(); an outer auto-tap here
+                // would both conflict with its drag/pan and spuriously fire the value-channel
+                // binding via dispatch(). Exclude it (like Button/Input/Switch).
+                let tap = (disabled || node.kind == "Button" || node.kind == "Input" || node.kind == "Switch" || node.kind == "Gesture") ? "" : node.action
                 render(node).modifier(TapAction(action: tap, scene: scene))
             }
         }
@@ -2235,14 +2238,43 @@ struct NodeView: View {
                 Button { if !node.action.isEmpty { scene.input(node.action, String(i)) } } label: { Text(node.text.components(separatedBy: "\t")[i]) }
             }
         }
-        case "Gesture": container(node)
-            .onTapGesture(count: 2) { if !node.action.isEmpty { scene.input(node.action, "doubletap") } }
-            .onLongPressGesture(minimumDuration: 0.5) { if !node.action.isEmpty { scene.input(node.action, "longpress") } }
-            .gesture(DragGesture(minimumDistance: 24).onEnded { val in
-                let dx = val.translation.width, dy = val.translation.height
-                let dir = abs(dx) > abs(dy) ? (dx < 0 ? "left" : "right") : (dy < 0 ? "up" : "down")
-                if !node.action.isEmpty { scene.input(node.action, "swipe:\(dir)") }
-            })
+        case "Gesture":
+            if node.text.isEmpty {   // discrete: swipe / double-tap / long-press
+                container(node)
+                    .onTapGesture(count: 2) { if !node.action.isEmpty { scene.input(node.action, "doubletap") } }
+                    .onLongPressGesture(minimumDuration: 0.5) { if !node.action.isEmpty { scene.input(node.action, "longpress") } }
+                    .gesture(DragGesture(minimumDistance: 24).onEnded { val in
+                        let dx = val.translation.width, dy = val.translation.height
+                        let dir = abs(dx) > abs(dy) ? (dx < 0 ? "left" : "right") : (dy < 0 ? "up" : "down")
+                        if !node.action.isEmpty { scene.input(node.action, "swipe:\(dir)") }
+                    })
+            } else {                 // continuous: pan / pinch / rotate (node.text lists them)
+                // Overlay imperative UIKit recognizers (via a representable) instead of
+                // SwiftUI's declarative gestures: the UIView + its recognizers survive the
+                // per-move re-renders that would otherwise drop an in-progress SwiftUI
+                // gesture. Same stream contract as the UIKit host.
+                container(node)
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(DragGesture(minimumDistance: 0)
+                        .onChanged { val in
+                            if node.text.contains("pan") && !node.action.isEmpty {
+                                scene.input(node.action, "pan:1,\(Int(val.translation.width)),\(Int(val.translation.height)),0,0")
+                            }
+                        }
+                        .onEnded { val in
+                            if node.text.contains("pan") && !node.action.isEmpty {
+                                let vx = Int(val.predictedEndTranslation.width - val.translation.width)
+                                let vy = Int(val.predictedEndTranslation.height - val.translation.height)
+                                scene.input(node.action, "pan:2,\(Int(val.translation.width)),\(Int(val.translation.height)),\(vx),\(vy)")
+                            }
+                        })
+                    .simultaneousGesture(MagnificationGesture()
+                        .onChanged { s in if node.text.contains("pinch") && !node.action.isEmpty { scene.input(node.action, "pinch:1,\(Int(s * 100)),0") } }
+                        .onEnded { s in if node.text.contains("pinch") && !node.action.isEmpty { scene.input(node.action, "pinch:2,\(Int(s * 100)),0") } })
+                    .simultaneousGesture(RotationGesture()
+                        .onChanged { a in if node.text.contains("rotate") && !node.action.isEmpty { scene.input(node.action, "rotate:1,\(Int(a.degrees)),0") } }
+                        .onEnded { a in if node.text.contains("rotate") && !node.action.isEmpty { scene.input(node.action, "rotate:2,\(Int(a.degrees)),0") } })
+            }
         case "Map": ChuksMap(spec: node.text).modifier(BoxStyle(s: node.style, parentRow: parentRow, parentStretch: parentStretch))
         case "Canvas": ChuksCanvas(shapes: node.text, style: node.style, parentRow: parentRow, parentStretch: parentStretch)
         case "Spinner": spinnerView(node)

@@ -1736,6 +1736,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func setText(_ id: String, _ t: String) {
+        if gestureIds.contains(id) {   // a Gesture's "text" is its continuous-recognizer list ("pan,pinch,rotate")
+            attachContinuousGestures(id, t)
+            return
+        }
         if let vv = views[id] as? VideoView {   // a Video's "text" is an optional poster URL shown until the first frame
             if !t.isEmpty && videoPosters[id] == nil {
                 let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
@@ -2269,7 +2273,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
-            if gestureIds.contains(k) { gestureIds.remove(k); gestureActions[k] = nil }
+            if gestureIds.contains(k) { gestureIds.remove(k); gestureActions[k] = nil; gestureContAttached.remove(k) }
             if menuIds.contains(k) { menuIds.remove(k); menuData[k] = nil; menuActions[k] = nil }
             if contextMenuIds.contains(k) { contextMenuIds.remove(k); contextMenuData[k] = nil; contextMenuActions[k] = nil }
             if alertIds.contains(k) { alertIds.remove(k); alertData[k] = nil; alertActions[k] = nil; if presentedAlert == k { presentedAlert = nil } }
@@ -2487,6 +2491,37 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     @objc func handleDoubleTap(_ g: UITapGestureRecognizer) { dispatchGesture(g.view, "doubletap") }
     @objc func handleLongPress(_ g: UILongPressGestureRecognizer) { if g.state == .began { dispatchGesture(g.view, "longpress") } }
+
+    // Attach the requested CONTINUOUS recognizers (pan/pinch/rotate) to a Gesture view,
+    // once. They stream an encoded value string every move; pinch+rotate recognize
+    // simultaneously (via the delegate) so a two-finger transform reports both.
+    var gestureContAttached: Set<String> = []
+    func attachContinuousGestures(_ id: String, _ list: String) {
+        guard !list.isEmpty, !gestureContAttached.contains(id), let gv = views[id] else { return }
+        gestureContAttached.insert(id)
+        let kinds = list.components(separatedBy: ",")
+        if kinds.contains("pan") {
+            let g = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:))); g.delegate = self; gv.addGestureRecognizer(g)
+        }
+        if kinds.contains("pinch") {
+            let g = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:))); g.delegate = self; gv.addGestureRecognizer(g)
+        }
+        if kinds.contains("rotate") {
+            let g = UIRotationGestureRecognizer(target: self, action: #selector(handleRotate(_:))); g.delegate = self; gv.addGestureRecognizer(g)
+        }
+    }
+    private func gPhase(_ s: UIGestureRecognizer.State) -> Int { s == .began ? 0 : (s == .changed ? 1 : 2) }
+    @objc func handlePan(_ g: UIPanGestureRecognizer) {
+        let t = g.translation(in: g.view), v = g.velocity(in: g.view)
+        dispatchGesture(g.view, "pan:\(gPhase(g.state)),\(Int(t.x)),\(Int(t.y)),\(Int(v.x)),\(Int(v.y))")
+    }
+    @objc func handlePinch(_ g: UIPinchGestureRecognizer) {
+        dispatchGesture(g.view, "pinch:\(gPhase(g.state)),\(Int(g.scale * 100)),\(Int(g.velocity * 100))")
+    }
+    @objc func handleRotate(_ g: UIRotationGestureRecognizer) {
+        let deg = g.rotation * 180.0 / .pi, vdeg = g.velocity * 180.0 / .pi
+        dispatchGesture(g.view, "rotate:\(gPhase(g.state)),\(Int(deg)),\(Int(vdeg))")
+    }
 
     // A native edit on a multiline TextArea -> the engine; toggles the placeholder.
     func textViewDidChange(_ tv: UITextView) {
