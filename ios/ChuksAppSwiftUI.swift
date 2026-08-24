@@ -723,6 +723,7 @@ struct NodeData {
     var endAction: String = ""
     var progressAction: String = ""
     var slideDoneAction: String = ""
+    var scrollAction: String = ""
 }
 
 // The parsed fields of a visible Alert node, for the native .alert presentation.
@@ -939,6 +940,7 @@ final class Scene: ObservableObject {
     // identical target (e.g. scrollToEnd bumped again) still re-fires the scroll.
     @Published var scrollTargets: [String: CGFloat] = [:]
     @Published var scrollNonce: [String: Int] = [:]
+    var scrollReported: [String: Int] = [:]   // Scroll id -> last onScroll offset dispatched (dedupe; not UI state)
 
     private var booted = false
     // True once a /mount has actually produced a node tree. Until then the DEV watcher
@@ -1057,6 +1059,7 @@ final class Scene: ObservableObject {
             case "MN" where f.count >= 2: nodes[f[1]]?.endAction = f[1] + ":end"
             case "MP" where f.count >= 2: nodes[f[1]]?.progressAction = f[1] + ":progress"
             case "SC" where f.count >= 2: nodes[f[1]]?.slideDoneAction = f[1] + ":slidedone"   // Slider onSlidingComplete
+            case "SS" where f.count >= 2: nodes[f[1]]?.scrollAction = f[1] + ":scroll"         // Scroll onScroll
             case "LS" where f.count >= 3:                          // scrollToIndex/scrollToEnd
                 scrollTargets[f[1]] = CGFloat(Int(f[2]) ?? 0)
                 scrollNonce[f[1], default: 0] += 1
@@ -2197,6 +2200,11 @@ struct ChuksScroll: View {
                 ScrollOffsetReader(horizontal: horiz) { off in
                     if horiz { scene.viewport(Int32(max(0, off)), Int32(outer.size.width), Int32(max(0, outer.size.height))) }
                     else { scene.viewport(Int32(max(0, off)), Int32(outer.size.height), Int32(max(0, outer.size.width))) }
+                    // Scroll onScroll: report the offset (points) when it changes, if opted in.
+                    if let tag = scene.nodes[id]?.scrollAction, !tag.isEmpty {
+                        let pts = Int(max(0, off).rounded())
+                        if scene.scrollReported[id] != pts { scene.scrollReported[id] = pts; scene.input(tag, String(pts)) }
+                    }
                 }.frame(width: 0, height: 0)
                 // scrollToIndex/scrollToEnd: drive the underlying UIScrollView's offset.
                 ScrollSetter(y: scene.scrollTargets[id], nonce: scene.scrollNonce[id] ?? 0, horizontal: horiz)

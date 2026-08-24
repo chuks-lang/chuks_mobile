@@ -130,6 +130,8 @@ class MainActivity : Activity() {
     private val sliderStep = HashMap<String, Int>()       // Slider id -> step (snap to multiples; 0 = continuous)
     private val sliderDone = HashMap<String, String>()    // Slider id -> onSlidingComplete tag ("<id>:slidedone")
     private val switchThumb = HashMap<String, Int>()      // Switch id -> thumb color (so bg's white default doesn't clobber thumbColor)
+    private val scrollOnScroll = HashMap<String, String>() // Scroll id -> onScroll tag ("<id>:scroll")
+    private val scrollLastPos = HashMap<String, Int>()     // Scroll id -> last reported offset (logical pts), to dedupe
     private val selectIds = HashSet<String>()             // Select node ids (PopupMenu buttons)
     private val selectOptions = HashMap<String, List<String>>()  // id -> option labels
     private val selectSel = HashMap<String, Int>()        // id -> chosen index
@@ -395,6 +397,16 @@ class MainActivity : Activity() {
         }
     }
 
+    // Scroll onScroll: report the offset (px -> logical points) when it changes, if the
+    // Scroll node opted in via SS. Deduped so an idle relayout doesn't re-fire.
+    private fun reportScroll(id: String, offsetPx: Int) {
+        val tag = scrollOnScroll[id] ?: return
+        val pts = Math.round(offsetPx / resources.displayMetrics.density)
+        if (scrollLastPos[id] == pts) return
+        scrollLastPos[id] = pts
+        hostInput(tag, pts.toString())
+    }
+
     // ---- viewport / scroll -------------------------------------------------
     private fun pushViewport(): Boolean {
         val sc = listScroll ?: return false
@@ -433,6 +445,7 @@ class MainActivity : Activity() {
                 "ME" -> if (f.size >= 2) mediaError[f[1]] = f[1] + ":error"              // Image onError
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
                 "SC" -> if (f.size >= 2) sliderDone[f[1]] = f[1] + ":slidedone"          // Slider onSlidingComplete
+                "SS" -> if (f.size >= 2) scrollOnScroll[f[1]] = f[1] + ":scroll"         // Scroll onScroll
                 "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
@@ -1406,13 +1419,13 @@ class MainActivity : Activity() {
             }
             "Scroll" -> SnapScrollView(this).also { sc ->
                 sc.isFillViewport = false
-                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility() }
+                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
                 listScroll = sc; scrollId = id; listHoriz = false }
             "HScroll" -> HorizontalScrollView(this).also { sc ->   // horizontal list (carousel)
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
-                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout() }
+                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
                 listScroll = sc; scrollId = id; listHoriz = true }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
                 it.setBackgroundColor(Color.argb(128, 0, 0, 0))
@@ -2468,7 +2481,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 

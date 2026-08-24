@@ -243,6 +243,10 @@ export class Node {
     // Slider: fires once when the drag gesture ENDS (RN onSlidingComplete), with
     // the final value; distinct from onChange which streams during the drag.
     var onSlideDone: any
+    // Scroll container: onScroll streams the scroll offset (logical points) as the
+    // user scrolls; scrollTo imperatively scrolls to an offset (>= 0 = active).
+    var onScroll: any
+    var scrollTo: int
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -250,7 +254,7 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
-        this.onSlideDone = null
+        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -763,6 +767,11 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
     if (!horizontal && pBool(p, "stickBottom", false)) { s.stick = 1 }
     const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", kids)
     if (orf != null) { n.onPress = orf }
+    // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
+    // an offset (logical points) and re-fires whenever the value changes.
+    const osc: Prop? = p.get("onScroll")
+    if (osc != null) { n.onScroll = osc }
+    n.scrollTo = pInt(p, "scrollTo", -1)
     return n
 }
 /**
@@ -1498,6 +1507,7 @@ export class Reconciler {
     var listScrollIdx: map[string]int // List id -> last scrollToIndex target emitted (fire on change)
     var listScrollEnd: map[string]int // List id -> last scrollToEnd nonce emitted (fire on change)
     var listScrollPos: map[string]int // List id -> last scroll offset reported to its onScroll
+    var scrollToPos: map[string]int  // Scroll id -> last scrollTo target emitted (fire on change)
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
@@ -1508,6 +1518,7 @@ export class Reconciler {
         this.listRefreshing = {}; this.listEmpty = {}; this.listContentH = -1
         this.listHeaderShown = {}; this.listFooterShown = {}
         this.listScrollIdx = {}; this.listScrollEnd = {}; this.listScrollPos = {}
+        this.scrollToPos = {}
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
     public begin(): void { this.lines = [] }
@@ -1655,6 +1666,7 @@ export class Reconciler {
         if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
         if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
+        if (n.onScroll != null) { this.handlers[id + ":scroll"] = n.onScroll; this.emit("SS|" + id) }
     }
 
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
@@ -1739,6 +1751,12 @@ export class Reconciler {
         if (next.onEnd != null) { this.handlers[id + ":end"] = next.onEnd }
         if (next.onProgress != null) { this.handlers[id + ":progress"] = next.onProgress }
         if (next.onSlideDone != null) { this.handlers[id + ":slidedone"] = next.onSlideDone }
+        if (next.onScroll != null) { this.handlers[id + ":scroll"] = next.onScroll }
+        // scrollTo: imperatively scroll when the target changes (reuses the List LS op).
+        if (next.scrollTo >= 0 && next.scrollTo != this.scrollToPos.getOr(id, -1)) {
+            this.scrollToPos[id] = next.scrollTo
+            this.emit("LS|" + id + "|" + string(next.scrollTo))
+        }
         for (var i: int = 0; i < next.kids.length; i = i + 1) {
             const child: Node? = i < p.kids.length ? p.kids[i] : null
             this.reconcile(child, next.kids[i], id + "." + string(i), id, i)
