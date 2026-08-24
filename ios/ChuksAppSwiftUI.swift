@@ -1812,7 +1812,8 @@ struct ChuksSlider: View {
         let lo = Double(Int(style["slmin"] ?? "0") ?? 0)
         let hi = Double(Int(style["slmax"] ?? "100") ?? 100)
         let tint = style["fg"].map { hexColor($0) } ?? Color.accentColor
-        return Slider(value: $value, in: lo...max(lo + 1, hi), step: 1)
+        let step = Double(Int(style["slstep"] ?? "0") ?? 0)
+        return Slider(value: $value, in: lo...max(lo + 1, hi), step: step > 0 ? step : 1)
             .tint(tint)
             .onChange(of: value) { nv in if !action.isEmpty { scene.input(action, String(Int(nv.rounded()))) } }
             .modifier(BoxStyle(s: style, parentRow: parentRow, parentStretch: parentStretch))

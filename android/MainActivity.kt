@@ -127,6 +127,7 @@ class MainActivity : Activity() {
     private var sheetHandle: View? = null                // host-drawn grab handle pill
     private var shownSheet: String? = null               // sheet currently on screen (null = none); a change drives the slide-up
     private val sliderMin = HashMap<String, Int>()        // Slider id -> min, to offset the SeekBar's 0-based progress
+    private val sliderStep = HashMap<String, Int>()       // Slider id -> step (snap to multiples; 0 = continuous)
     private val selectIds = HashSet<String>()             // Select node ids (PopupMenu buttons)
     private val selectOptions = HashMap<String, List<String>>()  // id -> option labels
     private val selectSel = HashMap<String, Int>()        // id -> chosen index
@@ -1361,7 +1362,10 @@ class MainActivity : Activity() {
                         if (!fromUser) return                       // ignore programmatic setProgress (the controlled sync)
                         val action = sb.getTag(TAG) as? String ?: return
                         val min = sliderMin[id] ?: 0
-                        hostInput(action, (progress + min).toString())
+                        val step = sliderStep[id] ?: 0
+                        val p = if (step > 0) Math.round(progress.toFloat() / step) * step else progress
+                        if (step > 0 && p != progress) s.progress = p   // snap the thumb (re-fire is fromUser=false, ignored)
+                        hostInput(action, (p + min).toString())
                     }
                     override fun onStartTrackingTouch(s: SeekBar) {}
                     override fun onStopTrackingTouch(s: SeekBar) {}
@@ -1505,6 +1509,7 @@ class MainActivity : Activity() {
                 "slv" -> slV = f.toInt()                 // Slider: current value
                 "slmin" -> slMin = f.toInt()             // Slider: min
                 "slmax" -> slMax = f.toInt()             // Slider: max
+                "slstep" -> sliderStep[id] = f.toInt()   // Slider: snap step
                 "seli" -> if (selectIds.contains(id)) { selectSel[id] = f.toInt(); (v as? Button)?.text = selectLabel(id) }
                 "dp" -> if (datePickerIds.contains(id)) { datePickerModes[id] = vl; (v as? Button)?.text = dateLabel(id) }
                 "avis" -> if (vl == "1") root.post { presentAlert(id) } else dismissAlert(id)   // defer present until the batch applies
@@ -2436,7 +2441,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 

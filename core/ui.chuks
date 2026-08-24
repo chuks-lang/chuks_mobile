@@ -53,6 +53,7 @@ export class Style {
     var slval: int      // Slider current value (-1 = not a Slider); min/max travel with it
     var slmin: int      // Slider minimum (>= 0)
     var slmax: int      // Slider maximum
+    var slstep: int     // Slider step: snap value to multiples of this (0 = continuous)
     var seli: int       // Select selected option index (-1 = not a Select)
     var avis: int       // Alert visible: 1 shown, 0 hidden (-1 = not an Alert)
     var resize: string  // Image resize mode: "cover" | "contain" | "center" ("" = default)
@@ -103,7 +104,7 @@ export class Style {
         this.swOn = -1; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
-        this.slval = -1; this.slmin = 0; this.slmax = 100
+        this.slval = -1; this.slmin = 0; this.slmax = 100; this.slstep = 0
         this.seli = -1; this.avis = -1; this.resize = ""; this.prog = -1; this.rfsh = -1
         this.dpmode = ""; this.dpdisp = ""
         this.tx = 0; this.ty = 0; this.rot = 0; this.scl = 100; this.animMs = -1; this.animEz = ""
@@ -185,10 +186,11 @@ export class Style {
         if (this.sbNavColor != "") { s = s + "sbnavcolor=" + this.sbNavColor + ";" }
         if (this.mvis >= 0) { s = s + "mvis=" + string(this.mvis) + ";" }
         if (this.mpos != "") { s = s + "mpos=" + this.mpos + ";" }
-        if (this.slval >= 0) {                       // a Slider: value + range travel together
+        if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
+            s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
+            s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
+            if (this.slstep > 0) { s = s + "slstep=" + string(this.slstep) + ";" }
             s = s + "slv=" + string(this.slval) + ";"
-            s = s + "slmin=" + string(this.slmin) + ";"
-            s = s + "slmax=" + string(this.slmax) + ";"
         }
         if (this.seli >= 0) { s = s + "seli=" + string(this.seli) + ";" }
         if (this.avis >= 0) { s = s + "avis=" + string(this.avis) + ";" }
@@ -925,6 +927,7 @@ export function Slider(p: map[string]Prop): Node {
     s.slmax = pInt(p, "max", 100)
     s.slval = pInt(p, "value", s.slmin)
     if (s.slval < 0) { s.slval = 0 }            // keep the serialization sentinel valid
+    s.slstep = pInt(p, "step", 0)               // snap to multiples of step (0 = continuous)
     s.h = pInt(p, "h", 40)
     s.fg = pStr(p, "color", "")                 // optional active-track / thumb tint
     applyLayout(s, p)

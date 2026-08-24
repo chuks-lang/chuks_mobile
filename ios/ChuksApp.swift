@@ -752,6 +752,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var fieldMaxLen: [UITextField: Int] = [:]      // maxLength (enforced in shouldChangeCharacters)
     var switchActions: [UISwitch: String] = [:]
     var sliderActions: [UISlider: String] = [:]
+    var sliderStep: [UISlider: Float] = [:]   // snap value to multiples of this (0 = continuous)
     var datePickerActions: [UIDatePicker: String] = [:]                   // DatePicker -> onChange action
     var datePickerModes: [UIDatePicker: String] = [:]                     // DatePicker -> "date"|"time"|"datetime"
     var gestureIds: Set<String> = []                                     // Gesture node ids
@@ -2060,6 +2061,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                           }
             case "slmin": (v as? UISlider)?.minimumValue = f
             case "slmax": (v as? UISlider)?.maximumValue = f
+            case "slstep": if let sl = v as? UISlider { sliderStep[sl] = f }
+
             case "slv":   if let sl = v as? UISlider, !sl.isTracking { sl.setValue(f, animated: false) }  // don't fight an active drag
             case "seli":  if selectIds.contains(id) { selectSel[id] = Int(val) ?? 0; rebuildSelectMenu(id) }
             case "dp":    if let dp = v as? UIDatePicker {
@@ -2278,7 +2281,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let b = views[k] as? UIButton { buttonActions[b] = nil }
             if let tf = views[k] as? UITextField { fieldActions[tf] = nil; fieldSubmit[tf] = nil; fieldFocus[tf] = nil; fieldBlur[tf] = nil; fieldMaxLen[tf] = nil }
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
-            if let sl = views[k] as? UISlider { sliderActions[sl] = nil }
+            if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil }
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
@@ -2399,6 +2402,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // int value; the controlled re-render syncs the thumb back (guarded by isTracking).
     @objc func sliderChanged(_ sl: UISlider) {
         guard let action = sliderActions[sl] else { return }
+        if let step = sliderStep[sl], step > 0 {   // snap the thumb + value to step multiples
+            sl.value = sl.minimumValue + (((sl.value - sl.minimumValue) / step).rounded() * step)
+        }
         let val = String(Int(sl.value.rounded()))
         guard let s = eInput(action, val) else { connected = false; return }
         apply(s)
