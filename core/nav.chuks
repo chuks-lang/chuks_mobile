@@ -1,12 +1,11 @@
 // @chuks/ui -- structural / navigation components: the app skeleton (top bar,
-    // bottom tabs, and later sheets/modals/toasts). Token-styled and cross-platform.
+// bottom tabs, and later sheets/modals/toasts). Token-styled and cross-platform.
 //
 // Core is ICON-AGNOSTIC (the React Native model, not Flutter's bundled set): it
 // never imports an icon package. You pass icons in — a prebuilt node for the bar
 // actions, or a render function for the tabs (whose color depends on the active
-    // state). Bring @chuks/lucide, or any other icon set, from the app side.
-import { Node, Row, Column, Text, Prop, KeyedComp } from "./ui.chuks";
-import { tw } from "./tw.chuks";
+// state). Bring @chuks/lucide, or any other icon set, from the app side.
+import { Node, Row, Column, Text, KeyedComp } from "./ui.chuks";
 import { tk } from "./theme.chuks";
 
 // A round, tappable icon button around a NON-NULL icon node. `hasPress` says
@@ -19,12 +18,12 @@ import { tk } from "./theme.chuks";
 // NavBar (inline field reads, which are correct), and iconBtn only ever receives a
 // real icon plus a plain bool.
 function iconBtn(icon: Node, hasPress: bool, onPress: function?(): void): Node {
-    var p: map[string]Prop = tw("w-10 h-10 rounded-full items-center justify-center")
-    if (hasPress) { const h: any = onPress; p["onPress"] = h }
-    return Row(p, [ icon ])
+    const cls: string = "w-10 h-10 rounded-full items-center justify-center"
+    if (hasPress) { return Row({ tw: cls, onPress: onPress }, [ icon ]) }
+    return Row({ tw: cls }, [ icon ])
 }
 // An empty 40x40 slot that balances the bar when a side has no icon.
-function iconSpacer(): Node { return Row(tw("w-10 h-10"), []) }
+function iconSpacer(): Node { return Row({ tw: "w-10 h-10" }, []) }
 
 // NavBar props: set only what you need, by name (no positional nulls). `title` is
 // required; the rest are optional. `leading`/`trailing` are prebuilt icon nodes
@@ -46,13 +45,13 @@ export function NavBar(p: NavBarProps): Node {
     if (p.leading != null) { leading = iconBtn(p.leading, p.onLeading != null, p.onLeading) }
     var trailing: Node = iconSpacer()
     if (p.trailing != null) { trailing = iconBtn(p.trailing, p.onTrailing != null, p.onTrailing) }
-    return Column(tw("bg-surface"), [
-        Row(tw("items-center gap-sm p-md"), [
-            leading,
-            Text(tw("grow text-lg font-bold text-text"), p.title),
-            trailing,
-        ]),
-        Row(tw("h-1 bg-borderSoft"), []),   // bottom hairline
+    return Column({ tw: "bg-surface" }, [
+            Row({ tw: "items-center gap-sm p-md" }, [
+                    leading,
+                    Text({ tw: "grow text-lg font-bold text-text" }, p.title),
+                    trailing,
+            ]),
+            Row({ tw: "h-1 bg-borderSoft" }, []),   // bottom hairline
     ])
 }
 
@@ -61,10 +60,10 @@ export function NavBar(p: NavBarProps): Node {
 // the TabBar calls it with the active/inactive color so selection recolors the
 // icon (the RN `tabBarIcon` pattern). `names` is parallel to `labels`.
 //   TabBar(["house","bell"], ["Home","Alerts"],
-    //          function(n,c,s){ return lucide(n, s, c) }, active, onSelect)
+//          function(n,c,s){ return lucide(n, s, c) }, active, onSelect)
 // Build a tab's onPress. The index is a parameter (fresh per call), not a
 // captured loop variable, so each tab fires with its own index (a closure that
-    // captured the loop var would fire with the last index for every tab).
+// captured the loop var would fire with the last index for every tab).
 function tabPress(onSelect: any, idx: int): any {
     return function(): void { const f: any = onSelect; f(idx) }
 }
@@ -74,16 +73,15 @@ export function TabBar(names: []string, labels: []string, iconFor: any, active: 
     for (var i: int = 0; i < names.length; i = i + 1) {
         const sel: bool = i == active
         const col: string = sel ? tk("primary") : tk("subtle")
-        var tp: map[string]Prop = tw("grow items-center justify-center gap-xs p-sm")
-        if (onSelect != null) { tp["onPress"] = tabPress(onSelect, i) }
+        const onP: any = onSelect != null ? tabPress(onSelect, i) : null
         const build: any = iconFor
         const icon: Node = build(names[i], col, 24)
         const lbl: string = sel ? "text-xs font-semibold text-primary" : "text-xs text-subtle"
-        tabs.push(Column(tp, [ icon, Text(tw(lbl), labels[i]) ]))
+        tabs.push(Column({ tw: "grow items-center justify-center gap-xs p-sm", onPress: onP }, [ icon, Text({ tw: lbl }, labels[i]) ]))
     }
-    return Column(tw("bg-surface"), [
-        Row(tw("h-1 bg-borderSoft"), []),   // top hairline
-        Row(tw("p-sm"), tabs),
+    return Column({ tw: "bg-surface" }, [
+            Row({ tw: "h-1 bg-borderSoft" }, []),   // top hairline
+            Row({ tw: "p-sm" }, tabs),
     ])
 }
 
@@ -95,10 +93,10 @@ export function TabBar(names: []string, labels: []string, iconFor: any, active: 
 //   TabView(["house","bell"], ["Home","Alerts"], iconFor, [Home, Alerts], active, onSelect)
 export function TabView(icons: []string, labels: []string, iconFor: any, screens: []any, active: int, onSelect: any): Node {
     const build: any = screens[active]
-    return Column(tw("bg-bg"), [
-        // Place the active screen lazily, keyed by tab, so it runs with its own
-        // identity (its useState is per-tab and doesn't leak to the next tab).
-        KeyedComp("tab:" + string(active), build),
-        TabBar(icons, labels, iconFor, active, onSelect),
+    return Column({ tw: "bg-bg" }, [
+            // Place the active screen lazily, keyed by tab, so it runs with its own
+            // identity (its useState is per-tab and doesn't leak to the next tab).
+            KeyedComp("tab:" + string(active), build),
+            TabBar(icons, labels, iconFor, active, onSelect),
     ])
 }

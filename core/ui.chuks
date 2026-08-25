@@ -10,6 +10,8 @@
 
 import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells } from "./state.chuks";
 import { host } from "std/host";
+import { Prop } from "./prop.chuks";
+import { tw } from "./tw.chuks";
 
 // ---- Style: a compact subset of the flexbox + visual model -----------------
 export class Style {
@@ -317,11 +319,8 @@ function mkModal(style: Style, kids: []Node): Node { return new Node("Modal", st
 function mkAlert(style: Style, joined: string): Node { return new Node("Alert", style, joined, []) }
 
 // ---- Prop value types ------------------------------------------------------
-// The value a prop can hold: a number, a string, a flag, or an event closure.
-// Using a union (not `any`) means the builders accept only these, so a stray
-// value like an object is a compile error. Chuks has no first-class function
-// type WITHOUT a signature, so the two event shapes are spelled out.
-export unionType Prop = int | string | bool | function(): void | function(v: string): void
+// `Prop` now lives in ./prop.chuks (a leaf module) so tw.chuks can share it
+// without a circular import; it is imported at the top of this file.
 // A List's config values: sizes/counts (int) plus its row callbacks. These have
 // List-specific signatures, so they get their own union, distinct from Prop. The
 // last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
@@ -439,9 +438,98 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
  * ])
  * ```
  */
-export function Row(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "row"; applyLayout(s, p)
-    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+// ── Typed component props ────────────────────────────────────────────────────
+// ViewProps is the shared, all-optional prop bag: every layout field, a Tailwind
+// `tw` string, and events. Per-component types EMBED it and add their own fields
+// (TextProps adds the text-only props). Because a builder's param is a typed
+// dataType, the literal `{...}` at the call site is checked: keys autocomplete,
+// unknown keys (typos) are rejected, and each value is type-checked — and the
+// caller imports nothing but the component. Inside, a builder hands the props
+// (as `any`) to the shared applyLayoutV/applyEventsV, which read fields BY KEY (a
+// dataType is map-backed), so one pair of helpers serves every typed builder.
+dataType LayoutProps {
+    gap: int?; pad: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
+    align: string?; justify: string?; bg: string?; color: string?; size: int?;
+    weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
+    dir: string?; border: int?; borderColor: string?; shadow: int?; glass: bool?;
+    opacity: int?; wrap: string?; font: string?; tx: int?; ty: int?; rotate: int?;
+    scale: int?; anim: int?; easing: string?; tw: string?;
+}
+dataType EventProps {
+    onPress: (function(): void)?; onChange: (function(v: string): void)?;
+    onLongPress: (function(): void)?; onPressIn: (function(): void)?; onPressOut: (function(): void)?;
+}
+export dataType ViewProps { LayoutProps; EventProps }
+export dataType TextProps { ViewProps; numberOfLines: int?; ellipsizeMode: string?; selectable: bool? }
+
+// By-key field readers over an `any` (a map-backed dataType), mirroring pInt/pStr/pBool.
+function pvI(p: any, k: string, d: int): int { const v: any = p[k]; return v != null ? int(v) : d }
+function pvS(p: any, k: string, d: string): string { const v: any = p[k]; return v != null ? string(v) : d }
+function pvB(p: any, k: string, d: bool): bool { const v: any = p[k]; return v != null ? (int(v) != 0) : d }
+
+// The typed-props twin of applyLayout: a Tailwind `tw` string first (so explicit
+// props override it), then every layout field by key. Serves all typed builders.
+function applyLayoutV(s: Style, p: any): void {
+    const tws: any = p["tw"]; if (tws != null) { applyLayout(s, tw(string(tws))) }
+    s.gap = pvI(p, "gap", s.gap)
+    s.pad = pvI(p, "pad", s.pad)
+    s.w = pvI(p, "w", s.w)
+    s.h = pvI(p, "h", s.h)
+    s.grow = pvI(p, "grow", s.grow)
+    s.basis = pvI(p, "basis", s.basis)
+    s.radius = pvI(p, "radius", s.radius)
+    s.align = pvS(p, "align", s.align)
+    s.just = pvS(p, "justify", s.just)
+    s.bg = pvS(p, "bg", s.bg)
+    s.fg = pvS(p, "color", s.fg)
+    s.fs = pvI(p, "size", s.fs)
+    s.fw = pvS(p, "weight", s.fw)
+    s.ta = pvS(p, "ta", s.ta)
+    if (pvB(p, "abs", false)) { s.pos = "abs" }
+    s.top = pvI(p, "top", s.top)
+    s.left = pvI(p, "left", s.left)
+    s.right = pvI(p, "right", s.right)
+    s.dir = pvS(p, "dir", s.dir)
+    s.bw = pvI(p, "border", s.bw)
+    s.bc = pvS(p, "borderColor", s.bc)
+    s.shadow = pvI(p, "shadow", s.shadow)
+    if (p["glass"] != null) { s.glass = pvB(p, "glass", false) ? 1 : -1 }
+    s.opacity = pvI(p, "opacity", s.opacity)
+    s.wrap = pvS(p, "wrap", s.wrap)
+    s.font = pvS(p, "font", s.font)
+    s.tx = pvI(p, "tx", s.tx)
+    s.ty = pvI(p, "ty", s.ty)
+    s.rot = pvI(p, "rotate", s.rot)
+    s.scl = pvI(p, "scale", s.scl)
+    s.animMs = pvI(p, "anim", s.animMs)
+    s.animEz = pvS(p, "easing", s.animEz)
+}
+function applyEventsV(n: Node, p: any): void {
+    const a: any = p["onPress"]; if (a != null) { n.onPress = a }
+    const b: any = p["onChange"]; if (b != null) { n.onChange = b }
+    const c: any = p["onLongPress"]; if (c != null) { n.onLongPress = c }
+    const d: any = p["onPressIn"]; if (d != null) { n.onPressIn = d }
+    const e: any = p["onPressOut"]; if (e != null) { n.onPressOut = e }
+}
+function applyMediaEventsV(n: Node, p: any): void {
+    const ld: any = p["onLoad"]; if (ld != null) { n.onLoad = ld }
+    const er: any = p["onError"]; if (er != null) { n.onError = er }
+    const en: any = p["onEnd"]; if (en != null) { n.onEnd = en }
+    const pr: any = p["onProgress"]; if (pr != null) { n.onProgress = pr }
+}
+// Media event fields, embedded by media component prop types (Image/Video).
+dataType MediaEventProps {
+    onLoad: (function(): void)?; onError: (function(): void)?;
+    onEnd: (function(): void)?; onProgress: (function(v: int): void)?;
+}
+
+export function Row(first: ViewProps | []Node, kids: []Node = []): Node {
+    const s: Style = new Style(); s.dir = "row"
+    // props-or-content: `Row([...])` (no config) passes children first; `Row({...}, [...])`
+    // passes props then children. Discriminate by type — an array is content, a `{...}` is props.
+    if (typeof(first) == "array") { const c: []Node = first; return mkView(s, c) }
+    const p: ViewProps = first  // typeof-guard narrowed the union to its dataType arm
+    applyLayoutV(s, p); const n: Node = mkView(s, kids); applyEventsV(n, p); return n
 }
 /**
  * A vertical column (flex-direction: col): lays its children top-to-bottom.
@@ -455,9 +543,12 @@ export function Row(p: map[string]Prop, kids: []Node): Node {
  * ])
  * ```
  */
-export function Column(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "col"; s.just = "center"; applyLayout(s, p)
-    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+export function Column(first: ViewProps | []Node, kids: []Node = []): Node {
+    const s: Style = new Style(); s.dir = "col"; s.just = "center"
+    // props-or-content (see Row): `Column([...])` or `Column({...}, [...])`.
+    if (typeof(first) == "array") { const c: []Node = first; return mkView(s, c) }
+    const p: ViewProps = first  // narrowed to the dataType arm
+    applyLayoutV(s, p); const n: Node = mkView(s, kids); applyEventsV(n, p); return n
 }
 /**
  * A plain box (the base container). No default direction or alignment — just the
@@ -469,9 +560,11 @@ export function Column(p: map[string]Prop, kids: []Node): Node {
  * View({ w: 44, h: 44, radius: 22, bg: tk("primary") }, [])
  * ```
  */
-export function View(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); applyLayout(s, p)
-    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+export function View(first: ViewProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return View({}, first) }   // content-only: `View([...])`
+    const p: ViewProps = first
+    const s: Style = new Style(); applyLayoutV(s, p)
+    const n: Node = mkView(s, kids); applyEventsV(n, p); return n
 }
 /**
  * A run of text; `t` is the string to display. Text self-sizes to its content.
@@ -483,13 +576,18 @@ export function View(p: map[string]Prop, kids: []Node): Node {
  * Text({ size: 30, weight: "bold", color: FG }, "Welcome back")
  * ```
  */
-export function Text(p: map[string]Prop, t: string): Node {
-    const s: Style = new Style(); applyLayout(s, p)
-    s.nlines = pInt(p, "numberOfLines", -1)          // cap lines (truncates the overflow)
-    s.ellip = pStr(p, "ellipsizeMode", "")           // "tail"|"head"|"middle"|"clip"
-    if (pBool(p, "selectable", false)) { s.selectable = 1 }   // user can select/copy the text
-    const n: Node = mkText(s, t)
-    applyEvents(n, p)                                 // onPress makes the text tappable (a link)
+export function Text(first: TextProps | string, body: string = ""): Node {
+    const s: Style = new Style()
+    // props-or-content: `Text("Hello")` (no config) passes the string first; `Text({...}, "Hello")`
+    // passes props then the string. Discriminate by type — a string is content, a `{...}` is props.
+    if (typeof(first) == "string") { const t: string = first; return mkText(s, t) }
+    const p: TextProps = first                               // narrowed to the dataType arm: typed field access
+    applyLayoutV(s, p)
+    s.nlines = p.numberOfLines ?? -1                         // cap lines (truncates the overflow)
+    s.ellip = p.ellipsizeMode ?? ""                          // "tail"|"head"|"middle"|"clip"
+    if (p.selectable ?? false) { s.selectable = 1 }          // user can select/copy the text
+    const n: Node = mkText(s, body)
+    applyEventsV(n, p)                                        // onPress makes the text tappable (a link)
     return n
 }
 /**
@@ -517,32 +615,38 @@ export function Text(p: map[string]Prop, t: string): Node {
  * Props: `src` (bundled name, "file://…", or http(s) URL), `playing` (default true),
  * `loop` (default true), `muted` (default true), `resizeMode` ("cover" | "contain").
  */
-export function Video(p: map[string]Prop): Node {
-    const s: Style = new Style(); applyLayout(s, p)
-    s.vid = pStr(p, "src", "")
+dataType VideoProps {
+    ViewProps; MediaEventProps;
+    src: string?; playing: bool?; loop: bool?; muted: bool?; resizeMode: string?;
+    seek: int?; volume: int?; rate: int?; controls: bool?; poster: string?;
+}
+export function Video(p: VideoProps): Node {
+    const s: Style = new Style(); applyLayoutV(s, p)
+    s.vid = pvS(p, "src", "")
     // Always set (default on) so these are emitted for every Video and stay controllable.
-    s.vidPlay = pBool(p, "playing", true) ? 1 : 0
-    s.vidLoop = pBool(p, "loop", true) ? 1 : 0
-    s.vidMute = pBool(p, "muted", true) ? 1 : 0
-    s.vidFit = pStr(p, "resizeMode", "cover")
-    s.seekTo = pInt(p, "seek", -1)                        // seek to N seconds when this changes
-    s.vidVol = pInt(p, "volume", -1)                      // 0-100
-    s.vidRate = pInt(p, "rate", -1)                       // playback speed percent (100 = 1x)
-    const controls: bool = pBool(p, "controls", false)
-    if (p.get("controls") != null) { s.vidCtrls = controls ? 1 : 0 }
+    s.vidPlay = pvB(p, "playing", true) ? 1 : 0
+    s.vidLoop = pvB(p, "loop", true) ? 1 : 0
+    s.vidMute = pvB(p, "muted", true) ? 1 : 0
+    s.vidFit = pvS(p, "resizeMode", "cover")
+    s.seekTo = pvI(p, "seek", -1)                         // seek to N seconds when this changes
+    s.vidVol = pvI(p, "volume", -1)                       // 0-100
+    s.vidRate = pvI(p, "rate", -1)                        // playback speed percent (100 = 1x)
+    const controls: bool = pvB(p, "controls", false)
+    if (p["controls"] != null) { s.vidCtrls = controls ? 1 : 0 }
     // A video with `controls` renders the platform's full native player UI (transport, scrubber,
     // fullscreen, AirPlay, PiP, subtitle/audio menus), so it's a distinct kind the host maps to
     // AVPlayerViewController / VideoPlayer / a MediaController-backed view.
     // The node text carries an optional `poster` image URL shown until the first frame plays.
-    const n: Node = new Node(controls ? "VideoControls" : "Video", s, pStr(p, "poster", ""), [])
-    applyMediaEvents(n, p)                                // onLoad / onEnd / onProgress
+    const n: Node = new Node(controls ? "VideoControls" : "Video", s, pvS(p, "poster", ""), [])
+    applyMediaEventsV(n, p)                               // onLoad / onEnd / onProgress
     return n
 }
-export function Icon(p: map[string]Prop): Node {
+dataType IconProps { ViewProps; name: string? }
+export function Icon(p: IconProps): Node {
     const s: Style = new Style()
-    const sz: int = pInt(p, "size", 24); s.w = sz; s.h = sz; s.radius = sz / 2
-    s.bg = pStr(p, "bg", "")
-    s.img = pStr(p, "name", ""); s.fg = pStr(p, "color", "FFFFFF")
+    const sz: int = pvI(p, "size", 24); s.w = sz; s.h = sz; s.radius = sz / 2
+    s.bg = pvS(p, "bg", "")
+    s.img = pvS(p, "name", ""); s.fg = pvS(p, "color", "FFFFFF")
     return mkImage(s)
 }
 /**
@@ -561,19 +665,24 @@ export function Icon(p: map[string]Prop): Node {
  * Image({ src: "https://picsum.photos/200", w: 96, h: 96, radius: 12, filter: "vivid" })
  * ```
  */
-export function Image(p: map[string]Prop): Node {
+dataType ImageProps {
+    ViewProps; MediaEventProps;
+    src: string?; resize: string?; tintColor: string?; blurRadius: int?;
+    filter: string?; spinner: bool?; ops: string?;
+}
+export function Image(p: ImageProps): Node {
     const s: Style = new Style()
-    s.resize = pStr(p, "resize", "cover")
-    s.bg = pStr(p, "bg", "")
-    s.tint = pStr(p, "tintColor", "")                     // recolor a template image
-    s.blur = pInt(p, "blurRadius", -1)                    // blur the image (px)
-    s.imgFilter = pStr(p, "filter", "")                   // photo filter preset (mono|sepia|vivid|cool|warm|noir|fade)
-    if (pBool(p, "spinner", false)) { s.spinner = 1 }     // show a loading spinner until it loads
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    const n: Node = new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
-    n.opsChain = pStr(p, "ops", "")                       // GPU op-chain (from effects.chain); host runs it on the GPU
-    applyMediaEvents(n, p)                                // onLoad / onError
+    s.resize = pvS(p, "resize", "cover")
+    s.bg = pvS(p, "bg", "")
+    s.tint = pvS(p, "tintColor", "")                      // recolor a template image
+    s.blur = pvI(p, "blurRadius", -1)                     // blur the image (px)
+    s.imgFilter = pvS(p, "filter", "")                    // photo filter preset (mono|sepia|vivid|cool|warm|noir|fade)
+    if (pvB(p, "spinner", false)) { s.spinner = 1 }       // show a loading spinner until it loads
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    const n: Node = new Node("Image", s, pvS(p, "src", ""), [])   // URL in the text channel
+    n.opsChain = pvS(p, "ops", "")                        // GPU op-chain (from effects.chain); host runs it on the GPU
+    applyMediaEventsV(n, p)                               // onLoad / onError
     return n
 }
 /**
@@ -587,12 +696,15 @@ export function Image(p: map[string]Prop): Node {
  * ImageBackground({ src: HERO_URL, pad: 24, radius: 16 }, [ Text(...), ... ])
  * ```
  */
-export function ImageBackground(p: map[string]Prop, kids: []Node): Node {
+dataType ImageBackgroundProps { ViewProps; src: string?; resize: string? }
+export function ImageBackground(first: ImageBackgroundProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return ImageBackground({}, first) }   // content-only
+    const p: ImageBackgroundProps = first
     const s: Style = new Style()
-    s.resize = pStr(p, "resize", "cover")
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    return new Node("ImageBackground", s, pStr(p, "src", ""), kids)   // URL in text; children on top
+    s.resize = pvS(p, "resize", "cover")
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    return new Node("ImageBackground", s, pvS(p, "src", ""), kids)   // URL in text; children on top
 }
 /**
  * A native web view (WKWebView on iOS, android.webkit.WebView on Android) that
@@ -606,11 +718,12 @@ export function ImageBackground(p: map[string]Prop, kids: []Node): Node {
  * WebView({ url: "https://chuks.dev", grow: 1, radius: 12 })
  * ```
  */
-export function WebView(p: map[string]Prop): Node {
+dataType WebViewProps { ViewProps; url: string? }
+export function WebView(p: WebViewProps): Node {
     const s: Style = new Style()
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    return new Node("WebView", s, pStr(p, "url", ""), [])   // URL in the text channel
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    return new Node("WebView", s, pvS(p, "url", ""), [])   // URL in the text channel
 }
 
 /**
@@ -620,11 +733,12 @@ export function WebView(p: map[string]Prop): Node {
  * Camera2 preview on a TextureView. Grab a still from the running preview with
  * Camera.capturePreview(onResult, onError), which resolves a file:// path you can hand to Image.
  */
-export function CameraView(p: map[string]Prop): Node {
+dataType CameraViewProps { ViewProps; facing: string? }
+export function CameraView(p: CameraViewProps): Node {
     const s: Style = new Style()
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    return new Node("CameraView", s, pStr(p, "facing", "back"), [])   // facing in the text channel
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    return new Node("CameraView", s, pvS(p, "facing", "back"), [])   // facing in the text channel
 }
 /**
  * A tappable button showing title `t`. Pass `onPress` as a () -> void closure;
@@ -637,10 +751,13 @@ export function CameraView(p: map[string]Prop): Node {
  *          bg: ACCENT, color: "FFFFFF", h: 52, radius: 12 }, "Log in")
  * ```
  */
-export function Button(p: map[string]Prop, t: string): Node {
-    const s: Style = new Style(); s.fw = "bold"; applyLayout(s, p)
-    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
-    const n: Node = mkButton(s, t); applyEvents(n, p); return n
+dataType ButtonBaseProps { ViewProps; disabled: bool? }
+export function Button(first: ButtonBaseProps | string, t: string = ""): Node {
+    if (typeof(first) == "string") { return Button({}, first) }   // label-only: `Button("Save")`
+    const p: ButtonBaseProps = first
+    const s: Style = new Style(); s.fw = "bold"; applyLayoutV(s, p)
+    if (p["disabled"] != null) { s.disabled = pvB(p, "disabled", false) ? 1 : 0 }   // dim + block taps
+    const n: Node = mkButton(s, t); applyEventsV(n, p); return n
 }
 /**
  * A small rounded value badge (a compact tappable button). Defaults to 56x36.
@@ -651,12 +768,14 @@ export function Button(p: map[string]Prop, t: string): Node {
  * Pill({ onPress: function(): void { self.inc() } }, string(this.value))
  * ```
  */
-export function Pill(p: map[string]Prop, t: string): Node {
+export function Pill(first: ViewProps | string, t: string = ""): Node {
+    if (typeof(first) == "string") { return Pill({}, first) }   // label-only: `Pill("New")`
+    const p: ViewProps = first
     const s: Style = new Style()
-    s.w = pInt(p, "w", 56); s.h = pInt(p, "h", 36); s.radius = 10
-    s.bg = pStr(p, "bg", "222A3A"); s.fg = pStr(p, "color", "5B8CFF"); s.fs = 16; s.fw = "bold"
-    applyLayout(s, p)
-    const n: Node = mkButton(s, t); applyEvents(n, p); return n
+    s.w = pvI(p, "w", 56); s.h = pvI(p, "h", 36); s.radius = 10
+    s.bg = pvS(p, "bg", "222A3A"); s.fg = pvS(p, "color", "5B8CFF"); s.fs = 16; s.fw = "bold"
+    applyLayoutV(s, p)
+    const n: Node = mkButton(s, t); applyEventsV(n, p); return n
 }
 /**
  * A single-line text field. Pass `onChange` as a (string) -> void closure that
@@ -676,28 +795,35 @@ export function Pill(p: map[string]Prop, t: string): Node {
  *             onSubmit: function(): void { send() } })
  * ```
  */
-export function TextInput(p: map[string]Prop): Node {
+dataType TextInputProps {
+    ViewProps;
+    placeholder: string?; value: string?; secure: bool?; multiline: bool?;
+    keyboardType: string?; returnKeyType: string?; editable: bool?; autoFocus: bool?;
+    autoCapitalize: string?; autoCorrect: bool?; maxLength: int?;
+    onSubmit: (function(): void)?; onFocus: (function(): void)?; onBlur: (function(): void)?;
+}
+export function TextInput(p: TextInputProps): Node {
     const s: Style = new Style()
-    const multi: bool = pBool(p, "multiline", false)   // a multi-line text area vs a single-line field
-    s.h = pInt(p, "h", multi ? 96 : 44); s.bg = pStr(p, "bg", "FFFFFF"); s.radius = 10
-    s.fg = pStr(p, "color", "111318"); s.fs = 15; applyLayout(s, p)
-    if (pBool(p, "secure", false)) { s.sec = 1 }    // password field: mask input
-    s.kbType = pStr(p, "keyboardType", "")
-    s.retKey = pStr(p, "returnKeyType", "")
-    if (p.get("editable") != null) { s.editable = pBool(p, "editable", true) ? 1 : 0 }
-    if (p.get("autoFocus") != null) { s.autoFocus = pBool(p, "autoFocus", false) ? 1 : 0 }
-    s.autoCap = pStr(p, "autoCapitalize", "")
-    if (p.get("autoCorrect") != null) { s.autoCorr = pBool(p, "autoCorrect", true) ? 1 : 0 }
-    s.maxLen = pInt(p, "maxLength", -1)
+    const multi: bool = pvB(p, "multiline", false)   // a multi-line text area vs a single-line field
+    s.h = pvI(p, "h", multi ? 96 : 44); s.bg = pvS(p, "bg", "FFFFFF"); s.radius = 10
+    s.fg = pvS(p, "color", "111318"); s.fs = 15; applyLayoutV(s, p)
+    if (pvB(p, "secure", false)) { s.sec = 1 }    // password field: mask input
+    s.kbType = pvS(p, "keyboardType", "")
+    s.retKey = pvS(p, "returnKeyType", "")
+    if (p["editable"] != null) { s.editable = pvB(p, "editable", true) ? 1 : 0 }
+    if (p["autoFocus"] != null) { s.autoFocus = pvB(p, "autoFocus", false) ? 1 : 0 }
+    s.autoCap = pvS(p, "autoCapitalize", "")
+    if (p["autoCorrect"] != null) { s.autoCorr = pvB(p, "autoCorrect", true) ? 1 : 0 }
+    s.maxLen = pvI(p, "maxLength", -1)
     // multiline swaps the native widget (UITextView / TextEditor / multiline EditText)
-    const n: Node = multi ? mkTextArea(s, pStr(p, "placeholder", "")) : mkInput(s, pStr(p, "placeholder", ""))
+    const n: Node = multi ? mkTextArea(s, pvS(p, "placeholder", "")) : mkInput(s, pvS(p, "placeholder", ""))
     // Controlled value: mark it so the reconciler emits the V| channel and the host
     // mirrors the field to it (only when it differs, so the cursor never jumps).
-    if (p.get("value") != null) { n.hasVal = true; n.val = pStr(p, "value", "") }
-    n.onSubmit = p.get("onSubmit")
-    n.onFocus = p.get("onFocus")
-    n.onBlur = p.get("onBlur")
-    applyEvents(n, p); return n
+    if (p["value"] != null) { n.hasVal = true; n.val = pvS(p, "value", "") }
+    n.onSubmit = p["onSubmit"]
+    n.onFocus = p["onFocus"]
+    n.onBlur = p["onBlur"]
+    applyEventsV(n, p); return n
 }
 /**
  * A native on/off switch (UISwitch / SwiftUI Toggle / Android Switch/SwitchMaterial).
@@ -728,14 +854,17 @@ export function TextInput(p: map[string]Prop): Node {
  * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
  * ```
  */
-export function SafeAreaView(p: map[string]Prop, kids: []Node): Node {
-    const edges: string = pStr(p, "edges", "top,bottom")
+dataType SafeAreaViewProps { ViewProps; edges: string? }
+export function SafeAreaView(first: SafeAreaViewProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return SafeAreaView({}, first) }   // content-only (default edges)
+    const p: SafeAreaViewProps = first
+    const edges: string = pvS(p, "edges", "top,bottom")
     const all: bool = edges.contains("all")
     var out: []Node = []
     if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
     for (var i: int = 0; i < kids.length; i = i + 1) { out.push(kids[i]) }
     if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
-    const s: Style = new Style(); s.dir = "col"; applyLayout(s, p)
+    const s: Style = new Style(); s.dir = "col"; applyLayoutV(s, p)
     return mkView(s, out)
 }
 // A fixed-height empty row (a safe-area spacer).
@@ -756,31 +885,43 @@ function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return m
  *     Scroll({}, [ Column({ gap: 12 }, [ Text(...), Card(...), Button(...) ]) ])
  *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
  */
-export function Scroll(p: map[string]Prop, kids: []Node): Node {
+dataType ScrollProps {
+    ViewProps; horizontal: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
+    onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
+}
+export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
+    // props-or-content: `Scroll([...])` is a default vertical scroll of the given content;
+    // `Scroll({...}, [...])` configures it. Discriminate by type (array = content, `{...}` = props).
+    if (typeof(first) == "array") {
+        const c: []Node = first
+        const s0: Style = new Style(); s0.dir = "col"; s0.grow = 1; s0.basis = 0
+        return new Node("Scroll", s0, "", c)
+    }
+    const p: ScrollProps = first  // narrowed to the dataType arm: typed field access below
     // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
     // HScroll (same control horizontal Lists use); children lay out in a row and the
     // content is measured wide, not clamped to the viewport. Vertical is the default.
-    const horizontal: bool = pBool(p, "horizontal", false)
+    const horizontal: bool = p.horizontal ?? false
     const s: Style = new Style()
     if (horizontal) { s.dir = "row"; s.horiz = 1 } else { s.dir = "col" }
     s.grow = 1; s.basis = 0
-    applyLayout(s, p)
+    applyLayoutV(s, p)
     // Pull-to-refresh: `onRefresh` fires when the user pulls down at the top; the
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
     // Vertical only (a horizontal carousel has no pull-to-refresh).
-    const orf: Prop? = horizontal ? null : p.get("onRefresh")
-    if (orf != null) { s.rfsh = pBool(p, "refreshing", false) ? 1 : 0 }
+    const orf: (function(): void)? = horizontal ? null : p.onRefresh
+    if (orf != null) { s.rfsh = (p.refreshing ?? false) ? 1 : 0 }
     // stickBottom: a chat transcript stays pinned to the newest message. The host keeps the
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
-    if (!horizontal && pBool(p, "stickBottom", false)) { s.stick = 1 }
+    if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
     const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", kids)
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
-    const osc: Prop? = p.get("onScroll")
+    const osc: (function(v: string): void)? = p.onScroll
     if (osc != null) { n.onScroll = osc }
-    n.scrollTo = pInt(p, "scrollTo", -1)
+    n.scrollTo = p.scrollTo ?? -1
     return n
 }
 /**
@@ -797,15 +938,18 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
  * Pressable({ onPress: open, bg: CARD, radius: 12, pad: 16 }, [ Text(...) ])
  * ```
  */
-export function Pressable(p: map[string]Prop, kids: []Node): Node {
+dataType PressableProps { ViewProps; activeOpacity: int?; delayLongPress: int?; hitSlop: int?; disabled: bool? }
+export function Pressable(first: PressableProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Pressable({}, first) }   // content-only
+    const p: PressableProps = first
     const s: Style = new Style(); s.dir = "col"
-    s.press = pInt(p, "activeOpacity", 60)
-    s.longDelay = pInt(p, "delayLongPress", -1)           // onLongPress hold time (ms)
-    s.hitSlop = pInt(p, "hitSlop", -1)                    // extra tappable px beyond the bounds
-    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
-    applyLayout(s, p)
+    s.press = pvI(p, "activeOpacity", 60)
+    s.longDelay = pvI(p, "delayLongPress", -1)            // onLongPress hold time (ms)
+    s.hitSlop = pvI(p, "hitSlop", -1)                     // extra tappable px beyond the bounds
+    if (p["disabled"] != null) { s.disabled = pvB(p, "disabled", false) ? 1 : 0 }   // dim + block taps
+    applyLayoutV(s, p)
     const n: Node = mkView(s, kids)
-    applyEvents(n, p)   // onPress + onLongPress + onPressIn/onPressOut
+    applyEventsV(n, p)   // onPress + onLongPress + onPressIn/onPressOut
     return n
 }
 /**
@@ -818,11 +962,11 @@ export function Pressable(p: map[string]Prop, kids: []Node): Node {
  * Spinner({ size: 28, color: ACCENT })
  * ```
  */
-export function Spinner(p: map[string]Prop): Node {
+export function Spinner(p: ViewProps): Node {
     const s: Style = new Style()
-    const sz: int = pInt(p, "size", 24)
-    s.fg = pStr(p, "color", s.fg)
-    applyLayout(s, p)
+    const sz: int = pvI(p, "size", 24)
+    s.fg = pvS(p, "color", s.fg)
+    applyLayoutV(s, p)
     // `size` is the spinner DIAMETER (w/h), not a font size — set after applyLayout
     // (which reads `size` as fs) so it wins and the spurious fs is cleared.
     s.w = sz; s.h = sz; s.fs = -1
@@ -839,16 +983,17 @@ export function Spinner(p: map[string]Prop): Node {
  * Progress({ value: pct.get(), max: 100, color: ACCENT })
  * ```
  */
-export function Progress(p: map[string]Prop): Node {
-    const val: int = pInt(p, "value", 0)
-    const mx: int = pInt(p, "max", 100)
+dataType ProgressProps { ViewProps; value: int?; max: int? }
+export function Progress(p: ProgressProps): Node {
+    const val: int = pvI(p, "value", 0)
+    const mx: int = pvI(p, "max", 100)
     var pct: int = mx > 0 ? (val * 100) / mx : 0
     if (pct < 0) { pct = 0 }
     if (pct > 100) { pct = 100 }
     const s: Style = new Style()
-    s.fg = pStr(p, "color", "")     // fill tint
-    s.h = pInt(p, "h", 6)           // bar thickness
-    applyLayout(s, p)
+    s.fg = pvS(p, "color", "")      // fill tint
+    s.h = pvI(p, "h", 6)            // bar thickness
+    applyLayoutV(s, p)
     s.prog = pct                    // set after applyLayout (which doesn't touch prog)
     return mkProgress(s)
 }
@@ -868,12 +1013,13 @@ export function Progress(p: map[string]Prop): Node {
  * StatusBar({ style: "light", color: tk("primary") })
  * ```
  */
-export function StatusBar(p: map[string]Prop): Node {
+dataType StatusBarProps { ViewProps; hidden: bool?; style: string?; navColor: string? }
+export function StatusBar(p: StatusBarProps): Node {
     const s: Style = new Style()
-    s.sbHide = pBool(p, "hidden", false) ? 1 : 0
-    s.sbStyle = pStr(p, "style", "")
-    s.sbColor = pStr(p, "color", "")
-    s.sbNavColor = pStr(p, "navColor", "")
+    s.sbHide = pvB(p, "hidden", false) ? 1 : 0
+    s.sbStyle = pvS(p, "style", "")
+    s.sbColor = pvS(p, "color", "")
+    s.sbNavColor = pvS(p, "navColor", "")
     s.w = 0; s.h = 0
     return mkStatusBar(s)
 }
@@ -893,14 +1039,17 @@ export function StatusBar(p: map[string]Prop): Node {
  * ])
  * ```
  */
-export function Modal(p: map[string]Prop, kids: []Node): Node {
-    const vis: bool = pBool(p, "visible", false)
+dataType ModalProps { ViewProps; visible: bool?; position: string?; onDismiss: (function(): void)? }
+export function Modal(first: ModalProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Modal({}, first) }   // content-only (hidden until visible)
+    const p: ModalProps = first
+    const vis: bool = pvB(p, "visible", false)
     const s: Style = new Style()
     s.mvis = vis ? 1 : 0
-    s.mpos = pStr(p, "position", "center")
+    s.mpos = pvS(p, "position", "center")
     // Hidden: emit the node but with NO children, so the content isn't mounted.
     const n: Node = mkModal(s, vis ? kids : [])
-    const od: Prop? = p.get("onDismiss")     // scrim tap fires onDismiss (wired as onPress)
+    const od: any = p["onDismiss"]           // scrim tap fires onDismiss (wired as onPress)
     if (od != null) { n.onPress = od }
     return n
 }
@@ -931,15 +1080,22 @@ export function Modal(p: map[string]Prop, kids: []Node): Node {
  *         onCancel:  function(): void { confirming.set(false) } })
  * ```
  */
-export function Alert(p: map[string]Prop): Node {
+dataType AlertProps {
+    visible: bool?; title: string?; message: string?;
+    confirmText: string?; cancelText: string?; destructive: bool?;
+    buttons: string?; prompt: bool?; placeholder: string?; promptValue: string?;
+    onConfirm: (function(): void)?; onCancel: (function(): void)?;
+    onButton: (function(v: string): void)?; onSubmit: (function(v: string): void)?;
+}
+export function Alert(p: AlertProps): Node {
     const s: Style = new Style()
-    s.avis = pBool(p, "visible", false) ? 1 : 0
-    const title: string = pStr(p, "title", "")
-    const message: string = pStr(p, "message", "")
-    const isPrompt: bool = pBool(p, "prompt", false)
-    const placeholder: string = pStr(p, "placeholder", "")
-    const promptValue: string = pStr(p, "promptValue", "")
-    const buttonsProp: string = pStr(p, "buttons", "")
+    s.avis = pvB(p, "visible", false) ? 1 : 0
+    const title: string = pvS(p, "title", "")
+    const message: string = pvS(p, "message", "")
+    const isPrompt: bool = pvB(p, "prompt", false)
+    const placeholder: string = pvS(p, "placeholder", "")
+    const promptValue: string = pvS(p, "promptValue", "")
+    const buttonsProp: string = pvS(p, "buttons", "")
     // Build the button list in tap-index order. The user API takes `buttons` as a
     // pipe-separated string; internally each button is its own trailing TAB field (the
     // mutation protocol splits ops on '|', so a '|' in the text truncates it). Multi-
@@ -951,9 +1107,9 @@ export function Alert(p: map[string]Prop): Node {
     if (buttonsProp != "") {
         buttonList = buttonsProp.split("|")
     } else {
-        const confirm: string = pStr(p, "confirmText", "OK")
-        const cancel: string = pStr(p, "cancelText", "")
-        const confirmLabel: string = (pBool(p, "destructive", false) ? "!" : "") + confirm
+        const confirm: string = pvS(p, "confirmText", "OK")
+        const cancel: string = pvS(p, "cancelText", "")
+        const confirmLabel: string = (pvB(p, "destructive", false) ? "!" : "") + confirm
         if (cancel != "") { buttonList = ["~" + cancel, confirmLabel]; cancelIdx = 0; confirmIdx = 1 }
         else { buttonList = [confirmLabel]; confirmIdx = 0 }
     }
@@ -963,17 +1119,17 @@ export function Alert(p: map[string]Prop): Node {
     // The host reports the tapped button INDEX ("0","1",...), plus "\t<text>" for a
     // prompt. routeAlert (top-level, so its locals don't sit inside the captured
     // closure and miscompile under AOT) dispatches to the right callback.
-    const ob: Prop? = p.get("onButton")
-    const oc: Prop? = p.get("onConfirm")
-    const ox: Prop? = p.get("onCancel")
-    const os: Prop? = p.get("onSubmit")
+    const ob: any = p["onButton"]
+    const oc: any = p["onConfirm"]
+    const ox: any = p["onCancel"]
+    const os: any = p["onSubmit"]
     n.onChange = function(v: string): void { routeAlert(v, ob, oc, ox, os, confirmIdx, cancelIdx) }
     return n
 }
 // Route an Alert button tap. `v` is "<idx>" or "<idx>\t<promptText>". Multi-button
 // alerts fire onButton(idx); simple/prompt alerts map idx to onConfirm/onCancel and
 // pass the prompt text to onSubmit. Top-level (not a closure) so its locals are safe.
-function routeAlert(v: string, ob: Prop?, oc: Prop?, ox: Prop?, os: Prop?, confirmIdx: int, cancelIdx: int): void {
+function routeAlert(v: string, ob: any, oc: any, ox: any, os: any, confirmIdx: int, cancelIdx: int): void {
     const tab: int = v.indexOf("\t")
     const idxStr: string = tab >= 0 ? v.slice(0, tab) : v
     const text: string = tab >= 0 ? v.slice(tab + 1) : ""
@@ -983,15 +1139,16 @@ function routeAlert(v: string, ob: Prop?, oc: Prop?, ox: Prop?, os: Prop?, confi
     else if (idx == cancelIdx) { callOpt(ox) }
 }
 // Invoke an optional Prop closure (a () -> void callback), if present.
-function callOpt(cb: Prop?): void { if (cb != null) { const f: any = cb; f() } }
-export function Toggle(p: map[string]Prop): Node {
+function callOpt(cb: any): void { if (cb != null) { const f: any = cb; f() } }
+dataType ToggleProps { ViewProps; on: bool?; thumbColor: string?; disabled: bool? }
+export function Toggle(p: ToggleProps): Node {
     const s: Style = new Style()
-    s.swOn = pBool(p, "on", false) ? 1 : 0
-    s.swThumb = pStr(p, "thumbColor", "")                                          // thumb (knob) color
-    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
-    applyLayout(s, p)
+    s.swOn = pvB(p, "on", false) ? 1 : 0
+    s.swThumb = pvS(p, "thumbColor", "")                                         // thumb (knob) color
+    if (p["disabled"] != null) { s.disabled = pvB(p, "disabled", false) ? 1 : 0 }   // dim + block taps
+    applyLayoutV(s, p)
     const n: Node = mkSwitch(s)
-    applyEvents(n, p)
+    applyEventsV(n, p)
     return n
 }
 /**
@@ -1010,19 +1167,20 @@ export function Toggle(p: map[string]Prop): Node {
  *          onChange: function(v: string): void { vol.set(int(v)) } })
  * ```
  */
-export function Slider(p: map[string]Prop): Node {
+dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?; onSlidingComplete: (function(v: string): void)? }
+export function Slider(p: SliderProps): Node {
     const s: Style = new Style()
-    s.slmin = pInt(p, "min", 0)
-    s.slmax = pInt(p, "max", 100)
-    s.slval = pInt(p, "value", s.slmin)
+    s.slmin = pvI(p, "min", 0)
+    s.slmax = pvI(p, "max", 100)
+    s.slval = pvI(p, "value", s.slmin)
     if (s.slval < 0) { s.slval = 0 }            // keep the serialization sentinel valid
-    s.slstep = pInt(p, "step", 0)               // snap to multiples of step (0 = continuous)
-    s.h = pInt(p, "h", 40)
-    s.fg = pStr(p, "color", "")                 // optional active-track / thumb tint
-    applyLayout(s, p)
+    s.slstep = pvI(p, "step", 0)                // snap to multiples of step (0 = continuous)
+    s.h = pvI(p, "h", 40)
+    s.fg = pvS(p, "color", "")                  // optional active-track / thumb tint
+    applyLayoutV(s, p)
     const n: Node = mkSlider(s)
-    applyEvents(n, p)                           // onChange(v) fires on drag
-    const sc: Prop? = p.get("onSlidingComplete")
+    applyEventsV(n, p)                          // onChange(v) fires on drag
+    const sc: any = p["onSlidingComplete"]
     if (sc != null) { n.onSlideDone = sc }      // fires once with the final value on release
     return n
 }
@@ -1040,17 +1198,18 @@ export function Slider(p: map[string]Prop): Node {
  *        ["Low", "Medium", "High"])
  * ```
  */
-export function Select(p: map[string]Prop, options: []string): Node {
+dataType SelectProps { ViewProps; value: int? }
+export function Select(p: SelectProps, options: []string): Node {
     const s: Style = new Style()
-    s.seli = pInt(p, "value", 0)
+    s.seli = pvI(p, "value", 0)
     if (s.seli < 0) { s.seli = 0 }
-    s.h = pInt(p, "h", 44)
-    s.bg = pStr(p, "bg", "FFFFFF")
-    s.fg = pStr(p, "color", "111318")
-    s.radius = pInt(p, "radius", 10)
-    applyLayout(s, p)
+    s.h = pvI(p, "h", 44)
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
     const n: Node = mkSelect(s, options.join("\t"))   // options in the text channel
-    applyEvents(n, p)                                 // onChange(index) fires on pick
+    applyEventsV(n, p)                                // onChange(index) fires on pick
     return n
 }
 /**
@@ -1075,23 +1234,24 @@ export function Select(p: map[string]Prop, options: []string): Node {
  *              onChange: function(v: string): void { born.set(v) } })
  * ```
  */
-export function DatePicker(p: map[string]Prop): Node {
+dataType DatePickerProps { ViewProps; mode: string?; display: string?; value: string? }
+export function DatePicker(p: DatePickerProps): Node {
     const s: Style = new Style()
-    s.dpmode = pStr(p, "mode", "date")          // date | time | datetime
-    s.dpdisp = pStr(p, "display", "")           // "" compact field | "inline" always-open | "wheels"
+    s.dpmode = pvS(p, "mode", "date")           // date | time | datetime
+    s.dpdisp = pvS(p, "display", "")            // "" compact field | "inline" always-open | "wheels"
     // The compact field is a fixed-height row; inline/wheels size to their natural
     // (tall) height, so only clamp height for the compact display.
-    if (s.dpdisp == "") { s.h = pInt(p, "h", 44) }
-    else if (p.get("h") != null) { s.h = pInt(p, "h", -1) }
-    s.bg = pStr(p, "bg", "FFFFFF")
-    s.fg = pStr(p, "color", "111318")
-    s.radius = pInt(p, "radius", 10)
-    applyLayout(s, p)
+    if (s.dpdisp == "") { s.h = pvI(p, "h", 44) }
+    else if (p["h"] != null) { s.h = pvI(p, "h", -1) }
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
     // Compact opens on tap (popover / dialog); inline & wheels are always-open, so
     // each host builds a different view — carry that in the node kind.
     const kind: string = (s.dpdisp == "") ? "DatePicker" : "DatePickerInline"
-    const n: Node = mkDatePicker(kind, s, pStr(p, "value", ""))   // ISO value in the text channel
-    applyEvents(n, p)                                       // onChange(iso) fires on pick
+    const n: Node = mkDatePicker(kind, s, pvS(p, "value", ""))   // ISO value in the text channel
+    applyEventsV(n, p)                                      // onChange(iso) fires on pick
     return n
 }
 /**
@@ -1108,16 +1268,17 @@ export function DatePicker(p: map[string]Prop): Node {
  *      ["Share", "Rename", "Delete"])
  * ```
  */
-export function Menu(p: map[string]Prop, items: []string): Node {
+dataType MenuProps { ViewProps; label: string? }
+export function Menu(p: MenuProps, items: []string): Node {
     const s: Style = new Style()
-    s.h = pInt(p, "h", 44)
-    s.bg = pStr(p, "bg", "FFFFFF")
-    s.fg = pStr(p, "color", "111318")
-    s.radius = pInt(p, "radius", 10)
-    applyLayout(s, p)
-    const label: string = pStr(p, "label", "Menu")
+    s.h = pvI(p, "h", 44)
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
+    const label: string = pvS(p, "label", "Menu")
     const n: Node = mkMenu(s, label + "\t" + items.join("\t"))   // parts[0]=label, rest=items
-    applyEvents(n, p)                                            // onChange(index) fires on pick
+    applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
 /**
@@ -1132,11 +1293,11 @@ export function Menu(p: map[string]Prop, items: []string): Node {
  *             [ Card({ children: [ Text(tw("text-text"), "Long-press me") ] }) ])
  * ```
  */
-export function ContextMenu(p: map[string]Prop, items: []string, kids: []Node): Node {
+export function ContextMenu(p: ViewProps, items: []string, kids: []Node): Node {
     const s: Style = new Style()
-    applyLayout(s, p)
+    applyLayoutV(s, p)
     const n: Node = mkContextMenu(s, items.join("\t"), kids)     // items in the text channel
-    applyEvents(n, p)                                            // onChange(index) fires on pick
+    applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
 /**
@@ -1153,9 +1314,12 @@ export function ContextMenu(p: map[string]Prop, items: []string, kids: []Node): 
  * Grid({ cols: 3, gap: 10 }, [ tileA, tileB, tileC, tileD, tileE ])
  * ```
  */
-export function Grid(p: map[string]Prop, items: []Node): Node {
-    const cols: int = pInt(p, "cols", 2)
-    const gap: int = pInt(p, "gap", 10)
+dataType GridProps { ViewProps; cols: int? }
+export function Grid(first: GridProps | []Node, items: []Node = []): Node {
+    if (typeof(first) == "array") { return Grid({}, first) }   // content-only: `Grid([...])`
+    const p: GridProps = first
+    const cols: int = pvI(p, "cols", 2)
+    const gap: int = pvI(p, "gap", 10)
     var rows: []Node = []
     var i: int = 0
     while (i < items.length) {
@@ -1173,7 +1337,7 @@ export function Grid(p: map[string]Prop, items: []Node): Node {
         rows.push(Row({ gap: gap }, cells))
         i = i + cols
     }
-    const s: Style = new Style(); s.dir = "col"; applyLayout(s, p); s.gap = gap
+    const s: Style = new Style(); s.dir = "col"; applyLayoutV(s, p); s.gap = gap
     return mkView(s, rows)
 }
 /**
@@ -1188,13 +1352,14 @@ export function Grid(p: map[string]Prop, items: []Node): Node {
  * Map({ lat: "37.7749", lng: "-122.4194", zoom: "12", grow: 1 })
  * ```
  */
-export function Map(p: map[string]Prop): Node {
+dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string? }
+export function Map(p: MapProps): Node {
     const s: Style = new Style()
-    s.radius = pInt(p, "radius", 0)
-    applyLayout(s, p)
-    const lat: string = pStr(p, "lat", "37.7749")
-    const lng: string = pStr(p, "lng", "-122.4194")
-    const zoom: string = pStr(p, "zoom", "12")
+    s.radius = pvI(p, "radius", 0)
+    applyLayoutV(s, p)
+    const lat: string = pvS(p, "lat", "37.7749")
+    const lng: string = pvS(p, "lng", "-122.4194")
+    const zoom: string = pvS(p, "zoom", "12")
     return new Node("Map", s, lat + "," + lng + "," + zoom, [])   // "lat,lng,zoom" in the text channel
 }
 
@@ -1202,27 +1367,33 @@ export function Map(p: map[string]Prop): Node {
 // Each shape builder returns a compact descriptor string; Canvas joins them with ";"
 // into the node's text channel (fields comma-separated). A Path's `d` uses
 // space-separated SVG commands (M/L/Z) so it never contains a "," or ";".
-function si(p: map[string]Prop, k: string): string { return string(pInt(p, k, 0)) }
+function si(p: any, k: string): string { return string(pvI(p, k, 0)) }
 
+// Vector-shape props for Rect/Circle/Line/Path (SVG primitives, no layout).
+dataType ShapeProps {
+    x: int?; y: int?; w: int?; h: int?; cx: int?; cy: int?; r: int?;
+    x1: int?; y1: int?; x2: int?; y2: int?; strokeWidth: int?; radius: int?;
+    fill: string?; stroke: string?; d: string?;
+}
 /** A rectangle. Props: `x`, `y`, `w`, `h`, `fill`, `stroke`, `strokeWidth`, `radius`. */
-export function Rect(p: map[string]Prop): string {
+export function Rect(p: ShapeProps): string {
     return "rect," + si(p, "x") + "," + si(p, "y") + "," + si(p, "w") + "," + si(p, "h") + "," +
-        pStr(p, "fill", "") + "," + pStr(p, "stroke", "") + "," + si(p, "strokeWidth") + "," + si(p, "radius")
+        pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth") + "," + si(p, "radius")
 }
 /** A circle. Props: `cx`, `cy`, `r`, `fill`, `stroke`, `strokeWidth`. */
-export function Circle(p: map[string]Prop): string {
+export function Circle(p: ShapeProps): string {
     return "circle," + si(p, "cx") + "," + si(p, "cy") + "," + si(p, "r") + "," +
-        pStr(p, "fill", "") + "," + pStr(p, "stroke", "") + "," + si(p, "strokeWidth")
+        pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
 }
 /** A line. Props: `x1`, `y1`, `x2`, `y2`, `stroke`, `strokeWidth`. */
-export function Line(p: map[string]Prop): string {
+export function Line(p: ShapeProps): string {
     return "line," + si(p, "x1") + "," + si(p, "y1") + "," + si(p, "x2") + "," + si(p, "y2") + "," +
-        pStr(p, "stroke", "") + "," + string(pInt(p, "strokeWidth", 1))
+        pvS(p, "stroke", "") + "," + string(pvI(p, "strokeWidth", 1))
 }
 /** An SVG path (M / L / Z subset). Props: `d` (path data), `fill`, `stroke`, `strokeWidth`. */
-export function Path(p: map[string]Prop): string {
-    return "path," + pStr(p, "d", "") + "," + pStr(p, "fill", "") + "," +
-        pStr(p, "stroke", "") + "," + si(p, "strokeWidth")
+export function Path(p: ShapeProps): string {
+    return "path," + pvS(p, "d", "") + "," + pvS(p, "fill", "") + "," +
+        pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
 }
 /**
  * A native drawing surface. Renders a list of vector shapes (Rect / Circle / Line /
@@ -1239,11 +1410,13 @@ export function Path(p: map[string]Prop): string {
  * ])
  * ```
  */
-export function Canvas(p: map[string]Prop, shapes: []string): Node {
+export function Canvas(first: ViewProps | []string, shapes: []string = []): Node {
+    if (typeof(first) == "array") { return Canvas({}, first) }   // content-only: `Canvas([...shapes])`
+    const p: ViewProps = first
     const s: Style = new Style()
-    s.bg = pStr(p, "bg", "")
-    s.radius = pInt(p, "radius", 0)
-    applyLayout(s, p)
+    s.bg = pvS(p, "bg", "")
+    s.radius = pvI(p, "radius", 0)
+    applyLayoutV(s, p)
     return new Node("Canvas", s, shapes.join(";"), [])   // shapes joined in the text channel
 }
 /**
@@ -1260,14 +1433,21 @@ export function Canvas(p: map[string]Prop, shapes: []string): Node {
  * } }, [ card ])
  * ```
  */
-export function Gesture(p: map[string]Prop, kids: []Node): Node {
+dataType GestureProps {
+    ViewProps;
+    onGesture: (function(v: string): void)?; onPan: (function(v: string): void)?;
+    onPinch: (function(v: string): void)?; onRotate: (function(v: string): void)?;
+}
+export function Gesture(first: GestureProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Gesture({}, first) }   // content-only (no recognizers)
+    const p: GestureProps = first
     const s: Style = new Style()
-    applyLayout(s, p)
+    applyLayoutV(s, p)
     const n: Node = new Node("Gesture", s, "", kids)
-    const og: Prop? = p.get("onGesture")      // discrete: swipe/doubletap/longpress
-    const onPan: Prop? = p.get("onPan")        // continuous, each a function(v: string): void
-    const onPinch: Prop? = p.get("onPinch")
-    const onRotate: Prop? = p.get("onRotate")
+    const og: any = p["onGesture"]      // discrete: swipe/doubletap/longpress
+    const onPan: any = p["onPan"]        // continuous, each a function(v: string): void
+    const onPinch: any = p["onPinch"]
+    const onRotate: any = p["onRotate"]
     // Tell the host which CONTINUOUS recognizers to attach (text channel, comma list).
     // Attaching only the requested ones avoids fighting a Scroll and skips the discrete
     // swipe recognizer when pan is on (they both track drags).
@@ -1359,9 +1539,11 @@ export function decodeRotate(v: string): RotateEvent {
  * ])
  * ```
  */
-export function Screen(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "col"; s.pad = pInt(p, "pad", 12); s.gap = pInt(p, "gap", 10)
-    s.bg = pStr(p, "bg", "")
+export function Screen(first: ViewProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Screen({}, first) }   // content-only: `Screen([...])`
+    const p: ViewProps = first
+    const s: Style = new Style(); s.dir = "col"; s.pad = pvI(p, "pad", 12); s.gap = pvI(p, "gap", 10)
+    s.bg = pvS(p, "bg", "")
     return mkView(s, kids)
 }
 /**

@@ -12,7 +12,7 @@
 // Spacing follows Tailwind's 1 unit = 4px scale (p-4 = 16px). Colors come from
 // the palette below; an unknown color name is passed through as a raw hex, so
 // bg-1B2130 and bg-CARD (a theme constant's hex) both work.
-import { Prop } from "./ui.chuks";
+import { Prop } from "./prop.chuks";
 import { tk, tkSpace } from "./theme.chuks";
 
 // A curated slice of the Tailwind v3 palette (hex, no leading #).
