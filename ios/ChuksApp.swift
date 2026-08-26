@@ -2092,7 +2092,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let k = String(p[0]), val = String(p[1])
             let f = Float(val) ?? 0
             switch k {
-            case "d":   YGNodeStyleSetFlexDirection(n, val == "row" ? YGFlexDirection.row : YGFlexDirection.column)
+            case "d":   YGNodeStyleSetFlexDirection(n, val == "row" ? YGFlexDirection.row : (val == "row-reverse" ? YGFlexDirection.rowReverse : (val == "col-reverse" ? YGFlexDirection.columnReverse : YGFlexDirection.column)))
             case "j":   YGNodeStyleSetJustifyContent(n, justify(val))
             case "a":   YGNodeStyleSetAlignItems(n, align(val))
             case "g":     YGNodeStyleSetFlexGrow(n, f)

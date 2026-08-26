@@ -1514,7 +1514,7 @@ class MainActivity : Activity() {
             val k = p[0]; val vl = p[1]
             val f = vl.toFloatOrNull() ?: 0f
             when (k) {
-                "d" -> N.ySetF(n, 0, if (vl == "row") 1f else 0f)
+                "d" -> N.ySetF(n, 0, when (vl) { "row" -> 1f; "row-reverse" -> 2f; "col-reverse" -> 3f; else -> 0f })
                 "j" -> N.ySetF(n, 1, justify(vl))
                 "a" -> N.ySetF(n, 2, align(vl))
                 "g" -> N.ySetF(n, 3, f)

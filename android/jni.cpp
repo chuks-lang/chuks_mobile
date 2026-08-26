@@ -123,7 +123,7 @@ JNIEXPORT jfloat JNICALL J(yGet)(JNIEnv*, jobject, jlong n, jint which) {
 JNIEXPORT void JNICALL J(ySetF)(JNIEnv*, jobject, jlong n, jint key, jfloat v) {
     YGNodeRef y = (YGNodeRef)n; int iv = (int)v;
     switch (key) {
-        case 0:  YGNodeStyleSetFlexDirection(y, iv == 1 ? YGFlexDirectionRow : YGFlexDirectionColumn); break;
+        case 0:  YGNodeStyleSetFlexDirection(y, iv == 1 ? YGFlexDirectionRow : iv == 2 ? YGFlexDirectionRowReverse : iv == 3 ? YGFlexDirectionColumnReverse : YGFlexDirectionColumn); break;
         case 1:  YGNodeStyleSetJustifyContent(y, (YGJustify)iv); break;
         case 2:  YGNodeStyleSetAlignItems(y, (YGAlign)iv); break;
         case 3:  YGNodeStyleSetFlexGrow(y, v); break;

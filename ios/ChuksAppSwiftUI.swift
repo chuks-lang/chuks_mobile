@@ -2640,7 +2640,9 @@ struct NodeView: View {
 
     @ViewBuilder func flowContainer(_ node: NodeData) -> some View {
         let s = node.style
-        let isRow = s["d"] == "row"
+        let dir = s["d"] ?? "col"
+        let isRow = dir == "row" || dir == "row-reverse"     // reverse lays out on the same axis
+        let reversed = dir == "row-reverse" || dir == "col-reverse"   // ... with children in reverse order
         let gap = numOf(s["gap"]) ?? 0
         // justify only distributes when the container actually fills its OWN main
         // axis (a main-axis size, or grow along its own main axis). Otherwise it is
@@ -2658,7 +2660,7 @@ struct NodeView: View {
         // chain) keeps stretching, and a column in a row with grow/explicit-w does too.
         let contentSizedColInRow = !isRow && parentRow && numOf(s["w"]) == nil && !grows
         let crossStretch = (a == nil || a == "stretch") && !contentSizedColInRow
-        let kids = node.children
+        let kids = reversed ? Array(node.children.reversed()) : node.children
         let hasGrowChild = kids.contains { (numOf(scene.nodes[$0]?.style["g"]) ?? 0) > 0 }
         // This container fills its own main axis (has room to distribute) if it has a
         // main-axis size, grows along its own main axis, or is a row a parent column
@@ -2666,7 +2668,11 @@ struct NodeView: View {
         let fillsMain = hasMainSize
             || (grows && (isRow == parentRow))
             || (parentStretch && !parentRow && isRow)
-        let justify = fillsMain ? (s["j"] ?? "start") : ""
+        let rawJustify = fillsMain ? (s["j"] ?? "start") : ""
+        // A reverse direction runs the main axis the other way, so flex-start packs to the
+        // FAR edge (Yoga row-reverse pushes items to the right). Swap start<->end so the
+        // spacer logic below packs the (already order-reversed) children to match Yoga.
+        let justify = reversed ? (rawJustify == "start" ? "end" : (rawJustify == "end" ? "start" : rawJustify)) : rawJustify
         // Content packing via Spacers (NOT frame alignment, which would collapse grow
         // children). flex-start (default) gets a TRAILING spacer to pack leading —
         // unless a child grows and already absorbs the space.
