@@ -73,7 +73,7 @@ YOGA_INC="$SDKROOT/core/yoga/include"     # shared Yoga headers (in the package)
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )
-BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated sources live under ~/.chuks/cache
+BD="$( { set +o pipefail; ls -dt "$HOME"/.chuks/cache/builds/*/ 2>/dev/null | head -1; } )"   # generated sources live under ~/.chuks/cache (pipefail-safe: ls SIGPIPEs when many build dirs exist)
 
 echo "2. Building the iOS engine ($PLATLABEL)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \

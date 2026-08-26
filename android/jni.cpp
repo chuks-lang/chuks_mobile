@@ -117,6 +117,9 @@ JNIEXPORT jfloat JNICALL J(yGet)(JNIEnv*, jobject, jlong n, jint which) {
 }
 // key: 0 flexDir(v:0col/1row) 1 justify 2 align 3 grow 4 basis 5 w 6 h
 //      7 padAll 8 gapAll 9 posAbs 10 posTop 11 posLeft 12 posRight
+//      13 flexWrap 14 padHorizontal 15 padVertical
+//      16-19 pad T/R/B/L  20-23 margin T/R/B/L  24-27 min/max W/H
+//      28 widthPct 29 heightPct 30 aspect(v/100) 31 posBottom
 JNIEXPORT void JNICALL J(ySetF)(JNIEnv*, jobject, jlong n, jint key, jfloat v) {
     YGNodeRef y = (YGNodeRef)n; int iv = (int)v;
     switch (key) {
@@ -134,6 +137,26 @@ JNIEXPORT void JNICALL J(ySetF)(JNIEnv*, jobject, jlong n, jint key, jfloat v) {
         case 11: YGNodeStyleSetPosition(y, YGEdgeLeft, v); break;
         case 12: YGNodeStyleSetPosition(y, YGEdgeRight, v); break;
         case 13: YGNodeStyleSetFlexWrap(y, iv == 1 ? YGWrapWrap : YGWrapNoWrap); break;
+        case 14: YGNodeStyleSetPadding(y, YGEdgeHorizontal, v); break;   // px
+        case 15: YGNodeStyleSetPadding(y, YGEdgeVertical, v); break;     // py
+        case 16: YGNodeStyleSetPadding(y, YGEdgeTop, v); break;
+        case 17: YGNodeStyleSetPadding(y, YGEdgeRight, v); break;
+        case 18: YGNodeStyleSetPadding(y, YGEdgeBottom, v); break;
+        case 19: YGNodeStyleSetPadding(y, YGEdgeLeft, v); break;
+        case 20: YGNodeStyleSetMargin(y, YGEdgeTop, v); break;
+        case 21: YGNodeStyleSetMargin(y, YGEdgeRight, v); break;
+        case 22: YGNodeStyleSetMargin(y, YGEdgeBottom, v); break;
+        case 23: YGNodeStyleSetMargin(y, YGEdgeLeft, v); break;
+        case 24: YGNodeStyleSetMinWidth(y, v); break;
+        case 25: YGNodeStyleSetMaxWidth(y, v); break;
+        case 26: YGNodeStyleSetMinHeight(y, v); break;
+        case 27: YGNodeStyleSetMaxHeight(y, v); break;
+        case 28: YGNodeStyleSetWidthPercent(y, v); break;
+        case 29: YGNodeStyleSetHeightPercent(y, v); break;
+        case 30: YGNodeStyleSetAspectRatio(y, v / 100.0f); break;
+        case 31: YGNodeStyleSetPosition(y, YGEdgeBottom, v); break;
+        case 32: YGNodeStyleSetDisplay(y, iv == 1 ? YGDisplayNone : YGDisplayFlex); break;   // hidden (display:none)
+        case 33: YGNodeStyleSetAlignSelf(y, (YGAlign)iv); break;                             // align-self
     }
 }
 

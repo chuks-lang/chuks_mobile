@@ -1,57 +1,73 @@
 // @chuks/ui -- tw(): a Tailwind-style utility-class adapter.
 //
 // Like NativeWind in React Native, this does NOT run CSS. It parses a class
-// string into the same prop map the builders already take, so you get the
-// Tailwind DX on top of the native Style model:
+// string into the same prop map the builders already take, mapping every
+// Tailwind utility that has a native flexbox analog onto the Chuks Style model:
 //
-//   Row(tw("flex-row items-center justify-between gap-3 p-4 bg-slate-800 rounded-xl"), [
-//       Text(tw("text-lg font-bold text-slate-50"), "Title"),
-//       Button(tw("bg-blue-500 rounded-lg"), "Open"),
+//   Row(tw("flex-row items-center justify-between gap-3 px-4 py-2 bg-slate-800 rounded-xl"), [
+//       Text(tw("text-lg font-bold tracking-tight text-slate-50"), "Title"),
+//       Button(tw("bg-blue-500 rounded-lg shadow-md"), "Open"),
 //   ])
 //
-// Spacing follows Tailwind's 1 unit = 4px scale (p-4 = 16px). Colors come from
-// the palette below; an unknown color name is passed through as a raw hex, so
-// bg-1B2130 and bg-CARD (a theme constant's hex) both work.
+// Coverage: layout/flex, alignment, spacing (padding + margin, per-side +
+// directional), sizing (incl. min/max + w-full/screen + fractions + arbitrary),
+// colors (full palette + theme roles + arbitrary hex), typography (full scale,
+// all weights, italic/underline/transform, tracking/leading, align), radius
+// (incl. per-corner), borders (widths + per-side + color), effects (opacity,
+// shadow), position (absolute/relative, inset incl. bottom, z), transforms
+// (scale/rotate/translate), overflow, and object-fit. Arbitrary values in
+// brackets are supported everywhere a length/color is expected: p-[13px],
+// bg-[#1a2b3c], w-[200px], text-[15px].
+//
+// CSS-only features with no native analog (grid templates, floats, pseudo-
+// elements, backdrop/blur filters, hover:/focus: state variants, transitions
+// with CSS timing, container queries) are intentionally not mapped.
+//
+// Spacing follows Tailwind's 1 unit = 4px scale (p-4 = 16px). Named steps
+// (p-md = 12) also work via the theme spacing scale.
 import { Prop } from "./prop.chuks";
 import { tk, tkSpace } from "./theme.chuks";
 
-// A curated slice of the Tailwind v3 palette (hex, no leading #).
+// The full Tailwind v3 color palette (hex, no leading #). Every hue, shades 50–950.
 const PALETTE: map[string]string = {
-    "white": "FFFFFF", "black": "000000",
-    "slate-50": "F8FAFC", "slate-100": "F1F5F9", "slate-200": "E2E8F0", "slate-300": "CBD5E1",
-    "slate-400": "94A3B8", "slate-500": "64748B", "slate-600": "475569", "slate-700": "334155",
-    "slate-800": "1E293B", "slate-900": "0F172A", "slate-950": "020617",
-    "gray-400": "9CA3AF", "gray-500": "6B7280", "gray-600": "4B5563", "gray-700": "374151",
-    "gray-800": "1F2937", "gray-900": "111827", "gray-950": "030712",
-    "zinc-700": "3F3F46", "zinc-800": "27272A", "zinc-900": "18181B",
-    "blue-400": "60A5FA", "blue-500": "3B82F6", "blue-600": "2563EB", "blue-700": "1D4ED8",
-    "indigo-500": "6366F1", "indigo-600": "4F46E5",
-    "violet-500": "8B5CF6", "violet-600": "7C3AED",
-    "purple-500": "A855F7", "purple-600": "9333EA",
-    "red-400": "F87171", "red-500": "EF4444", "red-600": "DC2626", "red-700": "B91C1C",
-    "orange-500": "F97316", "orange-600": "EA580C",
-    "amber-400": "FBBF24", "amber-500": "F59E0B", "amber-600": "D97706",
-    "yellow-400": "FACC15", "yellow-500": "EAB308",
-    "green-400": "4ADE80", "green-500": "22C55E", "green-600": "16A34A",
-    "emerald-500": "10B981", "emerald-600": "059669",
-    "teal-500": "14B8A6", "teal-600": "0D9488", "cyan-500": "06B6D4",
-    "pink-500": "EC4899", "pink-600": "DB2777", "rose-500": "F43F5E",
+    "white": "FFFFFF", "black": "000000", "transparent": "00000000",
+    "slate-50": "F8FAFC", "slate-100": "F1F5F9", "slate-200": "E2E8F0", "slate-300": "CBD5E1", "slate-400": "94A3B8", "slate-500": "64748B", "slate-600": "475569", "slate-700": "334155", "slate-800": "1E293B", "slate-900": "0F172A", "slate-950": "020617",
+    "gray-50": "F9FAFB", "gray-100": "F3F4F6", "gray-200": "E5E7EB", "gray-300": "D1D5DB", "gray-400": "9CA3AF", "gray-500": "6B7280", "gray-600": "4B5563", "gray-700": "374151", "gray-800": "1F2937", "gray-900": "111827", "gray-950": "030712",
+    "zinc-50": "FAFAFA", "zinc-100": "F4F4F5", "zinc-200": "E4E4E7", "zinc-300": "D4D4D8", "zinc-400": "A1A1AA", "zinc-500": "71717A", "zinc-600": "52525B", "zinc-700": "3F3F46", "zinc-800": "27272A", "zinc-900": "18181B", "zinc-950": "09090B",
+    "neutral-50": "FAFAFA", "neutral-100": "F5F5F5", "neutral-200": "E5E5E5", "neutral-300": "D4D4D4", "neutral-400": "A3A3A3", "neutral-500": "737373", "neutral-600": "525252", "neutral-700": "404040", "neutral-800": "262626", "neutral-900": "171717", "neutral-950": "0A0A0A",
+    "stone-50": "FAFAF9", "stone-100": "F5F5F4", "stone-200": "E7E5E4", "stone-300": "D6D3D1", "stone-400": "A8A29E", "stone-500": "78716C", "stone-600": "57534E", "stone-700": "44403C", "stone-800": "292524", "stone-900": "1C1917", "stone-950": "0C0A09",
+    "red-50": "FEF2F2", "red-100": "FEE2E2", "red-200": "FECACA", "red-300": "FCA5A5", "red-400": "F87171", "red-500": "EF4444", "red-600": "DC2626", "red-700": "B91C1C", "red-800": "991B1B", "red-900": "7F1D1D", "red-950": "450A0A",
+    "orange-50": "FFF7ED", "orange-100": "FFEDD5", "orange-200": "FED7AA", "orange-300": "FDBA74", "orange-400": "FB923C", "orange-500": "F97316", "orange-600": "EA580C", "orange-700": "C2410C", "orange-800": "9A3412", "orange-900": "7C2D12", "orange-950": "431407",
+    "amber-50": "FFFBEB", "amber-100": "FEF3C7", "amber-200": "FDE68A", "amber-300": "FCD34D", "amber-400": "FBBF24", "amber-500": "F59E0B", "amber-600": "D97706", "amber-700": "B45309", "amber-800": "92400E", "amber-900": "78350F", "amber-950": "451A03",
+    "yellow-50": "FEFCE8", "yellow-100": "FEF9C3", "yellow-200": "FEF08A", "yellow-300": "FDE047", "yellow-400": "FACC15", "yellow-500": "EAB308", "yellow-600": "CA8A04", "yellow-700": "A16207", "yellow-800": "854D0E", "yellow-900": "713F12", "yellow-950": "422006",
+    "lime-50": "F7FEE7", "lime-100": "ECFCCB", "lime-200": "D9F99D", "lime-300": "BEF264", "lime-400": "A3E635", "lime-500": "84CC16", "lime-600": "65A30D", "lime-700": "4D7C0F", "lime-800": "3F6212", "lime-900": "365314", "lime-950": "1A2E05",
+    "green-50": "F0FDF4", "green-100": "DCFCE7", "green-200": "BBF7D0", "green-300": "86EFAC", "green-400": "4ADE80", "green-500": "22C55E", "green-600": "16A34A", "green-700": "15803D", "green-800": "166534", "green-900": "14532D", "green-950": "052E16",
+    "emerald-50": "ECFDF5", "emerald-100": "D1FAE5", "emerald-200": "A7F3D0", "emerald-300": "6EE7B7", "emerald-400": "34D399", "emerald-500": "10B981", "emerald-600": "059669", "emerald-700": "047857", "emerald-800": "065F46", "emerald-900": "064E3B", "emerald-950": "022C22",
+    "teal-50": "F0FDFA", "teal-100": "CCFBF1", "teal-200": "99F6E4", "teal-300": "5EEAD4", "teal-400": "2DD4BF", "teal-500": "14B8A6", "teal-600": "0D9488", "teal-700": "0F766E", "teal-800": "115E59", "teal-900": "134E4A", "teal-950": "042F2E",
+    "cyan-50": "ECFEFF", "cyan-100": "CFFAFE", "cyan-200": "A5F3FC", "cyan-300": "67E8F9", "cyan-400": "22D3EE", "cyan-500": "06B6D4", "cyan-600": "0891B2", "cyan-700": "0E7490", "cyan-800": "155E75", "cyan-900": "164E63", "cyan-950": "083344",
+    "sky-50": "F0F9FF", "sky-100": "E0F2FE", "sky-200": "BAE6FD", "sky-300": "7DD3FC", "sky-400": "38BDF8", "sky-500": "0EA5E9", "sky-600": "0284C7", "sky-700": "0369A1", "sky-800": "075985", "sky-900": "0C4A6E", "sky-950": "082F49",
+    "blue-50": "EFF6FF", "blue-100": "DBEAFE", "blue-200": "BFDBFE", "blue-300": "93C5FD", "blue-400": "60A5FA", "blue-500": "3B82F6", "blue-600": "2563EB", "blue-700": "1D4ED8", "blue-800": "1E40AF", "blue-900": "1E3A8A", "blue-950": "172554",
+    "indigo-50": "EEF2FF", "indigo-100": "E0E7FF", "indigo-200": "C7D2FE", "indigo-300": "A5B4FC", "indigo-400": "818CF8", "indigo-500": "6366F1", "indigo-600": "4F46E5", "indigo-700": "4338CA", "indigo-800": "3730A3", "indigo-900": "312E81", "indigo-950": "1E1B4B",
+    "violet-50": "F5F3FF", "violet-100": "EDE9FE", "violet-200": "DDD6FE", "violet-300": "C4B5FD", "violet-400": "A78BFA", "violet-500": "8B5CF6", "violet-600": "7C3AED", "violet-700": "6D28D9", "violet-800": "5B21B6", "violet-900": "4C1D95", "violet-950": "2E1065",
+    "purple-50": "FAF5FF", "purple-100": "F3E8FF", "purple-200": "E9D5FF", "purple-300": "D8B4FE", "purple-400": "C084FC", "purple-500": "A855F7", "purple-600": "9333EA", "purple-700": "7E22CE", "purple-800": "6B21A8", "purple-900": "581C87", "purple-950": "3B0764",
+    "fuchsia-50": "FDF4FF", "fuchsia-100": "FAE8FF", "fuchsia-200": "F5D0FE", "fuchsia-300": "F0ABFC", "fuchsia-400": "E879F9", "fuchsia-500": "D946EF", "fuchsia-600": "C026D3", "fuchsia-700": "A21CAF", "fuchsia-800": "86198F", "fuchsia-900": "701A75", "fuchsia-950": "4A044E",
+    "pink-50": "FDF2F8", "pink-100": "FCE7F3", "pink-200": "FBCFE8", "pink-300": "F9A8D4", "pink-400": "F472B6", "pink-500": "EC4899", "pink-600": "DB2777", "pink-700": "BE185D", "pink-800": "9D174D", "pink-900": "831843", "pink-950": "500724",
+    "rose-50": "FFF1F2", "rose-100": "FFE4E6", "rose-200": "FECDD3", "rose-300": "FDA4AF", "rose-400": "FB7185", "rose-500": "F43F5E", "rose-600": "E11D48", "rose-700": "BE123C", "rose-800": "9F1239", "rose-900": "881337", "rose-950": "4C0519",
 }
 
 // hex for a color name: a semantic theme role first (surface/primary/muted/...),
 // then the Tailwind palette, else the token itself (assumed a raw hex).
 function twColor(name: string): string {
+    if (twHas(name, "[") && twHas(name.slice(name.length - 1, name.length), "]")) {
+        var v: string = name.slice(1, name.length - 1)          // arbitrary: [#1a2b3c] or [rgb(..)]
+        if (twHas(v, "#")) { v = v.slice(1, v.length) }
+        return v
+    }
     const sem: string = tk(name)
     if (sem != "") { return sem }
     return PALETTE.getOr(name, name)
 }
-// px for a spacing token: a plain number on the 4px scale (p-4 = 16), or a named
-// step (p-md = 12). -1 when neither.
-function twSpaceVal(rest: string): int {
-    const n: int = twNum(rest)
-    if (n >= 0) { return n * 4 }
-    return tkSpace(rest)
-}
+
 // true if `t` begins with `p`.
 function twHas(t: string, p: string): bool { return t.length >= p.length && t.slice(0, p.length) == p }
 // the substring of `t` after prefix `p`.
@@ -65,12 +81,71 @@ function twNum(s: string): int {
     }
     return int(s)
 }
-function twSize(k: string): int {
-    if (k == "xs") { return 11 } if (k == "sm") { return 13 } if (k == "base") { return 15 }
-    if (k == "lg") { return 18 } if (k == "xl") { return 22 } if (k == "2xl") { return 28 }
-    if (k == "3xl") { return 34 } if (k == "4xl") { return 40 }
+
+// A length token -> px. Handles: the 4px numeric scale (4 -> 16), `px` (1px),
+// named theme steps (md -> 12), fractions of the viewport-ish 100% is handled by
+// the caller, and arbitrary brackets [13px]/[20] -> the raw number.
+function twLen(rest: string): int {
+    if (twHas(rest, "[")) {                                     // arbitrary: [13px] / [20]
+        var v: string = rest.slice(1, rest.length - 1)
+        if (v.length > 2 && v.slice(v.length - 2, v.length) == "px") { v = v.slice(0, v.length - 2) }
+        const a: int = twNum(v); if (a >= 0) { return a }
+        return -1
+    }
+    if (rest == "px") { return 1 }                              // p-px = 1px
+    const n: int = twNum(rest)
+    if (n >= 0) { return n * 4 }                                // 4px scale
+    const step: int = tkSpace(rest); if (step >= 0) { return step }  // named theme step
     return -1
 }
+
+// spacing value (alias kept for readability at call sites)
+function twSpaceVal(rest: string): int { return twLen(rest) }
+
+// text size -> px. Full Tailwind scale xs..9xl, plus arbitrary [15px].
+function twSize(k: string): int {
+    if (twHas(k, "[")) { return twLen(k) }
+    if (k == "xs") { return 11 } if (k == "sm") { return 13 } if (k == "base") { return 15 }
+    if (k == "lg") { return 18 } if (k == "xl") { return 20 } if (k == "2xl") { return 24 }
+    if (k == "3xl") { return 30 } if (k == "4xl") { return 36 } if (k == "5xl") { return 48 }
+    if (k == "6xl") { return 60 } if (k == "7xl") { return 72 } if (k == "8xl") { return 96 }
+    if (k == "9xl") { return 128 }
+    return -1
+}
+
+// font-weight keyword -> the Style weight token (host maps to a platform weight).
+function twWeight(k: string): string {
+    if (k == "thin" || k == "extralight" || k == "light") { return "light" }
+    if (k == "normal") { return "regular" }
+    if (k == "medium") { return "medium" }
+    if (k == "semibold") { return "semibold" }
+    if (k == "bold" || k == "extrabold" || k == "black") { return "bold" }
+    return ""
+}
+
+// radius keyword -> px (the `rounded-*` scale). -1 if not a keyword.
+function twRadius(k: string): int {
+    if (k == "" ) { return 8 }               // bare `rounded`
+    if (k == "none") { return 0 } if (k == "sm") { return 4 } if (k == "md") { return 8 }
+    if (k == "lg") { return 12 } if (k == "xl") { return 16 } if (k == "2xl") { return 20 }
+    if (k == "3xl") { return 24 } if (k == "full") { return 9999 }
+    return twLen(k)                          // arbitrary rounded-[10px]
+}
+
+// Fractional / keyword width or height as a percent 0..100, else -1.
+function twPct(rest: string): int {
+    if (rest == "full") { return 100 }
+    const slash: int = rest.indexOf("/")
+    if (slash > 0) {
+        const num: int = twNum(rest.slice(0, slash))
+        const den: int = twNum(rest.slice(slash + 1, rest.length))
+        if (num >= 0 && den > 0) { return num * 100 / den }
+    }
+    return -1
+}
+
+// Set both members of a padding/margin axis (helper for px/py/mx/my).
+function setEdge(p: map[string]Prop, a: string, b: string, v: int): void { p[a] = v; p[b] = v }
 
 // Parse a space-separated class string into a builder prop map.
 export function tw(classes: string): map[string]Prop {
@@ -79,57 +154,130 @@ export function tw(classes: string): map[string]Prop {
     for (var i: int = 0; i < toks.length; i = i + 1) {
         const t: string = toks[i]
         if (t == "") { continue }
-        // ---- flex / layout ----
-        if (t == "flex-row") { p["dir"] = "row" }
-        else if (t == "flex-col") { p["dir"] = "col" }
+
+        // ---- display / flex direction ----
+        if (t == "flex" || t == "flex-col") { p["dir"] = "col" }
+        else if (t == "flex-row") { p["dir"] = "row" }
+        else if (t == "flex-row-reverse") { p["dir"] = "row-reverse" }
+        else if (t == "flex-col-reverse") { p["dir"] = "col-reverse" }
         else if (t == "flex-wrap") { p["wrap"] = "wrap" }
         else if (t == "flex-nowrap") { p["wrap"] = "nowrap" }
-        else if (t == "flex-1" || t == "grow") { p["grow"] = 1 }
+        else if (t == "hidden") { p["hidden"] = true }
+        // ---- flex grow / shrink / basis ----
+        else if (t == "flex-1" || t == "grow" || t == "grow-1") { p["grow"] = 1 }
+        else if (t == "grow-0" || t == "flex-none") { p["grow"] = 0 }
+        else if (twHas(t, "basis-")) { const v: int = twLen(twRest(t, "basis-")); if (v >= 0) { p["basis"] = v } else if (twRest(t, "basis-") == "full") { p["basis"] = 0 } }
+        // ---- alignment ----
         else if (twHas(t, "items-")) { p["align"] = twRest(t, "items-") }
         else if (twHas(t, "justify-")) { p["justify"] = twRest(t, "justify-") }
-        // ---- spacing / sizing (1 unit = 4px) ----
-        else if (twHas(t, "gap-")) { const v: int = twSpaceVal(twRest(t, "gap-")); if (v >= 0) { p["gap"] = v } }
-        else if (twHas(t, "p-")) { const v: int = twSpaceVal(twRest(t, "p-")); if (v >= 0) { p["pad"] = v } }
-        else if (twHas(t, "w-")) { const n: int = twNum(twRest(t, "w-")); if (n >= 0) { p["w"] = n * 4 } }
-        else if (twHas(t, "h-")) { const n: int = twNum(twRest(t, "h-")); if (n >= 0) { p["h"] = n * 4 } }
-        // ---- radius ----
+        else if (twHas(t, "self-")) { p["self"] = twRest(t, "self-") }
+        // ---- gap ----
+        else if (twHas(t, "gap-x-")) { const v: int = twLen(twRest(t, "gap-x-")); if (v >= 0) { p["gap"] = v } }
+        else if (twHas(t, "gap-y-")) { const v: int = twLen(twRest(t, "gap-y-")); if (v >= 0) { p["gap"] = v } }
+        else if (twHas(t, "gap-")) { const v: int = twLen(twRest(t, "gap-")); if (v >= 0) { p["gap"] = v } }
+        // ---- padding (per-side + directional) ----
+        else if (twHas(t, "px-")) { const v: int = twLen(twRest(t, "px-")); if (v >= 0) { p["px"] = v } }
+        else if (twHas(t, "py-")) { const v: int = twLen(twRest(t, "py-")); if (v >= 0) { p["py"] = v } }
+        else if (twHas(t, "pt-")) { const v: int = twLen(twRest(t, "pt-")); if (v >= 0) { p["pt"] = v } }
+        else if (twHas(t, "pr-")) { const v: int = twLen(twRest(t, "pr-")); if (v >= 0) { p["pr"] = v } }
+        else if (twHas(t, "pb-")) { const v: int = twLen(twRest(t, "pb-")); if (v >= 0) { p["pb"] = v } }
+        else if (twHas(t, "pl-")) { const v: int = twLen(twRest(t, "pl-")); if (v >= 0) { p["pl"] = v } }
+        else if (twHas(t, "p-")) { const v: int = twLen(twRest(t, "p-")); if (v >= 0) { p["pad"] = v } }
+        // ---- margin (per-side + directional) ----
+        else if (twHas(t, "mx-")) { const v: int = twLen(twRest(t, "mx-")); if (v >= 0) { setEdge(p, "ml", "mr", v) } }
+        else if (twHas(t, "my-")) { const v: int = twLen(twRest(t, "my-")); if (v >= 0) { setEdge(p, "mt", "mb", v) } }
+        else if (twHas(t, "mt-")) { const v: int = twLen(twRest(t, "mt-")); if (v >= 0) { p["mt"] = v } }
+        else if (twHas(t, "mr-")) { const v: int = twLen(twRest(t, "mr-")); if (v >= 0) { p["mr"] = v } }
+        else if (twHas(t, "mb-")) { const v: int = twLen(twRest(t, "mb-")); if (v >= 0) { p["mb"] = v } }
+        else if (twHas(t, "ml-")) { const v: int = twLen(twRest(t, "ml-")); if (v >= 0) { p["ml"] = v } }
+        else if (twHas(t, "m-")) { const v: int = twLen(twRest(t, "m-")); if (v >= 0) { p["mt"] = v; p["mr"] = v; p["mb"] = v; p["ml"] = v } }
+        // ---- sizing (px, keyword, fraction, min/max, arbitrary) ----
+        else if (twHas(t, "min-w-")) { const v: int = twLen(twRest(t, "min-w-")); if (v >= 0) { p["minw"] = v } }
+        else if (twHas(t, "max-w-")) { const v: int = twLen(twRest(t, "max-w-")); if (v >= 0) { p["maxw"] = v } }
+        else if (twHas(t, "min-h-")) { const v: int = twLen(twRest(t, "min-h-")); if (v >= 0) { p["minh"] = v } }
+        else if (twHas(t, "max-h-")) { const v: int = twLen(twRest(t, "max-h-")); if (v >= 0) { p["maxh"] = v } }
+        else if (twHas(t, "w-")) { const r: string = twRest(t, "w-"); const pc: int = twPct(r); if (pc >= 0) { p["wpct"] = pc } else { const v: int = twLen(r); if (v >= 0) { p["w"] = v } } }
+        else if (twHas(t, "h-")) { const r: string = twRest(t, "h-"); const pc: int = twPct(r); if (pc >= 0) { p["hpct"] = pc } else { const v: int = twLen(r); if (v >= 0) { p["h"] = v } } }
+        else if (twHas(t, "size-")) { const v: int = twLen(twRest(t, "size-")); if (v >= 0) { p["w"] = v; p["h"] = v } }
+        else if (twHas(t, "aspect-")) { const r: string = twRest(t, "aspect-"); if (r == "square") { p["aspect"] = 100 } else if (r == "video") { p["aspect"] = 178 } }
+        // ---- radius (all corners + per-corner) ----
+        else if (twHas(t, "rounded-t-")) { const v: int = twRadius(twRest(t, "rounded-t-")); if (v >= 0) { p["rtl"] = v; p["rtr"] = v } }
+        else if (twHas(t, "rounded-b-")) { const v: int = twRadius(twRest(t, "rounded-b-")); if (v >= 0) { p["rbl"] = v; p["rbr"] = v } }
+        else if (twHas(t, "rounded-tl-")) { const v: int = twRadius(twRest(t, "rounded-tl-")); if (v >= 0) { p["rtl"] = v } }
+        else if (twHas(t, "rounded-tr-")) { const v: int = twRadius(twRest(t, "rounded-tr-")); if (v >= 0) { p["rtr"] = v } }
+        else if (twHas(t, "rounded-br-")) { const v: int = twRadius(twRest(t, "rounded-br-")); if (v >= 0) { p["rbr"] = v } }
+        else if (twHas(t, "rounded-bl-")) { const v: int = twRadius(twRest(t, "rounded-bl-")); if (v >= 0) { p["rbl"] = v } }
         else if (t == "rounded") { p["radius"] = 8 }
-        else if (t == "rounded-sm") { p["radius"] = 4 }
-        else if (t == "rounded-md") { p["radius"] = 8 }
-        else if (t == "rounded-lg") { p["radius"] = 12 }
-        else if (t == "rounded-xl") { p["radius"] = 16 }
-        else if (t == "rounded-2xl") { p["radius"] = 20 }
-        else if (t == "rounded-3xl") { p["radius"] = 24 }
-        else if (t == "rounded-full") { p["radius"] = 9999 }
-        // ---- border (width keywords before color) ----
+        else if (twHas(t, "rounded-")) { const v: int = twRadius(twRest(t, "rounded-")); if (v >= 0) { p["radius"] = v } }
+        // ---- border (widths, per-side, style, color) ----
         else if (t == "border") { p["border"] = 1 }
         else if (t == "border-0") { p["border"] = 0 }
         else if (t == "border-2") { p["border"] = 2 }
         else if (t == "border-4") { p["border"] = 4 }
+        else if (t == "border-8") { p["border"] = 8 }
+        else if (t == "border-solid" || t == "border-dashed" || t == "border-dotted") { p["bstyle"] = twRest(t, "border-") }
         else if (twHas(t, "border-")) { p["borderColor"] = twColor(twRest(t, "border-")) }
-        // ---- colors ----
+        // ---- background / text colors ----
         else if (twHas(t, "bg-")) { p["bg"] = twColor(twRest(t, "bg-")) }
         else if (twHas(t, "text-")) {
             const rest: string = twRest(t, "text-")
             const sz: int = twSize(rest)
             if (sz >= 0) { p["size"] = sz }
-            else if (rest == "left" || rest == "center" || rest == "right") { p["ta"] = rest }
+            else if (rest == "left" || rest == "center" || rest == "right" || rest == "justify") { p["ta"] = rest }
             else { p["color"] = twColor(rest) }
         }
         // ---- typography ----
-        else if (t == "font-bold") { p["weight"] = "bold" }
-        else if (t == "font-semibold") { p["weight"] = "semibold" }
-        else if (t == "font-normal") { p["weight"] = "regular" }
+        else if (twHas(t, "font-")) { const w: string = twWeight(twRest(t, "font-")); if (w != "") { p["weight"] = w } else { p["fontFamily"] = twRest(t, "font-") } }
+        else if (t == "italic") { p["italic"] = true }
+        else if (t == "not-italic") { p["italic"] = false }
+        else if (t == "underline") { p["deco"] = "underline" }
+        else if (t == "line-through") { p["deco"] = "strike" }
+        else if (t == "no-underline") { p["deco"] = "none" }
+        else if (t == "uppercase") { p["transform"] = "upper" }
+        else if (t == "lowercase") { p["transform"] = "lower" }
+        else if (t == "capitalize") { p["transform"] = "cap" }
+        else if (t == "normal-case") { p["transform"] = "none" }
+        else if (twHas(t, "tracking-")) { const r: string = twRest(t, "tracking-"); p["tracking"] = twTracking(r) }
+        else if (twHas(t, "leading-")) { const v: int = twLen(twRest(t, "leading-")); if (v >= 0) { p["leading"] = v } }
         // ---- effects ----
         else if (twHas(t, "opacity-")) { const n: int = twNum(twRest(t, "opacity-")); if (n >= 0) { p["opacity"] = n } }
         else if (t == "shadow" || t == "shadow-md") { p["shadow"] = 2 }
         else if (t == "shadow-sm") { p["shadow"] = 1 }
-        else if (t == "shadow-lg" || t == "shadow-xl") { p["shadow"] = 3 }
-        // ---- position ----
+        else if (t == "shadow-lg") { p["shadow"] = 3 }
+        else if (t == "shadow-xl" || t == "shadow-2xl") { p["shadow"] = 4 }
+        else if (t == "shadow-none") { p["shadow"] = 0 }
+        // ---- overflow ----
+        else if (t == "overflow-hidden") { p["overflow"] = "hidden" }
+        else if (t == "overflow-visible") { p["overflow"] = "visible" }
+        else if (t == "overflow-scroll" || t == "overflow-auto") { p["overflow"] = "scroll" }
+        // ---- object-fit (media) ----
+        else if (t == "object-cover") { p["resize"] = "cover" }
+        else if (t == "object-contain") { p["resize"] = "contain" }
+        else if (t == "object-fill") { p["resize"] = "stretch" }
+        // ---- position + inset + z ----
         else if (t == "absolute") { p["abs"] = true }
-        else if (twHas(t, "top-")) { const n: int = twNum(twRest(t, "top-")); if (n >= 0) { p["top"] = n * 4 } }
-        else if (twHas(t, "left-")) { const n: int = twNum(twRest(t, "left-")); if (n >= 0) { p["left"] = n * 4 } }
-        else if (twHas(t, "right-")) { const n: int = twNum(twRest(t, "right-")); if (n >= 0) { p["right"] = n * 4 } }
+        else if (t == "relative" || t == "static") { p["abs"] = false }
+        else if (twHas(t, "inset-x-")) { const v: int = twLen(twRest(t, "inset-x-")); if (v >= 0) { setEdge(p, "left", "right", v) } }
+        else if (twHas(t, "inset-y-")) { const v: int = twLen(twRest(t, "inset-y-")); if (v >= 0) { setEdge(p, "top", "bottom", v) } }
+        else if (twHas(t, "inset-")) { const v: int = twLen(twRest(t, "inset-")); if (v >= 0) { p["top"] = v; p["right"] = v; p["bottom"] = v; p["left"] = v } }
+        else if (twHas(t, "top-")) { const v: int = twLen(twRest(t, "top-")); if (v >= 0) { p["top"] = v } }
+        else if (twHas(t, "right-")) { const v: int = twLen(twRest(t, "right-")); if (v >= 0) { p["right"] = v } }
+        else if (twHas(t, "bottom-")) { const v: int = twLen(twRest(t, "bottom-")); if (v >= 0) { p["bottom"] = v } }
+        else if (twHas(t, "left-")) { const v: int = twLen(twRest(t, "left-")); if (v >= 0) { p["left"] = v } }
+        else if (twHas(t, "z-")) { const n: int = twNum(twRest(t, "z-")); if (n >= 0) { p["z"] = n } }
+        // ---- transforms ----
+        else if (twHas(t, "scale-")) { const n: int = twNum(twRest(t, "scale-")); if (n >= 0) { p["scale"] = n } }
+        else if (twHas(t, "rotate-")) { const n: int = twNum(twRest(t, "rotate-")); if (n >= 0) { p["rotate"] = n } }
+        else if (twHas(t, "translate-x-")) { const v: int = twLen(twRest(t, "translate-x-")); if (v >= 0) { p["tx"] = v } }
+        else if (twHas(t, "translate-y-")) { const v: int = twLen(twRest(t, "translate-y-")); if (v >= 0) { p["ty"] = v } }
     }
     return p
+}
+
+// letter-spacing keyword -> px (Tailwind tracking scale), or arbitrary [1px].
+function twTracking(k: string): int {
+    if (k == "tighter") { return -1 } if (k == "tight") { return -1 } if (k == "normal") { return 0 }
+    if (k == "wide") { return 1 } if (k == "wider") { return 2 } if (k == "widest") { return 4 }
+    const v: int = twLen(k); if (v >= 0) { return v }
+    return 0
 }

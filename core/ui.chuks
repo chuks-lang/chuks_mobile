@@ -23,6 +23,26 @@ export class Style {
     var w: int
     var h: int
     var pad: int
+    var padX: int       // horizontal padding (px); -1 = unset. Overrides `pad` on the L/R edges.
+    var padY: int       // vertical padding (py); -1 = unset. Overrides `pad` on the T/B edges.
+    var padT: int; var padR: int; var padB: int; var padL: int   // per-side padding (pt/pr/pb/pl)
+    var marT: int; var marR: int; var marB: int; var marL: int   // per-side margin (mt/mr/mb/ml)
+    var minW: int; var maxW: int; var minH: int; var maxH: int   // min/max width/height
+    var wPct: int; var hPct: int   // width/height as a percent of the parent (0..100)
+    var bottom: int    // absolute inset from the bottom
+    var z: int         // z-index (paint order)
+    var aspectR: int   // aspect ratio as w/h * 100 (square = 100, video = 178)
+    var rTL: int; var rTR: int; var rBR: int; var rBL: int   // per-corner radius
+    var italic: int    // 1 = italic, 0 = not, -1 = unset
+    var deco: string   // text decoration: underline | strike | none
+    var txform: string // text transform: upper | lower | cap | none
+    var tracking: int  // letter spacing (px)
+    var leading: int   // line height (px)
+    var fontFam: string// font family name
+    var overflow: string // hidden | visible | scroll
+    var hidden: int    // 1 = not rendered
+    var selfAlign: string // align-self: start | center | end | stretch
+    var bStyle: string // border style: solid | dashed | dotted
     var gap: int
     var bg: string      // hex, e.g. "1B1F2A"
     var fg: string      // text color hex
@@ -101,7 +121,14 @@ export class Style {
     var spinner: int    // Image: 1 = show a loading spinner until the image loads (-1 = no)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
-        this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
+        this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
+        this.padT = -1; this.padR = -1; this.padB = -1; this.padL = -1
+        this.marT = -1; this.marR = -1; this.marB = -1; this.marL = -1
+        this.minW = -1; this.maxW = -1; this.minH = -1; this.maxH = -1
+        this.wPct = -1; this.hPct = -1; this.bottom = -1; this.z = -1; this.aspectR = -1
+        this.rTL = -1; this.rTR = -1; this.rBR = -1; this.rBL = -1
+        this.italic = -1; this.deco = ""; this.txform = ""; this.tracking = -9999; this.leading = -1; this.fontFam = ""
+        this.overflow = ""; this.hidden = -1; this.selfAlign = ""; this.bStyle = ""
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
         this.bw = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
@@ -132,6 +159,39 @@ export class Style {
         if (this.w >= 0) { s = s + "w=" + string(this.w) + ";" }
         if (this.h >= 0) { s = s + "h=" + string(this.h) + ";" }
         if (this.pad >= 0) { s = s + "p=" + string(this.pad) + ";" }
+        if (this.padX >= 0) { s = s + "px=" + string(this.padX) + ";" }
+        if (this.padY >= 0) { s = s + "py=" + string(this.padY) + ";" }
+        if (this.padT >= 0) { s = s + "pt=" + string(this.padT) + ";" }
+        if (this.padR >= 0) { s = s + "pr=" + string(this.padR) + ";" }
+        if (this.padB >= 0) { s = s + "pb=" + string(this.padB) + ";" }
+        if (this.padL >= 0) { s = s + "pl=" + string(this.padL) + ";" }
+        if (this.marT >= 0) { s = s + "mt=" + string(this.marT) + ";" }
+        if (this.marR >= 0) { s = s + "mr=" + string(this.marR) + ";" }
+        if (this.marB >= 0) { s = s + "mb=" + string(this.marB) + ";" }
+        if (this.marL >= 0) { s = s + "ml=" + string(this.marL) + ";" }
+        if (this.minW >= 0) { s = s + "minw=" + string(this.minW) + ";" }
+        if (this.maxW >= 0) { s = s + "maxw=" + string(this.maxW) + ";" }
+        if (this.minH >= 0) { s = s + "minh=" + string(this.minH) + ";" }
+        if (this.maxH >= 0) { s = s + "maxh=" + string(this.maxH) + ";" }
+        if (this.wPct >= 0) { s = s + "wpct=" + string(this.wPct) + ";" }
+        if (this.hPct >= 0) { s = s + "hpct=" + string(this.hPct) + ";" }
+        if (this.bottom >= 0) { s = s + "bottom=" + string(this.bottom) + ";" }
+        if (this.z >= 0) { s = s + "z=" + string(this.z) + ";" }
+        if (this.aspectR >= 0) { s = s + "aspect=" + string(this.aspectR) + ";" }
+        if (this.rTL >= 0) { s = s + "rtl=" + string(this.rTL) + ";" }
+        if (this.rTR >= 0) { s = s + "rtr=" + string(this.rTR) + ";" }
+        if (this.rBR >= 0) { s = s + "rbr=" + string(this.rBR) + ";" }
+        if (this.rBL >= 0) { s = s + "rbl=" + string(this.rBL) + ";" }
+        if (this.italic >= 0) { s = s + "italic=" + string(this.italic) + ";" }
+        if (this.deco != "") { s = s + "deco=" + this.deco + ";" }
+        if (this.txform != "") { s = s + "txform=" + this.txform + ";" }
+        if (this.tracking != -9999) { s = s + "tracking=" + string(this.tracking) + ";" }
+        if (this.leading >= 0) { s = s + "leading=" + string(this.leading) + ";" }
+        if (this.fontFam != "") { s = s + "fontfam=" + this.fontFam + ";" }
+        if (this.overflow != "") { s = s + "overflow=" + this.overflow + ";" }
+        if (this.hidden >= 0) { s = s + "hidden=" + string(this.hidden) + ";" }
+        if (this.selfAlign != "") { s = s + "self=" + this.selfAlign + ";" }
+        if (this.bStyle != "") { s = s + "bstyle=" + this.bStyle + ";" }
         if (this.gap >= 0) { s = s + "gap=" + string(this.gap) + ";" }
         if (this.bg != "") { s = s + "bg=" + this.bg + ";" }
         if (this.fg != "") { s = s + "fg=" + this.fg + ";" }
@@ -376,6 +436,19 @@ function lpBool(d: map[string]ListProp, k: string, def: bool): bool { const v: L
 function applyLayout(s: Style, p: map[string]Prop): void {
     s.gap = pInt(p, "gap", s.gap)
     s.pad = pInt(p, "pad", s.pad)
+    s.padX = pInt(p, "px", s.padX)
+    s.padY = pInt(p, "py", s.padY)
+    s.padT = pInt(p, "pt", s.padT); s.padR = pInt(p, "pr", s.padR); s.padB = pInt(p, "pb", s.padB); s.padL = pInt(p, "pl", s.padL)
+    s.marT = pInt(p, "mt", s.marT); s.marR = pInt(p, "mr", s.marR); s.marB = pInt(p, "mb", s.marB); s.marL = pInt(p, "ml", s.marL)
+    s.minW = pInt(p, "minw", s.minW); s.maxW = pInt(p, "maxw", s.maxW); s.minH = pInt(p, "minh", s.minH); s.maxH = pInt(p, "maxh", s.maxH)
+    s.wPct = pInt(p, "wpct", s.wPct); s.hPct = pInt(p, "hpct", s.hPct)
+    s.bottom = pInt(p, "bottom", s.bottom); s.z = pInt(p, "z", s.z); s.aspectR = pInt(p, "aspect", s.aspectR)
+    s.rTL = pInt(p, "rtl", s.rTL); s.rTR = pInt(p, "rtr", s.rTR); s.rBR = pInt(p, "rbr", s.rBR); s.rBL = pInt(p, "rbl", s.rBL)
+    s.tracking = pInt(p, "tracking", s.tracking); s.leading = pInt(p, "leading", s.leading)
+    s.deco = pStr(p, "deco", s.deco); s.txform = pStr(p, "transform", s.txform); s.fontFam = pStr(p, "fontFamily", s.fontFam)
+    s.overflow = pStr(p, "overflow", s.overflow); s.selfAlign = pStr(p, "self", s.selfAlign); s.bStyle = pStr(p, "bstyle", s.bStyle)
+    if (p.get("italic") != null) { s.italic = pBool(p, "italic", false) ? 1 : 0 }
+    if (p.get("hidden") != null) { s.hidden = pBool(p, "hidden", false) ? 1 : 0 }
     s.w = pInt(p, "w", s.w)
     s.h = pInt(p, "h", s.h)
     s.grow = pInt(p, "grow", s.grow)
@@ -448,7 +521,7 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
 // (as `any`) to the shared applyLayoutV/applyEventsV, which read fields BY KEY (a
 // dataType is map-backed), so one pair of helpers serves every typed builder.
 dataType LayoutProps {
-    gap: int?; pad: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
+    gap: int?; pad: int?; px: int?; py: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
     align: string?; justify: string?; bg: string?; color: string?; size: int?;
     weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
     dir: string?; border: int?; borderColor: string?; shadow: int?; glass: bool?;
@@ -473,6 +546,19 @@ function applyLayoutV(s: Style, p: any): void {
     const tws: any = p["tw"]; if (tws != null) { applyLayout(s, tw(string(tws))) }
     s.gap = pvI(p, "gap", s.gap)
     s.pad = pvI(p, "pad", s.pad)
+    s.padX = pvI(p, "px", s.padX)
+    s.padY = pvI(p, "py", s.padY)
+    s.padT = pvI(p, "pt", s.padT); s.padR = pvI(p, "pr", s.padR); s.padB = pvI(p, "pb", s.padB); s.padL = pvI(p, "pl", s.padL)
+    s.marT = pvI(p, "mt", s.marT); s.marR = pvI(p, "mr", s.marR); s.marB = pvI(p, "mb", s.marB); s.marL = pvI(p, "ml", s.marL)
+    s.minW = pvI(p, "minw", s.minW); s.maxW = pvI(p, "maxw", s.maxW); s.minH = pvI(p, "minh", s.minH); s.maxH = pvI(p, "maxh", s.maxH)
+    s.wPct = pvI(p, "wpct", s.wPct); s.hPct = pvI(p, "hpct", s.hPct)
+    s.bottom = pvI(p, "bottom", s.bottom); s.z = pvI(p, "z", s.z); s.aspectR = pvI(p, "aspect", s.aspectR)
+    s.rTL = pvI(p, "rtl", s.rTL); s.rTR = pvI(p, "rtr", s.rTR); s.rBR = pvI(p, "rbr", s.rBR); s.rBL = pvI(p, "rbl", s.rBL)
+    s.tracking = pvI(p, "tracking", s.tracking); s.leading = pvI(p, "leading", s.leading)
+    s.deco = pvS(p, "deco", s.deco); s.txform = pvS(p, "transform", s.txform); s.fontFam = pvS(p, "fontFamily", s.fontFam)
+    s.overflow = pvS(p, "overflow", s.overflow); s.selfAlign = pvS(p, "self", s.selfAlign); s.bStyle = pvS(p, "bstyle", s.bStyle)
+    if (p["italic"] != null) { s.italic = pvB(p, "italic", false) ? 1 : 0 }
+    if (p["hidden"] != null) { s.hidden = pvB(p, "hidden", false) ? 1 : 0 }
     s.w = pvI(p, "w", s.w)
     s.h = pvI(p, "h", s.h)
     s.grow = pvI(p, "grow", s.grow)
@@ -864,7 +950,10 @@ export function SafeAreaView(first: SafeAreaViewProps | []Node, kids: []Node = [
     if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
     for (var i: int = 0; i < kids.length; i = i + 1) { out.push(kids[i]) }
     if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
-    const s: Style = new Style(); s.dir = "col"; applyLayoutV(s, p)
+    // Fill the available space by default (a screen-level wrapper), so a grow child
+    // like a Scroll has a bounded height to size into on the Yoga hosts (UIKit/Android).
+    // Overridable with grow:0 for a content-sized safe inset (e.g. a bottom bar).
+    const s: Style = new Style(); s.dir = "col"; s.grow = 1; applyLayoutV(s, p)
     return mkView(s, out)
 }
 // A fixed-height empty row (a safe-area spacer).
@@ -876,17 +965,24 @@ function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return m
  * use `Scroll` for a bounded set of mixed content. Vertical by default; pass
  * `horizontal: true` for a left-to-right carousel of mixed content.
  *
- * Props: `horizontal` (bool), `onRefresh` (() -> void) + `refreshing` (vertical only),
- * `stickBottom` (bool, vertical only), plus any layout/style prop.
+ * Props: `horizontal` (bool), `paging` (bool: snap one full screen per swipe),
+ * `onRefresh` (() -> void) + `refreshing` (vertical only), `stickBottom` (bool,
+ * vertical only), `onScroll` ((offset) -> void), `scrollTo` (int), plus any layout prop.
+ *
+ * `horizontal: true` + `paging: true` is a full-screen swipe carousel (an onboarding
+ * pager, an image gallery): each child is one page, the host snaps to the nearest,
+ * and swiping goes both ways. Size each page to `viewportWidth()`. Track the current
+ * page with `onScroll` (offset / page width) and jump with `scrollTo`.
  *
  * Like every scroll container, wrap the content in a SINGLE child (a Column for
  * vertical, a Row for horizontal); the host scroll view hosts exactly one child.
  *
  *     Scroll({}, [ Column({ gap: 12 }, [ Text(...), Card(...), Button(...) ]) ])
  *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
+ *     Scroll({ horizontal: true, paging: true }, [ Row([ page0, page1, page2 ]) ])
  */
 dataType ScrollProps {
-    ViewProps; horizontal: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
+    ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
     onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
 }
 export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
@@ -905,6 +1001,9 @@ export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     const s: Style = new Style()
     if (horizontal) { s.dir = "row"; s.horiz = 1 } else { s.dir = "col" }
     s.grow = 1; s.basis = 0
+    // paging: snap one full screen per swipe (a carousel / onboarding pager). Works on both
+    // axes; combine with `horizontal` for a left-to-right paged carousel.
+    if (p.paging ?? false) { s.paging = 1 }
     applyLayoutV(s, p)
     // Pull-to-refresh: `onRefresh` fires when the user pulls down at the top; the
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
@@ -2237,9 +2336,11 @@ export class Reconciler {
             this.listCount = count; this.listContentH = contentW
         }
 
+        // Windowing runs along the X axis: vpTop is the scroll's x-offset and vpW the
+        // viewport WIDTH (the host reports true width/height; it does not swap them).
         var c0: int = (this.vpTop - leftStart) / stride - buffer
         if (c0 < 0) { c0 = 0 }
-        var c1: int = (this.vpTop + this.vpH - leftStart) / stride + buffer + 1
+        var c1: int = (this.vpTop + this.vpW - leftStart) / stride + buffer + 1
         if (c1 > count) { c1 = count }
         if (c1 < c0) { c1 = c0 }
 

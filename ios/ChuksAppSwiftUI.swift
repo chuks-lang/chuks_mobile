@@ -1062,6 +1062,16 @@ final class Scene: ObservableObject {
         Engine.setInsets(Int32(i.top), Int32(i.trailing), Int32(i.bottom), Int32(i.leading))
         apply(Engine.tick())
     }
+    // Report the full viewport size so viewportWidth()/viewportHeight() are populated even
+    // on scroll-less screens (a List/Scroll otherwise reports it; without one they stay 0).
+    private var lastVP: CGSize? = nil
+    func reportViewport(_ size: CGSize) {
+        if lastVP == size { return }
+        lastVP = size
+        let w = Int32(size.width), h = Int32(size.height)
+        if w <= 0 || h <= 0 { return }
+        apply(Engine.viewport(0, h, w))
+    }
 
     func apply(_ stream: String) {
         if stream.isEmpty { return }
@@ -1639,20 +1649,41 @@ struct BoxStyle: ViewModifier {
     // bg / radius / border / shadow / opacity — applied after sizing.
     func decor(_ input: AnyView) -> AnyView {
         var v = input
+        // Per-corner radius (rounded-t-*, rounded-bl-*, …). When any is set, use a custom
+        // RoundedCorners shape for bg fill / clip / border instead of the uniform radius.
+        let perCorner = s["rtl"] != nil || s["rtr"] != nil || s["rbr"] != nil || s["rbl"] != nil
+        let corners = RoundedCorners(tl: numOf(s["rtl"]) ?? 0, tr: numOf(s["rtr"]) ?? 0,
+                                     br: numOf(s["rbr"]) ?? 0, bl: numOf(s["rbl"]) ?? 0)
         if s["glass"] == "1" {   // Liquid Glass: iOS 26 glassEffect, ultraThinMaterial fallback below
             let r = numOf(s["r"]) ?? 0
             if #available(iOS 26.0, *) { v = AnyView(v.glassEffect(.regular, in: RoundedRectangle(cornerRadius: r))) }
             else { v = AnyView(v.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: r))) }
-        } else if let bg = s["bg"] { let r = numOf(s["r"]) ?? 0; v = AnyView(v.background(RoundedRectangle(cornerRadius: r).fill(hexColor(bg)))) }
-        if let r = numOf(s["r"]) { v = AnyView(v.clipShape(RoundedRectangle(cornerRadius: r))) }
-        if let bw = numOf(s["bw"]), let bc = s["bc"] { let r = numOf(s["r"]) ?? 0; v = AnyView(v.overlay(RoundedRectangle(cornerRadius: r).stroke(hexColor(bc), lineWidth: bw))) }
+        } else if let bg = s["bg"] {
+            let r = numOf(s["r"]) ?? 0
+            if perCorner { v = AnyView(v.background(corners.fill(hexColor(bg)))) }
+            else { v = AnyView(v.background(RoundedRectangle(cornerRadius: r).fill(hexColor(bg)))) }
+        }
+        if perCorner { v = AnyView(v.clipShape(corners)) }
+        else if let r = numOf(s["r"]) { v = AnyView(v.clipShape(RoundedRectangle(cornerRadius: r))) }
+        if let bw = numOf(s["bw"]), let bc = s["bc"] {
+            let r = numOf(s["r"]) ?? 0
+            if perCorner { v = AnyView(v.overlay(corners.stroke(hexColor(bc), lineWidth: bw))) }
+            else { v = AnyView(v.overlay(RoundedRectangle(cornerRadius: r).stroke(hexColor(bc), lineWidth: bw))) }
+        }
         if let lvl = numOf(s["shadow"]) { let radius: CGFloat = lvl >= 3 ? 20 : (lvl == 2 ? 8 : 3); v = AnyView(v.shadow(color: Color.black.opacity(0.18), radius: radius, x: 0, y: lvl >= 3 ? 8 : 3)) }
         if let o = numOf(s["opacity"]) { v = AnyView(v.opacity(Double(o) / 100.0)) }
         return v
     }
     func body(content: Content) -> some View {
+        if s["hidden"] == "1" { return AnyView(EmptyView()) }                    // display:none
         var v = AnyView(content)
         if let p = numOf(s["p"]) { v = AnyView(v.padding(p)) }
+        if let px = numOf(s["px"]) { v = AnyView(v.padding(.horizontal, px)) }   // px: horizontal padding
+        if let py = numOf(s["py"]) { v = AnyView(v.padding(.vertical, py)) }     // py: vertical padding
+        if let pt = numOf(s["pt"]) { v = AnyView(v.padding(.top, pt)) }          // pt/pr/pb/pl: per-side padding
+        if let pr = numOf(s["pr"]) { v = AnyView(v.padding(.trailing, pr)) }
+        if let pb = numOf(s["pb"]) { v = AnyView(v.padding(.bottom, pb)) }
+        if let pl = numOf(s["pl"]) { v = AnyView(v.padding(.leading, pl)) }
         // Absolute positioning (List rows in a fixed-height content ZStack): fill
         // width + fixed height FIRST so the bg spans the row, THEN inset by
         // left/right and offset by top. (Applying bg before the width-fill was why
@@ -1692,7 +1723,31 @@ struct BoxStyle: ViewModifier {
         // fixed size
         let w = numOf(s["w"]), h = numOf(s["h"])
         if w != nil || h != nil { v = AnyView(v.frame(width: w, height: h)) }
+        if s["wpct"] == "100" { v = AnyView(v.frame(maxWidth: .infinity)) }      // w-full
+        if s["hpct"] == "100" { v = AnyView(v.frame(maxHeight: .infinity)) }     // h-full
+        let mnw = numOf(s["minw"]), mxw = numOf(s["maxw"]), mnh = numOf(s["minh"]), mxh = numOf(s["maxh"])
+        if mnw != nil || mxw != nil || mnh != nil || mxh != nil { v = AnyView(v.frame(minWidth: mnw, maxWidth: mxw, minHeight: mnh, maxHeight: mxh)) }
+        if let ar = numOf(s["aspect"]) { v = AnyView(v.aspectRatio(CGFloat(ar) / 100.0, contentMode: .fit)) }
         v = decor(v)
+        // align-self: override the parent's cross-axis alignment for THIS child. In a Row the
+        // cross axis is vertical, in a Column horizontal. Wrap the sized+decorated box in a
+        // cross-filling frame and pin the content to start/center/end (applied AFTER decor so
+        // the bg colors the box, not the fill frame).
+        if let sf = s["self"], sf != "stretch" {
+            if parentRow {
+                let a: Alignment = sf == "start" ? .top : (sf == "end" ? .bottom : .center)
+                v = AnyView(v.frame(maxHeight: .infinity, alignment: a))
+            } else {
+                let a: Alignment = sf == "start" ? .leading : (sf == "end" ? .trailing : .center)
+                v = AnyView(v.frame(maxWidth: .infinity, alignment: a))
+            }
+        }
+        if let mt = numOf(s["mt"]) { v = AnyView(v.padding(.top, mt)) }          // mt/mr/mb/ml: margin (outer space, after bg)
+        if let mr = numOf(s["mr"]) { v = AnyView(v.padding(.trailing, mr)) }
+        if let mb = numOf(s["mb"]) { v = AnyView(v.padding(.bottom, mb)) }
+        if let ml = numOf(s["ml"]) { v = AnyView(v.padding(.leading, ml)) }
+        if s["overflow"] == "hidden" { v = AnyView(v.clipped()) }               // overflow-hidden
+        if let z = numOf(s["z"]) { v = AnyView(v.zIndex(Double(z))) }            // z-index
         // transform (visual only) + implicit animation: when `anim` is set, SwiftUI
         // tweens the offset/scale/rotation/opacity whenever the value key changes.
         let tx = numOf(s["tx"]) ?? 0, ty = numOf(s["ty"]) ?? 0
@@ -2223,13 +2278,14 @@ struct ChuksScroll: View {
     var body: some View {
         let horiz = style["horiz"] == "1"
         return GeometryReader { outer in
-            // A horizontal list reports its x-offset + width as the scroll window (main axis)
-            // and its height as the cross size; a vertical list reports y + height + width.
+            // top is the scroll offset along the MAIN axis (x for a horizontal list, y otherwise,
+            // handled by ScrollOffsetReader); height/width are ALWAYS the true viewport
+            // dimensions (never swapped), so viewportWidth()/viewportHeight() stay correct. The
+            // reconciler picks vpW vs vpH as the windowing extent per the list's orientation.
             ScrollView(horiz ? .horizontal : .vertical) {
                 // probe the underlying UIScrollView for its live contentOffset
                 ScrollOffsetReader(horizontal: horiz) { off in
-                    if horiz { scene.viewport(Int32(max(0, off)), Int32(outer.size.width), Int32(max(0, outer.size.height))) }
-                    else { scene.viewport(Int32(max(0, off)), Int32(outer.size.height), Int32(max(0, outer.size.width))) }
+                    scene.viewport(Int32(max(0, off)), Int32(max(0, outer.size.height)), Int32(max(0, outer.size.width)))
                     // Scroll onScroll: report the offset (points) when it changes, if opted in.
                     if let tag = scene.nodes[id]?.scrollAction, !tag.isEmpty {
                         let pts = Int(max(0, off).rounded())
@@ -2247,8 +2303,7 @@ struct ChuksScroll: View {
             .modifier(ScrollPaging(enabled: style["paging"] == "1"))   // snap per screen (video feeds)
             .modifier(StickBottom(enabled: style["stick"] == "1"))     // pin to newest (chat)
             .onAppear {
-                if horiz { scene.viewport(0, Int32(outer.size.width), Int32(max(0, outer.size.height))) }
-                else { scene.viewport(0, Int32(outer.size.height), Int32(max(0, outer.size.width))) }
+                scene.viewport(0, Int32(max(0, outer.size.height)), Int32(max(0, outer.size.width)))
             }
             // Pull-to-refresh when the Scroll has an onRefresh (its style carries `rfsh`).
             .refreshable {
@@ -2274,8 +2329,9 @@ struct StickBottom: ViewModifier {
 
 func textFont(_ s: [String: String]) -> Font {
     let size = numOf(s["fs"]) ?? 14
-    if let fam = s["font"], !fam.isEmpty { return .custom(fam, size: size) }
-    let weight: Font.Weight = s["fw"] == "bold" ? .bold : (s["fw"] == "semibold" ? .semibold : .regular)
+    let fam = s["fontfam"].flatMap { $0.isEmpty ? nil : $0 } ?? s["font"]
+    if let fam = fam, !fam.isEmpty { return .custom(fam, size: size) }
+    let weight: Font.Weight = s["fw"] == "bold" ? .bold : (s["fw"] == "semibold" ? .semibold : (s["fw"] == "medium" ? .medium : (s["fw"] == "light" ? .light : .regular)))
     return .system(size: size, weight: weight)
 }
 
@@ -2392,11 +2448,28 @@ struct NodeView: View {
         // a grown text box aligns its text left/center/right per ta (default left)
         let boxAlign: Alignment = ta == "center" ? .center : (ta == "right" ? .trailing : .leading)
         // numberOfLines caps the lines; ellipsizeMode picks how the overflow truncates.
-        let nlines = s["nlines"].flatMap { Int($0) }
+        // The Text builder emits nlines = -1 for "no cap"; map any non-positive value to
+        // nil so SwiftUI wraps freely. (Passing -1 to .lineLimit truncates to a single line.)
+        let nlines = s["nlines"].flatMap { Int($0) }.flatMap { $0 > 0 ? $0 : nil }
         let trunc: Text.TruncationMode = s["ellip"] == "head" ? .head : (s["ellip"] == "middle" ? .middle : .tail)
-        let base = Text(node.text).font(textFont(s)).foregroundColor(color).multilineTextAlignment(align)
+        // fixedSize(vertical) lets the text grow to as many wrapped lines as it needs
+        // instead of being squeezed to one line and truncated inside a flex frame — the
+        // usual SwiftUI-in-a-Yoga-layout wrapping bug. Skip it only when lines are capped
+        // (then truncation is intentional).
+        let wraps = nlines == nil
+        // text-transform (uppercase/lowercase/capitalize)
+        let raw = node.text
+        let disp = s["txform"] == "upper" ? raw.uppercased() : (s["txform"] == "lower" ? raw.lowercased() : (s["txform"] == "cap" ? raw.capitalized : raw))
+        var txt = Text(disp).font(textFont(s)).foregroundColor(color)
+        if s["italic"] == "1" { txt = txt.italic() }                            // italic
+        if s["deco"] == "underline" { txt = txt.underline() }                   // underline
+        if s["deco"] == "strike" { txt = txt.strikethrough() }                  // line-through
+        if let tr = numOf(s["tracking"]) { txt = txt.tracking(tr) }             // letter spacing
+        let base = txt.multilineTextAlignment(align)
             .lineLimit(nlines)
             .truncationMode(trunc)
+            .lineSpacing(CGFloat(max(0, (numOf(s["leading"]).map { Int($0) } ?? 0) - (numOf(s["fs"]).map { Int($0) } ?? 15))))   // leading
+            .fixedSize(horizontal: false, vertical: wraps)
             .modifier(BoxStyle(s: s, parentRow: parentRow, align: boxAlign, parentStretch: parentStretch))
             // A plain label is tap-transparent so a grown label (`.frame(maxWidth:.infinity)`,
             // e.g. a NavBar title) doesn't swallow taps meant for a sibling button. A pressable
@@ -2631,6 +2704,27 @@ struct NodeView: View {
 }
 
 // ================= app entry (SwiftUI lifecycle, no AppDelegate) =================
+// A rectangle with independent per-corner radii (rounded-t-*, rounded-bl-*, …).
+struct RoundedCorners: Shape {
+    var tl: CGFloat = 0, tr: CGFloat = 0, br: CGFloat = 0, bl: CGFloat = 0
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let lim = min(rect.width, rect.height) / 2
+        let tl = min(self.tl, lim), tr = min(self.tr, lim), br = min(self.br, lim), bl = min(self.bl, lim)
+        p.move(to: CGPoint(x: rect.minX + tl, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX - tr, y: rect.minY))
+        p.addArc(center: CGPoint(x: rect.maxX - tr, y: rect.minY + tr), radius: tr, startAngle: .degrees(-90), endAngle: .degrees(0), clockwise: false)
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - br))
+        p.addArc(center: CGPoint(x: rect.maxX - br, y: rect.maxY - br), radius: br, startAngle: .degrees(0), endAngle: .degrees(90), clockwise: false)
+        p.addLine(to: CGPoint(x: rect.minX + bl, y: rect.maxY))
+        p.addArc(center: CGPoint(x: rect.minX + bl, y: rect.maxY - bl), radius: bl, startAngle: .degrees(90), endAngle: .degrees(180), clockwise: false)
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.minY + tl))
+        p.addArc(center: CGPoint(x: rect.minX + tl, y: rect.minY + tl), radius: tl, startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false)
+        p.closeSubpath()
+        return p
+    }
+}
+
 struct RootView: View {
     @ObservedObject var scene: Scene
     @State private var alertText = ""   // the prompt Alert's text field
@@ -2683,8 +2777,9 @@ struct RootView: View {
                 }
                 modalOverlay   // a visible Modal renders here, above everything
             }
-            .onAppear { scene.reportInsets(geo.safeAreaInsets) }
+            .onAppear { scene.reportInsets(geo.safeAreaInsets); scene.reportViewport(geo.size) }
             .onChange(of: geo.safeAreaInsets) { scene.reportInsets($0) }
+            .onChange(of: geo.size) { scene.reportViewport($0) }
         }
         // Tap anywhere to dismiss the keyboard (like the UIKit host). Simultaneous so
         // it never swallows a button/tap; resigning the CURRENT first responder lets a
