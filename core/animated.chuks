@@ -308,9 +308,8 @@ export class AnimatedColor {
  *   const fade = useAnimated(0)
  */
 export function useAnimated(initial: int): Animated {
-    const c: Cell = useState(new Animated(initial))
-    const a: any = c.get()
-    return a
+    const c: Cell<Animated> = useState(new Animated(initial))
+    return c.get()
 }
 
 // ---- Composition: sequence / parallel / loop ------------------------------

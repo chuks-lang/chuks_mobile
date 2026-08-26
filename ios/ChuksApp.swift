@@ -392,10 +392,29 @@ let measureText: YGMeasureFunc = { node, width, widthMode, _, _ in
     guard let node = node, let ctx = YGNodeGetContext(node) else { return YGSize(width: 0, height: 0) }
     let label = Unmanaged<UILabel>.fromOpaque(ctx).takeUnretainedValue()
     let maxW = (widthMode == YGMeasureMode.undefined || width.isNaN) ? CGFloat.greatestFiniteMagnitude : CGFloat(width)
-    let s = (label.text ?? "") as NSString
-    let r = s.boundingRect(with: CGSize(width: maxW, height: .greatestFiniteMagnitude),
-                           options: [.usesLineFragmentOrigin], attributes: [.font: label.font as Any], context: nil)
-    return YGSize(width: Float(ceil(r.width)), height: Float(ceil(r.height)))
+    // Measure via the label itself (sizeThatFits), NOT NSString.boundingRect: boundingRect
+    // is unreliable for multi-line wrapping (it can stop after one line even when given a
+    // bounded width), whereas sizeThatFits honors the label's numberOfLines/lineBreakMode/
+    // attributedText and wraps to the given width. This is what makes Text wrap to its
+    // container width without an explicit `w` (paired with the Yoga errata config).
+    let sz = label.sizeThatFits(CGSize(width: maxW, height: .greatestFiniteMagnitude))
+    return YGSize(width: Float(ceil(sz.width)), height: Float(ceil(sz.height)))
+}
+
+// Tailwind font-weight name -> UIFont.Weight (thin..black).
+func weightOf(_ s: String) -> UIFont.Weight {
+    switch s {
+    case "thin": return .thin
+    case "extralight": return .ultraLight
+    case "light": return .light
+    case "normal", "regular": return .regular
+    case "medium": return .medium
+    case "semibold": return .semibold
+    case "bold": return .bold
+    case "extrabold": return .heavy
+    case "black": return .black
+    default: return .regular
+    }
 }
 
 // hex "5B8CFF" -> UIColor
@@ -703,7 +722,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // The two lockstep trees, keyed by Chuks node id.
     var views: [String: UIView] = [:]
     var ynodes: [String: YGNodeRef] = [:]
-    let config: YGConfigRef = YGConfigNew()
+    let config: YGConfigRef = {
+        let c: YGConfigRef = YGConfigNew()
+        // Opt into Yoga's 1.x "errata" layout behaviors. The modern default changed the
+        // cross-axis measure/stretch semantics so a measured Text no longer re-wraps to its
+        // stretched width (it keeps its single-line height); the classic behavior re-measures
+        // it at the resolved width, so Text wraps WITHOUT needing an explicit width set.
+        YGConfigSetErrata(c, YGErrata(rawValue: 2147483647)!)   // YGErrataAll
+        return c
+    }()
 
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
@@ -794,6 +821,19 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var mediaProgress: [String: String] = [:]                             // id -> onProgress action (Video)
     var imageTint: [String: UIColor] = [:]                                // id -> Image tintColor (template render)
     var imageBlur: [String: CGFloat] = [:]                                // id -> Image blur radius (px)
+    var imageFilter: [String: String] = [:]                              // id -> Image photo-filter preset
+    // Text typography that needs an attributed string (rebuilt from the raw text on any
+    // text/style change): raw string (pre-transform), decoration, letter spacing, line
+    // height, and case transform. `label.font` holds size/weight/italic/family directly.
+    var labelRaw: [String: String] = [:]        // Text raw string, before uppercase/etc
+    var labelDeco: [String: String] = [:]       // underline | strike
+    var labelKern: [String: CGFloat] = [:]      // tracking (letter spacing, px)
+    var labelLead: [String: CGFloat] = [:]      // leading (target line height, px)
+    var labelTransform: [String: String] = [:]  // upper | lower | cap
+    var dashBorders: [String: (CGFloat, UIColor, Bool)] = [:]                     // id -> (width, color, dotted)
+    var sideBorders: [String: (CGFloat, CGFloat, CGFloat, CGFloat, UIColor)] = [:] // id -> (t, r, b, l, color)
+    var imageOpChain: [String: String] = [:]                             // id -> Image GPU op-chain (JSON)
+    var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter/op swap re-applies from the original
     var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
     var videoPosters: [String: UIImageView] = [:]                        // id -> poster overlay (until first frame)
     var posterObs: [String: NSKeyValueObservation] = [:]                 // id -> readyForDisplay observation
@@ -966,13 +1006,25 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Report the scroll position to Chuks; it mounts/recycles to match.
     @discardableResult
     func pushViewport() -> Bool {
-        guard let sc = listScroll else { return false }
-        // The main axis is x for a horizontal list: report its x-offset + width as the scroll
-        // window, and the height as the cross size. Vertical lists report y + height + width.
-        let mainExtent = Int32(listHoriz ? sc.bounds.width : sc.bounds.height); if mainExtent <= 0 { return false }
+        guard let sc = listScroll else {
+            // No scroll/list on screen: still report the full root viewport so
+            // viewportWidth()/viewportHeight() are populated (e.g. for a Text wrap width).
+            let insets = view.safeAreaInsets
+            let w = Int32(view.bounds.width - insets.left - insets.right)
+            let h = Int32(view.bounds.height - insets.top - insets.bottom)
+            if w <= 0 || h <= 0 { return false }
+            guard let s = eViewport(0, h, w) else { connected = false; return false }
+            if !s.isEmpty { apply(s); return true }
+            return false
+        }
+        // top is the scroll offset along the MAIN axis (x for a horizontal list, y otherwise);
+        // height/width are ALWAYS the true viewport dimensions (never swapped), so
+        // viewportWidth()/viewportHeight() stay correct. The reconciler picks vpW vs vpH as the
+        // windowing extent per the list's orientation.
         let top = Int32(max(0, listHoriz ? sc.contentOffset.x : sc.contentOffset.y))
-        let cross = Int32(max(0, listHoriz ? sc.bounds.height : sc.bounds.width))
-        guard let s = eViewport(top, mainExtent, cross) else { connected = false; return false }
+        let vh = Int32(sc.bounds.height); let vw = Int32(sc.bounds.width)
+        if vh <= 0 || vw <= 0 { return false }
+        guard let s = eViewport(top, vh, vw) else { connected = false; return false }
         if !s.isEmpty { apply(s); return true }
         return false
     }
@@ -1240,6 +1292,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
             case "SC" where f.count >= 2: if let sl = views[f[1]] as? UISlider { sliderDoneAction[sl] = f[1] + ":slidedone" }   // Slider onSlidingComplete
             case "SS" where f.count >= 2: if let sc = views[f[1]] as? UIScrollView { scrollOnScroll[sc] = f[1] + ":scroll" }   // Scroll onScroll
+            case "IF" where f.count >= 3:   // Image GPU op-chain (JSON may contain '|', so rejoin)
+                imageOpChain[f[1]] = f[2...].joined(separator: "|")
+                if let iv = views[f[1]] as? UIImageView { applyOps(iv, f[1]) }
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -1785,10 +1840,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // remote Image URL
         if let iv = views[id] as? UIImageView, t.hasPrefix("file://") {   // picked/captured local file
             iv.image = UIImage(contentsOfFile: String(t.dropFirst(7)))
+            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
             if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
+            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = bgImageViews[id], !t.isEmpty {            // bundled ImageBackground asset
@@ -1815,10 +1872,42 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let d = Self.parseISO(t, mode: datePickerModes[dp] ?? "date") { dp.date = d }
             return
         }
-        if let l = views[id] as? UILabel { l.text = t; if let n = ynodes[id] { YGNodeMarkDirty(n) } }
+        if views[id] is UILabel { labelRaw[id] = t; refreshLabel(id) }
         else if let b = views[id] as? UIButton { b.setTitle(t, for: .normal) }
         else if let tf = views[id] as? UITextField { tf.placeholder = t }
         else if let tv = views[id] as? UITextView { textAreaPlaceholders[tv]?.text = t }   // TextArea placeholder
+    }
+
+    // Rebuild a label's rendered text from its raw string + font + typography. Called on
+    // every text OR style change so `l.font`/`l.textColor` (set by style()) and the raw
+    // text (set by setText) always compose. Plain path when no attributed attrs are set.
+    func refreshLabel(_ id: String) {
+        guard let l = views[id] as? UILabel else { return }
+        var text = labelRaw[id] ?? l.text ?? ""
+        switch labelTransform[id] {                       // text-transform
+        case "upper": text = text.uppercased()
+        case "lower": text = text.lowercased()
+        case "cap":   text = text.capitalized
+        default: break
+        }
+        let deco = labelDeco[id], kern = labelKern[id], lead = labelLead[id]
+        if deco == nil && kern == nil && lead == nil {
+            l.text = text                                  // no attributed attrs needed
+        } else {
+            var attrs: [NSAttributedString.Key: Any] = [.font: l.font as Any]
+            if let c = l.textColor { attrs[.foregroundColor] = c }
+            if let k = kern { attrs[.kern] = k }            // tracking
+            if deco == "underline" { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+            if deco == "strike" { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+            if let ld = lead {                              // leading (target line height)
+                let ps = NSMutableParagraphStyle()
+                ps.minimumLineHeight = ld; ps.maximumLineHeight = ld
+                ps.alignment = l.textAlignment
+                attrs[.paragraphStyle] = ps
+            }
+            l.attributedText = NSAttributedString(string: text, attributes: attrs)
+        }
+        if let n = ynodes[id] { YGNodeMarkDirty(n) }
     }
 
     func make(_ id: String, _ kind: String) {
@@ -1971,6 +2060,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "Scroll", "HScroll":   // one UIScrollView for both axes; the `horiz` style picks x vs y
             let sc = UIScrollView(); sc.delegate = self; sc.keyboardDismissMode = .onDrag
             sc.showsVerticalScrollIndicator = true
+            // Mark the Yoga node as a scroll container so its content is laid out at its full
+            // (overflowing) size along the scroll axis instead of being clamped to the scroll's
+            // own bounds. Without this, the content's top/bottom become unreachable.
+            YGNodeStyleSetOverflow(n, YGOverflow.scroll)
             listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll"); v = sc   // horiz confirmed by the style too
         case "Modal":
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
@@ -1997,6 +2090,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let hasShadow = s.contains("shadow=")   // a shadow needs masksToBounds=false, so don't clip
         var fs: CGFloat = 14, fw: UIFont.Weight = .regular
         var customFont = ""   // a registered font family (e.g. an icon font)
+        var italicFont = false // italic trait, folded into the font at the end
+        var labelDirty = false // a typography key changed -> rebuild the attributed text
+        // per-corner radius (rtl/rtr/rbr/rbl): collect, apply maskedCorners after the loop
+        var rc = (tl: CGFloat(-1), tr: CGFloat(-1), br: CGFloat(-1), bl: CGFloat(-1))
+        // border: collect width/color/style + per-side widths; a dashed/dotted or per-side
+        // border is drawn by a sublayer in relayout (needs the laid-out frame).
+        var borderStyle = "", borderColorHex = ""
+        var bwSide = (t: CGFloat(-1), r: CGFloat(-1), b: CGFloat(-1), l: CGFloat(-1))
         // animation: collect transform + opacity across the loop, apply (animated) after
         var tx: CGFloat = 0, ty: CGFloat = 0, sc: CGFloat = 1, rot: CGFloat = 0
         var hasTransform = false, opacity: CGFloat? = nil, animMs = -1, animEz = ""
@@ -2005,7 +2106,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let k = String(p[0]), val = String(p[1])
             let f = Float(val) ?? 0
             switch k {
-            case "d":   YGNodeStyleSetFlexDirection(n, val == "row" ? YGFlexDirection.row : YGFlexDirection.column)
+            case "d":   YGNodeStyleSetFlexDirection(n, val == "row" ? YGFlexDirection.row : (val == "row-reverse" ? YGFlexDirection.rowReverse : (val == "col-reverse" ? YGFlexDirection.columnReverse : YGFlexDirection.column)))
             case "j":   YGNodeStyleSetJustifyContent(n, justify(val))
             case "a":   YGNodeStyleSetAlignItems(n, align(val))
             case "g":     YGNodeStyleSetFlexGrow(n, f)
@@ -2015,9 +2116,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         (v as? UIActivityIndicatorView)?.transform = CGAffineTransform(scaleX: CGFloat(f) / 20, y: CGFloat(f) / 20)
             case "h":   YGNodeStyleSetHeight(n, f)
             case "p":   YGNodeStyleSetPadding(n, YGEdge.all, f)
+            case "px":  YGNodeStyleSetPadding(n, YGEdge.horizontal, f)   // horizontal padding
+            case "py":  YGNodeStyleSetPadding(n, YGEdge.vertical, f)     // vertical padding
+            case "pt":  YGNodeStyleSetPadding(n, YGEdge.top, f)
+            case "pr":  YGNodeStyleSetPadding(n, YGEdge.right, f)
+            case "pb":  YGNodeStyleSetPadding(n, YGEdge.bottom, f)
+            case "pl":  YGNodeStyleSetPadding(n, YGEdge.left, f)
+            case "mt":  YGNodeStyleSetMargin(n, YGEdge.top, f)           // per-side margin
+            case "mr":  YGNodeStyleSetMargin(n, YGEdge.right, f)
+            case "mb":  YGNodeStyleSetMargin(n, YGEdge.bottom, f)
+            case "ml":  YGNodeStyleSetMargin(n, YGEdge.left, f)
+            case "minw": YGNodeStyleSetMinWidth(n, f)                    // min/max size
+            case "maxw": YGNodeStyleSetMaxWidth(n, f)
+            case "minh": YGNodeStyleSetMinHeight(n, f)
+            case "maxh": YGNodeStyleSetMaxHeight(n, f)
+            case "wpct": YGNodeStyleSetWidthPercent(n, f)                // percent size (w-full/w-1/2)
+            case "hpct": YGNodeStyleSetHeightPercent(n, f)
+            case "aspect": YGNodeStyleSetAspectRatio(n, f / 100)         // aspect-square/video
             case "gap": YGNodeStyleSetGap(n, YGGutter.all, f)
             case "press": pressOpacity[id] = CGFloat(f) / 100     // Pressable active alpha
-            case "nlines": if let l = label { l.numberOfLines = Int(f); if let n = ynodes[id] { YGNodeMarkDirty(n) } }   // Text: cap lines
+            case "nlines": if let l = label { l.numberOfLines = max(0, Int(f)); if let n = ynodes[id] { YGNodeMarkDirty(n) } }   // Text: cap lines (nlines=-1 means no cap -> 0 = unlimited)
             case "ellip": if let l = label {                       // Text truncation mode
                 switch val { case "head": l.lineBreakMode = .byTruncatingHead; case "middle": l.lineBreakMode = .byTruncatingMiddle
                 case "clip": l.lineBreakMode = .byClipping; default: l.lineBreakMode = .byTruncatingTail } }
@@ -2103,9 +2221,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         (v as? UIProgressView)?.progressTintColor = hexColor(val)
                         if let sl = v as? UISlider { sl.minimumTrackTintColor = hexColor(val); sl.thumbTintColor = hexColor(val) }
             case "fs":  fs = CGFloat(f)
-            case "fw":  fw = (val == "bold") ? .bold : (val == "semibold" ? .semibold : .regular)
-            case "ta":  label?.textAlignment = (val == "right") ? .right : (val == "center" ? .center : .left)
+            case "fw":  fw = weightOf(val)
+            case "ta":  label?.textAlignment = (val == "right") ? .right : (val == "center" ? .center : (val == "justify" ? .justified : .left)); labelDirty = true
             case "font": customFont = val
+            case "fontfam": customFont = val                 // font-family (same mechanism)
+            case "italic": italicFont = (val == "1"); labelDirty = true
+            case "deco":  if val == "none" { labelDeco[id] = nil } else { labelDeco[id] = val }; labelDirty = true   // underline/strike
+            case "txform": if val == "none" { labelTransform[id] = nil } else { labelTransform[id] = val }; labelDirty = true   // upper/lower/cap
+            case "tracking": labelKern[id] = CGFloat(f); labelDirty = true      // letter spacing
+            case "leading": labelLead[id] = CGFloat(f); labelDirty = true       // line height
+            case "hidden":                                   // display:none — pull out of layout AND hide
+                let hid = (val == "1")
+                v.isHidden = hid
+                YGNodeStyleSetDisplay(n, hid ? YGDisplay.none : YGDisplay.flex)
+            case "overflow": if !hasShadow { v.clipsToBounds = (val == "hidden") }   // overflow-hidden clips
+            case "self":  YGNodeStyleSetAlignSelf(n, align(val))                // align-self
+            case "z":     v.layer.zPosition = CGFloat(f)                        // z-index
+            case "rtl":   rc.tl = CGFloat(f)
+            case "rtr":   rc.tr = CGFloat(f)
+            case "rbr":   rc.br = CGFloat(f)
+            case "rbl":   rc.bl = CGFloat(f)
             case "img": imgView?.image = UIImage(systemName: val)
             case "rmode":
                 let mode: UIView.ContentMode = (val == "contain") ? .scaleAspectFit : (val == "center" ? .center : .scaleAspectFill)
@@ -2183,6 +2318,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "vrate": if let p = videoPlayers[id], p.rate != 0 { p.rate = f / 100 }   // playback speed while playing
             case "ldelay": pressLongDelay[id] = TimeInterval(f) / 1000       // onLongPress hold time (ms)
             case "blur": if let iv = v as? UIImageView { imageBlur[id] = CGFloat(f); applyBlur(iv, id) }   // Image blur (px)
+            case "filt": if let iv = v as? UIImageView { imageFilter[id] = val; applyFilter(iv, id) }      // Image photo filter
             case "sel": if let l = v as? SelectableLabel { l.selectable = (val == "1"); if val == "1" { l.enableSelection() } }   // Text selectable
             case "hitslop": if let h = v as? HitSlopView { h.hitSlop = CGFloat(f) }   // Pressable enlarged tap area
             case "spin": if val == "1", let iv = v as? UIImageView, iv.image == nil { showImageSpinner(id, iv) }   // Image loading spinner
@@ -2211,10 +2347,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 } else { glassViews[id]?.removeFromSuperview(); glassViews[id] = nil }
             case "pos": if val == "abs" { YGNodeStyleSetPositionType(n, YGPositionType.absolute) }
             case "top":   YGNodeStyleSetPosition(n, YGEdge.top, f)
+            case "bottom": YGNodeStyleSetPosition(n, YGEdge.bottom, f)
             case "left":  YGNodeStyleSetPosition(n, YGEdge.left, f)
             case "right": YGNodeStyleSetPosition(n, YGEdge.right, f)
             case "bw":  v.layer.borderWidth = CGFloat(f)
-            case "bc":  v.layer.borderColor = hexColor(val).cgColor
+            case "bc":  v.layer.borderColor = hexColor(val).cgColor; borderColorHex = val
+            case "bstyle": borderStyle = val                      // solid | dashed | dotted
+            case "bwt": bwSide.t = CGFloat(f)
+            case "bwr": bwSide.r = CGFloat(f)
+            case "bwb": bwSide.b = CGFloat(f)
+            case "bwl": bwSide.l = CGFloat(f)
             case "opacity": opacity = CGFloat(f) / 100.0
             case "tx": tx = CGFloat(f); hasTransform = true
             case "ty": ty = CGFloat(f); hasTransform = true
@@ -2247,9 +2389,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 }
             } else { apply() }
         }
-        let font: UIFont = customFont.isEmpty
+        var font: UIFont = customFont.isEmpty
             ? .systemFont(ofSize: fs, weight: fw)
             : (UIFont(name: customFont, size: fs) ?? .systemFont(ofSize: fs, weight: fw))
+        if italicFont, let d = font.fontDescriptor.withSymbolicTraits(font.fontDescriptor.symbolicTraits.union(.traitItalic)) {
+            font = UIFont(descriptor: d, size: fs)
+        }
         if let l = label {
             l.font = font
             // A font change (e.g. a tab label going regular -> semibold when active)
@@ -2257,9 +2402,62 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // for DIRTY nodes. setText marks dirty; a style-only font change must too,
             // or the label keeps its old width and the wider text truncates to "…".
             YGNodeMarkDirty(n)
+            // Recompose the attributed text so a font/color/typography change is reflected.
+            if labelDirty || labelDeco[id] != nil || labelKern[id] != nil || labelLead[id] != nil || labelTransform[id] != nil {
+                refreshLabel(id)
+            }
         }
         btn?.titleLabel?.font = font
         field?.font = font
+        // Per-corner radius (rounded-t-*, rounded-bl-*, …): one radius on the selected
+        // corners via maskedCorners (Tailwind sets equal radii per corner group).
+        if rc.tl >= 0 || rc.tr >= 0 || rc.br >= 0 || rc.bl >= 0 {
+            var corners: CACornerMask = []
+            var radius: CGFloat = 0
+            if rc.tl >= 0 { corners.insert(.layerMinXMinYCorner); radius = max(radius, rc.tl) }
+            if rc.tr >= 0 { corners.insert(.layerMaxXMinYCorner); radius = max(radius, rc.tr) }
+            if rc.br >= 0 { corners.insert(.layerMaxXMaxYCorner); radius = max(radius, rc.br) }
+            if rc.bl >= 0 { corners.insert(.layerMinXMaxYCorner); radius = max(radius, rc.bl) }
+            v.layer.maskedCorners = corners
+            v.layer.cornerRadius = radius
+            v.clipsToBounds = !hasShadow
+        }
+        // Dashed/dotted border -> a shape sublayer in relayout; clear the solid layer border.
+        if (borderStyle == "dashed" || borderStyle == "dotted"), v.layer.borderWidth > 0, !borderColorHex.isEmpty {
+            dashBorders[id] = (v.layer.borderWidth, hexColor(borderColorHex), borderStyle == "dotted")
+            v.layer.borderWidth = 0
+        } else { dashBorders[id] = nil }
+        // Per-side border -> edge sublayers in relayout.
+        if (bwSide.t >= 0 || bwSide.r >= 0 || bwSide.b >= 0 || bwSide.l >= 0), !borderColorHex.isEmpty {
+            sideBorders[id] = (max(0, bwSide.t), max(0, bwSide.r), max(0, bwSide.b), max(0, bwSide.l), hexColor(borderColorHex))
+        } else { sideBorders[id] = nil }
+        if dashBorders[id] != nil || sideBorders[id] != nil { view.setNeedsLayout() }
+    }
+
+    // Draw dashed/dotted and per-side borders as sublayers, sized to the laid-out frame.
+    // Called from relayout after each view's frame is set.
+    func updateBorderLayers(_ id: String, _ v: UIView) {
+        let dashKey = "chuksDashBorder", sideKey = "chuksSideBorder"
+        if let (w, col, dotted) = dashBorders[id] {
+            let sl = (v.layer.sublayers?.first { $0.name == dashKey } as? CAShapeLayer) ?? {
+                let l = CAShapeLayer(); l.name = dashKey; l.fillColor = nil; v.layer.addSublayer(l); return l }()
+            sl.frame = v.bounds
+            sl.path = UIBezierPath(roundedRect: v.bounds.insetBy(dx: w / 2, dy: w / 2),
+                                   cornerRadius: max(0, v.layer.cornerRadius - w / 2)).cgPath
+            sl.lineWidth = w; sl.strokeColor = col.cgColor
+            sl.lineDashPattern = dotted ? [0.01, NSNumber(value: Double(w * 2))]
+                                        : [NSNumber(value: Double(w * 3)), NSNumber(value: Double(w * 2))]
+            sl.lineCap = dotted ? .round : .butt
+        } else { v.layer.sublayers?.first { $0.name == dashKey }?.removeFromSuperlayer() }
+        v.layer.sublayers?.filter { $0.name == sideKey }.forEach { $0.removeFromSuperlayer() }
+        if let (t, r, b, l, col) = sideBorders[id] {
+            let W = v.bounds.width, H = v.bounds.height
+            func edge(_ rect: CGRect) { let e = CALayer(); e.name = sideKey; e.frame = rect; e.backgroundColor = col.cgColor; v.layer.addSublayer(e) }
+            if t > 0 { edge(CGRect(x: 0, y: 0, width: W, height: t)) }
+            if b > 0 { edge(CGRect(x: 0, y: H - b, width: W, height: b)) }
+            if l > 0 { edge(CGRect(x: 0, y: 0, width: l, height: H)) }
+            if r > 0 { edge(CGRect(x: W - r, y: 0, width: r, height: H)) }
+        }
     }
 
     func insert(_ id: String, parent: String, index: Int) {
@@ -2277,6 +2475,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let base = bgImageViews[parent] != nil ? 1 : 0       // keep an ImageBackground's bg image at the back
         let i = min(index + base, pv.subviews.count)
         pv.insertSubview(child, at: i)
+        // A node id can be reused across a kind change (e.g. a Text becomes a container via
+        // conditional rendering / hot reload). Yoga aborts if you add a child to a node that
+        // still has a text measure func, so clear it first.
+        if YGNodeHasMeasureFunc(pn) { YGNodeSetMeasureFunc(pn, nil) }
         YGNodeInsertChild(pn, cn, min(index, YGNodeGetChildCount(pn)))
     }
 
@@ -2631,12 +2833,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
-        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); applyBlur(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
         ChuksImageLoader.shared.load(urlStr) { [weak self] img in
             guard let self = self else { return }
-            if iv.tag == wanted { iv.image = self.tinted(img, id); self.applyBlur(iv, id) }
+            if iv.tag == wanted { iv.image = self.tinted(img, id); self.imageOriginal[id] = nil; self.applyFilter(iv, id); self.applyBlur(iv, id); self.applyOps(iv, id) }
             self.hideImageSpinner(id)
             self.fireMedia(self.mediaLoad[id])
         } fail: { [weak self] in self?.hideImageSpinner(id); self?.fireMedia(self?.mediaError[id]) }
@@ -2660,6 +2862,39 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         filter.setValue(ci, forKey: kCIInputImageKey); filter.setValue(r, forKey: kCIInputRadiusKey)
         guard let out = filter.outputImage, let cg = ciContext.createCGImage(out, from: ci.extent) else { return }
         iv.image = UIImage(cgImage: cg)
+    }
+    // Image `filter`: a GPU photo-filter preset via Core Image (CIPhotoEffect family +
+    // temperature). Re-applies from the pre-filter original so switching presets doesn't
+    // stack (needed for a capture filter picker).
+    func applyFilter(_ iv: UIImageView, _ id: String) {
+        let name = imageFilter[id] ?? ""
+        if name.isEmpty || name == "normal" || name == "none" { if let orig = imageOriginal[id] { iv.image = orig }; return }
+        let base = imageOriginal[id] ?? iv.image
+        if imageOriginal[id] == nil, let b = base { imageOriginal[id] = b }
+        guard let img = base, let ci = CIImage(image: img) else { return }
+        var out: CIImage? = nil
+        switch name {
+        case "mono":  out = ci.applyingFilter("CIPhotoEffectMono")
+        case "noir":  out = ci.applyingFilter("CIPhotoEffectNoir")
+        case "sepia": out = ci.applyingFilter("CISepiaTone", parameters: [kCIInputIntensityKey: 0.9])
+        case "vivid": out = ci.applyingFilter("CIPhotoEffectChrome")
+        case "fade":  out = ci.applyingFilter("CIPhotoEffectFade")
+        case "cool":  out = ci.applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 9000, y: 0)])
+        case "warm":  out = ci.applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 4200, y: 0)])
+        default: return
+        }
+        guard let o = out, let cg = ciContext.createCGImage(o, from: ci.extent) else { return }
+        iv.image = UIImage(cgImage: cg)
+    }
+    // Image `ops`: run the GPU op-chain (from effects.chain) on the GPU, from the pre-filter
+    // original so switching chains does not stack. Supersedes the preset filter when set.
+    func applyOps(_ iv: UIImageView, _ id: String) {
+        let json = imageOpChain[id] ?? ""
+        if json.isEmpty { return }
+        let base = imageOriginal[id] ?? iv.image
+        if imageOriginal[id] == nil, let b = base { imageOriginal[id] = b }
+        guard let img = base else { return }
+        iv.image = runOpChain(img, json)
     }
     let ciContext = CIContext()
     // Dispatch a media event action (onLoad/onError/onEnd) if one is registered for the node.
@@ -2749,6 +2984,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 else { vv.bounds = CGRect(origin: .zero, size: fr.size); vv.center = CGPoint(x: fr.midX, y: fr.midY) }
             }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
+            if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
         }
         // place the whole Chuks app in the safe area, below the diagnostics header

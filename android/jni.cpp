@@ -99,13 +99,51 @@ JNIEXPORT void JNICALL J(setWake)(JNIEnv* e, jobject) {
 }
 
 // ---- Yoga (handle-based) ----
-JNIEXPORT jlong JNICALL J(yNew)(JNIEnv*, jobject) { return (jlong)YGNodeNew(); }
-JNIEXPORT void  JNICALL J(yInsert)(JNIEnv*, jobject, jlong p, jlong c, jint i) { YGNodeInsertChild((YGNodeRef)p, (YGNodeRef)c, (size_t)i); }
+// Shared config: opt into Yoga's classic "errata" layout so a measured Text re-wraps to
+// its resolved width (matches the iOS host).
+static YGConfigRef gYogaConfig = nullptr;
+static YGConfigRef yogaConfig() {
+    if (!gYogaConfig) { gYogaConfig = YGConfigNew(); YGConfigSetErrata(gYogaConfig, YGErrataAll); }
+    return gYogaConfig;
+}
+// Text measure callback: Yoga calls this for a text leaf during layout with the resolved
+// width constraint; we hop into Kotlin (N.measureTextNode) to measure the real TextView so
+// Text wraps to its container width without an explicit width, like the iOS host does.
+static JNIEnv*   gLayoutEnv    = nullptr;
+static jclass    gMeasureClass = nullptr;
+static jmethodID gMeasureMid   = nullptr;
+static YGSize androidTextMeasure(YGNodeConstRef node, float width, YGMeasureMode wmode, float, YGMeasureMode) {
+    if (!gLayoutEnv || !gMeasureClass || !gMeasureMid) return YGSize{0, 0};
+    jlong packed = gLayoutEnv->CallStaticLongMethod(gMeasureClass, gMeasureMid, (jlong)node, (jfloat)width, (jint)wmode);
+    return YGSize{(float)(int)(packed >> 32), (float)(int)(packed & 0xffffffff)};
+}
+JNIEXPORT jlong JNICALL J(yNew)(JNIEnv*, jobject) { return (jlong)YGNodeNewWithConfig(yogaConfig()); }
+JNIEXPORT void JNICALL J(ySetTextMeasure)(JNIEnv* e, jobject, jlong n) {
+    if (!gMeasureClass) {
+        jclass cls = e->FindClass("com/chuks/app/N");
+        if (cls) { gMeasureClass = (jclass)e->NewGlobalRef(cls);
+                   gMeasureMid = e->GetStaticMethodID(gMeasureClass, "measureTextNode", "(JFI)J"); }
+    }
+    YGNodeSetMeasureFunc((YGNodeRef)n, androidTextMeasure);
+}
+JNIEXPORT void JNICALL J(yMarkDirty)(JNIEnv*, jobject, jlong n) {
+    if (YGNodeHasMeasureFunc((YGNodeRef)n)) YGNodeMarkDirty((YGNodeRef)n);
+}
+JNIEXPORT void  JNICALL J(yInsert)(JNIEnv*, jobject, jlong p, jlong c, jint i) {
+    // A reused node id may have changed kind (Text -> container); Yoga aborts on adding a
+    // child to a node that still has a text measure func, so clear it first.
+    if (YGNodeHasMeasureFunc((YGNodeRef)p)) YGNodeSetMeasureFunc((YGNodeRef)p, nullptr);
+    YGNodeInsertChild((YGNodeRef)p, (YGNodeRef)c, (size_t)i);
+}
 JNIEXPORT void  JNICALL J(yRemove)(JNIEnv*, jobject, jlong p, jlong c) { YGNodeRemoveChild((YGNodeRef)p, (YGNodeRef)c); }
 JNIEXPORT jlong JNICALL J(yOwner)(JNIEnv*, jobject, jlong n) { return (jlong)YGNodeGetOwner((YGNodeRef)n); }
 JNIEXPORT jint  JNICALL J(yChildCount)(JNIEnv*, jobject, jlong n) { return (jint)YGNodeGetChildCount((YGNodeRef)n); }
 JNIEXPORT void  JNICALL J(yFree)(JNIEnv*, jobject, jlong n) { YGNodeFreeRecursive((YGNodeRef)n); }
-JNIEXPORT void  JNICALL J(yCalc)(JNIEnv*, jobject, jlong n, jfloat w, jfloat h) { YGNodeCalculateLayout((YGNodeRef)n, w, h, YGDirectionLTR); }
+JNIEXPORT void  JNICALL J(yCalc)(JNIEnv* e, jobject, jlong n, jfloat w, jfloat h) {
+    gLayoutEnv = e;
+    YGNodeCalculateLayout((YGNodeRef)n, w, h, YGDirectionLTR);
+    gLayoutEnv = nullptr;
+}
 JNIEXPORT jfloat JNICALL J(yGet)(JNIEnv*, jobject, jlong n, jint which) {
     YGNodeRef y = (YGNodeRef)n;
     switch (which) {
@@ -117,10 +155,13 @@ JNIEXPORT jfloat JNICALL J(yGet)(JNIEnv*, jobject, jlong n, jint which) {
 }
 // key: 0 flexDir(v:0col/1row) 1 justify 2 align 3 grow 4 basis 5 w 6 h
 //      7 padAll 8 gapAll 9 posAbs 10 posTop 11 posLeft 12 posRight
+//      13 flexWrap 14 padHorizontal 15 padVertical
+//      16-19 pad T/R/B/L  20-23 margin T/R/B/L  24-27 min/max W/H
+//      28 widthPct 29 heightPct 30 aspect(v/100) 31 posBottom
 JNIEXPORT void JNICALL J(ySetF)(JNIEnv*, jobject, jlong n, jint key, jfloat v) {
     YGNodeRef y = (YGNodeRef)n; int iv = (int)v;
     switch (key) {
-        case 0:  YGNodeStyleSetFlexDirection(y, iv == 1 ? YGFlexDirectionRow : YGFlexDirectionColumn); break;
+        case 0:  YGNodeStyleSetFlexDirection(y, iv == 1 ? YGFlexDirectionRow : iv == 2 ? YGFlexDirectionRowReverse : iv == 3 ? YGFlexDirectionColumnReverse : YGFlexDirectionColumn); break;
         case 1:  YGNodeStyleSetJustifyContent(y, (YGJustify)iv); break;
         case 2:  YGNodeStyleSetAlignItems(y, (YGAlign)iv); break;
         case 3:  YGNodeStyleSetFlexGrow(y, v); break;
@@ -134,6 +175,27 @@ JNIEXPORT void JNICALL J(ySetF)(JNIEnv*, jobject, jlong n, jint key, jfloat v) {
         case 11: YGNodeStyleSetPosition(y, YGEdgeLeft, v); break;
         case 12: YGNodeStyleSetPosition(y, YGEdgeRight, v); break;
         case 13: YGNodeStyleSetFlexWrap(y, iv == 1 ? YGWrapWrap : YGWrapNoWrap); break;
+        case 14: YGNodeStyleSetPadding(y, YGEdgeHorizontal, v); break;   // px
+        case 15: YGNodeStyleSetPadding(y, YGEdgeVertical, v); break;     // py
+        case 16: YGNodeStyleSetPadding(y, YGEdgeTop, v); break;
+        case 17: YGNodeStyleSetPadding(y, YGEdgeRight, v); break;
+        case 18: YGNodeStyleSetPadding(y, YGEdgeBottom, v); break;
+        case 19: YGNodeStyleSetPadding(y, YGEdgeLeft, v); break;
+        case 20: YGNodeStyleSetMargin(y, YGEdgeTop, v); break;
+        case 21: YGNodeStyleSetMargin(y, YGEdgeRight, v); break;
+        case 22: YGNodeStyleSetMargin(y, YGEdgeBottom, v); break;
+        case 23: YGNodeStyleSetMargin(y, YGEdgeLeft, v); break;
+        case 24: YGNodeStyleSetMinWidth(y, v); break;
+        case 25: YGNodeStyleSetMaxWidth(y, v); break;
+        case 26: YGNodeStyleSetMinHeight(y, v); break;
+        case 27: YGNodeStyleSetMaxHeight(y, v); break;
+        case 28: YGNodeStyleSetWidthPercent(y, v); break;
+        case 29: YGNodeStyleSetHeightPercent(y, v); break;
+        case 30: YGNodeStyleSetAspectRatio(y, v / 100.0f); break;
+        case 31: YGNodeStyleSetPosition(y, YGEdgeBottom, v); break;
+        case 32: YGNodeStyleSetDisplay(y, iv == 1 ? YGDisplayNone : YGDisplayFlex); break;   // hidden (display:none)
+        case 33: YGNodeStyleSetAlignSelf(y, (YGAlign)iv); break;                             // align-self
+        case 34: YGNodeStyleSetOverflow(y, YGOverflowScroll); break;                         // scroll container: content overflows
     }
 }
 

@@ -1,0 +1,9 @@
+// @chuks/ui -- the Prop value type, in a leaf module so both ui.chuks and
+// tw.chuks can share it without a circular import (ui imports tw for the `tw`
+// style field; tw needs Prop; keeping Prop here breaks the cycle).
+//
+// The value a prop can hold: a number, a string, a flag, or an event closure.
+// Using a union (not `any`) means the builders accept only these, so a stray
+// value like an object is a compile error. Chuks has no first-class function
+// type WITHOUT a signature, so the two event shapes are spelled out.
+export unionType Prop = int | string | bool | function(): void | function(v: string): void

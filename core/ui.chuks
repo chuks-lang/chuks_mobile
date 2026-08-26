@@ -10,6 +10,8 @@
 
 import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells } from "./state.chuks";
 import { host } from "std/host";
+import { Prop } from "./prop.chuks";
+import { tw } from "./tw.chuks";
 
 // ---- Style: a compact subset of the flexbox + visual model -----------------
 export class Style {
@@ -21,6 +23,26 @@ export class Style {
     var w: int
     var h: int
     var pad: int
+    var padX: int       // horizontal padding (px); -1 = unset. Overrides `pad` on the L/R edges.
+    var padY: int       // vertical padding (py); -1 = unset. Overrides `pad` on the T/B edges.
+    var padT: int; var padR: int; var padB: int; var padL: int   // per-side padding (pt/pr/pb/pl)
+    var marT: int; var marR: int; var marB: int; var marL: int   // per-side margin (mt/mr/mb/ml)
+    var minW: int; var maxW: int; var minH: int; var maxH: int   // min/max width/height
+    var wPct: int; var hPct: int   // width/height as a percent of the parent (0..100)
+    var bottom: int    // absolute inset from the bottom
+    var z: int         // z-index (paint order)
+    var aspectR: int   // aspect ratio as w/h * 100 (square = 100, video = 178)
+    var rTL: int; var rTR: int; var rBR: int; var rBL: int   // per-corner radius
+    var italic: int    // 1 = italic, 0 = not, -1 = unset
+    var deco: string   // text decoration: underline | strike | none
+    var txform: string // text transform: upper | lower | cap | none
+    var tracking: int  // letter spacing (px)
+    var leading: int   // line height (px)
+    var fontFam: string// font family name
+    var overflow: string // hidden | visible | scroll
+    var hidden: int    // 1 = not rendered
+    var selfAlign: string // align-self: start | center | end | stretch
+    var bStyle: string // border style: solid | dashed | dotted
     var gap: int
     var bg: string      // hex, e.g. "1B1F2A"
     var fg: string      // text color hex
@@ -34,6 +56,7 @@ export class Style {
     var left: int
     var right: int
     var bw: int         // border width (px)
+    var bwT: int; var bwR: int; var bwB: int; var bwL: int   // per-side border width (px); -1 = unset
     var bc: string      // border color hex
     var shadow: int     // elevation: 1 small, 2 medium, 3 large
     var glass: int      // Liquid Glass material: 1 = on (iOS 26 glassEffect; blur fallback elsewhere)
@@ -87,6 +110,7 @@ export class Style {
     var ellip: string   // Text truncation: "tail"|"head"|"middle"|"clip" ("" = tail default)
     var disabled: int   // interactive controls: 1 = disabled (dimmed, no press); -1 = enabled
     var tint: string    // Image tintColor (hex): recolor a template image ("" = none)
+    var imgFilter: string // Image photo filter preset (mono|sepia|vivid|cool|warm|noir|fade; "" = none)
     var seekTo: int     // Video: seek to this time in seconds when it changes (-1 = no seek)
     var vidCtrls: int   // Video: 1 = show native playback controls (-1 = none)
     var vidVol: int     // Video volume 0-100 (-1 = default, honors `muted`)
@@ -98,10 +122,17 @@ export class Style {
     var spinner: int    // Image: 1 = show a loading spinner until the image loads (-1 = no)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
-        this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.gap = -1
+        this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
+        this.padT = -1; this.padR = -1; this.padB = -1; this.padL = -1
+        this.marT = -1; this.marR = -1; this.marB = -1; this.marL = -1
+        this.minW = -1; this.maxW = -1; this.minH = -1; this.maxH = -1
+        this.wPct = -1; this.hPct = -1; this.bottom = -1; this.z = -1; this.aspectR = -1
+        this.rTL = -1; this.rTR = -1; this.rBR = -1; this.rBL = -1
+        this.italic = -1; this.deco = ""; this.txform = ""; this.tracking = -9999; this.leading = -1; this.fontFam = ""
+        this.overflow = ""; this.hidden = -1; this.selfAlign = ""; this.bStyle = ""
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
-        this.bw = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
+        this.bw = -1; this.bwT = -1; this.bwR = -1; this.bwB = -1; this.bwL = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
         this.swOn = -1; this.swThumb = ""; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
@@ -113,7 +144,7 @@ export class Style {
         this.kbType = ""; this.retKey = ""; this.editable = -1; this.autoFocus = -1
         this.autoCap = ""; this.autoCorr = -1; this.maxLen = -1; this.stick = -1; this.horiz = -1
         this.nlines = -1; this.ellip = ""; this.disabled = -1
-        this.tint = ""; this.seekTo = -1; this.vidCtrls = -1
+        this.tint = ""; this.imgFilter = ""; this.seekTo = -1; this.vidCtrls = -1
         this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
         this.selectable = -1; this.hitSlop = -1; this.spinner = -1
     }
@@ -129,6 +160,39 @@ export class Style {
         if (this.w >= 0) { s = s + "w=" + string(this.w) + ";" }
         if (this.h >= 0) { s = s + "h=" + string(this.h) + ";" }
         if (this.pad >= 0) { s = s + "p=" + string(this.pad) + ";" }
+        if (this.padX >= 0) { s = s + "px=" + string(this.padX) + ";" }
+        if (this.padY >= 0) { s = s + "py=" + string(this.padY) + ";" }
+        if (this.padT >= 0) { s = s + "pt=" + string(this.padT) + ";" }
+        if (this.padR >= 0) { s = s + "pr=" + string(this.padR) + ";" }
+        if (this.padB >= 0) { s = s + "pb=" + string(this.padB) + ";" }
+        if (this.padL >= 0) { s = s + "pl=" + string(this.padL) + ";" }
+        if (this.marT >= 0) { s = s + "mt=" + string(this.marT) + ";" }
+        if (this.marR >= 0) { s = s + "mr=" + string(this.marR) + ";" }
+        if (this.marB >= 0) { s = s + "mb=" + string(this.marB) + ";" }
+        if (this.marL >= 0) { s = s + "ml=" + string(this.marL) + ";" }
+        if (this.minW >= 0) { s = s + "minw=" + string(this.minW) + ";" }
+        if (this.maxW >= 0) { s = s + "maxw=" + string(this.maxW) + ";" }
+        if (this.minH >= 0) { s = s + "minh=" + string(this.minH) + ";" }
+        if (this.maxH >= 0) { s = s + "maxh=" + string(this.maxH) + ";" }
+        if (this.wPct >= 0) { s = s + "wpct=" + string(this.wPct) + ";" }
+        if (this.hPct >= 0) { s = s + "hpct=" + string(this.hPct) + ";" }
+        if (this.bottom >= 0) { s = s + "bottom=" + string(this.bottom) + ";" }
+        if (this.z >= 0) { s = s + "z=" + string(this.z) + ";" }
+        if (this.aspectR >= 0) { s = s + "aspect=" + string(this.aspectR) + ";" }
+        if (this.rTL >= 0) { s = s + "rtl=" + string(this.rTL) + ";" }
+        if (this.rTR >= 0) { s = s + "rtr=" + string(this.rTR) + ";" }
+        if (this.rBR >= 0) { s = s + "rbr=" + string(this.rBR) + ";" }
+        if (this.rBL >= 0) { s = s + "rbl=" + string(this.rBL) + ";" }
+        if (this.italic >= 0) { s = s + "italic=" + string(this.italic) + ";" }
+        if (this.deco != "") { s = s + "deco=" + this.deco + ";" }
+        if (this.txform != "") { s = s + "txform=" + this.txform + ";" }
+        if (this.tracking != -9999) { s = s + "tracking=" + string(this.tracking) + ";" }
+        if (this.leading >= 0) { s = s + "leading=" + string(this.leading) + ";" }
+        if (this.fontFam != "") { s = s + "fontfam=" + this.fontFam + ";" }
+        if (this.overflow != "") { s = s + "overflow=" + this.overflow + ";" }
+        if (this.hidden >= 0) { s = s + "hidden=" + string(this.hidden) + ";" }
+        if (this.selfAlign != "") { s = s + "self=" + this.selfAlign + ";" }
+        if (this.bStyle != "") { s = s + "bstyle=" + this.bStyle + ";" }
         if (this.gap >= 0) { s = s + "gap=" + string(this.gap) + ";" }
         if (this.bg != "") { s = s + "bg=" + this.bg + ";" }
         if (this.fg != "") { s = s + "fg=" + this.fg + ";" }
@@ -142,6 +206,10 @@ export class Style {
         if (this.left >= 0) { s = s + "left=" + string(this.left) + ";" }
         if (this.right >= 0) { s = s + "right=" + string(this.right) + ";" }
         if (this.bw >= 0) { s = s + "bw=" + string(this.bw) + ";" }
+        if (this.bwT >= 0) { s = s + "bwt=" + string(this.bwT) + ";" }
+        if (this.bwR >= 0) { s = s + "bwr=" + string(this.bwR) + ";" }
+        if (this.bwB >= 0) { s = s + "bwb=" + string(this.bwB) + ";" }
+        if (this.bwL >= 0) { s = s + "bwl=" + string(this.bwL) + ";" }
         if (this.bc != "") { s = s + "bc=" + this.bc + ";" }
         if (this.shadow >= 0) { s = s + "shadow=" + string(this.shadow) + ";" }
         if (this.glass >= 0) { s = s + "glass=" + string(this.glass) + ";" }
@@ -169,6 +237,7 @@ export class Style {
         if (this.ellip != "") { s = s + "ellip=" + this.ellip + ";" }
         if (this.disabled >= 0) { s = s + "dis=" + string(this.disabled) + ";" }
         if (this.tint != "") { s = s + "tint=" + this.tint + ";" }
+        if (this.imgFilter != "") { s = s + "filt=" + this.imgFilter + ";" }
         if (this.seekTo >= 0) { s = s + "seek=" + string(this.seekTo) + ";" }
         if (this.vidCtrls >= 0) { s = s + "vctrl=" + string(this.vidCtrls) + ";" }
         if (this.vidVol >= 0) { s = s + "vvol=" + string(this.vidVol) + ";" }
@@ -247,6 +316,8 @@ export class Node {
     // user scrolls; scrollTo imperatively scrolls to an offset (>= 0 = active).
     var onScroll: any
     var scrollTo: int
+    // Image GPU op-chain (a JSON op list from effects.chain); the host runs it on the GPU.
+    var opsChain: string
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -254,7 +325,7 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
-        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1
+        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1; this.opsChain = ""
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -313,11 +384,8 @@ function mkModal(style: Style, kids: []Node): Node { return new Node("Modal", st
 function mkAlert(style: Style, joined: string): Node { return new Node("Alert", style, joined, []) }
 
 // ---- Prop value types ------------------------------------------------------
-// The value a prop can hold: a number, a string, a flag, or an event closure.
-// Using a union (not `any`) means the builders accept only these, so a stray
-// value like an object is a compile error. Chuks has no first-class function
-// type WITHOUT a signature, so the two event shapes are spelled out.
-export unionType Prop = int | string | bool | function(): void | function(v: string): void
+// `Prop` now lives in ./prop.chuks (a leaf module) so tw.chuks can share it
+// without a circular import; it is imported at the top of this file.
 // A List's config values: sizes/counts (int) plus its row callbacks. These have
 // List-specific signatures, so they get their own union, distinct from Prop. The
 // last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
@@ -373,6 +441,19 @@ function lpBool(d: map[string]ListProp, k: string, def: bool): bool { const v: L
 function applyLayout(s: Style, p: map[string]Prop): void {
     s.gap = pInt(p, "gap", s.gap)
     s.pad = pInt(p, "pad", s.pad)
+    s.padX = pInt(p, "px", s.padX)
+    s.padY = pInt(p, "py", s.padY)
+    s.padT = pInt(p, "pt", s.padT); s.padR = pInt(p, "pr", s.padR); s.padB = pInt(p, "pb", s.padB); s.padL = pInt(p, "pl", s.padL)
+    s.marT = pInt(p, "mt", s.marT); s.marR = pInt(p, "mr", s.marR); s.marB = pInt(p, "mb", s.marB); s.marL = pInt(p, "ml", s.marL)
+    s.minW = pInt(p, "minw", s.minW); s.maxW = pInt(p, "maxw", s.maxW); s.minH = pInt(p, "minh", s.minH); s.maxH = pInt(p, "maxh", s.maxH)
+    s.wPct = pInt(p, "wpct", s.wPct); s.hPct = pInt(p, "hpct", s.hPct)
+    s.bottom = pInt(p, "bottom", s.bottom); s.z = pInt(p, "z", s.z); s.aspectR = pInt(p, "aspect", s.aspectR)
+    s.rTL = pInt(p, "rtl", s.rTL); s.rTR = pInt(p, "rtr", s.rTR); s.rBR = pInt(p, "rbr", s.rBR); s.rBL = pInt(p, "rbl", s.rBL)
+    s.tracking = pInt(p, "tracking", s.tracking); s.leading = pInt(p, "leading", s.leading)
+    s.deco = pStr(p, "deco", s.deco); s.txform = pStr(p, "transform", s.txform); s.fontFam = pStr(p, "fontFamily", s.fontFam)
+    s.overflow = pStr(p, "overflow", s.overflow); s.selfAlign = pStr(p, "self", s.selfAlign); s.bStyle = pStr(p, "bstyle", s.bStyle)
+    if (p.get("italic") != null) { s.italic = pBool(p, "italic", false) ? 1 : 0 }
+    if (p.get("hidden") != null) { s.hidden = pBool(p, "hidden", false) ? 1 : 0 }
     s.w = pInt(p, "w", s.w)
     s.h = pInt(p, "h", s.h)
     s.grow = pInt(p, "grow", s.grow)
@@ -391,6 +472,8 @@ function applyLayout(s: Style, p: map[string]Prop): void {
     s.right = pInt(p, "right", s.right)
     s.dir = pStr(p, "dir", s.dir)               // flex-direction (Row/Column set this too)
     s.bw = pInt(p, "border", s.bw)              // border width
+    s.bwT = pInt(p, "borderTop", s.bwT); s.bwR = pInt(p, "borderRight", s.bwR)   // per-side border width
+    s.bwB = pInt(p, "borderBottom", s.bwB); s.bwL = pInt(p, "borderLeft", s.bwL)
     s.bc = pStr(p, "borderColor", s.bc)         // border color hex
     s.shadow = pInt(p, "shadow", s.shadow)      // elevation 1..3
     if (p.get("glass") != null) { s.glass = pBool(p, "glass", false) ? 1 : -1 }   // Liquid Glass material
@@ -435,9 +518,113 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
  * ])
  * ```
  */
-export function Row(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "row"; applyLayout(s, p)
-    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+// ── Typed component props ────────────────────────────────────────────────────
+// ViewProps is the shared, all-optional prop bag: every layout field, a Tailwind
+// `tw` string, and events. Per-component types EMBED it and add their own fields
+// (TextProps adds the text-only props). Because a builder's param is a typed
+// dataType, the literal `{...}` at the call site is checked: keys autocomplete,
+// unknown keys (typos) are rejected, and each value is type-checked — and the
+// caller imports nothing but the component. Inside, a builder hands the props
+// (as `any`) to the shared applyLayoutV/applyEventsV, which read fields BY KEY (a
+// dataType is map-backed), so one pair of helpers serves every typed builder.
+dataType LayoutProps {
+    gap: int?; pad: int?; px: int?; py: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
+    align: string?; justify: string?; bg: string?; color: string?; size: int?;
+    weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
+    dir: string?; border: int?; borderColor: string?; shadow: int?; glass: bool?;
+    opacity: int?; wrap: string?; font: string?; tx: int?; ty: int?; rotate: int?;
+    scale: int?; anim: int?; easing: string?; tw: string?;
+}
+dataType EventProps {
+    onPress: (function(): void)?; onChange: (function(v: string): void)?;
+    onLongPress: (function(): void)?; onPressIn: (function(): void)?; onPressOut: (function(): void)?;
+}
+export dataType ViewProps { LayoutProps; EventProps }
+export dataType TextProps { ViewProps; numberOfLines: int?; ellipsizeMode: string?; selectable: bool? }
+
+// By-key field readers over an `any` (a map-backed dataType), mirroring pInt/pStr/pBool.
+function pvI(p: any, k: string, d: int): int { const v: any = p[k]; return v != null ? int(v) : d }
+function pvS(p: any, k: string, d: string): string { const v: any = p[k]; return v != null ? string(v) : d }
+function pvB(p: any, k: string, d: bool): bool { const v: any = p[k]; return v != null ? (int(v) != 0) : d }
+
+// The typed-props twin of applyLayout: a Tailwind `tw` string first (so explicit
+// props override it), then every layout field by key. Serves all typed builders.
+function applyLayoutV(s: Style, p: any): void {
+    const tws: any = p["tw"]; if (tws != null) { applyLayout(s, tw(string(tws))) }
+    s.gap = pvI(p, "gap", s.gap)
+    s.pad = pvI(p, "pad", s.pad)
+    s.padX = pvI(p, "px", s.padX)
+    s.padY = pvI(p, "py", s.padY)
+    s.padT = pvI(p, "pt", s.padT); s.padR = pvI(p, "pr", s.padR); s.padB = pvI(p, "pb", s.padB); s.padL = pvI(p, "pl", s.padL)
+    s.marT = pvI(p, "mt", s.marT); s.marR = pvI(p, "mr", s.marR); s.marB = pvI(p, "mb", s.marB); s.marL = pvI(p, "ml", s.marL)
+    s.minW = pvI(p, "minw", s.minW); s.maxW = pvI(p, "maxw", s.maxW); s.minH = pvI(p, "minh", s.minH); s.maxH = pvI(p, "maxh", s.maxH)
+    s.wPct = pvI(p, "wpct", s.wPct); s.hPct = pvI(p, "hpct", s.hPct)
+    s.bottom = pvI(p, "bottom", s.bottom); s.z = pvI(p, "z", s.z); s.aspectR = pvI(p, "aspect", s.aspectR)
+    s.rTL = pvI(p, "rtl", s.rTL); s.rTR = pvI(p, "rtr", s.rTR); s.rBR = pvI(p, "rbr", s.rBR); s.rBL = pvI(p, "rbl", s.rBL)
+    s.tracking = pvI(p, "tracking", s.tracking); s.leading = pvI(p, "leading", s.leading)
+    s.deco = pvS(p, "deco", s.deco); s.txform = pvS(p, "transform", s.txform); s.fontFam = pvS(p, "fontFamily", s.fontFam)
+    s.overflow = pvS(p, "overflow", s.overflow); s.selfAlign = pvS(p, "self", s.selfAlign); s.bStyle = pvS(p, "bstyle", s.bStyle)
+    if (p["italic"] != null) { s.italic = pvB(p, "italic", false) ? 1 : 0 }
+    if (p["hidden"] != null) { s.hidden = pvB(p, "hidden", false) ? 1 : 0 }
+    s.w = pvI(p, "w", s.w)
+    s.h = pvI(p, "h", s.h)
+    s.grow = pvI(p, "grow", s.grow)
+    s.basis = pvI(p, "basis", s.basis)
+    s.radius = pvI(p, "radius", s.radius)
+    s.align = pvS(p, "align", s.align)
+    s.just = pvS(p, "justify", s.just)
+    s.bg = pvS(p, "bg", s.bg)
+    s.fg = pvS(p, "color", s.fg)
+    s.fs = pvI(p, "size", s.fs)
+    s.fw = pvS(p, "weight", s.fw)
+    s.ta = pvS(p, "ta", s.ta)
+    if (pvB(p, "abs", false)) { s.pos = "abs" }
+    s.top = pvI(p, "top", s.top)
+    s.left = pvI(p, "left", s.left)
+    s.right = pvI(p, "right", s.right)
+    s.dir = pvS(p, "dir", s.dir)
+    s.bw = pvI(p, "border", s.bw)
+    s.bwT = pvI(p, "borderTop", s.bwT); s.bwR = pvI(p, "borderRight", s.bwR)
+    s.bwB = pvI(p, "borderBottom", s.bwB); s.bwL = pvI(p, "borderLeft", s.bwL)
+    s.bc = pvS(p, "borderColor", s.bc)
+    s.shadow = pvI(p, "shadow", s.shadow)
+    if (p["glass"] != null) { s.glass = pvB(p, "glass", false) ? 1 : -1 }
+    s.opacity = pvI(p, "opacity", s.opacity)
+    s.wrap = pvS(p, "wrap", s.wrap)
+    s.font = pvS(p, "font", s.font)
+    s.tx = pvI(p, "tx", s.tx)
+    s.ty = pvI(p, "ty", s.ty)
+    s.rot = pvI(p, "rotate", s.rot)
+    s.scl = pvI(p, "scale", s.scl)
+    s.animMs = pvI(p, "anim", s.animMs)
+    s.animEz = pvS(p, "easing", s.animEz)
+}
+function applyEventsV(n: Node, p: any): void {
+    const a: any = p["onPress"]; if (a != null) { n.onPress = a }
+    const b: any = p["onChange"]; if (b != null) { n.onChange = b }
+    const c: any = p["onLongPress"]; if (c != null) { n.onLongPress = c }
+    const d: any = p["onPressIn"]; if (d != null) { n.onPressIn = d }
+    const e: any = p["onPressOut"]; if (e != null) { n.onPressOut = e }
+}
+function applyMediaEventsV(n: Node, p: any): void {
+    const ld: any = p["onLoad"]; if (ld != null) { n.onLoad = ld }
+    const er: any = p["onError"]; if (er != null) { n.onError = er }
+    const en: any = p["onEnd"]; if (en != null) { n.onEnd = en }
+    const pr: any = p["onProgress"]; if (pr != null) { n.onProgress = pr }
+}
+// Media event fields, embedded by media component prop types (Image/Video).
+dataType MediaEventProps {
+    onLoad: (function(): void)?; onError: (function(): void)?;
+    onEnd: (function(): void)?; onProgress: (function(v: int): void)?;
+}
+
+export function Row(first: ViewProps | []Node, kids: []Node = []): Node {
+    const s: Style = new Style(); s.dir = "row"
+    // props-or-content: `Row([...])` (no config) passes children first; `Row({...}, [...])`
+    // passes props then children. Discriminate by type — an array is content, a `{...}` is props.
+    if (typeof(first) == "array") { const c: []Node = first; return mkView(s, c) }
+    const p: ViewProps = first  // typeof-guard narrowed the union to its dataType arm
+    applyLayoutV(s, p); const n: Node = mkView(s, kids); applyEventsV(n, p); return n
 }
 /**
  * A vertical column (flex-direction: col): lays its children top-to-bottom.
@@ -451,9 +638,12 @@ export function Row(p: map[string]Prop, kids: []Node): Node {
  * ])
  * ```
  */
-export function Column(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "col"; s.just = "center"; applyLayout(s, p)
-    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+export function Column(first: ViewProps | []Node, kids: []Node = []): Node {
+    const s: Style = new Style(); s.dir = "col"; s.just = "center"
+    // props-or-content (see Row): `Column([...])` or `Column({...}, [...])`.
+    if (typeof(first) == "array") { const c: []Node = first; return mkView(s, c) }
+    const p: ViewProps = first  // narrowed to the dataType arm
+    applyLayoutV(s, p); const n: Node = mkView(s, kids); applyEventsV(n, p); return n
 }
 /**
  * A plain box (the base container). No default direction or alignment — just the
@@ -465,9 +655,11 @@ export function Column(p: map[string]Prop, kids: []Node): Node {
  * View({ w: 44, h: 44, radius: 22, bg: tk("primary") }, [])
  * ```
  */
-export function View(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); applyLayout(s, p)
-    const n: Node = mkView(s, kids); applyEvents(n, p); return n
+export function View(first: ViewProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return View({}, first) }   // content-only: `View([...])`
+    const p: ViewProps = first
+    const s: Style = new Style(); applyLayoutV(s, p)
+    const n: Node = mkView(s, kids); applyEventsV(n, p); return n
 }
 /**
  * A run of text; `t` is the string to display. Text self-sizes to its content.
@@ -479,13 +671,18 @@ export function View(p: map[string]Prop, kids: []Node): Node {
  * Text({ size: 30, weight: "bold", color: FG }, "Welcome back")
  * ```
  */
-export function Text(p: map[string]Prop, t: string): Node {
-    const s: Style = new Style(); applyLayout(s, p)
-    s.nlines = pInt(p, "numberOfLines", -1)          // cap lines (truncates the overflow)
-    s.ellip = pStr(p, "ellipsizeMode", "")           // "tail"|"head"|"middle"|"clip"
-    if (pBool(p, "selectable", false)) { s.selectable = 1 }   // user can select/copy the text
-    const n: Node = mkText(s, t)
-    applyEvents(n, p)                                 // onPress makes the text tappable (a link)
+export function Text(first: TextProps | string, body: string = ""): Node {
+    const s: Style = new Style()
+    // props-or-content: `Text("Hello")` (no config) passes the string first; `Text({...}, "Hello")`
+    // passes props then the string. Discriminate by type — a string is content, a `{...}` is props.
+    if (typeof(first) == "string") { const t: string = first; return mkText(s, t) }
+    const p: TextProps = first                               // narrowed to the dataType arm: typed field access
+    applyLayoutV(s, p)
+    s.nlines = p.numberOfLines ?? -1                         // cap lines (truncates the overflow)
+    s.ellip = p.ellipsizeMode ?? ""                          // "tail"|"head"|"middle"|"clip"
+    if (p.selectable ?? false) { s.selectable = 1 }          // user can select/copy the text
+    const n: Node = mkText(s, body)
+    applyEventsV(n, p)                                        // onPress makes the text tappable (a link)
     return n
 }
 /**
@@ -513,32 +710,38 @@ export function Text(p: map[string]Prop, t: string): Node {
  * Props: `src` (bundled name, "file://…", or http(s) URL), `playing` (default true),
  * `loop` (default true), `muted` (default true), `resizeMode` ("cover" | "contain").
  */
-export function Video(p: map[string]Prop): Node {
-    const s: Style = new Style(); applyLayout(s, p)
-    s.vid = pStr(p, "src", "")
+dataType VideoProps {
+    ViewProps; MediaEventProps;
+    src: string?; playing: bool?; loop: bool?; muted: bool?; resizeMode: string?;
+    seek: int?; volume: int?; rate: int?; controls: bool?; poster: string?;
+}
+export function Video(p: VideoProps): Node {
+    const s: Style = new Style(); applyLayoutV(s, p)
+    s.vid = pvS(p, "src", "")
     // Always set (default on) so these are emitted for every Video and stay controllable.
-    s.vidPlay = pBool(p, "playing", true) ? 1 : 0
-    s.vidLoop = pBool(p, "loop", true) ? 1 : 0
-    s.vidMute = pBool(p, "muted", true) ? 1 : 0
-    s.vidFit = pStr(p, "resizeMode", "cover")
-    s.seekTo = pInt(p, "seek", -1)                        // seek to N seconds when this changes
-    s.vidVol = pInt(p, "volume", -1)                      // 0-100
-    s.vidRate = pInt(p, "rate", -1)                       // playback speed percent (100 = 1x)
-    const controls: bool = pBool(p, "controls", false)
-    if (p.get("controls") != null) { s.vidCtrls = controls ? 1 : 0 }
+    s.vidPlay = pvB(p, "playing", true) ? 1 : 0
+    s.vidLoop = pvB(p, "loop", true) ? 1 : 0
+    s.vidMute = pvB(p, "muted", true) ? 1 : 0
+    s.vidFit = pvS(p, "resizeMode", "cover")
+    s.seekTo = pvI(p, "seek", -1)                         // seek to N seconds when this changes
+    s.vidVol = pvI(p, "volume", -1)                       // 0-100
+    s.vidRate = pvI(p, "rate", -1)                        // playback speed percent (100 = 1x)
+    const controls: bool = pvB(p, "controls", false)
+    if (p["controls"] != null) { s.vidCtrls = controls ? 1 : 0 }
     // A video with `controls` renders the platform's full native player UI (transport, scrubber,
     // fullscreen, AirPlay, PiP, subtitle/audio menus), so it's a distinct kind the host maps to
     // AVPlayerViewController / VideoPlayer / a MediaController-backed view.
     // The node text carries an optional `poster` image URL shown until the first frame plays.
-    const n: Node = new Node(controls ? "VideoControls" : "Video", s, pStr(p, "poster", ""), [])
-    applyMediaEvents(n, p)                                // onLoad / onEnd / onProgress
+    const n: Node = new Node(controls ? "VideoControls" : "Video", s, pvS(p, "poster", ""), [])
+    applyMediaEventsV(n, p)                               // onLoad / onEnd / onProgress
     return n
 }
-export function Icon(p: map[string]Prop): Node {
+dataType IconProps { ViewProps; name: string? }
+export function Icon(p: IconProps): Node {
     const s: Style = new Style()
-    const sz: int = pInt(p, "size", 24); s.w = sz; s.h = sz; s.radius = sz / 2
-    s.bg = pStr(p, "bg", "")
-    s.img = pStr(p, "name", ""); s.fg = pStr(p, "color", "FFFFFF")
+    const sz: int = pvI(p, "size", 24); s.w = sz; s.h = sz; s.radius = sz / 2
+    s.bg = pvS(p, "bg", "")
+    s.img = pvS(p, "name", ""); s.fg = pvS(p, "color", "FFFFFF")
     return mkImage(s)
 }
 /**
@@ -548,23 +751,33 @@ export function Icon(p: map[string]Prop): Node {
  * (For a local SF Symbol icon use `Icon`/`name` instead.) The URL rides the text
  * channel, so it may not contain a newline or "|".
  *
- * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color).
+ * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color),
+ *   `tintColor`, `blurRadius`, `spinner`, and `filter` — a GPU photo-filter preset
+ *   (`mono` | `noir` | `sepia` | `vivid` | `cool` | `warm` | `fade`; `normal` = none),
+ *   applied natively via Core Image (iOS) / a ColorMatrix on the hardware layer (Android).
  *
  * ```chuks
- * Image({ src: "https://picsum.photos/200", w: 96, h: 96, radius: 12 })
+ * Image({ src: "https://picsum.photos/200", w: 96, h: 96, radius: 12, filter: "vivid" })
  * ```
  */
-export function Image(p: map[string]Prop): Node {
+dataType ImageProps {
+    ViewProps; MediaEventProps;
+    src: string?; resize: string?; tintColor: string?; blurRadius: int?;
+    filter: string?; spinner: bool?; ops: string?;
+}
+export function Image(p: ImageProps): Node {
     const s: Style = new Style()
-    s.resize = pStr(p, "resize", "cover")
-    s.bg = pStr(p, "bg", "")
-    s.tint = pStr(p, "tintColor", "")                     // recolor a template image
-    s.blur = pInt(p, "blurRadius", -1)                    // blur the image (px)
-    if (pBool(p, "spinner", false)) { s.spinner = 1 }     // show a loading spinner until it loads
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    const n: Node = new Node("Image", s, pStr(p, "src", ""), [])   // URL in the text channel
-    applyMediaEvents(n, p)                                // onLoad / onError
+    s.resize = pvS(p, "resize", "cover")
+    s.bg = pvS(p, "bg", "")
+    s.tint = pvS(p, "tintColor", "")                      // recolor a template image
+    s.blur = pvI(p, "blurRadius", -1)                     // blur the image (px)
+    s.imgFilter = pvS(p, "filter", "")                    // photo filter preset (mono|sepia|vivid|cool|warm|noir|fade)
+    if (pvB(p, "spinner", false)) { s.spinner = 1 }       // show a loading spinner until it loads
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    const n: Node = new Node("Image", s, pvS(p, "src", ""), [])   // URL in the text channel
+    n.opsChain = pvS(p, "ops", "")                        // GPU op-chain (from effects.chain); host runs it on the GPU
+    applyMediaEventsV(n, p)                               // onLoad / onError
     return n
 }
 /**
@@ -578,12 +791,15 @@ export function Image(p: map[string]Prop): Node {
  * ImageBackground({ src: HERO_URL, pad: 24, radius: 16 }, [ Text(...), ... ])
  * ```
  */
-export function ImageBackground(p: map[string]Prop, kids: []Node): Node {
+dataType ImageBackgroundProps { ViewProps; src: string?; resize: string? }
+export function ImageBackground(first: ImageBackgroundProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return ImageBackground({}, first) }   // content-only
+    const p: ImageBackgroundProps = first
     const s: Style = new Style()
-    s.resize = pStr(p, "resize", "cover")
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    return new Node("ImageBackground", s, pStr(p, "src", ""), kids)   // URL in text; children on top
+    s.resize = pvS(p, "resize", "cover")
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    return new Node("ImageBackground", s, pvS(p, "src", ""), kids)   // URL in text; children on top
 }
 /**
  * A native web view (WKWebView on iOS, android.webkit.WebView on Android) that
@@ -597,11 +813,12 @@ export function ImageBackground(p: map[string]Prop, kids: []Node): Node {
  * WebView({ url: "https://chuks.dev", grow: 1, radius: 12 })
  * ```
  */
-export function WebView(p: map[string]Prop): Node {
+dataType WebViewProps { ViewProps; url: string? }
+export function WebView(p: WebViewProps): Node {
     const s: Style = new Style()
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    return new Node("WebView", s, pStr(p, "url", ""), [])   // URL in the text channel
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    return new Node("WebView", s, pvS(p, "url", ""), [])   // URL in the text channel
 }
 
 /**
@@ -611,11 +828,12 @@ export function WebView(p: map[string]Prop): Node {
  * Camera2 preview on a TextureView. Grab a still from the running preview with
  * Camera.capturePreview(onResult, onError), which resolves a file:// path you can hand to Image.
  */
-export function CameraView(p: map[string]Prop): Node {
+dataType CameraViewProps { ViewProps; facing: string? }
+export function CameraView(p: CameraViewProps): Node {
     const s: Style = new Style()
-    if (p.get("radius") != null) { s.radius = pInt(p, "radius", 0) }
-    applyLayout(s, p)
-    return new Node("CameraView", s, pStr(p, "facing", "back"), [])   // facing in the text channel
+    if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
+    applyLayoutV(s, p)
+    return new Node("CameraView", s, pvS(p, "facing", "back"), [])   // facing in the text channel
 }
 /**
  * A tappable button showing title `t`. Pass `onPress` as a () -> void closure;
@@ -628,10 +846,13 @@ export function CameraView(p: map[string]Prop): Node {
  *          bg: ACCENT, color: "FFFFFF", h: 52, radius: 12 }, "Log in")
  * ```
  */
-export function Button(p: map[string]Prop, t: string): Node {
-    const s: Style = new Style(); s.fw = "bold"; applyLayout(s, p)
-    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
-    const n: Node = mkButton(s, t); applyEvents(n, p); return n
+dataType ButtonBaseProps { ViewProps; disabled: bool? }
+export function Button(first: ButtonBaseProps | string, t: string = ""): Node {
+    if (typeof(first) == "string") { return Button({}, first) }   // label-only: `Button("Save")`
+    const p: ButtonBaseProps = first
+    const s: Style = new Style(); s.fw = "bold"; applyLayoutV(s, p)
+    if (p["disabled"] != null) { s.disabled = pvB(p, "disabled", false) ? 1 : 0 }   // dim + block taps
+    const n: Node = mkButton(s, t); applyEventsV(n, p); return n
 }
 /**
  * A small rounded value badge (a compact tappable button). Defaults to 56x36.
@@ -642,12 +863,14 @@ export function Button(p: map[string]Prop, t: string): Node {
  * Pill({ onPress: function(): void { self.inc() } }, string(this.value))
  * ```
  */
-export function Pill(p: map[string]Prop, t: string): Node {
+export function Pill(first: ViewProps | string, t: string = ""): Node {
+    if (typeof(first) == "string") { return Pill({}, first) }   // label-only: `Pill("New")`
+    const p: ViewProps = first
     const s: Style = new Style()
-    s.w = pInt(p, "w", 56); s.h = pInt(p, "h", 36); s.radius = 10
-    s.bg = pStr(p, "bg", "222A3A"); s.fg = pStr(p, "color", "5B8CFF"); s.fs = 16; s.fw = "bold"
-    applyLayout(s, p)
-    const n: Node = mkButton(s, t); applyEvents(n, p); return n
+    s.w = pvI(p, "w", 56); s.h = pvI(p, "h", 36); s.radius = 10
+    s.bg = pvS(p, "bg", "222A3A"); s.fg = pvS(p, "color", "5B8CFF"); s.fs = 16; s.fw = "bold"
+    applyLayoutV(s, p)
+    const n: Node = mkButton(s, t); applyEventsV(n, p); return n
 }
 /**
  * A single-line text field. Pass `onChange` as a (string) -> void closure that
@@ -667,28 +890,35 @@ export function Pill(p: map[string]Prop, t: string): Node {
  *             onSubmit: function(): void { send() } })
  * ```
  */
-export function TextInput(p: map[string]Prop): Node {
+dataType TextInputProps {
+    ViewProps;
+    placeholder: string?; value: string?; secure: bool?; multiline: bool?;
+    keyboardType: string?; returnKeyType: string?; editable: bool?; autoFocus: bool?;
+    autoCapitalize: string?; autoCorrect: bool?; maxLength: int?;
+    onSubmit: (function(): void)?; onFocus: (function(): void)?; onBlur: (function(): void)?;
+}
+export function TextInput(p: TextInputProps): Node {
     const s: Style = new Style()
-    const multi: bool = pBool(p, "multiline", false)   // a multi-line text area vs a single-line field
-    s.h = pInt(p, "h", multi ? 96 : 44); s.bg = pStr(p, "bg", "FFFFFF"); s.radius = 10
-    s.fg = pStr(p, "color", "111318"); s.fs = 15; applyLayout(s, p)
-    if (pBool(p, "secure", false)) { s.sec = 1 }    // password field: mask input
-    s.kbType = pStr(p, "keyboardType", "")
-    s.retKey = pStr(p, "returnKeyType", "")
-    if (p.get("editable") != null) { s.editable = pBool(p, "editable", true) ? 1 : 0 }
-    if (p.get("autoFocus") != null) { s.autoFocus = pBool(p, "autoFocus", false) ? 1 : 0 }
-    s.autoCap = pStr(p, "autoCapitalize", "")
-    if (p.get("autoCorrect") != null) { s.autoCorr = pBool(p, "autoCorrect", true) ? 1 : 0 }
-    s.maxLen = pInt(p, "maxLength", -1)
+    const multi: bool = pvB(p, "multiline", false)   // a multi-line text area vs a single-line field
+    s.h = pvI(p, "h", multi ? 96 : 44); s.bg = pvS(p, "bg", "FFFFFF"); s.radius = 10
+    s.fg = pvS(p, "color", "111318"); s.fs = 15; applyLayoutV(s, p)
+    if (pvB(p, "secure", false)) { s.sec = 1 }    // password field: mask input
+    s.kbType = pvS(p, "keyboardType", "")
+    s.retKey = pvS(p, "returnKeyType", "")
+    if (p["editable"] != null) { s.editable = pvB(p, "editable", true) ? 1 : 0 }
+    if (p["autoFocus"] != null) { s.autoFocus = pvB(p, "autoFocus", false) ? 1 : 0 }
+    s.autoCap = pvS(p, "autoCapitalize", "")
+    if (p["autoCorrect"] != null) { s.autoCorr = pvB(p, "autoCorrect", true) ? 1 : 0 }
+    s.maxLen = pvI(p, "maxLength", -1)
     // multiline swaps the native widget (UITextView / TextEditor / multiline EditText)
-    const n: Node = multi ? mkTextArea(s, pStr(p, "placeholder", "")) : mkInput(s, pStr(p, "placeholder", ""))
+    const n: Node = multi ? mkTextArea(s, pvS(p, "placeholder", "")) : mkInput(s, pvS(p, "placeholder", ""))
     // Controlled value: mark it so the reconciler emits the V| channel and the host
     // mirrors the field to it (only when it differs, so the cursor never jumps).
-    if (p.get("value") != null) { n.hasVal = true; n.val = pStr(p, "value", "") }
-    n.onSubmit = p.get("onSubmit")
-    n.onFocus = p.get("onFocus")
-    n.onBlur = p.get("onBlur")
-    applyEvents(n, p); return n
+    if (p["value"] != null) { n.hasVal = true; n.val = pvS(p, "value", "") }
+    n.onSubmit = p["onSubmit"]
+    n.onFocus = p["onFocus"]
+    n.onBlur = p["onBlur"]
+    applyEventsV(n, p); return n
 }
 /**
  * A native on/off switch (UISwitch / SwiftUI Toggle / Android Switch/SwitchMaterial).
@@ -719,14 +949,20 @@ export function TextInput(p: map[string]Prop): Node {
  * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
  * ```
  */
-export function SafeAreaView(p: map[string]Prop, kids: []Node): Node {
-    const edges: string = pStr(p, "edges", "top,bottom")
+dataType SafeAreaViewProps { ViewProps; edges: string? }
+export function SafeAreaView(first: SafeAreaViewProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return SafeAreaView({}, first) }   // content-only (default edges)
+    const p: SafeAreaViewProps = first
+    const edges: string = pvS(p, "edges", "top,bottom")
     const all: bool = edges.contains("all")
     var out: []Node = []
     if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
     for (var i: int = 0; i < kids.length; i = i + 1) { out.push(kids[i]) }
     if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
-    const s: Style = new Style(); s.dir = "col"; applyLayout(s, p)
+    // Fill the available space by default (a screen-level wrapper), so a grow child
+    // like a Scroll has a bounded height to size into on the Yoga hosts (UIKit/Android).
+    // Overridable with grow:0 for a content-sized safe inset (e.g. a bottom bar).
+    const s: Style = new Style(); s.dir = "col"; s.grow = 1; applyLayoutV(s, p)
     return mkView(s, out)
 }
 // A fixed-height empty row (a safe-area spacer).
@@ -738,40 +974,62 @@ function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return m
  * use `Scroll` for a bounded set of mixed content. Vertical by default; pass
  * `horizontal: true` for a left-to-right carousel of mixed content.
  *
- * Props: `horizontal` (bool), `onRefresh` (() -> void) + `refreshing` (vertical only),
- * `stickBottom` (bool, vertical only), plus any layout/style prop.
+ * Props: `horizontal` (bool), `paging` (bool: snap one full screen per swipe),
+ * `onRefresh` (() -> void) + `refreshing` (vertical only), `stickBottom` (bool,
+ * vertical only), `onScroll` ((offset) -> void), `scrollTo` (int), plus any layout prop.
+ *
+ * `horizontal: true` + `paging: true` is a full-screen swipe carousel (an onboarding
+ * pager, an image gallery): each child is one page, the host snaps to the nearest,
+ * and swiping goes both ways. Size each page to `viewportWidth()`. Track the current
+ * page with `onScroll` (offset / page width) and jump with `scrollTo`.
  *
  * Like every scroll container, wrap the content in a SINGLE child (a Column for
  * vertical, a Row for horizontal); the host scroll view hosts exactly one child.
  *
  *     Scroll({}, [ Column({ gap: 12 }, [ Text(...), Card(...), Button(...) ]) ])
  *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
+ *     Scroll({ horizontal: true, paging: true }, [ Row([ page0, page1, page2 ]) ])
  */
-export function Scroll(p: map[string]Prop, kids: []Node): Node {
+dataType ScrollProps {
+    ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
+    onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
+}
+export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
+    // props-or-content: `Scroll([...])` is a default vertical scroll of the given content;
+    // `Scroll({...}, [...])` configures it. Discriminate by type (array = content, `{...}` = props).
+    if (typeof(first) == "array") {
+        const c: []Node = first
+        const s0: Style = new Style(); s0.dir = "col"; s0.grow = 1; s0.basis = 0
+        return new Node("Scroll", s0, "", c)
+    }
+    const p: ScrollProps = first  // narrowed to the dataType arm: typed field access below
     // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
     // HScroll (same control horizontal Lists use); children lay out in a row and the
     // content is measured wide, not clamped to the viewport. Vertical is the default.
-    const horizontal: bool = pBool(p, "horizontal", false)
+    const horizontal: bool = p.horizontal ?? false
     const s: Style = new Style()
     if (horizontal) { s.dir = "row"; s.horiz = 1 } else { s.dir = "col" }
     s.grow = 1; s.basis = 0
-    applyLayout(s, p)
+    // paging: snap one full screen per swipe (a carousel / onboarding pager). Works on both
+    // axes; combine with `horizontal` for a left-to-right paged carousel.
+    if (p.paging ?? false) { s.paging = 1 }
+    applyLayoutV(s, p)
     // Pull-to-refresh: `onRefresh` fires when the user pulls down at the top; the
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
     // Vertical only (a horizontal carousel has no pull-to-refresh).
-    const orf: Prop? = horizontal ? null : p.get("onRefresh")
-    if (orf != null) { s.rfsh = pBool(p, "refreshing", false) ? 1 : 0 }
+    const orf: (function(): void)? = horizontal ? null : p.onRefresh
+    if (orf != null) { s.rfsh = (p.refreshing ?? false) ? 1 : 0 }
     // stickBottom: a chat transcript stays pinned to the newest message. The host keeps the
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
-    if (!horizontal && pBool(p, "stickBottom", false)) { s.stick = 1 }
+    if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
     const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", kids)
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
-    const osc: Prop? = p.get("onScroll")
+    const osc: (function(v: string): void)? = p.onScroll
     if (osc != null) { n.onScroll = osc }
-    n.scrollTo = pInt(p, "scrollTo", -1)
+    n.scrollTo = p.scrollTo ?? -1
     return n
 }
 /**
@@ -788,15 +1046,18 @@ export function Scroll(p: map[string]Prop, kids: []Node): Node {
  * Pressable({ onPress: open, bg: CARD, radius: 12, pad: 16 }, [ Text(...) ])
  * ```
  */
-export function Pressable(p: map[string]Prop, kids: []Node): Node {
+dataType PressableProps { ViewProps; activeOpacity: int?; delayLongPress: int?; hitSlop: int?; disabled: bool? }
+export function Pressable(first: PressableProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Pressable({}, first) }   // content-only
+    const p: PressableProps = first
     const s: Style = new Style(); s.dir = "col"
-    s.press = pInt(p, "activeOpacity", 60)
-    s.longDelay = pInt(p, "delayLongPress", -1)           // onLongPress hold time (ms)
-    s.hitSlop = pInt(p, "hitSlop", -1)                    // extra tappable px beyond the bounds
-    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
-    applyLayout(s, p)
+    s.press = pvI(p, "activeOpacity", 60)
+    s.longDelay = pvI(p, "delayLongPress", -1)            // onLongPress hold time (ms)
+    s.hitSlop = pvI(p, "hitSlop", -1)                     // extra tappable px beyond the bounds
+    if (p["disabled"] != null) { s.disabled = pvB(p, "disabled", false) ? 1 : 0 }   // dim + block taps
+    applyLayoutV(s, p)
     const n: Node = mkView(s, kids)
-    applyEvents(n, p)   // onPress + onLongPress + onPressIn/onPressOut
+    applyEventsV(n, p)   // onPress + onLongPress + onPressIn/onPressOut
     return n
 }
 /**
@@ -809,11 +1070,11 @@ export function Pressable(p: map[string]Prop, kids: []Node): Node {
  * Spinner({ size: 28, color: ACCENT })
  * ```
  */
-export function Spinner(p: map[string]Prop): Node {
+export function Spinner(p: ViewProps): Node {
     const s: Style = new Style()
-    const sz: int = pInt(p, "size", 24)
-    s.fg = pStr(p, "color", s.fg)
-    applyLayout(s, p)
+    const sz: int = pvI(p, "size", 24)
+    s.fg = pvS(p, "color", s.fg)
+    applyLayoutV(s, p)
     // `size` is the spinner DIAMETER (w/h), not a font size — set after applyLayout
     // (which reads `size` as fs) so it wins and the spurious fs is cleared.
     s.w = sz; s.h = sz; s.fs = -1
@@ -830,16 +1091,17 @@ export function Spinner(p: map[string]Prop): Node {
  * Progress({ value: pct.get(), max: 100, color: ACCENT })
  * ```
  */
-export function Progress(p: map[string]Prop): Node {
-    const val: int = pInt(p, "value", 0)
-    const mx: int = pInt(p, "max", 100)
+dataType ProgressProps { ViewProps; value: int?; max: int? }
+export function Progress(p: ProgressProps): Node {
+    const val: int = pvI(p, "value", 0)
+    const mx: int = pvI(p, "max", 100)
     var pct: int = mx > 0 ? (val * 100) / mx : 0
     if (pct < 0) { pct = 0 }
     if (pct > 100) { pct = 100 }
     const s: Style = new Style()
-    s.fg = pStr(p, "color", "")     // fill tint
-    s.h = pInt(p, "h", 6)           // bar thickness
-    applyLayout(s, p)
+    s.fg = pvS(p, "color", "")      // fill tint
+    s.h = pvI(p, "h", 6)            // bar thickness
+    applyLayoutV(s, p)
     s.prog = pct                    // set after applyLayout (which doesn't touch prog)
     return mkProgress(s)
 }
@@ -859,12 +1121,13 @@ export function Progress(p: map[string]Prop): Node {
  * StatusBar({ style: "light", color: tk("primary") })
  * ```
  */
-export function StatusBar(p: map[string]Prop): Node {
+dataType StatusBarProps { ViewProps; hidden: bool?; style: string?; navColor: string? }
+export function StatusBar(p: StatusBarProps): Node {
     const s: Style = new Style()
-    s.sbHide = pBool(p, "hidden", false) ? 1 : 0
-    s.sbStyle = pStr(p, "style", "")
-    s.sbColor = pStr(p, "color", "")
-    s.sbNavColor = pStr(p, "navColor", "")
+    s.sbHide = pvB(p, "hidden", false) ? 1 : 0
+    s.sbStyle = pvS(p, "style", "")
+    s.sbColor = pvS(p, "color", "")
+    s.sbNavColor = pvS(p, "navColor", "")
     s.w = 0; s.h = 0
     return mkStatusBar(s)
 }
@@ -884,14 +1147,17 @@ export function StatusBar(p: map[string]Prop): Node {
  * ])
  * ```
  */
-export function Modal(p: map[string]Prop, kids: []Node): Node {
-    const vis: bool = pBool(p, "visible", false)
+dataType ModalProps { ViewProps; visible: bool?; position: string?; onDismiss: (function(): void)? }
+export function Modal(first: ModalProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Modal({}, first) }   // content-only (hidden until visible)
+    const p: ModalProps = first
+    const vis: bool = pvB(p, "visible", false)
     const s: Style = new Style()
     s.mvis = vis ? 1 : 0
-    s.mpos = pStr(p, "position", "center")
+    s.mpos = pvS(p, "position", "center")
     // Hidden: emit the node but with NO children, so the content isn't mounted.
     const n: Node = mkModal(s, vis ? kids : [])
-    const od: Prop? = p.get("onDismiss")     // scrim tap fires onDismiss (wired as onPress)
+    const od: any = p["onDismiss"]           // scrim tap fires onDismiss (wired as onPress)
     if (od != null) { n.onPress = od }
     return n
 }
@@ -922,15 +1188,22 @@ export function Modal(p: map[string]Prop, kids: []Node): Node {
  *         onCancel:  function(): void { confirming.set(false) } })
  * ```
  */
-export function Alert(p: map[string]Prop): Node {
+dataType AlertProps {
+    visible: bool?; title: string?; message: string?;
+    confirmText: string?; cancelText: string?; destructive: bool?;
+    buttons: string?; prompt: bool?; placeholder: string?; promptValue: string?;
+    onConfirm: (function(): void)?; onCancel: (function(): void)?;
+    onButton: (function(v: string): void)?; onSubmit: (function(v: string): void)?;
+}
+export function Alert(p: AlertProps): Node {
     const s: Style = new Style()
-    s.avis = pBool(p, "visible", false) ? 1 : 0
-    const title: string = pStr(p, "title", "")
-    const message: string = pStr(p, "message", "")
-    const isPrompt: bool = pBool(p, "prompt", false)
-    const placeholder: string = pStr(p, "placeholder", "")
-    const promptValue: string = pStr(p, "promptValue", "")
-    const buttonsProp: string = pStr(p, "buttons", "")
+    s.avis = pvB(p, "visible", false) ? 1 : 0
+    const title: string = pvS(p, "title", "")
+    const message: string = pvS(p, "message", "")
+    const isPrompt: bool = pvB(p, "prompt", false)
+    const placeholder: string = pvS(p, "placeholder", "")
+    const promptValue: string = pvS(p, "promptValue", "")
+    const buttonsProp: string = pvS(p, "buttons", "")
     // Build the button list in tap-index order. The user API takes `buttons` as a
     // pipe-separated string; internally each button is its own trailing TAB field (the
     // mutation protocol splits ops on '|', so a '|' in the text truncates it). Multi-
@@ -942,9 +1215,9 @@ export function Alert(p: map[string]Prop): Node {
     if (buttonsProp != "") {
         buttonList = buttonsProp.split("|")
     } else {
-        const confirm: string = pStr(p, "confirmText", "OK")
-        const cancel: string = pStr(p, "cancelText", "")
-        const confirmLabel: string = (pBool(p, "destructive", false) ? "!" : "") + confirm
+        const confirm: string = pvS(p, "confirmText", "OK")
+        const cancel: string = pvS(p, "cancelText", "")
+        const confirmLabel: string = (pvB(p, "destructive", false) ? "!" : "") + confirm
         if (cancel != "") { buttonList = ["~" + cancel, confirmLabel]; cancelIdx = 0; confirmIdx = 1 }
         else { buttonList = [confirmLabel]; confirmIdx = 0 }
     }
@@ -954,17 +1227,17 @@ export function Alert(p: map[string]Prop): Node {
     // The host reports the tapped button INDEX ("0","1",...), plus "\t<text>" for a
     // prompt. routeAlert (top-level, so its locals don't sit inside the captured
     // closure and miscompile under AOT) dispatches to the right callback.
-    const ob: Prop? = p.get("onButton")
-    const oc: Prop? = p.get("onConfirm")
-    const ox: Prop? = p.get("onCancel")
-    const os: Prop? = p.get("onSubmit")
+    const ob: any = p["onButton"]
+    const oc: any = p["onConfirm"]
+    const ox: any = p["onCancel"]
+    const os: any = p["onSubmit"]
     n.onChange = function(v: string): void { routeAlert(v, ob, oc, ox, os, confirmIdx, cancelIdx) }
     return n
 }
 // Route an Alert button tap. `v` is "<idx>" or "<idx>\t<promptText>". Multi-button
 // alerts fire onButton(idx); simple/prompt alerts map idx to onConfirm/onCancel and
 // pass the prompt text to onSubmit. Top-level (not a closure) so its locals are safe.
-function routeAlert(v: string, ob: Prop?, oc: Prop?, ox: Prop?, os: Prop?, confirmIdx: int, cancelIdx: int): void {
+function routeAlert(v: string, ob: any, oc: any, ox: any, os: any, confirmIdx: int, cancelIdx: int): void {
     const tab: int = v.indexOf("\t")
     const idxStr: string = tab >= 0 ? v.slice(0, tab) : v
     const text: string = tab >= 0 ? v.slice(tab + 1) : ""
@@ -974,15 +1247,16 @@ function routeAlert(v: string, ob: Prop?, oc: Prop?, ox: Prop?, os: Prop?, confi
     else if (idx == cancelIdx) { callOpt(ox) }
 }
 // Invoke an optional Prop closure (a () -> void callback), if present.
-function callOpt(cb: Prop?): void { if (cb != null) { const f: any = cb; f() } }
-export function Toggle(p: map[string]Prop): Node {
+function callOpt(cb: any): void { if (cb != null) { const f: any = cb; f() } }
+dataType ToggleProps { ViewProps; on: bool?; thumbColor: string?; disabled: bool? }
+export function Toggle(p: ToggleProps): Node {
     const s: Style = new Style()
-    s.swOn = pBool(p, "on", false) ? 1 : 0
-    s.swThumb = pStr(p, "thumbColor", "")                                          // thumb (knob) color
-    if (p.get("disabled") != null) { s.disabled = pBool(p, "disabled", false) ? 1 : 0 }   // dim + block taps
-    applyLayout(s, p)
+    s.swOn = pvB(p, "on", false) ? 1 : 0
+    s.swThumb = pvS(p, "thumbColor", "")                                         // thumb (knob) color
+    if (p["disabled"] != null) { s.disabled = pvB(p, "disabled", false) ? 1 : 0 }   // dim + block taps
+    applyLayoutV(s, p)
     const n: Node = mkSwitch(s)
-    applyEvents(n, p)
+    applyEventsV(n, p)
     return n
 }
 /**
@@ -1001,19 +1275,20 @@ export function Toggle(p: map[string]Prop): Node {
  *          onChange: function(v: string): void { vol.set(int(v)) } })
  * ```
  */
-export function Slider(p: map[string]Prop): Node {
+dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?; onSlidingComplete: (function(v: string): void)? }
+export function Slider(p: SliderProps): Node {
     const s: Style = new Style()
-    s.slmin = pInt(p, "min", 0)
-    s.slmax = pInt(p, "max", 100)
-    s.slval = pInt(p, "value", s.slmin)
+    s.slmin = pvI(p, "min", 0)
+    s.slmax = pvI(p, "max", 100)
+    s.slval = pvI(p, "value", s.slmin)
     if (s.slval < 0) { s.slval = 0 }            // keep the serialization sentinel valid
-    s.slstep = pInt(p, "step", 0)               // snap to multiples of step (0 = continuous)
-    s.h = pInt(p, "h", 40)
-    s.fg = pStr(p, "color", "")                 // optional active-track / thumb tint
-    applyLayout(s, p)
+    s.slstep = pvI(p, "step", 0)                // snap to multiples of step (0 = continuous)
+    s.h = pvI(p, "h", 40)
+    s.fg = pvS(p, "color", "")                  // optional active-track / thumb tint
+    applyLayoutV(s, p)
     const n: Node = mkSlider(s)
-    applyEvents(n, p)                           // onChange(v) fires on drag
-    const sc: Prop? = p.get("onSlidingComplete")
+    applyEventsV(n, p)                          // onChange(v) fires on drag
+    const sc: any = p["onSlidingComplete"]
     if (sc != null) { n.onSlideDone = sc }      // fires once with the final value on release
     return n
 }
@@ -1031,17 +1306,18 @@ export function Slider(p: map[string]Prop): Node {
  *        ["Low", "Medium", "High"])
  * ```
  */
-export function Select(p: map[string]Prop, options: []string): Node {
+dataType SelectProps { ViewProps; value: int? }
+export function Select(p: SelectProps, options: []string): Node {
     const s: Style = new Style()
-    s.seli = pInt(p, "value", 0)
+    s.seli = pvI(p, "value", 0)
     if (s.seli < 0) { s.seli = 0 }
-    s.h = pInt(p, "h", 44)
-    s.bg = pStr(p, "bg", "FFFFFF")
-    s.fg = pStr(p, "color", "111318")
-    s.radius = pInt(p, "radius", 10)
-    applyLayout(s, p)
+    s.h = pvI(p, "h", 44)
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
     const n: Node = mkSelect(s, options.join("\t"))   // options in the text channel
-    applyEvents(n, p)                                 // onChange(index) fires on pick
+    applyEventsV(n, p)                                // onChange(index) fires on pick
     return n
 }
 /**
@@ -1066,23 +1342,24 @@ export function Select(p: map[string]Prop, options: []string): Node {
  *              onChange: function(v: string): void { born.set(v) } })
  * ```
  */
-export function DatePicker(p: map[string]Prop): Node {
+dataType DatePickerProps { ViewProps; mode: string?; display: string?; value: string? }
+export function DatePicker(p: DatePickerProps): Node {
     const s: Style = new Style()
-    s.dpmode = pStr(p, "mode", "date")          // date | time | datetime
-    s.dpdisp = pStr(p, "display", "")           // "" compact field | "inline" always-open | "wheels"
+    s.dpmode = pvS(p, "mode", "date")           // date | time | datetime
+    s.dpdisp = pvS(p, "display", "")            // "" compact field | "inline" always-open | "wheels"
     // The compact field is a fixed-height row; inline/wheels size to their natural
     // (tall) height, so only clamp height for the compact display.
-    if (s.dpdisp == "") { s.h = pInt(p, "h", 44) }
-    else if (p.get("h") != null) { s.h = pInt(p, "h", -1) }
-    s.bg = pStr(p, "bg", "FFFFFF")
-    s.fg = pStr(p, "color", "111318")
-    s.radius = pInt(p, "radius", 10)
-    applyLayout(s, p)
+    if (s.dpdisp == "") { s.h = pvI(p, "h", 44) }
+    else if (p["h"] != null) { s.h = pvI(p, "h", -1) }
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
     // Compact opens on tap (popover / dialog); inline & wheels are always-open, so
     // each host builds a different view — carry that in the node kind.
     const kind: string = (s.dpdisp == "") ? "DatePicker" : "DatePickerInline"
-    const n: Node = mkDatePicker(kind, s, pStr(p, "value", ""))   // ISO value in the text channel
-    applyEvents(n, p)                                       // onChange(iso) fires on pick
+    const n: Node = mkDatePicker(kind, s, pvS(p, "value", ""))   // ISO value in the text channel
+    applyEventsV(n, p)                                      // onChange(iso) fires on pick
     return n
 }
 /**
@@ -1099,16 +1376,17 @@ export function DatePicker(p: map[string]Prop): Node {
  *      ["Share", "Rename", "Delete"])
  * ```
  */
-export function Menu(p: map[string]Prop, items: []string): Node {
+dataType MenuProps { ViewProps; label: string? }
+export function Menu(p: MenuProps, items: []string): Node {
     const s: Style = new Style()
-    s.h = pInt(p, "h", 44)
-    s.bg = pStr(p, "bg", "FFFFFF")
-    s.fg = pStr(p, "color", "111318")
-    s.radius = pInt(p, "radius", 10)
-    applyLayout(s, p)
-    const label: string = pStr(p, "label", "Menu")
+    s.h = pvI(p, "h", 44)
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
+    const label: string = pvS(p, "label", "Menu")
     const n: Node = mkMenu(s, label + "\t" + items.join("\t"))   // parts[0]=label, rest=items
-    applyEvents(n, p)                                            // onChange(index) fires on pick
+    applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
 /**
@@ -1123,11 +1401,11 @@ export function Menu(p: map[string]Prop, items: []string): Node {
  *             [ Card({ children: [ Text(tw("text-text"), "Long-press me") ] }) ])
  * ```
  */
-export function ContextMenu(p: map[string]Prop, items: []string, kids: []Node): Node {
+export function ContextMenu(p: ViewProps, items: []string, kids: []Node): Node {
     const s: Style = new Style()
-    applyLayout(s, p)
+    applyLayoutV(s, p)
     const n: Node = mkContextMenu(s, items.join("\t"), kids)     // items in the text channel
-    applyEvents(n, p)                                            // onChange(index) fires on pick
+    applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
 /**
@@ -1144,9 +1422,12 @@ export function ContextMenu(p: map[string]Prop, items: []string, kids: []Node): 
  * Grid({ cols: 3, gap: 10 }, [ tileA, tileB, tileC, tileD, tileE ])
  * ```
  */
-export function Grid(p: map[string]Prop, items: []Node): Node {
-    const cols: int = pInt(p, "cols", 2)
-    const gap: int = pInt(p, "gap", 10)
+dataType GridProps { ViewProps; cols: int? }
+export function Grid(first: GridProps | []Node, items: []Node = []): Node {
+    if (typeof(first) == "array") { return Grid({}, first) }   // content-only: `Grid([...])`
+    const p: GridProps = first
+    const cols: int = pvI(p, "cols", 2)
+    const gap: int = pvI(p, "gap", 10)
     var rows: []Node = []
     var i: int = 0
     while (i < items.length) {
@@ -1164,7 +1445,7 @@ export function Grid(p: map[string]Prop, items: []Node): Node {
         rows.push(Row({ gap: gap }, cells))
         i = i + cols
     }
-    const s: Style = new Style(); s.dir = "col"; applyLayout(s, p); s.gap = gap
+    const s: Style = new Style(); s.dir = "col"; applyLayoutV(s, p); s.gap = gap
     return mkView(s, rows)
 }
 /**
@@ -1179,13 +1460,14 @@ export function Grid(p: map[string]Prop, items: []Node): Node {
  * Map({ lat: "37.7749", lng: "-122.4194", zoom: "12", grow: 1 })
  * ```
  */
-export function Map(p: map[string]Prop): Node {
+dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string? }
+export function Map(p: MapProps): Node {
     const s: Style = new Style()
-    s.radius = pInt(p, "radius", 0)
-    applyLayout(s, p)
-    const lat: string = pStr(p, "lat", "37.7749")
-    const lng: string = pStr(p, "lng", "-122.4194")
-    const zoom: string = pStr(p, "zoom", "12")
+    s.radius = pvI(p, "radius", 0)
+    applyLayoutV(s, p)
+    const lat: string = pvS(p, "lat", "37.7749")
+    const lng: string = pvS(p, "lng", "-122.4194")
+    const zoom: string = pvS(p, "zoom", "12")
     return new Node("Map", s, lat + "," + lng + "," + zoom, [])   // "lat,lng,zoom" in the text channel
 }
 
@@ -1193,27 +1475,33 @@ export function Map(p: map[string]Prop): Node {
 // Each shape builder returns a compact descriptor string; Canvas joins them with ";"
 // into the node's text channel (fields comma-separated). A Path's `d` uses
 // space-separated SVG commands (M/L/Z) so it never contains a "," or ";".
-function si(p: map[string]Prop, k: string): string { return string(pInt(p, k, 0)) }
+function si(p: any, k: string): string { return string(pvI(p, k, 0)) }
 
+// Vector-shape props for Rect/Circle/Line/Path (SVG primitives, no layout).
+dataType ShapeProps {
+    x: int?; y: int?; w: int?; h: int?; cx: int?; cy: int?; r: int?;
+    x1: int?; y1: int?; x2: int?; y2: int?; strokeWidth: int?; radius: int?;
+    fill: string?; stroke: string?; d: string?;
+}
 /** A rectangle. Props: `x`, `y`, `w`, `h`, `fill`, `stroke`, `strokeWidth`, `radius`. */
-export function Rect(p: map[string]Prop): string {
+export function Rect(p: ShapeProps): string {
     return "rect," + si(p, "x") + "," + si(p, "y") + "," + si(p, "w") + "," + si(p, "h") + "," +
-        pStr(p, "fill", "") + "," + pStr(p, "stroke", "") + "," + si(p, "strokeWidth") + "," + si(p, "radius")
+        pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth") + "," + si(p, "radius")
 }
 /** A circle. Props: `cx`, `cy`, `r`, `fill`, `stroke`, `strokeWidth`. */
-export function Circle(p: map[string]Prop): string {
+export function Circle(p: ShapeProps): string {
     return "circle," + si(p, "cx") + "," + si(p, "cy") + "," + si(p, "r") + "," +
-        pStr(p, "fill", "") + "," + pStr(p, "stroke", "") + "," + si(p, "strokeWidth")
+        pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
 }
 /** A line. Props: `x1`, `y1`, `x2`, `y2`, `stroke`, `strokeWidth`. */
-export function Line(p: map[string]Prop): string {
+export function Line(p: ShapeProps): string {
     return "line," + si(p, "x1") + "," + si(p, "y1") + "," + si(p, "x2") + "," + si(p, "y2") + "," +
-        pStr(p, "stroke", "") + "," + string(pInt(p, "strokeWidth", 1))
+        pvS(p, "stroke", "") + "," + string(pvI(p, "strokeWidth", 1))
 }
 /** An SVG path (M / L / Z subset). Props: `d` (path data), `fill`, `stroke`, `strokeWidth`. */
-export function Path(p: map[string]Prop): string {
-    return "path," + pStr(p, "d", "") + "," + pStr(p, "fill", "") + "," +
-        pStr(p, "stroke", "") + "," + si(p, "strokeWidth")
+export function Path(p: ShapeProps): string {
+    return "path," + pvS(p, "d", "") + "," + pvS(p, "fill", "") + "," +
+        pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
 }
 /**
  * A native drawing surface. Renders a list of vector shapes (Rect / Circle / Line /
@@ -1230,11 +1518,13 @@ export function Path(p: map[string]Prop): string {
  * ])
  * ```
  */
-export function Canvas(p: map[string]Prop, shapes: []string): Node {
+export function Canvas(first: ViewProps | []string, shapes: []string = []): Node {
+    if (typeof(first) == "array") { return Canvas({}, first) }   // content-only: `Canvas([...shapes])`
+    const p: ViewProps = first
     const s: Style = new Style()
-    s.bg = pStr(p, "bg", "")
-    s.radius = pInt(p, "radius", 0)
-    applyLayout(s, p)
+    s.bg = pvS(p, "bg", "")
+    s.radius = pvI(p, "radius", 0)
+    applyLayoutV(s, p)
     return new Node("Canvas", s, shapes.join(";"), [])   // shapes joined in the text channel
 }
 /**
@@ -1251,14 +1541,21 @@ export function Canvas(p: map[string]Prop, shapes: []string): Node {
  * } }, [ card ])
  * ```
  */
-export function Gesture(p: map[string]Prop, kids: []Node): Node {
+dataType GestureProps {
+    ViewProps;
+    onGesture: (function(v: string): void)?; onPan: (function(v: string): void)?;
+    onPinch: (function(v: string): void)?; onRotate: (function(v: string): void)?;
+}
+export function Gesture(first: GestureProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Gesture({}, first) }   // content-only (no recognizers)
+    const p: GestureProps = first
     const s: Style = new Style()
-    applyLayout(s, p)
+    applyLayoutV(s, p)
     const n: Node = new Node("Gesture", s, "", kids)
-    const og: Prop? = p.get("onGesture")      // discrete: swipe/doubletap/longpress
-    const onPan: Prop? = p.get("onPan")        // continuous, each a function(v: string): void
-    const onPinch: Prop? = p.get("onPinch")
-    const onRotate: Prop? = p.get("onRotate")
+    const og: any = p["onGesture"]      // discrete: swipe/doubletap/longpress
+    const onPan: any = p["onPan"]        // continuous, each a function(v: string): void
+    const onPinch: any = p["onPinch"]
+    const onRotate: any = p["onRotate"]
     // Tell the host which CONTINUOUS recognizers to attach (text channel, comma list).
     // Attaching only the requested ones avoids fighting a Scroll and skips the discrete
     // swipe recognizer when pan is on (they both track drags).
@@ -1350,9 +1647,11 @@ export function decodeRotate(v: string): RotateEvent {
  * ])
  * ```
  */
-export function Screen(p: map[string]Prop, kids: []Node): Node {
-    const s: Style = new Style(); s.dir = "col"; s.pad = pInt(p, "pad", 12); s.gap = pInt(p, "gap", 10)
-    s.bg = pStr(p, "bg", "")
+export function Screen(first: ViewProps | []Node, kids: []Node = []): Node {
+    if (typeof(first) == "array") { return Screen({}, first) }   // content-only: `Screen([...])`
+    const p: ViewProps = first
+    const s: Style = new Style(); s.dir = "col"; s.pad = pvI(p, "pad", 12); s.gap = pvI(p, "gap", 10)
+    s.bg = pvS(p, "bg", "")
     return mkView(s, kids)
 }
 /**
@@ -1690,6 +1989,7 @@ export class Reconciler {
         const st: string = n.style.str()
         if (st != "") { this.emit("S|" + id + "|" + st) }
         if (n.text != "") { this.emit("P|" + id + "|" + n.text) }
+        if (n.opsChain != "") { this.emit("IF|" + id + "|" + n.opsChain) }   // Image GPU op-chain
         if (n.hasVal) { this.emit("V|" + id + "|" + n.val) }   // controlled TextInput value
         this.bindEvents(n, id)
         this.emit("I|" + id + "|" + parent + "|" + string(index))
@@ -1724,6 +2024,7 @@ export class Reconciler {
         if (next.kind == "List") { this.reconcileList(prev, next, id, parent, index); return }
         if (next.kind == "SectionList") { this.reconcileSectionList(prev, next, id, parent, index); return }
         if (p.text != next.text) { this.emit("P|" + id + "|" + next.text) }
+        if (p.opsChain != next.opsChain) { this.emit("IF|" + id + "|" + next.opsChain) }   // Image GPU op-chain change
         if (next.hasVal && (!p.hasVal || p.val != next.val)) { this.emit("V|" + id + "|" + next.val) }
         const ps: string = p.style.str()
         const ns: string = next.style.str()
@@ -2044,9 +2345,11 @@ export class Reconciler {
             this.listCount = count; this.listContentH = contentW
         }
 
+        // Windowing runs along the X axis: vpTop is the scroll's x-offset and vpW the
+        // viewport WIDTH (the host reports true width/height; it does not swap them).
         var c0: int = (this.vpTop - leftStart) / stride - buffer
         if (c0 < 0) { c0 = 0 }
-        var c1: int = (this.vpTop + this.vpH - leftStart) / stride + buffer + 1
+        var c1: int = (this.vpTop + this.vpW - leftStart) / stride + buffer + 1
         if (c1 > count) { c1 = count }
         if (c1 < c0) { c1 = c0 }
 

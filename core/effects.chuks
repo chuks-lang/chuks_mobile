@@ -1,0 +1,43 @@
+// GPU op-chain: the framework's generic image-effects primitive. Compose a chain of
+// primitive ops (data), and the native executor runs it on the GPU (Core Image on iOS,
+// GLES on Android). Ops are chosen for COMPOSITIONAL REACH, not for specific effects:
+// a `colorMatrix` expresses sepia among thousands of transforms, a `convolve` yields
+// blur/sharpen/edge from different kernels. Filters (sepia, vivid, ...) are packages that
+// compose these; core keeps only the mechanism. See docs/mobile-compute-and-effects.md.
+import { json } from "std/json";
+
+// One op is a `map[string]any` (a typed op record); `chain()` serializes a list of them
+// for the Image `ops` prop / gpuFilter. abi 1.
+
+// ── per-pixel color ──────────────────────────────────────────────────────────
+// 4x5 linear color transform (row-major, 20 floats: r' = m0*r+m1*g+m2*b+m3*a+m4, ...).
+export function colorMatrix(m: []float): map[string]any { return { "op": "colorMatrix", "m": m } }
+// Per-channel tone curve. `ch` = "rgb" | "r" | "g" | "b" | "luma". `pts` = control
+// points [[x,y]...] in 0..255, monotonically increasing x.
+export function curves(ch: string, pts: [][]int): map[string]any { return { "op": "curves", "ch": ch, "pts": pts } }
+// Arbitrary RGB->RGB grade from a 3D LUT image (a Hald/strip PNG asset or URL).
+export function lut3d(image: string): map[string]any { return { "op": "lut3d", "img": image } }
+// Map luminance to a color gradient (duotone/split-tone). `stops` = [[pos0..100, "RRGGBB"]...].
+export function gradientMap(stops: []any): map[string]any { return { "op": "gradientMap", "stops": stops } }
+// Posterize / quantize to `levels` bands per channel.
+export function threshold(levels: int): map[string]any { return { "op": "threshold", "levels": levels } }
+
+// ── spatial (one generic op; kernels are data) ───────────────────────────────
+// Convolution. `k` = the kernel weights, `w` = kernel width (k.length == w*w for a 2D
+// kernel). `sep` = true means `k` is a 1D separable kernel run as two O(r) passes (fast
+// large blur / bloom). Blur/sharpen/edge/emboss are all just different kernels.
+export function convolve(k: []float, w: int, sep: bool): map[string]any { return { "op": "convolve", "k": k, "w": w, "sep": sep } }
+
+// ── composite + generate ─────────────────────────────────────────────────────
+// Composite an overlay (image asset/URL, or a generated source id) with a blend mode
+// ("normal"|"multiply"|"screen"|"overlay"|"add"|"softlight"|"difference"), opacity 0..100.
+export function blend(source: string, mode: string, opacity: int): map[string]any { return { "op": "blend", "src": source, "mode": mode, "opacity": opacity } }
+// Generate a gradient as a source for blend. `kind` = "linear" | "radial". `stops` as in
+// gradientMap. `geo` = [x0,y0,x1,y1] (0..100, endpoints for linear; center+edge for radial).
+export function gradient(kind: string, stops: []any, geo: []int): map[string]any { return { "op": "gradient", "kind": kind, "stops": stops, "geo": geo } }
+// Generate noise as a source for blend (film grain, dither). `kind` = "film" | "white".
+export function noise(kind: string, scale: int): map[string]any { return { "op": "noise", "kind": kind, "scale": scale } }
+
+// Serialize an op-chain for the Image `ops` prop / gpuFilter. JSON, so it rides the IF op
+// (host splits on '|' and rejoins) and the capability channel unchanged.
+export function chain(ops: []map[string]any): string { return json.stringify(ops) }

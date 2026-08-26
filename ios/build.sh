@@ -73,7 +73,7 @@ YOGA_INC="$SDKROOT/core/yoga/include"     # shared Yoga headers (in the package)
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )
-BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated sources live under ~/.chuks/cache
+BD="$( { set +o pipefail; ls -dt "$HOME"/.chuks/cache/builds/*/ 2>/dev/null | head -1; } )"   # generated sources live under ~/.chuks/cache (pipefail-safe: ls SIGPIPEs when many build dirs exist)
 
 echo "2. Building the iOS engine ($PLATLABEL)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
@@ -90,7 +90,7 @@ if [ "$ENGINE" = "swiftui" ]; then
     # Preview adds its connect/scan entry and the CHUKS_PREVIEW flag (drops the per-app @main).
     PREVIEW_SRC=""; PREVIEW_FLAG=""
     [ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW"; }
-    swiftc "$PKGDIR/ChuksAppSwiftUI.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
+    swiftc "$PKGDIR/ChuksAppSwiftUI.swift" "$PKGDIR/ChuksEffects.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" \
         "$OUT/libapp.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \
@@ -103,7 +103,7 @@ else
     # (drops the per-app @main, hands the connect screen off to CardsVC). SwiftUI needs SwiftUI framework.
     PREVIEW_SRC=""; PREVIEW_FLAG=""; PREVIEW_FW=""
     [ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT"; PREVIEW_FW="-framework SwiftUI -framework AVKit"; }
-    swiftc "$PKGDIR/ChuksApp.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
+    swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
         -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
         "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
         -Xclang-linker -Wno-incompatible-sysroot \

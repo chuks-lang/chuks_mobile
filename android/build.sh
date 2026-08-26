@@ -48,7 +48,7 @@ OUTABS="$(cd "$OUT" && pwd)"   # absolute; the .so is compiled inside the cache 
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )   # --c-archive emits the chuks_* C-ABI bridge
-BD="$(ls -dt "$HOME"/.chuks/cache/builds/*/ | head -1)"   # generated sources live here, under ~/.chuks/cache
+BD="$( { set +o pipefail; ls -dt "$HOME"/.chuks/cache/builds/*/ 2>/dev/null | head -1; } )"   # generated sources live here, under ~/.chuks/cache
 # Stage the JNI bridge + cgo link flags + Yoga (from the PACKAGE) next to the generated Go.
 cp "$PKGDIR/jni.cpp" "$PKGDIR/cgo_android.go" "$BD/"
 mkdir -p "$BD/yoga"; cp "$PKGDIR/yoga/libyoga.a" "$BD/yoga/"; cp -r "$SDKROOT/core/yoga/include" "$BD/yoga/"
@@ -58,7 +58,7 @@ echo "2. Building the Android engine (arm64)"
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" . )
 
 echo "3. Building the Android host${PREVIEW:+ (Chuks Preview)}"
-KT_SRC="$PKGDIR/MainActivity.kt"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
+KT_SRC="$PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
 if [ "$PREVIEW" = "1" ]; then
     KT_SRC="$KT_SRC $PKGDIR/ConnectActivity.kt $PKGDIR/ScannerActivity.kt"   # + in-app QR scanner
     [ -f "$ZXING" ] && KT_CP="$AJAR:$ZXING"

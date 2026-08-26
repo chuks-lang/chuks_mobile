@@ -93,6 +93,11 @@ object N {
     external fun yCalc(node: Long, w: Float, h: Float)
     external fun yGet(node: Long, which: Int): Float
     external fun ySetF(node: Long, key: Int, v: Float)
+    external fun ySetTextMeasure(node: Long)
+    external fun yMarkDirty(node: Long)
+    var measureCb: ((Long, Float, Int) -> Long)? = null
+    @JvmStatic fun measureTextNode(node: Long, width: Float, wmode: Int): Long =
+        measureCb?.invoke(node, width, wmode) ?: 0L
 
     // Host wake: registers a native callback (jni.cpp) that a background Chuks task
     // fires when it posts work to the render thread. onNativeWake is called FROM that
@@ -280,6 +285,10 @@ class MainActivity : Activity() {
         root.post { reportInsets(); relayout(); if (pushViewport()) relayout() }
         root.setOnApplyWindowInsetsListener { _, insets -> reportInsets(); insets }   // update on inset changes
 
+        // Text measure callback: needed in BOTH dev and production (the wake/heartbeat setup
+        // below is split by devMode, but Yoga's text measurement is not).
+        N.measureCb = { node, width, wmode -> measureTextNode(node, width, wmode) }
+
         if (devMode) {
             // Poll the dev server off the main thread; when it comes back after a chuks
             // watch restart, remount so the edit shows with no rebuild.
@@ -409,14 +418,26 @@ class MainActivity : Activity() {
 
     // ---- viewport / scroll -------------------------------------------------
     private fun pushViewport(): Boolean {
-        val sc = listScroll ?: return false
-        // Horizontal list: report the x-offset + width as the scroll window (main axis) and the
-        // height as the cross size. Vertical list reports y + height + width.
-        val mainExtent = if (listHoriz) sc.width else sc.height
-        if (mainExtent <= 0) return false
+        val sc = listScroll
+        if (sc == null) {
+            // No scroll/list on screen: still report the full root viewport so
+            // viewportWidth()/viewportHeight() are populated (e.g. for computing a Text
+            // wrap width). Without this they stay 0 on scroll-less screens.
+            val rw = root.width; val rh = root.height
+            if (rw <= 0 || rh <= 0) return false
+            val wDp = (rw / density).toInt(); val hDp = (rh / density).toInt()
+            if (devMode) { applyStream(devBlocking("/viewport", "0 $hDp $wDp")); return true }
+            if (N.viewport(0, hDp, wDp) > 0) { applyDrain(); return true }
+            return false
+        }
+        // top is the scroll offset along the MAIN axis (x for a horizontal list, y otherwise);
+        // height/width are ALWAYS the true viewport dimensions (never swapped), so
+        // viewportWidth()/viewportHeight() stay correct. The reconciler picks vpW vs vpH as the
+        // windowing extent per the list's orientation.
         val topDp = ((if (listHoriz) sc.scrollX else sc.scrollY) / density).toInt()
-        val hDp = (mainExtent / density).toInt()
-        val wDp = ((if (listHoriz) sc.height else sc.width) / density).toInt()
+        val hDp = (sc.height / density).toInt()
+        val wDp = (sc.width / density).toInt()
+        if (hDp <= 0 || wDp <= 0) return false
         if (devMode) { applyStream(devBlocking("/viewport", "$topDp $hDp $wDp")); return true }
         if (N.viewport(topDp, hDp, wDp) > 0) { applyDrain(); return true }
         return false
@@ -446,6 +467,10 @@ class MainActivity : Activity() {
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
                 "SC" -> if (f.size >= 2) sliderDone[f[1]] = f[1] + ":slidedone"          // Slider onSlidingComplete
                 "SS" -> if (f.size >= 2) scrollOnScroll[f[1]] = f[1] + ":scroll"         // Scroll onScroll
+                "IF" -> if (f.size >= 3) {                                                // Image GPU op-chain (JSON; rejoin '|')
+                    imageOpChain[f[1]] = f.drop(2).joinToString("|")
+                    imageOrigBmp[f[1]]?.let { b -> (views[f[1]] as? ImageView)?.setImageBitmap(runOps(f[1], b)) }
+                }
                 "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
@@ -1418,11 +1443,13 @@ class MainActivity : Activity() {
                 N.ySetF(n, 5, sw.measuredWidth.toFloat()); N.ySetF(n, 6, sw.measuredHeight.toFloat())
             }
             "Scroll" -> SnapScrollView(this).also { sc ->
+                N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full height
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
                 listScroll = sc; scrollId = id; listHoriz = false }
-            "HScroll" -> HorizontalScrollView(this).also { sc ->   // horizontal list (carousel)
+            "HScroll" -> SnapHScrollView(this).also { sc ->   // horizontal list (carousel); snaps when paging=1
+                N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full width
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
@@ -1436,7 +1463,10 @@ class MainActivity : Activity() {
         }
         views[id] = v
         ynodes[id] = n
+        if (v is TextView && v !is Button && v !is EditText) { textNodes[n] = v; N.ySetTextMeasure(n) }
     }
+
+    private val textNodes = HashMap<Long, TextView>()
 
     // pending visual state per view (bg color + radius) -> a GradientDrawable
     private val bgColor = HashMap<String, Int>()
@@ -1454,6 +1484,8 @@ class MainActivity : Activity() {
     private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
     private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
+    private val imageOpChain = HashMap<String, String>()       // id -> Image GPU op-chain (JSON)
+    private val imageOrigBmp = HashMap<String, android.graphics.Bitmap>()   // id -> pre-op bitmap, for re-applying a changed chain
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
     private val videoControlsIds = HashSet<String>()           // ids that show a native MediaController
     private val videoMediaControllers = HashMap<String, android.widget.MediaController>()  // id -> attached controller
@@ -1461,6 +1493,8 @@ class MainActivity : Activity() {
     private val progressPollers = HashMap<String, Runnable>()  // id -> the active progress poll Runnable
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
+    private val borderStyleM = HashMap<String, String>()   // border style: dashed | dotted
+    private val bwSideM = HashMap<String, FloatArray>()     // per-side border [t,r,b,l] (px)
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
     private val explicitHeight = HashSet<String>()       // ids with an explicit `h`; a Button then keeps it instead of self-measuring
     private val iconFonts = HashMap<String, android.graphics.Typeface>()   // custom fonts by name, cached
@@ -1475,9 +1509,18 @@ class MainActivity : Activity() {
         // this a previous bordered/filled element leaves its border/bg under the new
         // one (e.g. a stray outline around a row that later holds a Switch).
         bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
+        borderStyleM.remove(id); bwSideM.remove(id)
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
+        var weightStr = ""    // font-weight name (thin..black); "" = default
+        var italicText = false
+        var deco = ""         // underline | strike
+        var txform = ""       // upper | lower | cap
+        var tracking = -9999f // letter spacing (px); em-normalized by font size at apply
+        var leading = -1f     // line height (px)
+        // per-corner radius (rtl/rtr/rbr/rbl), px; -1 = unset
+        var rcTL = -1f; var rcTR = -1f; var rcBR = -1f; var rcBL = -1f
         var slV = -1; var slMin = 0; var slMax = 100   // Slider: collected in-loop, applied after (order-independent)
         // animation: collect transform + opacity, apply (animated) after the loop
         var tx = 0f; var ty = 0f; var sc = 1f; var rot = 0f
@@ -1488,7 +1531,7 @@ class MainActivity : Activity() {
             val k = p[0]; val vl = p[1]
             val f = vl.toFloatOrNull() ?: 0f
             when (k) {
-                "d" -> N.ySetF(n, 0, if (vl == "row") 1f else 0f)
+                "d" -> N.ySetF(n, 0, when (vl) { "row" -> 1f; "row-reverse" -> 2f; "col-reverse" -> 3f; else -> 0f })
                 "j" -> N.ySetF(n, 1, justify(vl))
                 "a" -> N.ySetF(n, 2, align(vl))
                 "g" -> N.ySetF(n, 3, f)
@@ -1504,6 +1547,13 @@ class MainActivity : Activity() {
                     // content to measure to its true (tall) height so the List scrolls.
                     v.minimumHeight = dpf(f).toInt() }
                 "p" -> N.ySetF(n, 7, dpf(f))
+                "px" -> N.ySetF(n, 14, dpf(f))   // horizontal padding
+                "py" -> N.ySetF(n, 15, dpf(f))   // vertical padding
+                "pt" -> N.ySetF(n, 16, dpf(f)); "pr" -> N.ySetF(n, 17, dpf(f)); "pb" -> N.ySetF(n, 18, dpf(f)); "pl" -> N.ySetF(n, 19, dpf(f))
+                "mt" -> N.ySetF(n, 20, dpf(f)); "mr" -> N.ySetF(n, 21, dpf(f)); "mb" -> N.ySetF(n, 22, dpf(f)); "ml" -> N.ySetF(n, 23, dpf(f))
+                "minw" -> N.ySetF(n, 24, dpf(f)); "maxw" -> N.ySetF(n, 25, dpf(f)); "minh" -> N.ySetF(n, 26, dpf(f)); "maxh" -> N.ySetF(n, 27, dpf(f))
+                "wpct" -> N.ySetF(n, 28, f); "hpct" -> N.ySetF(n, 29, f); "aspect" -> N.ySetF(n, 30, f)
+                "bottom" -> N.ySetF(n, 31, dpf(f))
                 "gap" -> N.ySetF(n, 8, dpf(f))
                 "pos" -> if (vl == "abs") N.ySetF(n, 9, 0f)
                 "top" -> N.ySetF(n, 10, dpf(f))
@@ -1521,6 +1571,11 @@ class MainActivity : Activity() {
                 "r" -> bgRadius[id] = dpf(f)
                 "bw" -> borderW[id] = dpf(f)
                 "bc" -> borderC[id] = Color.parseColor("#$vl")
+                "bstyle" -> if (vl == "dashed" || vl == "dotted") borderStyleM[id] = vl
+                "bwt" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[0] = dpf(f)
+                "bwr" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[1] = dpf(f)
+                "bwb" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[2] = dpf(f)
+                "bwl" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[3] = dpf(f)
                 "opacity" -> opacity = f / 100f
                 "tx" -> { tx = f; hasTransform = true }
                 "ty" -> { ty = f; hasTransform = true }
@@ -1532,7 +1587,29 @@ class MainActivity : Activity() {
                 "glass" -> if (vl == "1") glassIds.add(id) else glassIds.remove(id)
                 "wrap" -> N.ySetF(n, 13, if (vl == "wrap") 1f else 0f)
                 "fs" -> fsPx = dpf(f)
-                "fw" -> bold = (vl == "bold" || vl == "semibold")
+                "fw" -> { weightStr = vl; bold = (vl == "bold" || vl == "semibold" || vl == "extrabold" || vl == "black") }
+                "fontfam" -> customFont = vl                       // font-family
+                "italic" -> italicText = (vl == "1")
+                "deco" -> deco = if (vl == "none") "" else vl      // underline/strike
+                "txform" -> txform = if (vl == "none") "" else vl  // upper/lower/cap
+                "tracking" -> tracking = dpf(f)                    // letter spacing (px)
+                "leading" -> leading = dpf(f)                      // line height (px)
+                "hidden" -> {                                      // display:none — out of layout + gone
+                    val hid = (vl == "1")
+                    v.visibility = if (hid) View.GONE else View.VISIBLE
+                    N.ySetF(n, 32, if (hid) 1f else 0f)
+                }
+                "overflow" -> {   // overflow-hidden: clip children to the (rounded) bounds, like iOS clipsToBounds
+                    val clip = (vl == "hidden")
+                    (v as? ViewGroup)?.clipChildren = clip
+                    v.clipToOutline = clip   // rounds the clip to the bg drawable's outline
+                }
+                "self" -> N.ySetF(n, 33, align(vl))                // align-self
+                "z" -> v.translationZ = dpf(f)                     // z-index
+                "rtl" -> rcTL = dpf(f)
+                "rtr" -> rcTR = dpf(f)
+                "rbr" -> rcBR = dpf(f)
+                "rbl" -> rcBL = dpf(f)
                 "slv" -> slV = f.toInt()                 // Slider: current value
                 "slmin" -> slMin = f.toInt()             // Slider: min
                 "slmax" -> slMax = f.toInt()             // Slider: max
@@ -1566,12 +1643,16 @@ class MainActivity : Activity() {
                     videoPlayers[id]?.let { try { it.isLooping = lp } catch (e: Exception) {} }
                 }
                 "vfit" -> {}                    // cover is the default; contain reserved for a later slice
-                "paging" -> (v as? SnapScrollView)?.pageSnap = (vl == "1")   // List/Scroll snap-per-screen
+                "paging" -> {   // List/Scroll snap-per-screen (vertical feed or horizontal carousel)
+                    (v as? SnapScrollView)?.pageSnap = (vl == "1")
+                    (v as? SnapHScrollView)?.pageSnap = (vl == "1")
+                }
                 "stick" -> if (v is ScrollView) stickBottomOn = (vl == "1")   // Scroll stickBottom (chat)
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
                 "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (UIKit/SwiftUI do), an explicit `ellip` overrides
-                    it.maxLines = f.toInt()
-                    if (it.ellipsize == null) it.ellipsize = android.text.TextUtils.TruncateAt.END
+                    val n = f.toInt()                 // nlines=-1 means "no cap" -> unlimited, and no forced ellipsis
+                    if (n > 0) { it.maxLines = n; if (it.ellipsize == null) it.ellipsize = android.text.TextUtils.TruncateAt.END }
+                    else { it.maxLines = Integer.MAX_VALUE }
                     measureText(id, it) }
                 "ellip" -> (v as? TextView)?.let {                                                    // Text truncation mode
                     it.ellipsize = when (vl) { "head" -> android.text.TextUtils.TruncateAt.START
@@ -1580,6 +1661,7 @@ class MainActivity : Activity() {
                 "dis" -> { v.alpha = if (vl == "1") 0.4f else 1f; v.isEnabled = (vl != "1")            // disabled: dim + block
                     if (vl == "1") disabledIds.add(id) else disabledIds.remove(id) }
                 "tint" -> (v as? ImageView)?.let { val c = Color.parseColor("#" + vl); imageTint[id] = c; it.setColorFilter(c) }   // Image tintColor
+                "filt" -> (v as? ImageView)?.let { val m = photoMatrix(vl); if (m != null) it.colorFilter = android.graphics.ColorMatrixColorFilter(m) else it.clearColorFilter() }   // Image photo filter
                 "seek" -> videoPlayers[id]?.let { mp ->                                                // Video seek (seconds)
                     val secs = f.toInt()
                     if (videoSeek[id] != secs) { videoSeek[id] = secs; try { mp.seekTo(secs * 1000) } catch (e: Exception) {} } }
@@ -1653,8 +1735,47 @@ class MainActivity : Activity() {
         }
         (v as? TextView)?.let {
             it.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, fsPx)
-            if (customFont.isNotEmpty()) it.typeface = iconFont(customFont)
-            else it.setTypeface(null, if (bold) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
+            // Typeface: family (icon/custom font) or system, with bold/italic style bits.
+            val styleBits = (if (bold) android.graphics.Typeface.BOLD else 0) or
+                            (if (italicText) android.graphics.Typeface.ITALIC else 0)
+            val base = if (customFont.isNotEmpty()) iconFont(customFont) else android.graphics.Typeface.DEFAULT
+            it.setTypeface(base, styleBits)
+            // Finer weights (thin/light/medium) on API 28+, keeping the italic bit.
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                val wgt = when (weightStr) {
+                    "thin" -> 100; "extralight" -> 200; "light" -> 300; "normal", "regular" -> 400
+                    "medium" -> 500; "semibold" -> 600; "bold" -> 700; "extrabold" -> 800; "black" -> 900
+                    else -> -1
+                }
+                if (wgt > 0) it.typeface = android.graphics.Typeface.create(base ?: android.graphics.Typeface.DEFAULT, wgt, italicText)
+            }
+            // Decoration: underline / line-through via paint flags (preserve antialias).
+            var flags = it.paintFlags and
+                (android.graphics.Paint.UNDERLINE_TEXT_FLAG or android.graphics.Paint.STRIKE_THRU_TEXT_FLAG).inv()
+            if (deco == "underline") flags = flags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
+            if (deco == "strike") flags = flags or android.graphics.Paint.STRIKE_THRU_TEXT_FLAG
+            it.paintFlags = flags
+            // Letter spacing is em-relative on Android; convert px -> em by the font size.
+            it.letterSpacing = if (tracking != -9999f && fsPx > 0f) tracking / fsPx else 0f
+            // Line height (leading).
+            if (leading >= 0f && android.os.Build.VERSION.SDK_INT >= 28) it.lineHeight = leading.toInt()
+            // Case transform.
+            it.transformationMethod = when (txform) {
+                "upper" -> object : android.text.method.ReplacementTransformationMethod() {
+                    override fun getOriginal() = CharArray(0); override fun getReplacement() = CharArray(0)
+                    override fun getTransformation(source: CharSequence?, v: View?): CharSequence = source?.toString()?.uppercase() ?: ""
+                }
+                "lower" -> object : android.text.method.ReplacementTransformationMethod() {
+                    override fun getOriginal() = CharArray(0); override fun getReplacement() = CharArray(0)
+                    override fun getTransformation(source: CharSequence?, v: View?): CharSequence = source?.toString()?.lowercase() ?: ""
+                }
+                "cap" -> object : android.text.method.ReplacementTransformationMethod() {
+                    override fun getOriginal() = CharArray(0); override fun getReplacement() = CharArray(0)
+                    override fun getTransformation(source: CharSequence?, v: View?): CharSequence =
+                        source?.toString()?.split(" ")?.joinToString(" ") { w -> w.replaceFirstChar { c -> c.uppercase() } } ?: ""
+                }
+                else -> null
+            }
             // Size/font/width just changed; re-measure so wrapped height (and any
             // fixed width) are correct regardless of style-vs-text op order.
             if (it.text.isNotEmpty()) measureText(id, it)
@@ -1683,12 +1804,30 @@ class MainActivity : Activity() {
             }
         }
         // bg + radius + border -> GradientDrawable (a large radius clamps to a pill)
-        if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id)) {
+        val hasPerCorner = rcTL >= 0f || rcTR >= 0f || rcBR >= 0f || rcBL >= 0f
+        val side = bwSideM[id]
+        if (side != null && v !is TextureView) {   // per-side border: a custom drawable draws the set edges
+            val bc = borderC[id] ?: Color.parseColor("#334155")
+            v.background = SideBorderDrawable(bgColor[id] ?: Color.TRANSPARENT, bgRadius[id] ?: 0f,
+                if (side[0] >= 0f) side[0] else 0f, if (side[1] >= 0f) side[1] else 0f,
+                if (side[2] >= 0f) side[2] else 0f, if (side[3] >= 0f) side[3] else 0f, bc)
+        } else if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id) || hasPerCorner) {
             val gd = GradientDrawable()
             gd.setColor(if (glassIds.contains(id)) Color.argb(56, 255, 255, 255) else (bgColor[id] ?: Color.TRANSPARENT))   // frosted translucent
-            gd.cornerRadius = bgRadius[id] ?: 0f
+            if (hasPerCorner) {   // rounded-t-*, rounded-bl-*, … : per-corner radii (tl, tr, br, bl x2)
+                val tl = if (rcTL >= 0f) rcTL else 0f; val tr = if (rcTR >= 0f) rcTR else 0f
+                val br = if (rcBR >= 0f) rcBR else 0f; val bl = if (rcBL >= 0f) rcBL else 0f
+                gd.cornerRadii = floatArrayOf(tl, tl, tr, tr, br, br, bl, bl)
+            } else gd.cornerRadius = bgRadius[id] ?: 0f
             val bw = borderW[id]
-            if (bw != null && bw > 0f) gd.setStroke(bw.toInt(), borderC[id] ?: Color.parseColor("#334155"))
+            if (bw != null && bw > 0f) {
+                val bc = borderC[id] ?: Color.parseColor("#334155")
+                when (borderStyleM[id]) {   // dashed/dotted -> a dashed stroke
+                    "dashed" -> gd.setStroke(bw.toInt(), bc, dpf(6f), dpf(3f))
+                    "dotted" -> gd.setStroke(bw.toInt(), bc, dpf(1.5f), dpf(2.5f))
+                    else -> gd.setStroke(bw.toInt(), bc)
+                }
+            }
             else if (glassIds.contains(id)) gd.setStroke(dpf(1f).toInt(), Color.argb(40, 255, 255, 255))   // subtle glass rim
             if (v !is TextureView) v.background = gd   // TextureView rejects a background drawable (rounded below via outline)
         } else if (v !is Switch && v !is TextureView && !modalIds.contains(id)) {
@@ -1943,14 +2082,14 @@ class MainActivity : Activity() {
         if (t.startsWith("file://")) {                                        // picked/captured local file
             (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->
                 var ok = false
-                try { iv.setImageBitmap(android.graphics.BitmapFactory.decodeFile(t.substring(7))); ok = true } catch (e: Exception) {}
+                try { android.graphics.BitmapFactory.decodeFile(t.substring(7))?.let { iv.setImageBitmap(bmpFor(it, id)) }; ok = true } catch (e: Exception) {}
                 (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
                 return
             }
         }
         (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->            // bundled local asset (e.g. chuks-logo.png)
             var ok = false
-            if (t.isNotEmpty()) try { assets.open(t).use { iv.setImageBitmap(android.graphics.BitmapFactory.decodeStream(it)) }; ok = true } catch (e: Exception) {}
+            if (t.isNotEmpty()) try { assets.open(t).use { android.graphics.BitmapFactory.decodeStream(it)?.let { b -> iv.setImageBitmap(bmpFor(b, id)) } }; ok = true } catch (e: Exception) {}
             (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
             return
         }
@@ -2038,21 +2177,24 @@ class MainActivity : Activity() {
     }
 
     // eager text self-sizing (the Android analogue of Yoga's measure func)
+    // Text/style changed; the node owns a Yoga measure callback, so mark it dirty and Yoga
+    // re-invokes measureTextNode with the resolved width on the next layout.
     private fun measureText(id: String, tv: TextView) {
         val n = ynodes[id] ?: return
-        val fixedW = textWidthPx[id]
-        val unspecH = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        if (fixedW != null) {
-            // Explicit width: measure CONSTRAINED so the text wraps, keep that width,
-            // and report the wrapped height. (Measuring UNSPECIFIED here would report the
-            // single-line width and clobber the width, so the text never wraps.)
-            tv.measure(View.MeasureSpec.makeMeasureSpec(fixedW.toInt(), View.MeasureSpec.EXACTLY), unspecH)
-            N.ySetF(n, 6, tv.measuredHeight.toFloat())
-        } else {
-            tv.measure(unspecH, unspecH)
-            N.ySetF(n, 5, tv.measuredWidth.toFloat())
-            N.ySetF(n, 6, tv.measuredHeight.toFloat())
+        N.yMarkDirty(n)
+    }
+
+    // Yoga measure callback (from jni.cpp during layout): measure the TextView at the width
+    // Yoga resolved, so text wraps to its container. wmode: 0 undefined, 1 exactly, 2 at-most.
+    private fun measureTextNode(node: Long, width: Float, wmode: Int): Long {
+        val tv = textNodes[node] ?: return 0L
+        val wSpec = when (wmode) {
+            1 -> View.MeasureSpec.makeMeasureSpec(width.toInt(), View.MeasureSpec.EXACTLY)
+            2 -> View.MeasureSpec.makeMeasureSpec(width.toInt(), View.MeasureSpec.AT_MOST)
+            else -> View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         }
+        tv.measure(wSpec, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+        return (tv.measuredWidth.toLong() shl 32) or (tv.measuredHeight.toLong() and 0xffffffffL)
     }
 
     // A Button self-sizes its HEIGHT to its label (like iOS). Button subclasses
@@ -2066,6 +2208,23 @@ class MainActivity : Activity() {
         val unspec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         b.measure(unspec, unspec)
         N.ySetF(n, 6, b.measuredHeight.toFloat())
+    }
+
+    // Image `filter`: a GPU photo-filter preset as a ColorMatrix applied to the ImageView
+    // (drawn on the hardware layer). null = no filter (normal/none). Mirrors the iOS CIFilter set.
+    private fun photoMatrix(preset: String): android.graphics.ColorMatrix? {
+        val cm = android.graphics.ColorMatrix()
+        when (preset) {
+            "mono" -> cm.setSaturation(0f)
+            "noir" -> { cm.setSaturation(0f); cm.postConcat(android.graphics.ColorMatrix(floatArrayOf(1.5f,0f,0f,0f,-40f, 0f,1.5f,0f,0f,-40f, 0f,0f,1.5f,0f,-40f, 0f,0f,0f,1f,0f))) }
+            "sepia" -> { cm.setSaturation(0f); cm.postConcat(android.graphics.ColorMatrix(floatArrayOf(1f,0f,0f,0f,40f, 0f,1f,0f,0f,20f, 0f,0f,1f,0f,-20f, 0f,0f,0f,1f,0f))) }
+            "vivid" -> cm.setSaturation(1.6f)
+            "cool" -> cm.set(floatArrayOf(0.9f,0f,0f,0f,0f, 0f,1f,0f,0f,0f, 0f,0f,1.18f,0f,0f, 0f,0f,0f,1f,0f))
+            "warm" -> cm.set(floatArrayOf(1.18f,0f,0f,0f,0f, 0f,1.02f,0f,0f,0f, 0f,0f,0.85f,0f,0f, 0f,0f,0f,1f,0f))
+            "fade" -> { cm.setSaturation(0.72f); cm.postConcat(android.graphics.ColorMatrix(floatArrayOf(1f,0f,0f,0f,22f, 0f,1f,0f,0f,22f, 0f,0f,1f,0f,22f, 0f,0f,0f,1f,0f))) }
+            else -> return null
+        }
+        return cm
     }
 
     // A vector drawing surface: parses the ";"-joined shape descriptors and draws them
@@ -2299,6 +2458,59 @@ class MainActivity : Activity() {
         }
     }
 
+    // The horizontal counterpart: snaps to the nearest full-width page after a drag/fling
+    // settles (a swipe carousel / onboarding pager). Same pure-platform approach as
+    // SnapScrollView, snapping by the viewport WIDTH instead of height.
+    inner class SnapHScrollView(ctx: Context) : HorizontalScrollView(ctx) {
+        var pageSnap = false
+        private var lastX = -1
+        private val settle = object : Runnable {
+            override fun run() {
+                if (!pageSnap) return
+                if (scrollX == lastX) {
+                    val pw = width
+                    if (pw > 0) {
+                        val target = Math.round(scrollX.toFloat() / pw) * pw
+                        if (target != scrollX) smoothScrollTo(target, 0)
+                    }
+                } else { lastX = scrollX; postDelayed(this, 80) }
+            }
+        }
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            val handled = super.onTouchEvent(ev)
+            if (pageSnap && (ev.action == MotionEvent.ACTION_UP || ev.action == MotionEvent.ACTION_CANCEL)) {
+                lastX = -1; removeCallbacks(settle); postDelayed(settle, 80)
+            }
+            return handled
+        }
+    }
+
+    // Draws a (rounded) background fill plus per-side border edges. Android has no native
+    // per-side border, so we paint the edges ourselves. Radius applies to the fill only.
+    inner class SideBorderDrawable(
+        private val bg: Int, private val radius: Float,
+        private val t: Float, private val r: Float, private val b: Float, private val l: Float,
+        private val borderColor: Int
+    ) : android.graphics.drawable.Drawable() {
+        private val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        override fun draw(canvas: android.graphics.Canvas) {
+            val bd = bounds
+            val L = bd.left.toFloat(); val T = bd.top.toFloat(); val R = bd.right.toFloat(); val B = bd.bottom.toFloat()
+            if (bg != Color.TRANSPARENT) {
+                p.style = android.graphics.Paint.Style.FILL; p.color = bg
+                canvas.drawRoundRect(L, T, R, B, radius, radius, p)
+            }
+            p.color = borderColor
+            if (t > 0f) canvas.drawRect(L, T, R, T + t, p)
+            if (b > 0f) canvas.drawRect(L, B - b, R, B, p)
+            if (l > 0f) canvas.drawRect(L, T, L + l, B, p)
+            if (r > 0f) canvas.drawRect(R - r, T, R, B, p)
+        }
+        override fun setAlpha(a: Int) {}
+        override fun setColorFilter(cf: android.graphics.ColorFilter?) {}
+        override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
+    }
+
     private fun bytesToHex(b: ByteArray?): String {
         if (b == null) return ""
         val sb = StringBuilder(b.size * 2)
@@ -2476,7 +2688,7 @@ class MainActivity : Activity() {
 
     private fun remove(id: String) {
         views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
-        ynodes[id]?.let { val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
+        ynodes[id]?.let { textNodes.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
@@ -2713,8 +2925,15 @@ class MainActivity : Activity() {
         return out
     }
     private fun bmpFor(bmp: android.graphics.Bitmap, id: String): android.graphics.Bitmap {
-        val r = imageBlur[id] ?: return bmp
-        return if (r > 0f) blurBitmap(bmp, r) else bmp
+        val r = imageBlur[id] ?: 0f
+        val base = if (r > 0f) blurBitmap(bmp, r) else bmp
+        imageOrigBmp[id] = base
+        return runOps(id, base)
+    }
+    // Run the Image GPU op-chain (effects.chain) on the GPU, if set (else the base bitmap).
+    private fun runOps(id: String, bmp: android.graphics.Bitmap): android.graphics.Bitmap {
+        val j = imageOpChain[id]
+        return if (j.isNullOrEmpty()) bmp else try { ChuksEffects.run(bmp, j) } catch (e: Exception) { bmp }
     }
 
     private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {
