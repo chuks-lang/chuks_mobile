@@ -93,6 +93,11 @@ object N {
     external fun yCalc(node: Long, w: Float, h: Float)
     external fun yGet(node: Long, which: Int): Float
     external fun ySetF(node: Long, key: Int, v: Float)
+    external fun ySetTextMeasure(node: Long)
+    external fun yMarkDirty(node: Long)
+    var measureCb: ((Long, Float, Int) -> Long)? = null
+    @JvmStatic fun measureTextNode(node: Long, width: Float, wmode: Int): Long =
+        measureCb?.invoke(node, width, wmode) ?: 0L
 
     // Host wake: registers a native callback (jni.cpp) that a background Chuks task
     // fires when it posts work to the render thread. onNativeWake is called FROM that
@@ -279,6 +284,10 @@ class MainActivity : Activity() {
         // first layout after the window is measured
         root.post { reportInsets(); relayout(); if (pushViewport()) relayout() }
         root.setOnApplyWindowInsetsListener { _, insets -> reportInsets(); insets }   // update on inset changes
+
+        // Text measure callback: needed in BOTH dev and production (the wake/heartbeat setup
+        // below is split by devMode, but Yoga's text measurement is not).
+        N.measureCb = { node, width, wmode -> measureTextNode(node, width, wmode) }
 
         if (devMode) {
             // Poll the dev server off the main thread; when it comes back after a chuks
@@ -1452,7 +1461,10 @@ class MainActivity : Activity() {
         }
         views[id] = v
         ynodes[id] = n
+        if (v is TextView && v !is Button && v !is EditText) { textNodes[n] = v; N.ySetTextMeasure(n) }
     }
+
+    private val textNodes = HashMap<Long, TextView>()
 
     // pending visual state per view (bg color + radius) -> a GradientDrawable
     private val bgColor = HashMap<String, Int>()
@@ -2142,21 +2154,24 @@ class MainActivity : Activity() {
     }
 
     // eager text self-sizing (the Android analogue of Yoga's measure func)
+    // Text/style changed; the node owns a Yoga measure callback, so mark it dirty and Yoga
+    // re-invokes measureTextNode with the resolved width on the next layout.
     private fun measureText(id: String, tv: TextView) {
         val n = ynodes[id] ?: return
-        val fixedW = textWidthPx[id]
-        val unspecH = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        if (fixedW != null) {
-            // Explicit width: measure CONSTRAINED so the text wraps, keep that width,
-            // and report the wrapped height. (Measuring UNSPECIFIED here would report the
-            // single-line width and clobber the width, so the text never wraps.)
-            tv.measure(View.MeasureSpec.makeMeasureSpec(fixedW.toInt(), View.MeasureSpec.EXACTLY), unspecH)
-            N.ySetF(n, 6, tv.measuredHeight.toFloat())
-        } else {
-            tv.measure(unspecH, unspecH)
-            N.ySetF(n, 5, tv.measuredWidth.toFloat())
-            N.ySetF(n, 6, tv.measuredHeight.toFloat())
+        N.yMarkDirty(n)
+    }
+
+    // Yoga measure callback (from jni.cpp during layout): measure the TextView at the width
+    // Yoga resolved, so text wraps to its container. wmode: 0 undefined, 1 exactly, 2 at-most.
+    private fun measureTextNode(node: Long, width: Float, wmode: Int): Long {
+        val tv = textNodes[node] ?: return 0L
+        val wSpec = when (wmode) {
+            1 -> View.MeasureSpec.makeMeasureSpec(width.toInt(), View.MeasureSpec.EXACTLY)
+            2 -> View.MeasureSpec.makeMeasureSpec(width.toInt(), View.MeasureSpec.AT_MOST)
+            else -> View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         }
+        tv.measure(wSpec, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+        return (tv.measuredWidth.toLong() shl 32) or (tv.measuredHeight.toLong() and 0xffffffffL)
     }
 
     // A Button self-sizes its HEIGHT to its label (like iOS). Button subclasses
@@ -2624,7 +2639,7 @@ class MainActivity : Activity() {
 
     private fun remove(id: String) {
         views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
-        ynodes[id]?.let { val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
+        ynodes[id]?.let { textNodes.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }

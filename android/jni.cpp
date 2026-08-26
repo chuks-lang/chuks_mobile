@@ -99,13 +99,46 @@ JNIEXPORT void JNICALL J(setWake)(JNIEnv* e, jobject) {
 }
 
 // ---- Yoga (handle-based) ----
-JNIEXPORT jlong JNICALL J(yNew)(JNIEnv*, jobject) { return (jlong)YGNodeNew(); }
+// Shared config: opt into Yoga's classic "errata" layout so a measured Text re-wraps to
+// its resolved width (matches the iOS host).
+static YGConfigRef gYogaConfig = nullptr;
+static YGConfigRef yogaConfig() {
+    if (!gYogaConfig) { gYogaConfig = YGConfigNew(); YGConfigSetErrata(gYogaConfig, YGErrataAll); }
+    return gYogaConfig;
+}
+// Text measure callback: Yoga calls this for a text leaf during layout with the resolved
+// width constraint; we hop into Kotlin (N.measureTextNode) to measure the real TextView so
+// Text wraps to its container width without an explicit width, like the iOS host does.
+static JNIEnv*   gLayoutEnv    = nullptr;
+static jclass    gMeasureClass = nullptr;
+static jmethodID gMeasureMid   = nullptr;
+static YGSize androidTextMeasure(YGNodeConstRef node, float width, YGMeasureMode wmode, float, YGMeasureMode) {
+    if (!gLayoutEnv || !gMeasureClass || !gMeasureMid) return YGSize{0, 0};
+    jlong packed = gLayoutEnv->CallStaticLongMethod(gMeasureClass, gMeasureMid, (jlong)node, (jfloat)width, (jint)wmode);
+    return YGSize{(float)(int)(packed >> 32), (float)(int)(packed & 0xffffffff)};
+}
+JNIEXPORT jlong JNICALL J(yNew)(JNIEnv*, jobject) { return (jlong)YGNodeNewWithConfig(yogaConfig()); }
+JNIEXPORT void JNICALL J(ySetTextMeasure)(JNIEnv* e, jobject, jlong n) {
+    if (!gMeasureClass) {
+        jclass cls = e->FindClass("com/chuks/app/N");
+        if (cls) { gMeasureClass = (jclass)e->NewGlobalRef(cls);
+                   gMeasureMid = e->GetStaticMethodID(gMeasureClass, "measureTextNode", "(JFI)J"); }
+    }
+    YGNodeSetMeasureFunc((YGNodeRef)n, androidTextMeasure);
+}
+JNIEXPORT void JNICALL J(yMarkDirty)(JNIEnv*, jobject, jlong n) {
+    if (YGNodeHasMeasureFunc((YGNodeRef)n)) YGNodeMarkDirty((YGNodeRef)n);
+}
 JNIEXPORT void  JNICALL J(yInsert)(JNIEnv*, jobject, jlong p, jlong c, jint i) { YGNodeInsertChild((YGNodeRef)p, (YGNodeRef)c, (size_t)i); }
 JNIEXPORT void  JNICALL J(yRemove)(JNIEnv*, jobject, jlong p, jlong c) { YGNodeRemoveChild((YGNodeRef)p, (YGNodeRef)c); }
 JNIEXPORT jlong JNICALL J(yOwner)(JNIEnv*, jobject, jlong n) { return (jlong)YGNodeGetOwner((YGNodeRef)n); }
 JNIEXPORT jint  JNICALL J(yChildCount)(JNIEnv*, jobject, jlong n) { return (jint)YGNodeGetChildCount((YGNodeRef)n); }
 JNIEXPORT void  JNICALL J(yFree)(JNIEnv*, jobject, jlong n) { YGNodeFreeRecursive((YGNodeRef)n); }
-JNIEXPORT void  JNICALL J(yCalc)(JNIEnv*, jobject, jlong n, jfloat w, jfloat h) { YGNodeCalculateLayout((YGNodeRef)n, w, h, YGDirectionLTR); }
+JNIEXPORT void  JNICALL J(yCalc)(JNIEnv* e, jobject, jlong n, jfloat w, jfloat h) {
+    gLayoutEnv = e;
+    YGNodeCalculateLayout((YGNodeRef)n, w, h, YGDirectionLTR);
+    gLayoutEnv = nullptr;
+}
 JNIEXPORT jfloat JNICALL J(yGet)(JNIEnv*, jobject, jlong n, jint which) {
     YGNodeRef y = (YGNodeRef)n;
     switch (which) {

@@ -164,7 +164,8 @@ export function tw(classes: string): map[string]Prop {
         else if (t == "flex-nowrap") { p["wrap"] = "nowrap" }
         else if (t == "hidden") { p["hidden"] = true }
         // ---- flex grow / shrink / basis ----
-        else if (t == "flex-1" || t == "grow" || t == "grow-1") { p["grow"] = 1 }
+        else if (t == "flex-1") { p["grow"] = 1; p["basis"] = 0 }   // Tailwind flex-1 = flex: 1 1 0% (grow + basis 0 so it wraps to the space left, not its natural width)
+        else if (t == "grow" || t == "grow-1") { p["grow"] = 1 }
         else if (t == "grow-0" || t == "flex-none") { p["grow"] = 0 }
         else if (twHas(t, "basis-")) { const v: int = twLen(twRest(t, "basis-")); if (v >= 0) { p["basis"] = v } else if (twRest(t, "basis-") == "full") { p["basis"] = 0 } }
         // ---- alignment ----
