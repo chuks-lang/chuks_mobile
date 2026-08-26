@@ -830,6 +830,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var labelKern: [String: CGFloat] = [:]      // tracking (letter spacing, px)
     var labelLead: [String: CGFloat] = [:]      // leading (target line height, px)
     var labelTransform: [String: String] = [:]  // upper | lower | cap
+    var dashBorders: [String: (CGFloat, UIColor, Bool)] = [:]                     // id -> (width, color, dotted)
+    var sideBorders: [String: (CGFloat, CGFloat, CGFloat, CGFloat, UIColor)] = [:] // id -> (t, r, b, l, color)
     var imageOpChain: [String: String] = [:]                             // id -> Image GPU op-chain (JSON)
     var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter/op swap re-applies from the original
     var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
@@ -2092,6 +2094,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         var labelDirty = false // a typography key changed -> rebuild the attributed text
         // per-corner radius (rtl/rtr/rbr/rbl): collect, apply maskedCorners after the loop
         var rc = (tl: CGFloat(-1), tr: CGFloat(-1), br: CGFloat(-1), bl: CGFloat(-1))
+        // border: collect width/color/style + per-side widths; a dashed/dotted or per-side
+        // border is drawn by a sublayer in relayout (needs the laid-out frame).
+        var borderStyle = "", borderColorHex = ""
+        var bwSide = (t: CGFloat(-1), r: CGFloat(-1), b: CGFloat(-1), l: CGFloat(-1))
         // animation: collect transform + opacity across the loop, apply (animated) after
         var tx: CGFloat = 0, ty: CGFloat = 0, sc: CGFloat = 1, rot: CGFloat = 0
         var hasTransform = false, opacity: CGFloat? = nil, animMs = -1, animEz = ""
@@ -2345,7 +2351,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "left":  YGNodeStyleSetPosition(n, YGEdge.left, f)
             case "right": YGNodeStyleSetPosition(n, YGEdge.right, f)
             case "bw":  v.layer.borderWidth = CGFloat(f)
-            case "bc":  v.layer.borderColor = hexColor(val).cgColor
+            case "bc":  v.layer.borderColor = hexColor(val).cgColor; borderColorHex = val
+            case "bstyle": borderStyle = val                      // solid | dashed | dotted
+            case "bwt": bwSide.t = CGFloat(f)
+            case "bwr": bwSide.r = CGFloat(f)
+            case "bwb": bwSide.b = CGFloat(f)
+            case "bwl": bwSide.l = CGFloat(f)
             case "opacity": opacity = CGFloat(f) / 100.0
             case "tx": tx = CGFloat(f); hasTransform = true
             case "ty": ty = CGFloat(f); hasTransform = true
@@ -2410,6 +2421,42 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             v.layer.maskedCorners = corners
             v.layer.cornerRadius = radius
             v.clipsToBounds = !hasShadow
+        }
+        // Dashed/dotted border -> a shape sublayer in relayout; clear the solid layer border.
+        if (borderStyle == "dashed" || borderStyle == "dotted"), v.layer.borderWidth > 0, !borderColorHex.isEmpty {
+            dashBorders[id] = (v.layer.borderWidth, hexColor(borderColorHex), borderStyle == "dotted")
+            v.layer.borderWidth = 0
+        } else { dashBorders[id] = nil }
+        // Per-side border -> edge sublayers in relayout.
+        if (bwSide.t >= 0 || bwSide.r >= 0 || bwSide.b >= 0 || bwSide.l >= 0), !borderColorHex.isEmpty {
+            sideBorders[id] = (max(0, bwSide.t), max(0, bwSide.r), max(0, bwSide.b), max(0, bwSide.l), hexColor(borderColorHex))
+        } else { sideBorders[id] = nil }
+        if dashBorders[id] != nil || sideBorders[id] != nil { view.setNeedsLayout() }
+    }
+
+    // Draw dashed/dotted and per-side borders as sublayers, sized to the laid-out frame.
+    // Called from relayout after each view's frame is set.
+    func updateBorderLayers(_ id: String, _ v: UIView) {
+        let dashKey = "chuksDashBorder", sideKey = "chuksSideBorder"
+        if let (w, col, dotted) = dashBorders[id] {
+            let sl = (v.layer.sublayers?.first { $0.name == dashKey } as? CAShapeLayer) ?? {
+                let l = CAShapeLayer(); l.name = dashKey; l.fillColor = nil; v.layer.addSublayer(l); return l }()
+            sl.frame = v.bounds
+            sl.path = UIBezierPath(roundedRect: v.bounds.insetBy(dx: w / 2, dy: w / 2),
+                                   cornerRadius: max(0, v.layer.cornerRadius - w / 2)).cgPath
+            sl.lineWidth = w; sl.strokeColor = col.cgColor
+            sl.lineDashPattern = dotted ? [0.01, NSNumber(value: Double(w * 2))]
+                                        : [NSNumber(value: Double(w * 3)), NSNumber(value: Double(w * 2))]
+            sl.lineCap = dotted ? .round : .butt
+        } else { v.layer.sublayers?.first { $0.name == dashKey }?.removeFromSuperlayer() }
+        v.layer.sublayers?.filter { $0.name == sideKey }.forEach { $0.removeFromSuperlayer() }
+        if let (t, r, b, l, col) = sideBorders[id] {
+            let W = v.bounds.width, H = v.bounds.height
+            func edge(_ rect: CGRect) { let e = CALayer(); e.name = sideKey; e.frame = rect; e.backgroundColor = col.cgColor; v.layer.addSublayer(e) }
+            if t > 0 { edge(CGRect(x: 0, y: 0, width: W, height: t)) }
+            if b > 0 { edge(CGRect(x: 0, y: H - b, width: W, height: b)) }
+            if l > 0 { edge(CGRect(x: 0, y: 0, width: l, height: H)) }
+            if r > 0 { edge(CGRect(x: W - r, y: 0, width: r, height: H)) }
         }
     }
 
@@ -2937,6 +2984,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 else { vv.bounds = CGRect(origin: .zero, size: fr.size); vv.center = CGPoint(x: fr.midX, y: fr.midY) }
             }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
+            if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
         }
         // place the whole Chuks app in the safe area, below the diagnostics header

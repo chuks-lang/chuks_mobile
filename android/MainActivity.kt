@@ -1493,6 +1493,8 @@ class MainActivity : Activity() {
     private val progressPollers = HashMap<String, Runnable>()  // id -> the active progress poll Runnable
     private val borderW = HashMap<String, Float>()   // border width (px)
     private val borderC = HashMap<String, Int>()     // border color
+    private val borderStyleM = HashMap<String, String>()   // border style: dashed | dotted
+    private val bwSideM = HashMap<String, FloatArray>()     // per-side border [t,r,b,l] (px)
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
     private val explicitHeight = HashSet<String>()       // ids with an explicit `h`; a Button then keeps it instead of self-measuring
     private val iconFonts = HashMap<String, android.graphics.Typeface>()   // custom fonts by name, cached
@@ -1507,6 +1509,7 @@ class MainActivity : Activity() {
         // this a previous bordered/filled element leaves its border/bg under the new
         // one (e.g. a stray outline around a row that later holds a Switch).
         bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
+        borderStyleM.remove(id); bwSideM.remove(id)
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
@@ -1568,6 +1571,11 @@ class MainActivity : Activity() {
                 "r" -> bgRadius[id] = dpf(f)
                 "bw" -> borderW[id] = dpf(f)
                 "bc" -> borderC[id] = Color.parseColor("#$vl")
+                "bstyle" -> if (vl == "dashed" || vl == "dotted") borderStyleM[id] = vl
+                "bwt" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[0] = dpf(f)
+                "bwr" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[1] = dpf(f)
+                "bwb" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[2] = dpf(f)
+                "bwl" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[3] = dpf(f)
                 "opacity" -> opacity = f / 100f
                 "tx" -> { tx = f; hasTransform = true }
                 "ty" -> { ty = f; hasTransform = true }
@@ -1797,7 +1805,13 @@ class MainActivity : Activity() {
         }
         // bg + radius + border -> GradientDrawable (a large radius clamps to a pill)
         val hasPerCorner = rcTL >= 0f || rcTR >= 0f || rcBR >= 0f || rcBL >= 0f
-        if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id) || hasPerCorner) {
+        val side = bwSideM[id]
+        if (side != null && v !is TextureView) {   // per-side border: a custom drawable draws the set edges
+            val bc = borderC[id] ?: Color.parseColor("#334155")
+            v.background = SideBorderDrawable(bgColor[id] ?: Color.TRANSPARENT, bgRadius[id] ?: 0f,
+                if (side[0] >= 0f) side[0] else 0f, if (side[1] >= 0f) side[1] else 0f,
+                if (side[2] >= 0f) side[2] else 0f, if (side[3] >= 0f) side[3] else 0f, bc)
+        } else if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id) || hasPerCorner) {
             val gd = GradientDrawable()
             gd.setColor(if (glassIds.contains(id)) Color.argb(56, 255, 255, 255) else (bgColor[id] ?: Color.TRANSPARENT))   // frosted translucent
             if (hasPerCorner) {   // rounded-t-*, rounded-bl-*, … : per-corner radii (tl, tr, br, bl x2)
@@ -1806,7 +1820,14 @@ class MainActivity : Activity() {
                 gd.cornerRadii = floatArrayOf(tl, tl, tr, tr, br, br, bl, bl)
             } else gd.cornerRadius = bgRadius[id] ?: 0f
             val bw = borderW[id]
-            if (bw != null && bw > 0f) gd.setStroke(bw.toInt(), borderC[id] ?: Color.parseColor("#334155"))
+            if (bw != null && bw > 0f) {
+                val bc = borderC[id] ?: Color.parseColor("#334155")
+                when (borderStyleM[id]) {   // dashed/dotted -> a dashed stroke
+                    "dashed" -> gd.setStroke(bw.toInt(), bc, dpf(6f), dpf(3f))
+                    "dotted" -> gd.setStroke(bw.toInt(), bc, dpf(1.5f), dpf(2.5f))
+                    else -> gd.setStroke(bw.toInt(), bc)
+                }
+            }
             else if (glassIds.contains(id)) gd.setStroke(dpf(1f).toInt(), Color.argb(40, 255, 255, 255))   // subtle glass rim
             if (v !is TextureView) v.background = gd   // TextureView rejects a background drawable (rounded below via outline)
         } else if (v !is Switch && v !is TextureView && !modalIds.contains(id)) {
@@ -2462,6 +2483,32 @@ class MainActivity : Activity() {
             }
             return handled
         }
+    }
+
+    // Draws a (rounded) background fill plus per-side border edges. Android has no native
+    // per-side border, so we paint the edges ourselves. Radius applies to the fill only.
+    inner class SideBorderDrawable(
+        private val bg: Int, private val radius: Float,
+        private val t: Float, private val r: Float, private val b: Float, private val l: Float,
+        private val borderColor: Int
+    ) : android.graphics.drawable.Drawable() {
+        private val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        override fun draw(canvas: android.graphics.Canvas) {
+            val bd = bounds
+            val L = bd.left.toFloat(); val T = bd.top.toFloat(); val R = bd.right.toFloat(); val B = bd.bottom.toFloat()
+            if (bg != Color.TRANSPARENT) {
+                p.style = android.graphics.Paint.Style.FILL; p.color = bg
+                canvas.drawRoundRect(L, T, R, B, radius, radius, p)
+            }
+            p.color = borderColor
+            if (t > 0f) canvas.drawRect(L, T, R, T + t, p)
+            if (b > 0f) canvas.drawRect(L, B - b, R, B, p)
+            if (l > 0f) canvas.drawRect(L, T, L + l, B, p)
+            if (r > 0f) canvas.drawRect(R - r, T, R, B, p)
+        }
+        override fun setAlpha(a: Int) {}
+        override fun setColorFilter(cf: android.graphics.ColorFilter?) {}
+        override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
     }
 
     private fun bytesToHex(b: ByteArray?): String {

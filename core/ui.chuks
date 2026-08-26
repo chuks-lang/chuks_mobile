@@ -56,6 +56,7 @@ export class Style {
     var left: int
     var right: int
     var bw: int         // border width (px)
+    var bwT: int; var bwR: int; var bwB: int; var bwL: int   // per-side border width (px); -1 = unset
     var bc: string      // border color hex
     var shadow: int     // elevation: 1 small, 2 medium, 3 large
     var glass: int      // Liquid Glass material: 1 = on (iOS 26 glassEffect; blur fallback elsewhere)
@@ -131,7 +132,7 @@ export class Style {
         this.overflow = ""; this.hidden = -1; this.selfAlign = ""; this.bStyle = ""
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
-        this.bw = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
+        this.bw = -1; this.bwT = -1; this.bwR = -1; this.bwB = -1; this.bwL = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
         this.swOn = -1; this.swThumb = ""; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
@@ -205,6 +206,10 @@ export class Style {
         if (this.left >= 0) { s = s + "left=" + string(this.left) + ";" }
         if (this.right >= 0) { s = s + "right=" + string(this.right) + ";" }
         if (this.bw >= 0) { s = s + "bw=" + string(this.bw) + ";" }
+        if (this.bwT >= 0) { s = s + "bwt=" + string(this.bwT) + ";" }
+        if (this.bwR >= 0) { s = s + "bwr=" + string(this.bwR) + ";" }
+        if (this.bwB >= 0) { s = s + "bwb=" + string(this.bwB) + ";" }
+        if (this.bwL >= 0) { s = s + "bwl=" + string(this.bwL) + ";" }
         if (this.bc != "") { s = s + "bc=" + this.bc + ";" }
         if (this.shadow >= 0) { s = s + "shadow=" + string(this.shadow) + ";" }
         if (this.glass >= 0) { s = s + "glass=" + string(this.glass) + ";" }
@@ -467,6 +472,8 @@ function applyLayout(s: Style, p: map[string]Prop): void {
     s.right = pInt(p, "right", s.right)
     s.dir = pStr(p, "dir", s.dir)               // flex-direction (Row/Column set this too)
     s.bw = pInt(p, "border", s.bw)              // border width
+    s.bwT = pInt(p, "borderTop", s.bwT); s.bwR = pInt(p, "borderRight", s.bwR)   // per-side border width
+    s.bwB = pInt(p, "borderBottom", s.bwB); s.bwL = pInt(p, "borderLeft", s.bwL)
     s.bc = pStr(p, "borderColor", s.bc)         // border color hex
     s.shadow = pInt(p, "shadow", s.shadow)      // elevation 1..3
     if (p.get("glass") != null) { s.glass = pBool(p, "glass", false) ? 1 : -1 }   // Liquid Glass material
@@ -577,6 +584,8 @@ function applyLayoutV(s: Style, p: any): void {
     s.right = pvI(p, "right", s.right)
     s.dir = pvS(p, "dir", s.dir)
     s.bw = pvI(p, "border", s.bw)
+    s.bwT = pvI(p, "borderTop", s.bwT); s.bwR = pvI(p, "borderRight", s.bwR)
+    s.bwB = pvI(p, "borderBottom", s.bwB); s.bwL = pvI(p, "borderLeft", s.bwL)
     s.bc = pvS(p, "borderColor", s.bc)
     s.shadow = pvI(p, "shadow", s.shadow)
     if (p["glass"] != null) { s.glass = pvB(p, "glass", false) ? 1 : -1 }

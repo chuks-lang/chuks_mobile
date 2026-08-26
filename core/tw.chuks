@@ -132,6 +132,15 @@ function twRadius(k: string): int {
     return twLen(k)                          // arbitrary rounded-[10px]
 }
 
+// Per-side border width: border-t-{0,2,4,8} or arbitrary border-t-[3px]; "" (border-t) = 1.
+function twBorderW(k: string): int {
+    if (k == "") { return 1 }
+    if (k == "0") { return 0 } if (k == "2") { return 2 }
+    if (k == "4") { return 4 } if (k == "8") { return 8 }
+    const v: int = twLen(k)                  // arbitrary [Npx]
+    return v >= 0 ? v : 1
+}
+
 // Fractional / keyword width or height as a percent 0..100, else -1.
 function twPct(rest: string): int {
     if (rest == "full") { return 100 }
@@ -217,6 +226,19 @@ export function tw(classes: string): map[string]Prop {
         else if (t == "border-4") { p["border"] = 4 }
         else if (t == "border-8") { p["border"] = 8 }
         else if (t == "border-solid" || t == "border-dashed" || t == "border-dotted") { p["bstyle"] = twRest(t, "border-") }
+        // per-side border width: border-{t,r,b,l,x,y}[-N] (N in 0/2/4/8; bare = 1)
+        else if (t == "border-t") { p["borderTop"] = 1 }
+        else if (t == "border-r") { p["borderRight"] = 1 }
+        else if (t == "border-b") { p["borderBottom"] = 1 }
+        else if (t == "border-l") { p["borderLeft"] = 1 }
+        else if (t == "border-x") { p["borderLeft"] = 1; p["borderRight"] = 1 }
+        else if (t == "border-y") { p["borderTop"] = 1; p["borderBottom"] = 1 }
+        else if (twHas(t, "border-t-")) { p["borderTop"] = twBorderW(twRest(t, "border-t-")) }
+        else if (twHas(t, "border-r-")) { p["borderRight"] = twBorderW(twRest(t, "border-r-")) }
+        else if (twHas(t, "border-b-")) { p["borderBottom"] = twBorderW(twRest(t, "border-b-")) }
+        else if (twHas(t, "border-l-")) { p["borderLeft"] = twBorderW(twRest(t, "border-l-")) }
+        else if (twHas(t, "border-x-")) { const w: int = twBorderW(twRest(t, "border-x-")); p["borderLeft"] = w; p["borderRight"] = w }
+        else if (twHas(t, "border-y-")) { const w: int = twBorderW(twRest(t, "border-y-")); p["borderTop"] = w; p["borderBottom"] = w }
         else if (twHas(t, "border-")) { p["borderColor"] = twColor(twRest(t, "border-")) }
         // ---- background / text colors ----
         else if (twHas(t, "bg-")) { p["bg"] = twColor(twRest(t, "bg-")) }

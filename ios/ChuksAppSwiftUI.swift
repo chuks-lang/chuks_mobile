@@ -1667,8 +1667,24 @@ struct BoxStyle: ViewModifier {
         else if let r = numOf(s["r"]) { v = AnyView(v.clipShape(RoundedRectangle(cornerRadius: r))) }
         if let bw = numOf(s["bw"]), let bc = s["bc"] {
             let r = numOf(s["r"]) ?? 0
-            if perCorner { v = AnyView(v.overlay(corners.stroke(hexColor(bc), lineWidth: bw))) }
-            else { v = AnyView(v.overlay(RoundedRectangle(cornerRadius: r).stroke(hexColor(bc), lineWidth: bw))) }
+            // border-style: dashed / dotted -> a dash pattern (solid = no dash).
+            let style: StrokeStyle = {
+                switch s["bstyle"] {
+                case "dashed": return StrokeStyle(lineWidth: bw, dash: [bw * 3, bw * 2])
+                case "dotted": return StrokeStyle(lineWidth: bw, lineCap: .round, dash: [0.1, bw * 2])
+                default: return StrokeStyle(lineWidth: bw)
+                }
+            }()
+            if perCorner { v = AnyView(v.overlay(corners.stroke(hexColor(bc), style: style))) }
+            else { v = AnyView(v.overlay(RoundedRectangle(cornerRadius: r).stroke(hexColor(bc), style: style))) }
+        }
+        // Per-side border width: one thin rectangle per set edge, in the border color.
+        if let bc = s["bc"] {
+            let col = hexColor(bc)
+            if let t = numOf(s["bwt"]) { v = AnyView(v.overlay(alignment: .top)    { col.frame(height: t) }) }
+            if let b = numOf(s["bwb"]) { v = AnyView(v.overlay(alignment: .bottom) { col.frame(height: b) }) }
+            if let l = numOf(s["bwl"]) { v = AnyView(v.overlay(alignment: .leading)  { col.frame(width: l) }) }
+            if let rr = numOf(s["bwr"]) { v = AnyView(v.overlay(alignment: .trailing) { col.frame(width: rr) }) }
         }
         if let lvl = numOf(s["shadow"]) { let radius: CGFloat = lvl >= 3 ? 20 : (lvl == 2 ? 8 : 3); v = AnyView(v.shadow(color: Color.black.opacity(0.18), radius: radius, x: 0, y: lvl >= 3 ? 8 : 3)) }
         if let o = numOf(s["opacity"]) { v = AnyView(v.opacity(Double(o) / 100.0)) }
@@ -1719,16 +1735,41 @@ struct BoxStyle: ViewModifier {
         // cross-axis stretch (flexbox align-items: stretch default): a COLUMN
         // stretches its children to full width (cards, rows). NOT full height on row
         // children — that fights the vertical layout (tab bar would unpin).
-        if parentStretch, !parentRow, numOf(s["w"]) == nil { v = fill(v, true) }
+        if parentStretch, !parentRow, numOf(s["w"]) == nil, numOf(s["wpct"]) == nil { v = fill(v, true) }   // a fractional width sizes itself
         // fixed size
         let w = numOf(s["w"]), h = numOf(s["h"])
         if w != nil || h != nil { v = AnyView(v.frame(width: w, height: h)) }
-        if s["wpct"] == "100" { v = AnyView(v.frame(maxWidth: .infinity)) }      // w-full
-        if s["hpct"] == "100" { v = AnyView(v.frame(maxHeight: .infinity)) }     // h-full
         let mnw = numOf(s["minw"]), mxw = numOf(s["maxw"]), mnh = numOf(s["minh"]), mxh = numOf(s["maxh"])
         if mnw != nil || mxw != nil || mnh != nil || mxh != nil { v = AnyView(v.frame(minWidth: mnw, maxWidth: mxw, minHeight: mnh, maxHeight: mxh)) }
         if let ar = numOf(s["aspect"]) { v = AnyView(v.aspectRatio(CGFloat(ar) / 100.0, contentMode: .fit)) }
-        v = decor(v)
+        // Fractional width/height (w-1/2, h-2/3, …): a percent of the PARENT, left/top-aligned
+        // like flexbox. A GeometryReader reads the offered size and frames the content to the
+        // fraction; decor (bg/border) is applied INSIDE, to the fraction-sized content, so it
+        // fills only that fraction (not the greedy GeometryReader). Needs a bound on the other
+        // axis (explicit h / w); otherwise fall back to containerRelativeFrame (centered).
+        var decorated = false
+        if let wp = numOf(s["wpct"]), wp < 100, let hh = numOf(s["h"]) {
+            let base = v
+            v = AnyView(GeometryReader { geo in decor(AnyView(base.frame(width: geo.size.width * wp / 100, height: hh, alignment: .leading))) }.frame(height: hh))
+            decorated = true
+        } else if let hp = numOf(s["hpct"]), hp < 100, let ww = numOf(s["w"]) {
+            let base = v
+            v = AnyView(GeometryReader { geo in decor(AnyView(base.frame(width: ww, height: geo.size.height * hp / 100, alignment: .top))) }.frame(width: ww))
+            decorated = true
+        }
+        if !decorated { v = decor(v) }
+        if let wp = numOf(s["wpct"]) {
+            if wp >= 100 { v = AnyView(v.frame(maxWidth: .infinity, alignment: .leading)) }
+            else if numOf(s["h"]) == nil, #available(iOS 17.0, *) {
+                v = AnyView(v.containerRelativeFrame(.horizontal) { len, _ in len * wp / 100 })
+            }
+        }
+        if let hp = numOf(s["hpct"]) {
+            if hp >= 100 { v = AnyView(v.frame(maxHeight: .infinity, alignment: .top)) }
+            else if numOf(s["w"]) == nil, #available(iOS 17.0, *) {
+                v = AnyView(v.containerRelativeFrame(.vertical) { len, _ in len * hp / 100 })
+            }
+        }
         // align-self: override the parent's cross-axis alignment for THIS child. In a Row the
         // cross axis is vertical, in a Column horizontal. Wrap the sized+decorated box in a
         // cross-filling frame and pin the content to start/center/end (applied AFTER decor so
