@@ -392,17 +392,13 @@ let measureText: YGMeasureFunc = { node, width, widthMode, _, _ in
     guard let node = node, let ctx = YGNodeGetContext(node) else { return YGSize(width: 0, height: 0) }
     let label = Unmanaged<UILabel>.fromOpaque(ctx).takeUnretainedValue()
     let maxW = (widthMode == YGMeasureMode.undefined || width.isNaN) ? CGFloat.greatestFiniteMagnitude : CGFloat(width)
-    let box = CGSize(width: maxW, height: .greatestFiniteMagnitude)
-    // Prefer the attributedText so tracking/leading/case-transform are reflected in the
-    // measured size; fall back to plain text + font.
-    let r: CGRect
-    if let at = label.attributedText, at.length > 0 {
-        r = at.boundingRect(with: box, options: [.usesLineFragmentOrigin], context: nil)
-    } else {
-        let s = (label.text ?? "") as NSString
-        r = s.boundingRect(with: box, options: [.usesLineFragmentOrigin], attributes: [.font: label.font as Any], context: nil)
-    }
-    return YGSize(width: Float(ceil(r.width)), height: Float(ceil(r.height)))
+    // Measure via the label itself (sizeThatFits), NOT NSString.boundingRect: boundingRect
+    // is unreliable for multi-line wrapping (it can stop after one line even when given a
+    // bounded width), whereas sizeThatFits honors the label's numberOfLines/lineBreakMode/
+    // attributedText and wraps to the given width. This is what makes Text wrap to its
+    // container width without an explicit `w` (paired with the Yoga errata config).
+    let sz = label.sizeThatFits(CGSize(width: maxW, height: .greatestFiniteMagnitude))
+    return YGSize(width: Float(ceil(sz.width)), height: Float(ceil(sz.height)))
 }
 
 // Tailwind font-weight name -> UIFont.Weight (thin..black).
@@ -726,7 +722,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // The two lockstep trees, keyed by Chuks node id.
     var views: [String: UIView] = [:]
     var ynodes: [String: YGNodeRef] = [:]
-    let config: YGConfigRef = YGConfigNew()
+    let config: YGConfigRef = {
+        let c: YGConfigRef = YGConfigNew()
+        // Opt into Yoga's 1.x "errata" layout behaviors. The modern default changed the
+        // cross-axis measure/stretch semantics so a measured Text no longer re-wraps to its
+        // stretched width (it keeps its single-line height); the classic behavior re-measures
+        // it at the resolved width, so Text wraps WITHOUT needing an explicit width set.
+        YGConfigSetErrata(c, YGErrata(rawValue: 2147483647)!)   // YGErrataAll
+        return c
+    }()
 
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
