@@ -1443,11 +1443,13 @@ class MainActivity : Activity() {
                 N.ySetF(n, 5, sw.measuredWidth.toFloat()); N.ySetF(n, 6, sw.measuredHeight.toFloat())
             }
             "Scroll" -> SnapScrollView(this).also { sc ->
+                N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full height
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
                 listScroll = sc; scrollId = id; listHoriz = false }
             "HScroll" -> SnapHScrollView(this).also { sc ->   // horizontal list (carousel); snaps when paging=1
+                N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full width
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }

@@ -2058,6 +2058,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "Scroll", "HScroll":   // one UIScrollView for both axes; the `horiz` style picks x vs y
             let sc = UIScrollView(); sc.delegate = self; sc.keyboardDismissMode = .onDrag
             sc.showsVerticalScrollIndicator = true
+            // Mark the Yoga node as a scroll container so its content is laid out at its full
+            // (overflowing) size along the scroll axis instead of being clamped to the scroll's
+            // own bounds. Without this, the content's top/bottom become unreachable.
+            YGNodeStyleSetOverflow(n, YGOverflow.scroll)
             listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll"); v = sc   // horiz confirmed by the style too
         case "Modal":
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
@@ -2424,6 +2428,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let base = bgImageViews[parent] != nil ? 1 : 0       // keep an ImageBackground's bg image at the back
         let i = min(index + base, pv.subviews.count)
         pv.insertSubview(child, at: i)
+        // A node id can be reused across a kind change (e.g. a Text becomes a container via
+        // conditional rendering / hot reload). Yoga aborts if you add a child to a node that
+        // still has a text measure func, so clear it first.
+        if YGNodeHasMeasureFunc(pn) { YGNodeSetMeasureFunc(pn, nil) }
         YGNodeInsertChild(pn, cn, min(index, YGNodeGetChildCount(pn)))
     }
 

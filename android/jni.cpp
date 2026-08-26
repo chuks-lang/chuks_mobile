@@ -129,7 +129,12 @@ JNIEXPORT void JNICALL J(ySetTextMeasure)(JNIEnv* e, jobject, jlong n) {
 JNIEXPORT void JNICALL J(yMarkDirty)(JNIEnv*, jobject, jlong n) {
     if (YGNodeHasMeasureFunc((YGNodeRef)n)) YGNodeMarkDirty((YGNodeRef)n);
 }
-JNIEXPORT void  JNICALL J(yInsert)(JNIEnv*, jobject, jlong p, jlong c, jint i) { YGNodeInsertChild((YGNodeRef)p, (YGNodeRef)c, (size_t)i); }
+JNIEXPORT void  JNICALL J(yInsert)(JNIEnv*, jobject, jlong p, jlong c, jint i) {
+    // A reused node id may have changed kind (Text -> container); Yoga aborts on adding a
+    // child to a node that still has a text measure func, so clear it first.
+    if (YGNodeHasMeasureFunc((YGNodeRef)p)) YGNodeSetMeasureFunc((YGNodeRef)p, nullptr);
+    YGNodeInsertChild((YGNodeRef)p, (YGNodeRef)c, (size_t)i);
+}
 JNIEXPORT void  JNICALL J(yRemove)(JNIEnv*, jobject, jlong p, jlong c) { YGNodeRemoveChild((YGNodeRef)p, (YGNodeRef)c); }
 JNIEXPORT jlong JNICALL J(yOwner)(JNIEnv*, jobject, jlong n) { return (jlong)YGNodeGetOwner((YGNodeRef)n); }
 JNIEXPORT jint  JNICALL J(yChildCount)(JNIEnv*, jobject, jlong n) { return (jint)YGNodeGetChildCount((YGNodeRef)n); }
@@ -190,6 +195,7 @@ JNIEXPORT void JNICALL J(ySetF)(JNIEnv*, jobject, jlong n, jint key, jfloat v) {
         case 31: YGNodeStyleSetPosition(y, YGEdgeBottom, v); break;
         case 32: YGNodeStyleSetDisplay(y, iv == 1 ? YGDisplayNone : YGDisplayFlex); break;   // hidden (display:none)
         case 33: YGNodeStyleSetAlignSelf(y, (YGAlign)iv); break;                             // align-self
+        case 34: YGNodeStyleSetOverflow(y, YGOverflowScroll); break;                         // scroll container: content overflows
     }
 }
 
