@@ -3,16 +3,15 @@
 # AOT-compatible chuks_* C ABI) instead of AOT-compiling the app, and bakes a
 # chukspack source bundle the VM interprets on-device. Run from a Chuks project
 # root:  bash chuks_packages/@chuks/mobile/android/build-cmr.sh
-# Env: CHUKS_REPO (chuks source repo), CMR_APP_ENTRY (default app/app.chuks).
+# Env: CMR_APP_ENTRY (default app/app.chuks). No Go or chuks source needed: the
+# CMR runtime ships prebuilt in this package (cmr/) and bundling uses `chuks pack`.
 set -euo pipefail
 PKGDIR="$(cd "$(dirname "$0")" && pwd)"
 SDKROOT="$(cd "$PKGDIR/.." && pwd)"
 PROJDIR="$(pwd)"
 [ -f "$PROJDIR/chuks.json" ] || { echo "run from a Chuks project root"; exit 1; }
-CHUKS_REPO="${CHUKS_REPO:-/Users/chukwuemekaigbokwe/Box/Code/Chuks}"
 APP_ENTRY="${CMR_APP_ENTRY:-$PROJDIR/app/app.chuks}"
 [ -f "$APP_ENTRY" ] || { echo "no app entry at $APP_ENTRY (needs to export createRoot)"; exit 1; }
-[ -d "$CHUKS_REPO/cmd/cmr" ] || { echo "CHUKS_REPO=$CHUKS_REPO has no cmd/cmr"; exit 1; }
 export CHUKS_NO_WARNINGS=1
 
 SDK="$HOME/Library/Android/sdk"; NDK="$SDK/ndk/27.1.12297006"
@@ -33,15 +32,13 @@ _ajb="$(AJ ios-bundle)"; [ -n "$_ajb" ] && APPID="$_ajb"
 
 OUT="$PROJDIR/.chuks/android-cmr-out"; rm -rf "$OUT"; mkdir -p "$OUT/assets"; OUTABS="$(cd "$OUT" && pwd)"
 
-echo "1. Building CMR (libcmr -> libapp.so) for Android/$ABI"
-STAGE="$CHUKS_REPO/cmd/cmr"
-cp "$PKGDIR/jni.cpp" "$PKGDIR/cgo_android.go" "$STAGE/"
-mkdir -p "$STAGE/yoga"; cp "$PKGDIR/yoga/libyoga.a" "$STAGE/yoga/"; cp -r "$SDKROOT/core/yoga/include" "$STAGE/yoga/"
-cleanup() { rm -f "$STAGE/jni.cpp" "$STAGE/cgo_android.go"; rm -rf "$STAGE/yoga"; }
-trap cleanup EXIT
-( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=android GOARCH=$GOARCH CC="$CC" CXX="$CXX" \
-    CGO_CXXFLAGS="-DCMR_BUILD" \
-    go build -buildmode=c-shared -o "$OUTABS/libapp.so" ./cmd/cmr )
+echo "1. Using the prebuilt CMR runtime shipped with the package (Android/$ABI)"
+# The native layer (VM + JNI + Yoga = libapp.so) is app-independent, so it ships
+# prebuilt per package version. No Go, no chuks source; only the Kotlin host below
+# is compiled per build.
+CMRLIB="$PKGDIR/cmr/$ABI/libapp.so"
+[ -f "$CMRLIB" ] || { echo "prebuilt libapp.so missing at $CMRLIB (ABI $ABI; rebuild via tools/build-libcmr.sh)"; exit 1; }
+cp "$CMRLIB" "$OUTABS/libapp.so"
 
 echo "2. Packing the source bundle (chukspack) -> assets/cmr.bundle"
 chuks pack "$APP_ENTRY" -o "$OUTABS/assets/cmr.bundle"

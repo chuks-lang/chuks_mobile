@@ -3,16 +3,15 @@
 # Runtime (libcmr — the VM behind the chuks_* C ABI) and bakes a chukspack
 # source bundle into the app. The VM interprets it on-device. Run from a Chuks
 # project root:  bash chuks_packages/@chuks/mobile/ios/build-cmr.sh
-# Env: CHUKS_REPO (path to the chuks source repo), CMR_APP_ENTRY (default app/app.chuks).
+# Env: CMR_APP_ENTRY (default app/app.chuks). No Go or chuks source needed: the
+# CMR runtime ships prebuilt in this package (cmr/) and bundling uses `chuks pack`.
 set -euo pipefail
 PKGDIR="$(cd "$(dirname "$0")" && pwd)"
 SDKROOT="$(cd "$PKGDIR/.." && pwd)"
 PROJDIR="$(pwd)"
 [ -f "$PROJDIR/chuks.json" ] || { echo "run from a Chuks project root"; exit 1; }
-CHUKS_REPO="${CHUKS_REPO:-/Users/chukwuemekaigbokwe/Box/Code/Chuks}"
 APP_ENTRY="${CMR_APP_ENTRY:-$PROJDIR/app/app.chuks}"
 [ -f "$APP_ENTRY" ] || { echo "no app entry at $APP_ENTRY (needs to export createRoot)"; exit 1; }
-[ -d "$CHUKS_REPO/cmd/cmr" ] || { echo "CHUKS_REPO=$CHUKS_REPO has no cmd/cmr"; exit 1; }
 export CHUKS_NO_WARNINGS=1
 
 # ---- app identity (same as build.sh) ----
@@ -31,16 +30,19 @@ APP_BUILD="$(AJ build)";     APP_BUILD="${APP_BUILD:-1}"
 OUT="$PROJDIR/.chuks/ios-cmr-out"; APP="$OUT/$APPNAME.app"
 rm -rf "$OUT"; mkdir -p "$OUT"; OUTABS="$(cd "$OUT" && pwd)"
 
-# ---- simulator toolchain ----
-SDKPATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-CLANG="$(xcrun --sdk iphonesimulator --find clang)"
-TRIPLE="arm64-apple-ios15.0-simulator"
+# ---- toolchain: booted simulator (default) or a paired device (IOS_TARGET=device) ----
+IOS_TARGET="${IOS_TARGET:-sim}"
+if [ "$IOS_TARGET" = "device" ]; then
+    SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"; CLANG="$(xcrun --sdk iphoneos --find clang)"
+    TRIPLE="arm64-apple-ios15.0"; CMRLIB="$PKGDIR/cmr/device/libcmr.a"
+else
+    SDKPATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"; CLANG="$(xcrun --sdk iphonesimulator --find clang)"
+    TRIPLE="arm64-apple-ios15.0-simulator"; CMRLIB="$PKGDIR/cmr/sim/libcmr.a"
+fi
 YOGA="$PKGDIR/yoga"; YOGA_INC="$SDKROOT/core/yoga/include"
 
-echo "1. Building CMR (libcmr.a) for the simulator"
-( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
-    CC="$CLANG -isysroot $SDKPATH -target $TRIPLE" CGO_CFLAGS="-isysroot $SDKPATH -target $TRIPLE" \
-    go build -buildmode=c-archive -tags ios -o "$OUTABS/libcmr.a" ./cmd/cmr )
+echo "1. Using the prebuilt CMR runtime shipped with the package ($IOS_TARGET)"
+[ -f "$CMRLIB" ] || { echo "prebuilt libcmr.a missing at $CMRLIB (rebuild via tools/build-libcmr.sh)"; exit 1; }
 
 echo "2. Packing the source bundle (chukspack)"
 chuks pack "$APP_ENTRY" -o "$OUTABS/cmr.bundle"
@@ -60,8 +62,8 @@ fi
 echo "3. Building the UIKit host (CMR mode)"
 printf '#include "libcmr.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" -sdk "$SDKPATH" -target "$TRIPLE" \
-    -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
-    "$OUT/libcmr.a" "$YOGA/libyoga.a" -lc++ \
+    -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$PKGDIR/cmr" -I "$YOGA_INC" \
+    "$CMRLIB" "$YOGA/libyoga.a" -lc++ \
     -Xclang-linker -Wno-incompatible-sysroot \
     -framework UIKit -framework Foundation -parse-as-library -Onone -D CMR \
     -o "$OUT/$APPNAME"
