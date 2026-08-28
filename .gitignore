@@ -35,3 +35,4 @@ examples/
 # Staging for packages that will graduate to their own repos (e.g. @chuks/filters).
 # Kept local until ported out; not shipped as part of @chuks/mobile.
 packages/
+chuks.lock
