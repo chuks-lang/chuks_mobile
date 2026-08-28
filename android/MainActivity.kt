@@ -84,6 +84,7 @@ object N {
     external fun setInsets(top: Int, right: Int, bottom: Int, left: Int)
     external fun setPlatform(os: String, version: String, model: String, isTablet: Int)
     external fun drain(): String
+    external fun cmrBoot(bundle: ByteArray, tmpdir: String): Int   // CMR: load a chukspack bundle (libcmr only)
     external fun yNew(): Long
     external fun yInsert(parent: Long, child: Long, idx: Int)
     external fun yRemove(parent: Long, child: Long)
@@ -272,6 +273,14 @@ class MainActivity : Activity() {
         getSharedPreferences("chuks.preview", MODE_PRIVATE).getString("host", "")?.let {
             if (it.isNotEmpty()) devBase = "http://$it"
         }
+
+        // CMR: if a chukspack bundle is baked into assets, load it into the
+        // in-process VM (libcmr). No-op/caught in AOT + DEV builds.
+        try {
+            val bundle = assets.open("cmr.bundle").readBytes()
+            val rc = N.cmrBoot(bundle, cacheDir.absolutePath)   // cacheDir => $TMPDIR for on-device compile
+            android.util.Log.i("CMR", "booted rc=$rc (${bundle.size} bytes)")
+        } catch (_: Throwable) { /* no cmr.bundle, or cmrBoot native absent (AOT) */ }
 
         if (!devMode) {
             N.setup(1000)
@@ -1486,6 +1495,8 @@ class MainActivity : Activity() {
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
     private val imageOpChain = HashMap<String, String>()       // id -> Image GPU op-chain (JSON)
     private val imageOrigBmp = HashMap<String, android.graphics.Bitmap>()   // id -> pre-op bitmap, for re-applying a changed chain
+    private val imageSrc = HashMap<String, String>()           // id -> local image source (asset name or file://), for RN-style sized re-decode
+    private val imageDecodedDim = HashMap<String, Int>()       // id -> power-of-two bucket last decoded at (guards relayout re-decode)
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
     private val videoControlsIds = HashSet<String>()           // ids that show a native MediaController
     private val videoMediaControllers = HashMap<String, android.widget.MediaController>()  // id -> attached controller
@@ -2080,17 +2091,19 @@ class MainActivity : Activity() {
             (bgImageViews[id] ?: views[id] as? ImageView)?.let { loadRemoteImage(t, it, id); return }
         }
         if (t.startsWith("file://")) {                                        // picked/captured local file
-            (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->
-                var ok = false
-                try { android.graphics.BitmapFactory.decodeFile(t.substring(7))?.let { iv.setImageBitmap(bmpFor(it, id)) }; ok = true } catch (e: Exception) {}
-                (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
+            (bgImageViews[id] ?: views[id] as? ImageView)?.let {
+                imageSrc[id] = t; imageDecodedDim.remove(id)
+                ensureSizedImage(id, if (root.width > 0) root.width else MAX_DIM)   // provisional; relayout() refines to the frame
+                (if (imageDecodedDim.containsKey(id)) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
                 return
             }
         }
-        (bgImageViews[id] ?: views[id] as? ImageView)?.let { iv ->            // bundled local asset (e.g. chuks-logo.png)
-            var ok = false
-            if (t.isNotEmpty()) try { assets.open(t).use { android.graphics.BitmapFactory.decodeStream(it)?.let { b -> iv.setImageBitmap(bmpFor(b, id)) } }; ok = true } catch (e: Exception) {}
-            (if (ok) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
+        (bgImageViews[id] ?: views[id] as? ImageView)?.let {                  // bundled local asset (e.g. chuks-logo.png)
+            if (t.isNotEmpty()) {
+                imageSrc[id] = t; imageDecodedDim.remove(id)
+                ensureSizedImage(id, if (root.width > 0) root.width else MAX_DIM)
+            }
+            (if (imageDecodedDim.containsKey(id)) mediaLoad[id] else mediaError[id])?.let { a -> fire(a) }
             return
         }
         when (val v = views[id]) {
@@ -2693,7 +2706,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
@@ -2926,9 +2939,52 @@ class MainActivity : Activity() {
     }
     private fun bmpFor(bmp: android.graphics.Bitmap, id: String): android.graphics.Bitmap {
         val r = imageBlur[id] ?: 0f
-        val base = if (r > 0f) blurBitmap(bmp, r) else bmp
+        val capped = capBitmap(bmp)
+        val base = if (r > 0f) blurBitmap(capped, r) else capped
         imageOrigBmp[id] = base
         return runOps(id, base)
+    }
+
+    // A hardware canvas refuses to draw a bitmap over ~100MB, so a high-res source
+    // image (e.g. a 5000px onboarding photo) crashes at draw time. Decode local
+    // assets downsampled (decodeScaled), and cap anything that still arrives large
+    // here so every setImageBitmap path is safe. MAX_DIM keeps a bitmap near 26MB.
+    private val MAX_DIM = 2560
+    private fun capBitmap(b: android.graphics.Bitmap, maxDim: Int = MAX_DIM): android.graphics.Bitmap {
+        val w = b.width; val h = b.height
+        if (w <= maxDim && h <= maxDim) return b
+        val scale = maxDim.toFloat() / maxOf(w, h)
+        val nb = android.graphics.Bitmap.createScaledBitmap(b, (w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1), true)
+        if (nb !== b) b.recycle()
+        return nb
+    }
+    // Two-pass decode: read bounds, pick an inSampleSize so neither side exceeds
+    // maxDim, then decode at that sample. Avoids ever allocating the full-res bitmap.
+    private fun decodeScaled(bytes: ByteArray, maxDim: Int = MAX_DIM): android.graphics.Bitmap? {
+        val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
+        var s = 1
+        while (o.outWidth / s > maxDim || o.outHeight / s > maxDim) s *= 2
+        val o2 = android.graphics.BitmapFactory.Options().apply { inSampleSize = s }
+        return android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o2)
+    }
+
+    // RN/Fresco parity: (re)decode a LOCAL image downsampled to the view's laid-out
+    // pixel size instead of the source resolution. Called provisionally at screen
+    // width on load, then refined from the real frame in relayout(). Re-reads from
+    // the source each time (bundled assets/files are cheap); a power-of-two bucket
+    // skips the common case where a relayout did not cross a resolution boundary.
+    private fun ensureSizedImage(id: String, targetPx: Int) {
+        val src = imageSrc[id] ?: return
+        val iv = (views[id] as? ImageView) ?: bgImageViews[id] ?: return
+        val target = targetPx.coerceIn(1, MAX_DIM)
+        val bucket = Integer.highestOneBit(target)
+        if (imageDecodedDim[id] == bucket) return
+        val bytes = try {
+            if (src.startsWith("file://")) java.io.File(src.substring(7)).readBytes()
+            else assets.open(src).use { it.readBytes() }
+        } catch (e: Exception) { return }
+        decodeScaled(bytes, target)?.let { iv.setImageBitmap(bmpFor(it, id)); imageDecodedDim[id] = bucket }
     }
     // Run the Image GPU op-chain (effects.chain) on the GPU, if set (else the base bitmap).
     private fun runOps(id: String, bmp: android.graphics.Bitmap): android.graphics.Bitmap {
@@ -2941,14 +2997,17 @@ class MainActivity : Activity() {
         // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
         imageMem.get(url)?.let { iv.setImageBitmap(bmpFor(it, id)); mediaLoad[id]?.let { a -> fire(a) }; return }
         iv.setTag(TAG, url)
+        // RN parity: downsample to the view's display size (captured here on the main
+        // thread), else screen width if the view is not laid out yet.
+        val target = (if (iv.width > 0 || iv.height > 0) maxOf(iv.width, iv.height) else root.width).coerceIn(1, MAX_DIM)
         Thread {
             try {
                 val key = Integer.toHexString(url.hashCode())
                 val f = java.io.File(imgDir, key)
-                var bmp = if (f.exists()) android.graphics.BitmapFactory.decodeFile(f.absolutePath) else null
+                var bmp = if (f.exists()) f.readBytes().let { decodeScaled(it, target) } else null
                 if (bmp == null) {
                     val bytes = java.net.URL(url).openStream().use { it.readBytes() }
-                    bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    bmp = decodeScaled(bytes, target)
                     if (bmp != null) try { f.outputStream().use { os -> bmp!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os) }; trimImgDir() } catch (e: Exception) {}
                 }
                 if (bmp != null) {
@@ -2987,6 +3046,8 @@ class MainActivity : Activity() {
             // the scroll's own height (the cross axis); it scrolls sideways only.
             if (listHoriz && id == contentId) { lp.height = listScroll?.height ?: lp.height }
             v.layoutParams = lp
+            // RN parity: now that the frame is known, decode the image to its display size.
+            if (imageSrc.containsKey(id)) ensureSizedImage(id, maxOf(lp.width, lp.height))
         }
         // place the whole Chuks app just below the top inset
         (views["app"]?.layoutParams as? FrameLayout.LayoutParams)?.let { it.leftMargin = 0; it.topMargin = topY }

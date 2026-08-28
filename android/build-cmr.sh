@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Android CMR build: links the Chuks Mobile Runtime (libcmr — the VM behind the
+# AOT-compatible chuks_* C ABI) instead of AOT-compiling the app, and bakes a
+# chukspack source bundle the VM interprets on-device. Run from a Chuks project
+# root:  bash chuks_packages/@chuks/mobile/android/build-cmr.sh
+# Env: CHUKS_REPO (chuks source repo), CMR_APP_ENTRY (default app/app.chuks).
+set -euo pipefail
+PKGDIR="$(cd "$(dirname "$0")" && pwd)"
+SDKROOT="$(cd "$PKGDIR/.." && pwd)"
+PROJDIR="$(pwd)"
+[ -f "$PROJDIR/chuks.json" ] || { echo "run from a Chuks project root"; exit 1; }
+CHUKS_REPO="${CHUKS_REPO:-/Users/chukwuemekaigbokwe/Box/Code/Chuks}"
+APP_ENTRY="${CMR_APP_ENTRY:-$PROJDIR/app/app.chuks}"
+[ -f "$APP_ENTRY" ] || { echo "no app entry at $APP_ENTRY (needs to export createRoot)"; exit 1; }
+[ -d "$CHUKS_REPO/cmd/cmr" ] || { echo "CHUKS_REPO=$CHUKS_REPO has no cmd/cmr"; exit 1; }
+export CHUKS_NO_WARNINGS=1
+
+SDK="$HOME/Library/Android/sdk"; NDK="$SDK/ndk/27.1.12297006"
+BT="$SDK/build-tools/35.0.0"; AJAR="$SDK/platforms/android-35/android.jar"
+BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+ADB="$SDK/platform-tools/adb"
+ABI="${CMR_ABI:-arm64-v8a}"
+if [ "$ABI" = "x86_64" ]; then GOARCH=amd64; CC="$BIN/x86_64-linux-android24-clang"; CXX="$BIN/x86_64-linux-android24-clang++"; CXXLIB="x86_64-linux-android"
+else GOARCH=arm64; CC="$BIN/aarch64-linux-android24-clang"; CXX="$BIN/aarch64-linux-android24-clang++"; CXXLIB="aarch64-linux-android"; fi
+
+pj() { sed -n "s/.*\"$1\"[^\"]*\"\([^\"]*\)\".*/\1/p" "$PROJDIR/chuks.json" | head -1; }
+NAME_RAW="$(pj name)"; NAME_RAW="${NAME_RAW:-chuksapp}"
+DISPLAY="$(pj displayName)"; DISPLAY="${DISPLAY:-$NAME_RAW}"
+CODEPKG="com.chuks.app"
+APPID="$(pj bundleId)"; APPID="${APPID:-com.chuks.$(printf '%s' "$NAME_RAW" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')}"
+AJ() { chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" "$1" 2>/dev/null; }
+_ajb="$(AJ ios-bundle)"; [ -n "$_ajb" ] && APPID="$_ajb"
+
+OUT="$PROJDIR/.chuks/android-cmr-out"; rm -rf "$OUT"; mkdir -p "$OUT/assets"; OUTABS="$(cd "$OUT" && pwd)"
+
+echo "1. Building CMR (libcmr -> libapp.so) for Android/$ABI"
+STAGE="$CHUKS_REPO/cmd/cmr"
+cp "$PKGDIR/jni.cpp" "$PKGDIR/cgo_android.go" "$STAGE/"
+mkdir -p "$STAGE/yoga"; cp "$PKGDIR/yoga/libyoga.a" "$STAGE/yoga/"; cp -r "$SDKROOT/core/yoga/include" "$STAGE/yoga/"
+cleanup() { rm -f "$STAGE/jni.cpp" "$STAGE/cgo_android.go"; rm -rf "$STAGE/yoga"; }
+trap cleanup EXIT
+( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=android GOARCH=$GOARCH CC="$CC" CXX="$CXX" \
+    CGO_CXXFLAGS="-DCMR_BUILD" \
+    go build -buildmode=c-shared -o "$OUTABS/libapp.so" ./cmd/cmr )
+
+echo "2. Packing the source bundle (chukspack) -> assets/cmr.bundle"
+( cd "$CHUKS_REPO" && go run ./cmd/chukspack "$APP_ENTRY" -o "$OUTABS/assets/cmr.bundle" )
+echo "   bundle: $(grep -c '^--- module:' "$OUT/assets/cmr.bundle") modules"
+
+echo "3. Building the Android host (Kotlin)"
+kotlinc "$PKGDIR/MainActivity.kt" "$PKGDIR/ChuksEffects.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1 \
+    || { echo "  kotlin build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1; }
+
+echo "4. Dexing"
+"$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar" > "$OUT/d8.log" 2>&1 \
+    || { echo "  dex failed:"; grep -viE "Metadata|kotlin|ForkJoin|^\s+at " "$OUT/d8.log" | tail -20; exit 1; }
+
+echo "5. Linking resources"
+cp "$PKGDIR/AndroidManifest.xml" "$OUT/AndroidManifest.xml"
+sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
+chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" patch-manifest "$OUT/AndroidManifest.xml" 2>/dev/null || true
+"$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
+    --rename-manifest-package "$APPID" --min-sdk-version 24 --target-sdk-version 34
+
+echo "6. Bundling (+ assets, libcmr as libapp.so)"
+mkdir -p "$OUT/lib/$ABI"; cp "$OUT/libapp.so" "$OUT/lib/$ABI/"
+cp "$BIN/../sysroot/usr/lib/$CXXLIB/libc++_shared.so" "$OUT/lib/$ABI/"
+for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
+for f in $(find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev/null); do cp "$f" "$OUT/assets/"; done
+( cd "$OUT" && zip -qj base.apk classes.dex \
+    && zip -q base.apk "lib/$ABI/libapp.so" "lib/$ABI/libc++_shared.so" \
+    && zip -q base.apk assets/cmr.bundle \
+    && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
+    && for im in assets/*.png assets/*.jpg; do [ -e "$im" ] && zip -q base.apk "$im" || true; done )
+"$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/chuks.apk" > "$OUT/zipalign.log" 2>&1
+
+echo "7. Signing + installing + launching (CMR — the VM runs on the device)"
+[ -f "$HOME/.android/debug.keystore" ] || keytool -genkey -v -keystore "$HOME/.android/debug.keystore" \
+    -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+    -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+"$BT/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android "$OUT/chuks.apk" >/dev/null 2>&1
+DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
+[ -z "$DEV_ID" ] && { echo "no android device/emulator (adb devices)"; exit 1; }
+"$ADB" -s "$DEV_ID" install -r "$OUT/chuks.apk"
+"$ADB" -s "$DEV_ID" shell am start -n "$APPID/$CODEPKG.MainActivity"
+echo "   launched $APPID on $DEV_ID"

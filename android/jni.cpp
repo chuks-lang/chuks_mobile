@@ -98,6 +98,25 @@ JNIEXPORT void JNICALL J(setWake)(JNIEnv* e, jobject) {
     chuks_set_wake(reinterpret_cast<void*>(chuks_wake_trampoline));
 }
 
+// CMR: load a chukspack source bundle into the in-process VM. Only built when
+// linking libcmr (-DCMR_BUILD); the AOT libapp has no chuks_cmr_boot.
+#ifdef CMR_BUILD
+extern "C" int chuks_cmr_boot(char* bundle, int length);
+extern "C" void chuks_cmr_set_tmpdir(char* path);
+JNIEXPORT jint JNICALL J(cmrBoot)(JNIEnv* e, jobject, jbyteArray b, jstring tmp) {
+    // The bundle compiles on-device via os.MkdirTemp. An Android app sandbox has
+    // no writable /tmp and no $TMPDIR, so hand the VM the app's cache dir (into
+    // Go directly: Go snapshots the environ at startup, so a C setenv is unseen).
+    const char* ct = e->GetStringUTFChars(tmp, nullptr);
+    if (ct) { chuks_cmr_set_tmpdir((char*)ct); e->ReleaseStringUTFChars(tmp, ct); }
+    jsize n = e->GetArrayLength(b);
+    jbyte* p = e->GetByteArrayElements(b, nullptr);
+    jint rc = chuks_cmr_boot((char*)p, (int)n);
+    e->ReleaseByteArrayElements(b, p, JNI_ABORT);
+    return rc;
+}
+#endif
+
 // ---- Yoga (handle-based) ----
 // Shared config: opt into Yoga's classic "errata" layout so a measured Text re-wraps to
 // its resolved width (matches the iOS host).
