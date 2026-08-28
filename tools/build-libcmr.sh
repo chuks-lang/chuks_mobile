@@ -32,16 +32,23 @@ cp "$PKGDIR/ios/cmr/sim/libcmr.h" "$PKGDIR/ios/cmr/libcmr.h"; rm -f "$PKGDIR/ios
 rm -f "$PKGDIR/ios/cmr/device/libcmr.h"
 echo "   sim $(du -h "$PKGDIR/ios/cmr/sim/libcmr.a" | cut -f1), device $(du -h "$PKGDIR/ios/cmr/device/libcmr.a" | cut -f1)"
 
-echo "== Android: libapp.so (VM + JNI + Yoga c-shared) =="
+echo "== Android: libapp.so (VM + JNI + Yoga c-shared), per ABI =="
 NDK="$HOME/Library/Android/sdk/ndk/27.1.12297006"; BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 STAGE="$CHUKS_REPO/cmd/cmr"
-cp "$PKGDIR/android/jni.cpp" "$PKGDIR/android/cgo_android.go" "$STAGE/"
-mkdir -p "$STAGE/yoga"; cp "$PKGDIR/android/yoga/libyoga.a" "$STAGE/yoga/"; cp -r "$PKGDIR/core/yoga/include" "$STAGE/yoga/"
 cleanup() { rm -f "$STAGE/jni.cpp" "$STAGE/cgo_android.go"; rm -rf "$STAGE/yoga"; }
 trap cleanup EXIT
-mkdir -p "$PKGDIR/android/cmr/arm64-v8a"
-( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
-    CC="$BIN/aarch64-linux-android24-clang" CXX="$BIN/aarch64-linux-android24-clang++" CGO_CXXFLAGS="-DCMR_BUILD" \
-    go build -buildmode=c-shared -ldflags="-s -w" -o "$PKGDIR/android/cmr/arm64-v8a/libapp.so" ./cmd/cmr )
-echo "   arm64-v8a $(du -h "$PKGDIR/android/cmr/arm64-v8a/libapp.so" | cut -f1)"
+# ABI  GOARCH  clang-prefix          yoga-dir (prebuilt libyoga.a for that ABI)
+android_abi() {
+    local ABI="$1" GOARCH="$2" PREFIX="$3" YOGADIR="$4"
+    cp "$PKGDIR/android/jni.cpp" "$PKGDIR/android/cgo_android.go" "$STAGE/"
+    rm -rf "$STAGE/yoga"; mkdir -p "$STAGE/yoga"
+    cp "$PKGDIR/$YOGADIR/libyoga.a" "$STAGE/yoga/"; cp -r "$PKGDIR/core/yoga/include" "$STAGE/yoga/"
+    mkdir -p "$PKGDIR/android/cmr/$ABI"
+    ( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=android GOARCH="$GOARCH" \
+        CC="$BIN/${PREFIX}-clang" CXX="$BIN/${PREFIX}-clang++" CGO_CXXFLAGS="-DCMR_BUILD" \
+        go build -buildmode=c-shared -ldflags="-s -w" -o "$PKGDIR/android/cmr/$ABI/libapp.so" ./cmd/cmr )
+    echo "   $ABI $(du -h "$PKGDIR/android/cmr/$ABI/libapp.so" | cut -f1)"
+}
+android_abi arm64-v8a arm64 aarch64-linux-android24 android/yoga
+android_abi x86_64     amd64 x86_64-linux-android24  android/yoga-x86_64
 echo "done. Commit the updated cmr/ prebuilts."

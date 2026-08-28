@@ -18,9 +18,19 @@ SDK="$HOME/Library/Android/sdk"; NDK="$SDK/ndk/27.1.12297006"
 BT="$SDK/build-tools/35.0.0"; AJAR="$SDK/platforms/android-35/android.jar"
 BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 ADB="$SDK/platform-tools/adb"
-ABI="${CMR_ABI:-arm64-v8a}"
-if [ "$ABI" = "x86_64" ]; then GOARCH=amd64; CC="$BIN/x86_64-linux-android24-clang"; CXX="$BIN/x86_64-linux-android24-clang++"; CXXLIB="x86_64-linux-android"
-else GOARCH=arm64; CC="$BIN/aarch64-linux-android24-clang"; CXX="$BIN/aarch64-linux-android24-clang++"; CXXLIB="aarch64-linux-android"; fi
+# Match the connected device/emulator ABI (arm64 on real phones and Apple-Silicon
+# emulators; x86_64 on emulators run on Intel Mac / Windows / Linux). Override with
+# CMR_ABI. The prebuilt libapp.so + libc++_shared.so are picked for this ABI.
+if [ -n "${CMR_ABI:-}" ]; then ABI="$CMR_ABI"; else
+    _dev="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
+    ABI="$("$ADB" -s "${_dev:-none}" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+    ABI="${ABI:-arm64-v8a}"
+fi
+case "$ABI" in
+    x86_64) CXXLIB="x86_64-linux-android" ;;
+    *)      ABI="arm64-v8a"; CXXLIB="aarch64-linux-android" ;;
+esac
+echo "   target ABI: $ABI"
 
 pj() { sed -n "s/.*\"$1\"[^\"]*\"\([^\"]*\)\".*/\1/p" "$PROJDIR/chuks.json" | head -1; }
 NAME_RAW="$(pj name)"; NAME_RAW="${NAME_RAW:-chuksapp}"
