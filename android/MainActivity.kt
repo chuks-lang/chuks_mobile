@@ -85,6 +85,9 @@ object N {
     external fun setPlatform(os: String, version: String, model: String, isTablet: Int)
     external fun drain(): String
     external fun cmrBoot(bundle: ByteArray, tmpdir: String): Int   // CMR: load a chukspack bundle (libcmr only)
+    external fun cmrApplyDelta(delta: ByteArray): Int              // CMR: merge only the changed modules + re-init
+    external fun cmrSaveState(): String                            // CMR: serialize app state (cells + nav) before a reload
+    external fun cmrLoadState(state: String)                       // CMR: restore it into the fresh VM after a reload
     external fun yNew(): Long
     external fun yInsert(parent: Long, child: Long, idx: Int)
     external fun yRemove(parent: Long, child: Long)
@@ -556,24 +559,42 @@ class MainActivity : Activity() {
             while (true) {
                 val v = cmrPollHmr(cmrVersion)
                 if (v > cmrVersion) {
-                    cmrVersion = v                       // advance baseline immediately (avoid a double poll)
-                    val (b, ver) = cmrFetchBundle()
-                    if (b != null) handler.post { cmrReloadInPlace(b, ver) }
+                    val (b, ver, isDelta) = cmrFetchDelta(cmrVersion)   // since = OLD version, so the delta covers the edit
+                    cmrVersion = ver                                     // advance now so the next poll doesn't re-trigger
+                    if (b != null) handler.post { cmrReloadInPlace(b, ver, isDelta) }
                 } else {
                     try { Thread.sleep(150) } catch (e: InterruptedException) { return@Thread }
                 }
             }
         }.apply { isDaemon = true; start() }
     }
+    // GET /delta?since=cmrVersion: the changed modules only (X-CMR-Delta:1), or a full
+    // bundle (X-CMR-Delta:0) on first load / after a server restart. Off the main thread.
+    private fun cmrFetchDelta(since: Int): Triple<ByteArray?, Int, Boolean> {
+        return try {
+            val c = java.net.URL("$cmrDevBase/delta?since=$since").openConnection() as java.net.HttpURLConnection
+            c.connectTimeout = 3000; c.readTimeout = 8000
+            val code = c.responseCode
+            fun hdr(name: String) = c.headerFields?.entries?.firstOrNull { it.key?.equals(name, true) == true }?.value?.firstOrNull()?.trim()
+            val ver = hdr("X-CMR-Version")?.toIntOrNull() ?: cmrVersion
+            val isDelta = hdr("X-CMR-Delta") == "1"
+            val body = if (code == 200) c.inputStream.use { it.readBytes() } else null
+            c.disconnect(); Triple(body, ver, isDelta)
+        } catch (e: Exception) { Triple(null, cmrVersion, false) }
+    }
     // Hot reload WITHOUT an Activity recreate (no blank flash): tear down the current
-    // tree, re-boot the VM with the new bundle, and rebuild, all in one main-thread
-    // frame so the screen swaps in place. Runs on the UI thread.
-    private fun cmrReloadInPlace(bundle: ByteArray, ver: Int) {
+    // tree, apply the delta (or full bundle) to the VM, and rebuild, all in one
+    // main-thread frame so the screen swaps in place. Runs on the UI thread.
+    private fun cmrReloadInPlace(payload: ByteArray, ver: Int, isDelta: Boolean) {
         setFrameDriver(false)
+        val saved = try { N.cmrSaveState() } catch (e: Throwable) { "" }   // capture cells + nav from the OLD VM
         remove("app")                                    // detaches from root, frees the Yoga tree, clears per-node maps
         activeModal = null; listScroll = null; contentId = ""; shownSheet = null
         everMounted = false
-        N.cmrBoot(bundle, cacheDir.absolutePath); cmrVersion = ver
+        val rc = if (isDelta) N.cmrApplyDelta(payload) else N.cmrBoot(payload, cacheDir.absolutePath)
+        cmrVersion = ver
+        android.util.Log.i("CMR", "reload ${if (isDelta) "delta" else "full"} rc=$rc v=$ver (${payload.size}B)")
+        try { N.cmrLoadState(saved) } catch (e: Throwable) {}              // restore into the fresh VM before mount
         hostMount(); relayout(); if (pushViewport()) relayout()
     }
 

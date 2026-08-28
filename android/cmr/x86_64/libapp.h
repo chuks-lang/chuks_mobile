@@ -95,6 +95,7 @@ extern "C" {
 
 extern void chuks_cmr_set_tmpdir(char* path);
 extern int32_t chuks_cmr_boot(char* bundle, int32_t length);
+extern int32_t chuks_cmr_apply_delta(char* delta, int32_t length);
 extern void chuks_init(void);
 extern int chuks_mount(void);
 extern int chuks_remount(void);
@@ -104,6 +105,8 @@ extern int chuks_dispatchInput(char* action, char* value);
 extern int chuks_setViewport(int top, int height, int width);
 extern char* chuks_drain(void);
 extern void chuks_free_str(char* p);
+extern char* chuks_cmr_save_state(void);
+extern void chuks_cmr_load_state(char* state);
 extern void chuks_set_count(int n);
 extern void chuks_setColorScheme(int dark);
 extern int chuks_colorSchemeFollows(void);

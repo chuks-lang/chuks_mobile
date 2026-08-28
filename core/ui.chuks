@@ -2751,6 +2751,19 @@ export class NavStack extends App {
     // lets screens and their components use useState() with no key.
     override render(): Node { const f: any = this.cur(); return Comp(f) }
     override setup(_n: int): void { }
+    // Hot reload also preserves the current screen: serialize the route stack ahead
+    // of the useState cells so an edit keeps you on the page you were on, not route 0.
+    // Format: "<route\t...>\n<cellsJSON>" (cell JSON is single-line, no raw newlines).
+    override saveState(): string { return this.stack.join("\t") + "\n" + serializeCells() }
+    override loadState(data: string): void {
+        if (data == "") { return }
+        const parts: []string = data.split("\n")
+        if (parts.length < 2) { restoreCells(data); return }   // old format: cells only
+        if (parts[0] != "") { this.stack = parts[0].split("\t") }
+        var cells: string = parts[1]
+        for (var i: int = 2; i < parts.length; i = i + 1) { cells = cells + "\n" + parts[i] }
+        restoreCells(cells)
+    }
 }
 
 /**
