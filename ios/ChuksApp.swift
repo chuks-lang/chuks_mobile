@@ -19,6 +19,29 @@ import PhotosUI
 import UserNotifications
 import CoreLocation
 import CoreMotion
+import ImageIO
+
+// RN/Nuke/SDWebImage parity (WWDC "Image and Graphics Best Practices"): decode a
+// large source image downsampled to the target display size via ImageIO, instead
+// of letting UIImageView hold a full-res bitmap. maxPixel is the longest side in
+// PIXELS (points * screen scale).
+func downsampledImage(data: Data, maxPixel: CGFloat) -> UIImage? {
+    guard maxPixel > 0,
+          let src = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+    else { return UIImage(data: data) }
+    let opts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return UIImage(data: data) }
+    return UIImage(cgImage: cg)
+}
+func downsampledImage(path: String, maxPixel: CGFloat) -> UIImage? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+    return downsampledImage(data: data, maxPixel: maxPixel)
+}
 import CoreHaptics
 import Contacts
 import EventKit
@@ -51,11 +74,16 @@ final class ChuksImageLoader {
     func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void, fail: (() -> Void)? = nil) {
         if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
         guard let url = URL(string: urlStr) else { DispatchQueue.main.async { fail?() }; return }
+        // RN parity: cap the decode near screen size so a huge remote image never
+        // holds a full-res bitmap. A generous bound (screen's long side) keeps
+        // full-bleed feed images crisp while shielding memory.
+        let cap = max(UIScreen.main.bounds.width, UIScreen.main.bounds.height) * UIScreen.main.scale
         session.dataTask(with: url) { [weak self] data, _, _ in
-            guard let data = data, let raw = UIImage(data: data) else { DispatchQueue.main.async { fail?() }; return }
+            guard let data = data else { DispatchQueue.main.async { fail?() }; return }
             // Thread-safe off-main decode (UIGraphicsImageRenderer is UIKit and NOT thread-safe
-            // off main — it corrupts UIKit state and crashes text drawing). preparingForDisplay
-            // is the designed-for-background decode API.
+            // off main — it corrupts UIKit state and crashes text drawing). ImageIO downsampling
+            // and preparingForDisplay are both background-safe.
+            guard let raw = downsampledImage(data: data, maxPixel: cap) else { DispatchQueue.main.async { fail?() }; return }
             let img = raw.preparingForDisplay() ?? raw
             let cost = Int(img.size.width * img.size.height * img.scale * img.scale) * 4  // ~bytes of the decoded bitmap
             self?.mem.setObject(img, forKey: urlStr as NSString, cost: cost)
@@ -851,6 +879,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var sideBorders: [String: (CGFloat, CGFloat, CGFloat, CGFloat, UIColor)] = [:] // id -> (t, r, b, l, color)
     var imageOpChain: [String: String] = [:]                             // id -> Image GPU op-chain (JSON)
     var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter/op swap re-applies from the original
+    var imageSrc: [String: String] = [:]                                 // id -> local image source (file:// or bundled asset), for RN-style sized re-decode
+    var imageDecodedDim: [String: Int] = [:]                             // id -> power-of-two px bucket last decoded at (guards relayout re-decode)
+    let maxImageDim: CGFloat = 2560                                       // safety cap on decoded image side (px)
     var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
     var videoPosters: [String: UIImageView] = [:]                        // id -> poster overlay (until first frame)
     var posterObs: [String: NSKeyValueObservation] = [:]                 // id -> readyForDisplay observation
@@ -1861,17 +1892,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let iv = bgImageViews[id], t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // ImageBackground URL
         if let iv = views[id] as? UIImageView, t.hasPrefix("http") { loadRemoteImage(t, into: iv, id: id); return }   // remote Image URL
         if let iv = views[id] as? UIImageView, t.hasPrefix("file://") {   // picked/captured local file
-            iv.image = UIImage(contentsOfFile: String(t.dropFirst(7)))
-            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
+            imageSrc[id] = t; imageDecodedDim[id] = nil
+            ensureSizedImage(id, UIScreen.main.bounds.width * UIScreen.main.scale)   // provisional; relayout() refines to the frame
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
-            if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
-            imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
+            imageSrc[id] = t; imageDecodedDim[id] = nil
+            ensureSizedImage(id, UIScreen.main.bounds.width * UIScreen.main.scale)
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
-        if let iv = bgImageViews[id], !t.isEmpty {            // bundled ImageBackground asset
-            if let url = Bundle.main.url(forResource: t, withExtension: nil) { iv.image = UIImage(contentsOfFile: url.path) }
+        if bgImageViews[id] != nil, !t.isEmpty {              // bundled ImageBackground asset
+            imageSrc[id] = t; imageDecodedDim[id] = nil
+            ensureSizedImage(id, UIScreen.main.bounds.width * UIScreen.main.scale)
             return
         }
         if let cv = views[id] as? CameraPreviewUIView { cv.controller?.configure(t.isEmpty ? "back" : t); return }   // CameraView facing
@@ -2533,6 +2565,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if contextMenuIds.contains(k) { contextMenuIds.remove(k); contextMenuData[k] = nil; contextMenuActions[k] = nil }
             if alertIds.contains(k) { alertIds.remove(k); alertData[k] = nil; alertActions[k] = nil; if presentedAlert == k { presentedAlert = nil } }
             bgImageViews[k] = nil
+            imageSrc[k] = nil; imageDecodedDim[k] = nil
             pressOpacity[k] = nil
             modalIds.remove(k); if activeModal == k { activeModal = nil }
             if let p = videoPlayers[k] {                     // recycle: pool the player, keep it primed
@@ -2852,6 +2885,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         c.timeoutIntervalForRequest = 20
         return URLSession(configuration: c)
     }()
+    // RN parity: (re)decode a LOCAL image downsampled to the view's display size.
+    // Called provisionally at screen width on load, then refined from the real frame
+    // in relayout(). A power-of-two px bucket skips redundant re-decodes.
+    func ensureSizedImage(_ id: String, _ targetPx: CGFloat) {
+        guard let src = imageSrc[id] else { return }
+        guard let iv = (views[id] as? UIImageView) ?? bgImageViews[id] else { return }
+        let target = max(1, min(targetPx, maxImageDim))
+        let ti = max(1, Int(target))
+        let bucket = 1 << (Int.bitWidth - 1 - ti.leadingZeroBitCount)   // highest one bit
+        if imageDecodedDim[id] == bucket { return }
+        let path: String? = src.hasPrefix("file://") ? String(src.dropFirst(7))
+            : Bundle.main.url(forResource: src, withExtension: nil)?.path
+        guard let p = path, let img = downsampledImage(path: p, maxPixel: target) else { return }
+        iv.image = img
+        imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
+        imageDecodedDim[id] = bucket
+    }
+
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
@@ -3005,6 +3056,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if vv.transform.isIdentity { vv.frame = fr }
                 else { vv.bounds = CGRect(origin: .zero, size: fr.size); vv.center = CGPoint(x: fr.midX, y: fr.midY) }
             }
+            // RN parity: now that the frame is known, decode the image to its display size.
+            if imageSrc[id] != nil { ensureSizedImage(id, max(fr.width, fr.height) * UIScreen.main.scale) }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
             if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
