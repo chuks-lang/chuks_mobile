@@ -455,6 +455,23 @@ let DEV_MODE = true
 #else
 let DEV_MODE = false
 #endif
+
+// CMR mode (built with -D CMR against libcmr): the Chuks VM runs in-process and
+// interprets a source bundle (packed by chukspack), instead of the AOT-compiled
+// app. libcmr exposes the same chuks_* C ABI, so the only addition is loading the
+// baked cmr.bundle at startup via chuks_cmr_boot.
+#if CMR
+func cmrBootBundle() {
+    guard let u = Bundle.main.url(forResource: "cmr", withExtension: "bundle"),
+          let data = try? Data(contentsOf: u) else {
+        NSLog("CMR: cmr.bundle missing from app"); return
+    }
+    let rc = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+        chuks_cmr_boot(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
+    }
+    NSLog("CMR boot rc=%d (%d bytes)", rc, data.count)
+}
+#endif
 // The perf/jank harness (auto-scroll sweep + fps header) is a benchmark tool, not
 // app behavior — off unless built with -D BENCHMARK. Without this it grabs whatever
 // Scroll is on screen (e.g. the Components gallery) and auto-scrolls it.
@@ -858,7 +875,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let c = chuks_drain() else { return "" }
         let s = String(cString: c); chuks_free_str(c); return s
     }
-    func eSetup() { if !DEV_MODE { chuks_set_count(N) } }   // chuks_* bridge auto-runs chuks_init; dev server self-inits on boot
+    func eSetup() {
+        #if CMR
+        cmrBootBundle()   // load the packed source bundle into the in-process VM
+        #endif
+        if !DEV_MODE { chuks_set_count(N) }
+    }   // chuks_* bridge auto-runs chuks_init; dev server self-inits on boot
     func eMount() -> String? {
         if DEV_MODE { return devHTTP("/mount", "") }
         _ = chuks_mount(); return drainStr()
