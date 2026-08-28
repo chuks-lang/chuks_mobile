@@ -44,7 +44,7 @@ trap cleanup EXIT
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" ./cmd/cmr )
 
 echo "2. Packing the source bundle (chukspack) -> assets/cmr.bundle"
-( cd "$CHUKS_REPO" && go run ./cmd/chukspack "$APP_ENTRY" -o "$OUTABS/assets/cmr.bundle" )
+chuks pack "$APP_ENTRY" -o "$OUTABS/assets/cmr.bundle"
 echo "   bundle: $(grep -c '^--- module:' "$OUT/assets/cmr.bundle") modules"
 
 # CMR dev hot reload (DEV=1): point the app at `chukspack serve` so it fetches the
