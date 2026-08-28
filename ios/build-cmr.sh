@@ -43,7 +43,7 @@ echo "1. Building CMR (libcmr.a) for the simulator"
     go build -buildmode=c-archive -tags ios -o "$OUTABS/libcmr.a" ./cmd/cmr )
 
 echo "2. Packing the source bundle (chukspack)"
-( cd "$CHUKS_REPO" && go run ./cmd/chukspack "$APP_ENTRY" -o "$OUTABS/cmr.bundle" )
+chuks pack "$APP_ENTRY" -o "$OUTABS/cmr.bundle"
 mkdir -p "$APP"; cp "$OUTABS/cmr.bundle" "$APP/cmr.bundle"
 echo "   bundle: $(grep -c '^--- module:' "$APP/cmr.bundle") modules, $(wc -c < "$APP/cmr.bundle") bytes"
 
