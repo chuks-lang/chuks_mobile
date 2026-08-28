@@ -47,6 +47,20 @@ echo "2. Packing the source bundle (chukspack) -> assets/cmr.bundle"
 ( cd "$CHUKS_REPO" && go run ./cmd/chukspack "$APP_ENTRY" -o "$OUTABS/assets/cmr.bundle" )
 echo "   bundle: $(grep -c '^--- module:' "$OUT/assets/cmr.bundle") modules"
 
+# CMR dev hot reload (DEV=1): point the app at `chukspack serve` so it fetches the
+# source bundle over HTTP and re-boots the on-device VM on each .chuks change. The
+# baked bundle above stays as a fallback for the first launch if the server is down.
+if [ "${DEV:-0}" = "1" ]; then
+    DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
+    case "$DEV_ID" in
+        emulator-*) DEV_HOST="10.0.2.2" ;;   # emulator's alias for the host loopback
+        *) if "$ADB" -s "$DEV_ID" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then DEV_HOST="localhost"
+           else DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)"; fi ;;
+    esac
+    printf '%s:7799' "$DEV_HOST" > "$OUTABS/assets/cmr-dev.txt"
+    echo "   CMR dev: app will fetch the bundle from $DEV_HOST:7799 (first run: chuks dev)"
+fi
+
 echo "3. Building the Android host (Kotlin)"
 kotlinc "$PKGDIR/MainActivity.kt" "$PKGDIR/ChuksEffects.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1 \
     || { echo "  kotlin build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1; }
@@ -70,6 +84,7 @@ for f in $(find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev
 ( cd "$OUT" && zip -qj base.apk classes.dex \
     && zip -q base.apk "lib/$ABI/libapp.so" "lib/$ABI/libc++_shared.so" \
     && zip -q base.apk assets/cmr.bundle \
+    && { [ -e assets/cmr-dev.txt ] && zip -q base.apk assets/cmr-dev.txt || true; } \
     && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
     && for im in assets/*.png assets/*.jpg; do [ -e "$im" ] && zip -q base.apk "$im" || true; done )
 "$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/chuks.apk" > "$OUT/zipalign.log" 2>&1
