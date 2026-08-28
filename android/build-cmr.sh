@@ -59,11 +59,17 @@ echo "   bundle: $(grep -c '^--- module:' "$OUT/assets/cmr.bundle") modules"
 # baked bundle above stays as a fallback for the first launch if the server is down.
 if [ "${DEV:-0}" = "1" ]; then
     DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
-    case "$DEV_ID" in
-        emulator-*) DEV_HOST="10.0.2.2" ;;   # emulator's alias for the host loopback
-        *) if "$ADB" -s "$DEV_ID" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then DEV_HOST="localhost"
-           else DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)"; fi ;;
-    esac
+    # Prefer an `adb reverse` tunnel (works for emulators AND USB devices): the app
+    # then talks to localhost, which handles the held-open /hmr long-poll reliably.
+    # The emulator's 10.0.2.2 NAT stalls long-polls, so use it only as a fallback.
+    if "$ADB" -s "$DEV_ID" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then
+        DEV_HOST="localhost"
+    else
+        case "$DEV_ID" in
+            emulator-*) DEV_HOST="10.0.2.2" ;;
+            *)          DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)" ;;
+        esac
+    fi
     printf '%s:7799' "$DEV_HOST" > "$OUTABS/assets/cmr-dev.txt"
     echo "   CMR dev: app will fetch the bundle from $DEV_HOST:7799 (first run: chuks dev)"
 fi
