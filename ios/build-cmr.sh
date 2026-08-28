@@ -75,7 +75,11 @@ FONT_PLIST=""
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do
     bn="$(basename "$f")"; cp "$f" "$APP/$bn"; FONT_PLIST="$FONT_PLIST<string>$bn</string>"
 done
-for f in $(find -L "$PROJDIR/assets" -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" 2>/dev/null); do cp "$f" "$APP/$(basename "$f")"; done
+# Media assets keep their path relative to assets/ (organize in subfolders, reference
+# as src:"sub/dir/name.png"); the host resolves them against the .app bundle path.
+find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" \) 2>/dev/null | while IFS= read -r f; do
+    rel="${f#"$PROJDIR/assets/"}"; mkdir -p "$APP/$(dirname "$rel")"; cp "$f" "$APP/$rel"
+done
 cat > "$APP/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

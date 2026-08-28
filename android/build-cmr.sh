@@ -92,14 +92,19 @@ chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" patch-manifest "$OUT/AndroidMani
 echo "6. Bundling (+ assets, libcmr as libapp.so)"
 mkdir -p "$OUT/lib/$ABI"; cp "$OUT/libapp.so" "$OUT/lib/$ABI/"
 cp "$BIN/../sysroot/usr/lib/$CXXLIB/libc++_shared.so" "$OUT/lib/$ABI/"
+# Fonts are referenced by family name, so they flatten. Images keep their path
+# relative to assets/, so you can organize them in subfolders and reference them as
+# src:"sub/dir/name.png" (basenames no longer collide across folders).
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
-for f in $(find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev/null); do cp "$f" "$OUT/assets/"; done
+find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev/null | while IFS= read -r f; do
+    rel="${f#"$PROJDIR/assets/"}"; mkdir -p "$OUT/assets/$(dirname "$rel")"; cp "$f" "$OUT/assets/$rel"
+done
 ( cd "$OUT" && zip -qj base.apk classes.dex \
     && zip -q base.apk "lib/$ABI/libapp.so" "lib/$ABI/libc++_shared.so" \
     && zip -q base.apk assets/cmr.bundle \
     && { [ -e assets/cmr-dev.txt ] && zip -q base.apk assets/cmr-dev.txt || true; } \
     && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
-    && for im in assets/*.png assets/*.jpg; do [ -e "$im" ] && zip -q base.apk "$im" || true; done )
+    && find assets \( -name "*.png" -o -name "*.jpg" \) -type f | while IFS= read -r im; do zip -q base.apk "$im"; done )
 "$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/chuks.apk" > "$OUT/zipalign.log" 2>&1
 
 echo "7. Signing + installing + launching (CMR — the VM runs on the device)"

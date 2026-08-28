@@ -25,6 +25,16 @@ import ImageIO
 // large source image downsampled to the target display size via ImageIO, instead
 // of letting UIImageView hold a full-res bitmap. maxPixel is the longest side in
 // PIXELS (points * screen scale).
+// Resolve a bundled asset name to a file URL in the .app. The build scripts preserve
+// each asset's path relative to assets/, so a name may be a subfolder path like
+// "images/logo.png"; a direct bundlePath join finds those. Fall back to the flat
+// resource lookup for a bare top-level name.
+func bundledAssetURL(_ name: String) -> URL? {
+    let direct = Bundle.main.bundlePath + "/" + name
+    if FileManager.default.fileExists(atPath: direct) { return URL(fileURLWithPath: direct) }
+    return Bundle.main.url(forResource: name, withExtension: nil)
+}
+
 func downsampledImage(data: Data, maxPixel: CGFloat) -> UIImage? {
     guard maxPixel > 0,
           let src = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
@@ -1794,7 +1804,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 trigger: UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)))
         case "audio.play":
             let src: URL? = args.hasPrefix("file://") ? URL(fileURLWithPath: String(args.dropFirst(7)))   // a recording / downloaded file
-                                                      : Bundle.main.url(forResource: args, withExtension: nil)   // a bundled asset
+                                                      : bundledAssetURL(args)   // a bundled asset
             if let url = src {
                 try? AVAudioSession.sharedInstance().setCategory(.playback)
                 try? AVAudioSession.sharedInstance().setActive(true)
@@ -2435,7 +2445,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if let vc = videoCtrlVCs[id], videoPlayers[id] == nil, !val.isEmpty {
                     let url: URL? = val.hasPrefix("http") ? URL(string: val)
                                   : val.hasPrefix("file://") ? URL(fileURLWithPath: String(val.dropFirst(7)))
-                                  : Bundle.main.url(forResource: val, withExtension: nil)
+                                  : bundledAssetURL(val)
                     if let url = url {
                         let p = AVPlayer(url: url); vc.player = p; videoPlayers[id] = p; videoPlayerKey[id] = val; p.play()
                     }
@@ -2453,7 +2463,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         // http(s) -> remote; file:// -> captured/downloaded; else a bundled asset.
                         let url: URL? = val.hasPrefix("http") ? URL(string: val)
                                       : val.hasPrefix("file://") ? URL(fileURLWithPath: String(val.dropFirst(7)))
-                                      : Bundle.main.url(forResource: val, withExtension: nil)
+                                      : bundledAssetURL(val)
                         if let url = url {
                             let item = AVPlayerItem(url: url)
                             let p = AVPlayer(playerItem: item); p.isMuted = true; p.actionAtItemEnd = .none
@@ -3028,7 +3038,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let bucket = 1 << (Int.bitWidth - 1 - ti.leadingZeroBitCount)   // highest one bit
         if imageDecodedDim[id] == bucket { return }
         let path: String? = src.hasPrefix("file://") ? String(src.dropFirst(7))
-            : Bundle.main.url(forResource: src, withExtension: nil)?.path
+            : bundledAssetURL(src)?.path
         guard let p = path, let img = downsampledImage(path: p, maxPixel: target) else { return }
         iv.image = img
         imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id)
