@@ -13,10 +13,9 @@
     "ios:release": "bash chuks_packages/@chuks/mobile/ios/build.sh",
     "ios:device": "IOS_TARGET=device bash chuks_packages/@chuks/mobile/ios/build.sh",
     "android": "bash chuks_packages/@chuks/mobile/android/build.sh",
-    "dev": "rm -f .chuks/dev-state.txt; chuks run .chuks/qrprint.chuks; chuks watch .chuks/devserver.chuks",
-    "dev:ios": "DEV=1 FAST=1 bash chuks_packages/@chuks/mobile/ios/build.sh",
-    "dev:ios:device": "DEV=1 FAST=1 IOS_TARGET=device bash chuks_packages/@chuks/mobile/ios/build.sh",
-    "dev:android": "DEV=1 bash chuks_packages/@chuks/mobile/android/build.sh",
+    "dev": "E=\"$PWD/app/app.chuks\"; cd \"${CHUKS_REPO:?set CHUKS_REPO to the chuks source repo}\" && go run ./cmd/chukspack serve \"$E\" --port 7799",
+    "dev:ios": "DEV=1 bash chuks_packages/@chuks/mobile/ios/build-cmr.sh",
+    "dev:android": "DEV=1 bash chuks_packages/@chuks/mobile/android/build-cmr.sh",
     "typecheck": "chuks check .chuks/entry.chuks"
   }
 }

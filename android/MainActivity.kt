@@ -274,13 +274,26 @@ class MainActivity : Activity() {
             if (it.isNotEmpty()) devBase = "http://$it"
         }
 
-        // CMR: if a chukspack bundle is baked into assets, load it into the
-        // in-process VM (libcmr). No-op/caught in AOT + DEV builds.
-        try {
-            val bundle = assets.open("cmr.bundle").readBytes()
-            val rc = N.cmrBoot(bundle, cacheDir.absolutePath)   // cacheDir => $TMPDIR for on-device compile
-            android.util.Log.i("CMR", "booted rc=$rc (${bundle.size} bytes)")
-        } catch (_: Throwable) { /* no cmr.bundle, or cmrBoot native absent (AOT) */ }
+        // CMR boot. Two sources for the source bundle the on-device VM (libcmr) runs:
+        //   1. cmr-dev.txt present  -> fetch it over HTTP from `chukspack serve` and
+        //      hot-reload on change (Metro/Hermes model: the VM runs HERE, only the
+        //      SOURCE is fetched, unlike the retired chuks-dev.txt mutation-stream flow).
+        //   2. else                 -> the baked assets/cmr.bundle (standalone CMR).
+        val cmrDevHost = try { assets.open("cmr-dev.txt").bufferedReader().use { it.readText().trim() } } catch (e: Exception) { "" }
+        if (cmrDevHost.isNotEmpty()) {
+            cmrDevBase = "http://$cmrDevHost"
+            var b: ByteArray? = null; var v = 0
+            val t = Thread { val r = cmrFetchBundle(); b = r.first; v = r.second }; t.start(); t.join(8000)
+            if (b == null) try { b = assets.open("cmr.bundle").readBytes() } catch (e: Exception) {}   // fallback if server down
+            if (b != null) { val rc = N.cmrBoot(b!!, cacheDir.absolutePath); cmrVersion = v; android.util.Log.i("CMR", "dev boot rc=$rc v=$v (${b!!.size} bytes) from $cmrDevBase") }
+            startCmrHmr()
+        } else {
+            try {
+                val bundle = assets.open("cmr.bundle").readBytes()
+                val rc = N.cmrBoot(bundle, cacheDir.absolutePath)   // cacheDir => $TMPDIR for on-device compile
+                android.util.Log.i("CMR", "booted rc=$rc (${bundle.size} bytes)")
+            } catch (_: Throwable) { /* no cmr.bundle, or cmrBoot native absent (AOT) */ }
+        }
 
         if (!devMode) {
             N.setup(1000)
@@ -506,6 +519,63 @@ class MainActivity : Activity() {
     private var devBase = ""            // "http://10.0.2.2:7799"; empty => production (JNI)
     private val devMode get() = devBase.isNotEmpty()
     private var devConnected = true
+
+    // ================= CMR dev hot reload ===================================
+    // A CMR dev build (build-cmr.sh DEV=1) drops assets/cmr-dev.txt = "<host>:<port>"
+    // of `chukspack serve`. On boot the host fetches GET /bundle and boots the
+    // on-device VM with it; a background thread long-polls GET /hmr?since=N and,
+    // when a .chuks file changes, recreate()s the Activity so onCreate re-fetches the
+    // new bundle and re-boots. The VM runs on the device; only the SOURCE crosses HTTP.
+    private var cmrDevBase = ""         // "http://10.0.2.2:7799"; empty => baked bundle
+    private var cmrVersion = 0
+    // GET /bundle -> (bytes, X-CMR-Version). Blocking; call off the main thread.
+    private fun cmrFetchBundle(): Pair<ByteArray?, Int> {
+        return try {
+            val c = java.net.URL("$cmrDevBase/bundle").openConnection() as java.net.HttpURLConnection
+            c.connectTimeout = 3000; c.readTimeout = 8000
+            val code = c.responseCode
+            // Read the version header BEFORE consuming the body (Go canonicalizes it to
+            // "X-Cmr-Version"; match case-insensitively).
+            val ver = c.headerFields?.entries?.firstOrNull { it.key?.equals("X-CMR-Version", true) == true }
+                ?.value?.firstOrNull()?.trim()?.toIntOrNull() ?: cmrVersion
+            val body = if (code == 200) c.inputStream.use { it.readBytes() } else null
+            c.disconnect(); Pair(body, ver)
+        } catch (e: Exception) { Pair(null, cmrVersion) }
+    }
+    // GET /hmr?since=N -> new version (>since), or 0 on 204/timeout/error. Long-poll.
+    private fun cmrPollHmr(since: Int): Int {
+        return try {
+            val c = java.net.URL("$cmrDevBase/hmr?since=$since").openConnection() as java.net.HttpURLConnection
+            c.connectTimeout = 3000; c.readTimeout = 35000
+            val v = if (c.responseCode == 200) c.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8).trim().toIntOrNull() ?: 0 else 0
+            c.disconnect(); v
+        } catch (e: Exception) { 0 }
+    }
+    private fun startCmrHmr() {
+        Thread {
+            while (true) {
+                val v = cmrPollHmr(cmrVersion)
+                if (v > cmrVersion) {
+                    cmrVersion = v                       // advance baseline immediately (avoid a double poll)
+                    val (b, ver) = cmrFetchBundle()
+                    if (b != null) handler.post { cmrReloadInPlace(b, ver) }
+                } else {
+                    try { Thread.sleep(150) } catch (e: InterruptedException) { return@Thread }
+                }
+            }
+        }.apply { isDaemon = true; start() }
+    }
+    // Hot reload WITHOUT an Activity recreate (no blank flash): tear down the current
+    // tree, re-boot the VM with the new bundle, and rebuild, all in one main-thread
+    // frame so the screen swaps in place. Runs on the UI thread.
+    private fun cmrReloadInPlace(bundle: ByteArray, ver: Int) {
+        setFrameDriver(false)
+        remove("app")                                    // detaches from root, frees the Yoga tree, clears per-node maps
+        activeModal = null; listScroll = null; contentId = ""; shownSheet = null
+        everMounted = false
+        N.cmrBoot(bundle, cacheDir.absolutePath); cmrVersion = ver
+        hostMount(); relayout(); if (pushViewport()) relayout()
+    }
 
     // Synchronous HTTP to the dev server. MUST run off the main thread. Returns null on a
     // network error (the server is briefly down while chuks watch restarts it).
@@ -2309,7 +2379,11 @@ class MainActivity : Activity() {
         val pn = ynodes[parent] ?: return
         val base = if (bgImageViews.containsKey(parent)) 1 else 0   // keep an ImageBackground's bg image at the back
         pv.addView(child, minOf(index + base, pv.childCount))
-        N.yInsert(pn, ynodes[id]!!, minOf(index, N.yChildCount(pn)))
+        val cn = ynodes[id]!!
+        // Yoga aborts if `cn` still has an owner (a hot reload can re-emit an insert for a
+        // node already parented). Detach it from its old owner first (reconciler re-parent).
+        val owner = N.yOwner(cn); if (owner != 0L) N.yRemove(owner, cn)
+        N.yInsert(pn, cn, minOf(index, N.yChildCount(pn)))
     }
 
     // Drives the live camera preview for a CameraView node on a TextureView, via Camera2

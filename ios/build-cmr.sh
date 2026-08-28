@@ -47,6 +47,16 @@ echo "2. Packing the source bundle (chukspack)"
 mkdir -p "$APP"; cp "$OUTABS/cmr.bundle" "$APP/cmr.bundle"
 echo "   bundle: $(grep -c '^--- module:' "$APP/cmr.bundle") modules, $(wc -c < "$APP/cmr.bundle") bytes"
 
+# CMR dev hot reload (DEV=1): point the app at `chukspack serve` so it fetches the
+# source bundle over HTTP and re-boots the on-device VM on each .chuks change. The
+# baked bundle above stays as a first-launch fallback if the server is down. The
+# simulator reaches the Mac at localhost; a device needs the Mac's LAN IP (IOS_DEV_HOST).
+if [ "${DEV:-0}" = "1" ]; then
+    DEVHOST="${IOS_DEV_HOST:-localhost:7799}"
+    printf '%s' "$DEVHOST" > "$APP/cmr-dev.txt"
+    echo "   CMR dev: app will fetch the bundle from $DEVHOST (first run: chuks dev)"
+fi
+
 echo "3. Building the UIKit host (CMR mode)"
 printf '#include "libcmr.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" -sdk "$SDKPATH" -target "$TRIPLE" \
@@ -55,6 +65,7 @@ swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" -sdk "$SDKPATH" -ta
     -Xclang-linker -Wno-incompatible-sysroot \
     -framework UIKit -framework Foundation -parse-as-library -Onone -D CMR \
     -o "$OUT/$APPNAME"
+cp "$OUT/$APPNAME" "$APP/$APPNAME"   # the .app's executable (CFBundleExecutable)
 
 echo "4. Assembling the app (+ assets)"
 IOS_PLIST_EXTRA="$(AJ ios-plist)"

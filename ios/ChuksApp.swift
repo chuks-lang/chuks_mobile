@@ -899,6 +899,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var sheetPan: UIPanGestureRecognizer? = nil                          // drag-to-dismiss recognizer on the sheet
     var shownSheet: String? = nil                                        // the sheet currently on screen (nil = none); a change drives the slide-up
     var connected = false                               // dev mode: is the VM server reachable?
+    var cmrDevBase = ""                                 // CMR dev build: "http://<host>:7799" (cmr-dev.txt); empty => baked bundle
+    var cmrVersion = 0                                  // last bundle version booted (for /hmr long-poll)
 
     // ---- engine calls: cgo (prod) or HTTP to the VM dev server (dev) -------
     // Each returns the mutation stream; nil means the server is down (reloading).
@@ -908,7 +910,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     func eSetup() {
         #if CMR
-        cmrBootBundle()   // load the packed source bundle into the in-process VM
+        if !cmrDevBoot() { cmrBootBundle() }   // dev: fetch bundle over HTTP + hot reload; else the baked bundle
         #endif
         if !DEV_MODE { chuks_set_count(N) }
     }   // chuks_* bridge auto-runs chuks_init; dev server self-inits on boot
@@ -1240,6 +1242,87 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         listScroll = nil; scrollId = ""; contentId = ""
         apply(mountStream)
     }
+
+    #if CMR
+    // ---- CMR dev hot reload -------------------------------------------------
+    // A CMR dev build (build-cmr.sh DEV=1) bundles cmr-dev.txt = "<host>:<port>" of
+    // `chukspack serve`. On boot we fetch GET /bundle and boot the on-device VM with
+    // it; a background poll of GET /hmr?since=N re-boots + remounts in place on each
+    // .chuks change. The VM runs on the device; only the SOURCE crosses HTTP.
+    func cmrDevBoot() -> Bool {
+        guard let u = Bundle.main.url(forResource: "cmr-dev", withExtension: "txt"),
+              let s = try? String(contentsOf: u, encoding: .utf8) else { return false }
+        let host = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.isEmpty { return false }
+        cmrDevBase = "http://\(host)"
+        let (data, ver) = cmrFetchBundle()
+        guard let data = data else { NSLog("CMR dev: %@ unreachable, using baked bundle", cmrDevBase); return false }
+        cmrBootData(data); cmrVersion = ver
+        NSLog("CMR dev boot v=%d (%d bytes) from %@", ver, data.count, cmrDevBase)
+        startCmrHmr()
+        return true
+    }
+    func cmrBootData(_ data: Data) {
+        _ = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+            chuks_cmr_boot(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
+        }
+    }
+    // GET /bundle -> (data, X-CMR-Version). Synchronous (semaphore).
+    func cmrFetchBundle() -> (Data?, Int) {
+        guard let url = URL(string: "\(cmrDevBase)/bundle") else { return (nil, cmrVersion) }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let sem = DispatchSemaphore(value: 0)
+        var out: Data? = nil; var ver = cmrVersion; var code = -1
+        URLSession.shared.dataTask(with: req) { d, resp, _ in
+            if let h = resp as? HTTPURLResponse {
+                code = h.statusCode
+                if h.statusCode == 200, let d = d { out = d }
+                if let v = h.value(forHTTPHeaderField: "X-CMR-Version").flatMap({ Int($0) }) { ver = v }
+            }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 9)
+        NSLog("CMRDBG fetchBundle %@ -> code=%d bytes=%d ver=%d", url.absoluteString, code, out?.count ?? 0, ver)
+        return (out, ver)
+    }
+    // GET /hmr?since=N -> new version (!= since), or 0 on 204/error. Long-poll.
+    func cmrPollHmr(_ since: Int) -> Int {
+        guard let url = URL(string: "\(cmrDevBase)/hmr?since=\(since)") else { return 0 }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 35)
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let sem = DispatchSemaphore(value: 0)
+        var v = 0
+        URLSession.shared.dataTask(with: req) { d, resp, _ in
+            if let h = resp as? HTTPURLResponse, h.statusCode == 200, let d = d,
+               let n = Int((String(data: d, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)) { v = n }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 36)
+        return v
+    }
+    func startCmrHmr() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            while let self = self {
+                let v = self.cmrPollHmr(self.cmrVersion)
+                if v != self.cmrVersion && v > 0 {
+                    self.cmrVersion = v
+                    let (data, ver) = self.cmrFetchBundle()
+                    if let data = data { DispatchQueue.main.async { self.cmrReloadInPlace(data, ver) } }
+                } else {
+                    Thread.sleep(forTimeInterval: 0.15)
+                }
+            }
+        }
+    }
+    // In-place reload (no VC recreate, no blank): reboot the VM with the new bundle
+    // and rebuild the tree via remount().
+    func cmrReloadInPlace(_ data: Data, _ ver: Int) {
+        setFrameDriver(false)
+        cmrBootData(data); cmrVersion = ver
+        if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
+    }
+    #endif
 
     func headerText(_ line2: String) {
         header.text = "Chuks app (100% Chuks): \(N) cards, \(views.count) live views\n\(line2)"
@@ -2533,6 +2616,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // conditional rendering / hot reload). Yoga aborts if you add a child to a node that
         // still has a text measure func, so clear it first.
         if YGNodeHasMeasureFunc(pn) { YGNodeSetMeasureFunc(pn, nil) }
+        // Yoga aborts if `cn` still has an owner (a hot reload can re-emit an insert for a
+        // node already parented). Detach it from its old owner first (reconciler re-parent).
+        if let owner = YGNodeGetOwner(cn) { YGNodeRemoveChild(owner, cn) }
         YGNodeInsertChild(pn, cn, min(index, YGNodeGetChildCount(pn)))
     }
 
