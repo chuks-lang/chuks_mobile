@@ -115,6 +115,28 @@ JNIEXPORT jint JNICALL J(cmrBoot)(JNIEnv* e, jobject, jbyteArray b, jstring tmp)
     e->ReleaseByteArrayElements(b, p, JNI_ABORT);
     return rc;
 }
+// Hot-reload delta: merge only the changed modules into the kept set + re-init.
+extern "C" int chuks_cmr_apply_delta(char* delta, int length);
+JNIEXPORT jint JNICALL J(cmrApplyDelta)(JNIEnv* e, jobject, jbyteArray d) {
+    jsize n = e->GetArrayLength(d);
+    jbyte* p = e->GetByteArrayElements(d, nullptr);
+    jint rc = chuks_cmr_apply_delta((char*)p, (int)n);
+    e->ReleaseByteArrayElements(d, p, JNI_ABORT);
+    return rc;
+}
+// Hot-reload state preservation: save before a reboot, restore into the fresh VM.
+extern "C" char* chuks_cmr_save_state();
+extern "C" void chuks_cmr_load_state(char* state);
+JNIEXPORT jstring JNICALL J(cmrSaveState)(JNIEnv* e, jobject) {
+    char* s = chuks_cmr_save_state();
+    jstring r = e->NewStringUTF(s ? s : "");
+    if (s) chuks_free_str(s);
+    return r;
+}
+JNIEXPORT void JNICALL J(cmrLoadState)(JNIEnv* e, jobject, jstring st) {
+    const char* c = e->GetStringUTFChars(st, nullptr);
+    if (c) { chuks_cmr_load_state((char*)c); e->ReleaseStringUTFChars(st, c); }
+}
 #endif
 
 // ---- Yoga (handle-based) ----

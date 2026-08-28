@@ -1306,21 +1306,67 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             while let self = self {
                 let v = self.cmrPollHmr(self.cmrVersion)
                 if v != self.cmrVersion && v > 0 {
-                    self.cmrVersion = v
-                    let (data, ver) = self.cmrFetchBundle()
-                    if let data = data { DispatchQueue.main.async { self.cmrReloadInPlace(data, ver) } }
+                    // Fetch the delta with the CURRENT (old) version so the server
+                    // sends only the modules changed since it. Advance cmrVersion HERE,
+                    // in the poll thread, before dispatching the reload — otherwise the
+                    // next poll (running before the async main-thread reload sets it)
+                    // still sees the old version and re-fetches the same delta.
+                    let (data, ver, isDelta) = self.cmrFetchDelta(self.cmrVersion)
+                    self.cmrVersion = ver
+                    if let data = data { DispatchQueue.main.async { self.cmrReloadInPlace(data, ver, isDelta) } }
                 } else {
                     Thread.sleep(forTimeInterval: 0.15)
                 }
             }
         }
     }
-    // In-place reload (no VC recreate, no blank): reboot the VM with the new bundle
-    // and rebuild the tree via remount().
-    func cmrReloadInPlace(_ data: Data, _ ver: Int) {
+    // GET /delta?since=N -> (payload, X-CMR-Version, isDelta). A delta (isDelta=true)
+    // carries only the modules edited since N (~5KB); a full bundle (isDelta=false) is
+    // sent when the device is fresh or the server restarted. Synchronous (semaphore).
+    func cmrFetchDelta(_ since: Int) -> (Data?, Int, Bool) {
+        guard let url = URL(string: "\(cmrDevBase)/delta?since=\(since)") else { return (nil, cmrVersion, false) }
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let sem = DispatchSemaphore(value: 0)
+        var out: Data? = nil; var ver = cmrVersion; var isDelta = false
+        URLSession.shared.dataTask(with: req) { d, resp, _ in
+            if let h = resp as? HTTPURLResponse, h.statusCode == 200, let d = d {
+                out = d
+                if let v = h.value(forHTTPHeaderField: "X-CMR-Version").flatMap({ Int($0) }) { ver = v }
+                isDelta = (h.value(forHTTPHeaderField: "X-CMR-Delta") ?? "0") == "1"
+            }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 11)
+        return (out, ver, isDelta)
+    }
+    func cmrApplyDelta(_ data: Data) -> Int32 {
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+            chuks_cmr_apply_delta(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
+        }
+    }
+    // In-place reload (no VC recreate, no blank): merge the delta (or reboot with a
+    // full bundle), then rebuild the tree via remount(). State/nav are carried across.
+    func cmrReloadInPlace(_ data: Data, _ ver: Int, _ isDelta: Bool) {
         setFrameDriver(false)
-        cmrBootData(data); cmrVersion = ver
+        let saved = cmrSaveState()          // cells + nav from the OLD VM
+        let rc = isDelta ? cmrApplyDelta(data)
+                         : data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+                             chuks_cmr_boot(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
+                           }
+        cmrVersion = ver
+        NSLog("CMR reload %@ rc=%d v=%d (%d bytes)", isDelta ? "delta" : "full", rc, ver, data.count)
+        cmrLoadState(saved)                 // restore into the fresh VM before mount
         if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
+    }
+    // Serialize / restore the app's state (useState cells + navigation stack) around
+    // a reload, so an edit keeps your current screen instead of resetting to route 0.
+    func cmrSaveState() -> String {
+        guard let c = chuks_cmr_save_state() else { return "" }
+        let s = String(cString: c); chuks_free_str(c); return s
+    }
+    func cmrLoadState(_ state: String) {
+        state.withCString { chuks_cmr_load_state(UnsafeMutablePointer(mutating: $0)) }
     }
     #endif
 
