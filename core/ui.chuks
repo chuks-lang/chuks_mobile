@@ -534,6 +534,17 @@ dataType LayoutProps {
     dir: string?; border: int?; borderColor: string?; shadow: int?; glass: bool?;
     opacity: int?; wrap: string?; font: string?; tx: int?; ty: int?; rotate: int?;
     scale: int?; anim: int?; easing: string?; tw: string?;
+    // Per-side padding + margins (px/py are the axes; pt/pr/pb/pl are the sides).
+    pt: int?; pr: int?; pb: int?; pl: int?; mt: int?; mr: int?; mb: int?; ml: int?;
+    // Min/max size, percentage size, bottom offset, z-index, aspect ratio.
+    minw: int?; maxw: int?; minh: int?; maxh: int?; wpct: int?; hpct: int?; bottom: int?; z: int?; aspect: int?;
+    // Per-corner radius.
+    rtl: int?; rtr: int?; rbr: int?; rbl: int?;
+    // Per-side border widths + border style.
+    borderTop: int?; borderRight: int?; borderBottom: int?; borderLeft: int?; bstyle: string?;
+    // Typography extras, box overflow, self-align, hidden/italic toggles.
+    tracking: int?; leading: int?; deco: string?; transform: string?; fontFamily: string?;
+    overflow: string?; self: string?; hidden: bool?; italic: bool?;
 }
 dataType EventProps {
     onPress: (function(): void)?; onChange: (function(v: string): void)?;
