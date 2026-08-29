@@ -2624,7 +2624,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if (bwSide.t >= 0 || bwSide.r >= 0 || bwSide.b >= 0 || bwSide.l >= 0), !borderColorHex.isEmpty {
             sideBorders[id] = (max(0, bwSide.t), max(0, bwSide.r), max(0, bwSide.b), max(0, bwSide.l), hexColor(borderColorHex))
         } else { sideBorders[id] = nil }
-        if dashBorders[id] != nil || sideBorders[id] != nil { view.setNeedsLayout() }
+        // Border props are PAINT-ONLY: never call setNeedsLayout here. Doing so from
+        // inside a style-apply (which itself runs during the root's viewDidLayoutSubviews
+        // -> pushViewport -> apply cycle) re-arms a full layout pass before the current
+        // one commits, and updateBorderLayers churns a fresh CALayer burst each pass, so
+        // an incrementally-mounted side/dash border never converges and freezes the app.
+        // Draw immediately if the node is already laid out; otherwise the relayout that
+        // follows every apply() draws it (see relayout -> updateBorderLayers).
+        if (dashBorders[id] != nil || sideBorders[id] != nil), v.bounds != .zero { updateBorderLayers(id, v) }
     }
 
     // Draw dashed/dotted and per-side borders as sublayers, sized to the laid-out frame.
@@ -2642,14 +2649,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                                         : [NSNumber(value: Double(w * 3)), NSNumber(value: Double(w * 2))]
             sl.lineCap = dotted ? .round : .butt
         } else { v.layer.sublayers?.first { $0.name == dashKey }?.removeFromSuperlayer() }
-        v.layer.sublayers?.filter { $0.name == sideKey }.forEach { $0.removeFromSuperlayer() }
+        // Per-side borders: reuse ONE persistent named layer per edge, updated in place.
+        // (The old code removed + re-allocated every edge layer on each relayout, which
+        // is the CALayer/autorelease burst that made the freeze loop so violent.)
         if let (t, r, b, l, col) = sideBorders[id] {
             let W = v.bounds.width, H = v.bounds.height
-            func edge(_ rect: CGRect) { let e = CALayer(); e.name = sideKey; e.frame = rect; e.backgroundColor = col.cgColor; v.layer.addSublayer(e) }
-            if t > 0 { edge(CGRect(x: 0, y: 0, width: W, height: t)) }
-            if b > 0 { edge(CGRect(x: 0, y: H - b, width: W, height: b)) }
-            if l > 0 { edge(CGRect(x: 0, y: 0, width: l, height: H)) }
-            if r > 0 { edge(CGRect(x: W - r, y: 0, width: r, height: H)) }
+            func edge(_ suffix: String, _ present: Bool, _ rect: CGRect) {
+                let name = sideKey + suffix
+                let existing = v.layer.sublayers?.first { $0.name == name }
+                if !present { existing?.removeFromSuperlayer(); return }
+                let e = existing ?? { let l = CALayer(); l.name = name; v.layer.addSublayer(l); return l }()
+                e.frame = rect; e.backgroundColor = col.cgColor
+            }
+            edge(".t", t > 0, CGRect(x: 0, y: 0, width: W, height: t))
+            edge(".b", b > 0, CGRect(x: 0, y: H - b, width: W, height: b))
+            edge(".l", l > 0, CGRect(x: 0, y: 0, width: l, height: H))
+            edge(".r", r > 0, CGRect(x: W - r, y: 0, width: r, height: H))
+        } else {
+            v.layer.sublayers?.filter { ($0.name ?? "").hasPrefix(sideKey) }.forEach { $0.removeFromSuperlayer() }
         }
     }
 

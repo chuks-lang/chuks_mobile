@@ -2,12 +2,13 @@
 //
 // It links no app engine of its own. You point it at a running `chuks dev` server by
 // scanning the QR that server prints (or typing the address), and it renders whatever
-// app the server serves over HTTP, hot-reloading as you edit. It reuses the entire
-// rendering machinery in ChuksAppSwiftUI.swift (Scene, NodeView, RootView, devHTTP);
-// this file only adds the connect screen and drives `devServerHost` at runtime.
+// app the server serves over HTTP, hot-reloading as you edit. It reuses the UIKit
+// rendering machinery in ChuksApp.swift (CardsVC, the render gate, devHTTP); this file
+// only adds the connect screen and drives `devServerHost` at runtime.
 //
-// Built with -D CHUKS_PREVIEW (so ChuksAppSwiftUI.swift drops its own @main) and -D DEV
-// (so the engine bridge always talks to the dev server instead of a linked library).
+// Built with -D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT (so ChuksApp.swift drops its own
+// @main) and -D DEV (so the engine bridge always talks to the dev server). The connect
+// screen itself is a small hosted SwiftUI view; the app content renders through UIKit.
 #if CHUKS_PREVIEW
 import SwiftUI
 import UIKit
@@ -29,87 +30,6 @@ func parseDevServer(_ raw: String) -> String? {
     if !s.contains(":") { s += ":7799" }
     return s
 }
-
-// ─── App entry ──────────────────────────────────────────────────────────────
-// Two render gates share one connect screen. The SwiftUI gate (here) hands off to
-// RootView; the UIKit gate (bottom of file, -D CHUKS_PREVIEW_UIKIT) hands off to CardsVC.
-// Only the host being compiled defines RootView/Scene (SwiftUI) or CardsVC (UIKit), so
-// each gate is behind the matching flag.
-#if !CHUKS_PREVIEW_UIKIT
-@main
-struct ChuksPreviewApp: App {
-    @UIApplicationDelegateAdaptor(ChuksOrientationDelegate.self) var appDelegate   // orientation lock mask
-    var body: some SwiftUI.Scene {
-        WindowGroup { PreviewGate() }
-    }
-}
-
-// Shows the connect screen until a server is chosen, then hands off to RootView, which
-// boots the Scene against `devServerHost`. "Disconnect" returns here with a fresh Scene.
-struct PreviewGate: View {
-    @State private var connected = false
-    @State private var sceneKey = UUID()   // changing it makes a brand-new Scene on reconnect
-
-    var body: some View {
-        Group {
-            if connected {
-                ConnectedHost(onDisconnect: { connected = false; sceneKey = UUID() })
-                    .id(sceneKey)
-            } else {
-                ConnectView(onConnect: connect)
-            }
-        }
-        // A chuks:// deep link (scanned on a real device, or `simctl openurl`) connects
-        // straight through, no manual entry.
-        .onOpenURL { url in
-            if let host = parseDevServer(url.absoluteString) { connect(host) }
-        }
-        // Env override for scripted / CI launches: SIMCTL_CHILD_CHUKS_PREVIEW_HOST=host:port.
-        .onAppear {
-            if !connected, let h = ProcessInfo.processInfo.environment["CHUKS_PREVIEW_HOST"],
-               let host = parseDevServer(h) { connect(host) }
-        }
-    }
-
-    private func connect(_ host: String) {
-        devServerHost = host
-        UserDefaults.standard.set(host, forKey: "chuks.preview.lastHost")
-        connected = true
-    }
-}
-
-// A fresh Scene + the shared RootView, plus a small floating "disconnect" control.
-// The control lives inside the safe area (clears the notch/status bar) and carries its
-// own contrasting chip so it stays visible over any app background, light or dark.
-struct ConnectedHost: View {
-    @StateObject private var scene = Scene()
-    let onDisconnect: () -> Void
-    var body: some View {
-        ZStack {
-            RootView(scene: scene)
-            VStack {
-                HStack {
-                    Spacer()
-                    Button(action: onDisconnect) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundColor(.white)
-                            .frame(width: 34, height: 34)
-                            .background(Color.black.opacity(0.55))
-                            .clipShape(Circle())
-                            .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1))
-                            .shadow(color: .black.opacity(0.35), radius: 4, y: 1)
-                    }
-                    .accessibilityLabel("Disconnect")
-                }
-                Spacer()
-            }
-            .padding(.top, 6)
-            .padding(.trailing, 14)
-        }
-    }
-}
-#endif
 
 // ─── UIKit render gate ────────────────────────────────────────────────────────
 // The Preview built with the UIKit engine: a UIKit @main that shows the shared SwiftUI
