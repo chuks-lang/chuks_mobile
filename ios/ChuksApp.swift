@@ -2012,6 +2012,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             resolve(token, "\(v),\(bld)")
         case "deviceinfo.locale":
             resolve(token, "\(Locale.current.languageCode ?? ""),\(Locale.current.regionCode ?? "")")
+        case "deviceinfo.id":
+            resolve(token, UIDevice.current.identifierForVendor?.uuidString ?? "")
+        case "deviceinfo.appid":
+            resolve(token, Bundle.main.bundleIdentifier ?? "")
+        case "deviceinfo.appname":
+            let name = (Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String)
+                ?? (Bundle.main.infoDictionary?["CFBundleName"] as? String) ?? ""
+            resolve(token, name)
+        case "deviceinfo.installtime":
+            // iOS exposes no install-time API; the document directory's creation date is
+            // the standard proxy (created at first launch, reset on reinstall).
+            var ms = ""
+            if let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let d = attrs[.creationDate] as? Date {
+                ms = String(Int64(d.timeIntervalSince1970 * 1000))
+            }
+            resolve(token, ms)
         case "contacts.list":
             var contactsOK = CNContactStore.authorizationStatus(for: .contacts) == .authorized
             if #available(iOS 18.0, *) { contactsOK = contactsOK || CNContactStore.authorizationStatus(for: .contacts) == .limited }

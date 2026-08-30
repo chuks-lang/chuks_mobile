@@ -223,6 +223,18 @@ export class DeviceInfo {
     public static appVersion(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appversion", "", onResult) }
     // The device language + region, as "language,region" (e.g. "en,US").
     public static locale(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.locale", "", onResult) }
+    // A STABLE per-vendor device id: iOS identifierForVendor, Android ANDROID_ID. It
+    // survives app updates; it resets on a factory reset (Android) or when all of the
+    // vendor's apps are removed (iOS). Needs no permission. (RN's expo-application
+    // getIosIdForVendorAsync / getAndroidId.) Occasionally "" on iOS just after boot.
+    public static deviceId(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.id", "", onResult) }
+    // The app's bundle id (iOS) / application id (Android), e.g. "com.chuks.walksocials".
+    public static appId(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appid", "", onResult) }
+    // The app's human-readable display name.
+    public static appName(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appname", "", onResult) }
+    // First-install time as epoch milliseconds (a string; parse with int()). Resets on
+    // reinstall. On iOS this is the app's document-directory creation time (no OS API).
+    public static installTime(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.installtime", "", onResult) }
 }
 
 // ---- Biometrics -------------------------------------------------------------

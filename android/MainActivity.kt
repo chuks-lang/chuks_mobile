@@ -995,6 +995,17 @@ class MainActivity : Activity() {
                 val loc = resources.configuration.locales[0]
                 resolve(token, "${loc.language},${loc.country}")
             }
+            "deviceinfo.id" -> {
+                @Suppress("HardwareIds")
+                val id = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+                resolve(token, id ?: "")
+            }
+            "deviceinfo.appid" -> resolve(token, packageName)
+            "deviceinfo.appname" -> resolve(token, applicationInfo.loadLabel(packageManager).toString())
+            "deviceinfo.installtime" -> {
+                val pi = packageManager.getPackageInfo(packageName, 0)
+                resolve(token, pi.firstInstallTime.toString())
+            }
             "contacts.list" -> {
                 if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) { fail(token, "contacts permission denied"); return }
                 try {
