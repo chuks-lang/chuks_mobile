@@ -1408,6 +1408,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         cmrLoadState(cmrPendingState.isEmpty ? saved : cmrPendingState)   // restore before mount
         cmrPendingState = ""
         dismissDevError()
+        // A hot reload swaps in a FRESH VM whose safe-area insets are zero. The change-guard
+        // in viewDidLayoutSubviews (ins == lastInsets) would skip re-sending them, so the new
+        // VM would lay out edge-to-edge (content under the status bar, tab bar under the home
+        // indicator). Force-resend the current insets to the fresh VM before mounting.
+        let ins = view.safeAreaInsets; lastInsets = ins; eInsets(ins)
         if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
     }
     var cmrPendingState = ""   // app state kept across a failed reload, restored on the fix

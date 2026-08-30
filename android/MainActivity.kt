@@ -791,7 +791,11 @@ class MainActivity : Activity() {
         try { N.cmrLoadState(if (lastGoodState.isNotEmpty()) lastGoodState else saved) } catch (e: Throwable) {}  // restore into the fresh VM before mount
         lastGoodState = ""
         dismissDevError()
-        hostMount(); relayout(); if (pushViewport()) relayout()
+        // A hot reload swaps in a FRESH VM whose insets are zero. reportInsets' change-guard
+        // would skip re-sending them, so the new VM would lay out edge-to-edge (content under
+        // the status bar, tab bar under the nav bar). Invalidate the cache so reportInsets resends.
+        lastInsets = intArrayOf(-1, -1, -1, -1)
+        hostMount(); reportInsets(); relayout(); if (pushViewport()) relayout()
     }
     private var lastGoodState: String = ""   // app state kept across a failed reload, restored on the fix
 
