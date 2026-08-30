@@ -1,0 +1,72 @@
+// Reconciler determinism / idempotency tests.
+//
+// These drive the REAL reconciler (core/ui.chuks) headlessly and assert the
+// properties whose absence caused the side-border freeze: a render must be a pure
+// function of state, so re-reconciling an unchanged tree produces ZERO mutations
+// and never fails to converge. Also checks that a single change emits a single,
+// targeted mutation (diff precision), and that style serialization is deterministic
+// (a non-deterministic style string silently breaks the diff).
+//
+// Run:  chuks run tests/reconcile_test.chuks   (exits non-zero on failure)
+
+import { Node, Row, Column, Text, Reconciler } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+// A small, representative tree: nested Row/Column with styled Text (incl. a
+// borderTop, the prop that froze us) so the test exercises the real style path.
+function tree(label: string, sub: string): Node {
+    return Column({ dir: "col", grow: 1, bg: "#111318" }, [
+        Row({ dir: "row", gap: 8, pt: 14, pb: 14, px: 12, borderTop: 1, borderColor: "#2A2F3A" }, [
+            Text({ size: 16, weight: "bold", color: "#FFFFFF" }, label),
+            Text({ size: 12, color: "#8A8F99" }, sub),
+        ]),
+    ])
+}
+
+function main(): void {
+    println("reconcile_test")
+
+    // 1. Idempotency: after the first render, re-rendering an IDENTICAL tree must
+    //    emit zero mutations, and must stay zero across many passes (convergence).
+    const r: Reconciler = new Reconciler()
+    r.begin(); r.renderRoot(tree("Distance", "106 m"))
+    const created: int = r.count()
+    check(created > 0, "first render creates nodes (" + string(created) + " ops)")
+
+    var maxRepeat: int = 0
+    for (var i: int = 0; i < 5; i = i + 1) {
+        r.begin(); r.renderRoot(tree("Distance", "106 m"))
+        if (r.count() > maxRepeat) { maxRepeat = r.count() }
+    }
+    check(maxRepeat == 0, "re-rendering an identical tree emits 0 mutations x5 (idempotent/convergent), max=" + string(maxRepeat))
+
+    // 2. Diff precision: changing exactly one Text emits exactly one mutation.
+    r.begin(); r.renderRoot(tree("Distance", "108 m"))
+    check(r.count() == 1, "a single text change emits exactly 1 mutation, got " + string(r.count()))
+
+    // 3. Determinism: the same props serialize to the same style string every time.
+    //    (A non-deterministic style.str() would make every diff look changed = the
+    //    render-until-stable trap.)
+    const a: Node = tree("X", "Y")
+    const b: Node = tree("X", "Y")
+    const sa: string = a.style.str()
+    const sb: string = b.style.str()
+    check(sa == sb, "identical props -> identical style string (deterministic)")
+
+    // 4. A fresh Reconciler mounting the same tree is stable on the immediate re-render.
+    const r2: Reconciler = new Reconciler()
+    r2.begin(); r2.renderRoot(tree("A", "B"))
+    r2.begin(); r2.renderRoot(tree("A", "B"))
+    check(r2.count() == 0, "second identical render on a fresh reconciler emits 0, got " + string(r2.count()))
+
+    println("reconcile_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "reconcile_test failed" }
+}
+main()

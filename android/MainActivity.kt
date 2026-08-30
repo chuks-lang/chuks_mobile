@@ -120,6 +120,11 @@ object N {
 class MainActivity : Activity() {
     private val views = HashMap<String, View>()
     private val ynodes = HashMap<String, Long>()
+    // Incremental apply: relayout() reassigns a view's LayoutParams (which triggers a child
+    // requestLayout) only when its computed frame actually changed vs the last applied one,
+    // so an incremental update touches a handful of views instead of the whole tree.
+    private val lastFrame = HashMap<String, IntArray>()   // id -> [left, top, width, height] last applied
+    private val needsFrame = HashSet<String>()            // just-created views, force-applied once
     private var density = 1f
 
     private lateinit var root: FrameLayout
@@ -1563,6 +1568,7 @@ class MainActivity : Activity() {
         }
         views[id] = v
         ynodes[id] = n
+        needsFrame.add(id); lastFrame.remove(id)   // a fresh view must get its frame next relayout
         if (v is TextView && v !is Button && v !is EditText) { textNodes[n] = v; N.ySetTextMeasure(n) }
     }
 
@@ -1586,7 +1592,7 @@ class MainActivity : Activity() {
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
     private val imageOpChain = HashMap<String, String>()       // id -> Image GPU op-chain (JSON)
     private val imageOrigBmp = HashMap<String, android.graphics.Bitmap>()   // id -> pre-op bitmap, for re-applying a changed chain
-    private val imageSrc = HashMap<String, String>()           // id -> local image source (asset name or file://), for RN-style sized re-decode
+    private val imageSrc = HashMap<String, String>()           // id -> local image source (asset name or file://), for sized re-decode
     private val imageDecodedDim = HashMap<String, Int>()       // id -> power-of-two bucket last decoded at (guards relayout re-decode)
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
     private val videoControlsIds = HashSet<String>()           // ids that show a native MediaController
@@ -2801,7 +2807,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
@@ -3133,17 +3139,25 @@ class MainActivity : Activity() {
         for ((id, node) in ynodes) {
             if (modalIds.contains(id)) continue          // modal overlay node placed explicitly below
             val v = views[id] ?: continue
-            val lp = FrameLayout.LayoutParams(N.yGet(node, 2).toInt(), N.yGet(node, 3).toInt())
-            lp.leftMargin = N.yGet(node, 0).toInt()
-            lp.topMargin = N.yGet(node, 1).toInt()
+            val left = N.yGet(node, 0).toInt(); val top = N.yGet(node, 1).toInt()
+            val wd = N.yGet(node, 2).toInt()
             // A horizontal list's content node has an explicit WIDTH but no height (its cells
             // are abs), so Yoga gives it height 0 and Android would clip the cells. Fill it to
             // the scroll's own height (the cross axis); it scrolls sideways only.
-            if (listHoriz && id == contentId) { lp.height = listScroll?.height ?: lp.height }
+            val ht = if (listHoriz && id == contentId) (listScroll?.height ?: N.yGet(node, 3).toInt()) else N.yGet(node, 3).toInt()
+            // Incremental apply: reassign LayoutParams (which triggers a child requestLayout)
+            // only when the frame changed vs the last applied one, or the view is brand new.
+            val prev = lastFrame[id]
+            if (!needsFrame.contains(id) && prev != null && prev[0] == left && prev[1] == top && prev[2] == wd && prev[3] == ht) continue
+            val lp = FrameLayout.LayoutParams(wd, ht)
+            lp.leftMargin = left
+            lp.topMargin = top
             v.layoutParams = lp
-            // RN parity: now that the frame is known, decode the image to its display size.
-            if (imageSrc.containsKey(id)) ensureSizedImage(id, maxOf(lp.width, lp.height))
+            lastFrame[id] = intArrayOf(left, top, wd, ht)
+            // now that the frame is known, decode the image to its display size.
+            if (imageSrc.containsKey(id)) ensureSizedImage(id, maxOf(wd, ht))
         }
+        needsFrame.clear()   // consumed for this pass
         // place the whole Chuks app just below the top inset
         (views["app"]?.layoutParams as? FrameLayout.LayoutParams)?.let { it.leftMargin = 0; it.topMargin = topY }
         // a visible modal fills the window and sits on top (children laid out above)

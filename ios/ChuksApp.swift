@@ -6,8 +6,8 @@
 // The only node kinds it special-cases are structural: a `Scroll` node whose
 // viewport it reports back to Chuks (virtualization), and an `Input` node whose
 // text it reports back (TextInput). Everything else (the search bar, the list,
-// the cards) is declared in engine.chuks. This is React Native's architecture
-// with Chuks in place of JavaScript, and the layout engine is the real Yoga.
+// the cards) is declared in engine.chuks. The app is written entirely in Chuks; this
+// native layer only renders it, and the layout engine is the real Yoga.
 
 import UIKit
 import AVFoundation
@@ -21,7 +21,7 @@ import CoreLocation
 import CoreMotion
 import ImageIO
 
-// RN/Nuke/SDWebImage parity (WWDC "Image and Graphics Best Practices"): decode a
+// Per WWDC "Image and Graphics Best Practices": decode a
 // large source image downsampled to the target display size via ImageIO, instead
 // of letting UIImageView hold a full-res bitmap. maxPixel is the longest side in
 // PIXELS (points * screen scale).
@@ -84,7 +84,7 @@ final class ChuksImageLoader {
     func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void, fail: (() -> Void)? = nil) {
         if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
         guard let url = URL(string: urlStr) else { DispatchQueue.main.async { fail?() }; return }
-        // RN parity: cap the decode near screen size so a huge remote image never
+        // cap the decode near screen size so a huge remote image never
         // holds a full-res bitmap. A generous bound (screen's long side) keeps
         // full-bleed feed images crisp while shielding memory.
         let cap = max(UIScreen.main.bounds.width, UIScreen.main.bounds.height) * UIScreen.main.scale
@@ -777,6 +777,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // The two lockstep trees, keyed by Chuks node id.
     var views: [String: UIView] = [:]
     var ynodes: [String: YGNodeRef] = [:]
+    // Incremental apply via Yoga's HasNewLayout: relayout() writes a view's frame only when
+    // Yoga recomputed its layout, so an incremental update touches a handful of views instead
+    // of the whole tree. `needsFrame` is a belt-and-suspenders set of just-created views that
+    // must get their frame at least once even if Yoga's flag says unchanged.
+    var needsFrame = Set<String>()
     let config: YGConfigRef = {
         let c: YGConfigRef = YGConfigNew()
         // Opt into Yoga's 1.x "errata" layout behaviors. The modern default changed the
@@ -889,7 +894,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var sideBorders: [String: (CGFloat, CGFloat, CGFloat, CGFloat, UIColor)] = [:] // id -> (t, r, b, l, color)
     var imageOpChain: [String: String] = [:]                             // id -> Image GPU op-chain (JSON)
     var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter/op swap re-applies from the original
-    var imageSrc: [String: String] = [:]                                 // id -> local image source (file:// or bundled asset), for RN-style sized re-decode
+    var imageSrc: [String: String] = [:]                                 // id -> local image source (file:// or bundled asset), for sized re-decode
     var imageDecodedDim: [String: Int] = [:]                             // id -> power-of-two px bucket last decoded at (guards relayout re-decode)
     let maxImageDim: CGFloat = 2560                                       // safety cap on decoded image side (px)
     var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
@@ -2271,6 +2276,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         v.translatesAutoresizingMaskIntoConstraints = true   // we drive .frame directly
         views[id] = v
         ynodes[id] = n
+        needsFrame.insert(id)   // a fresh view must get its frame on the next relayout
     }
 
     // parse "k=v;k=v" -> Yoga style (layout) + UIView style (visual)
@@ -3044,7 +3050,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         c.timeoutIntervalForRequest = 20
         return URLSession(configuration: c)
     }()
-    // RN parity: (re)decode a LOCAL image downsampled to the view's display size.
+    // (re)decode a LOCAL image downsampled to the view's display size.
     // Called provisionally at screen width on load, then refined from the real frame
     // in relayout(). A power-of-two px bucket skips redundant re-decodes.
     func ensureSizedImage(_ id: String, _ targetPx: CGFloat) {
@@ -3207,6 +3213,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         for (id, n) in ynodes {
             if modalIds.contains(id) { continue }   // modal overlay node has no app-tree layout (placed below)
+            // Incremental apply: skip nodes Yoga did not re-lay-out this pass (unless the view
+            // was just created). Yoga sets HasNewLayout on every node it recomputes (a fresh
+            // insert dirties it), so an unchanged subtree costs nothing here.
+            if !YGNodeGetHasNewLayout(n) && !needsFrame.contains(id) { continue }
+            YGNodeSetHasNewLayout(n, false)
             let fr = CGRect(x: CGFloat(YGNodeLayoutGetLeft(n)), y: CGFloat(YGNodeLayoutGetTop(n)),
                             width: CGFloat(YGNodeLayoutGetWidth(n)), height: CGFloat(YGNodeLayoutGetHeight(n)))
             if let vv = views[id] {
@@ -3215,12 +3226,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if vv.transform.isIdentity { vv.frame = fr }
                 else { vv.bounds = CGRect(origin: .zero, size: fr.size); vv.center = CGPoint(x: fr.midX, y: fr.midY) }
             }
-            // RN parity: now that the frame is known, decode the image to its display size.
+            // now that the frame is known, decode the image to its display size.
             if imageSrc[id] != nil { ensureSizedImage(id, max(fr.width, fr.height) * UIScreen.main.scale) }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
             if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
         }
+        needsFrame.removeAll()   // consumed for this pass
         // place the whole Chuks app in the safe area, below the diagnostics header
         views["app"]?.frame = CGRect(x: insets.left, y: topY, width: CGFloat(W), height: CGFloat(H))
         // a visible modal fills the window and sits on top (its children were laid out above)
