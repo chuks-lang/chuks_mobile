@@ -1633,6 +1633,21 @@ class MainActivity : Activity() {
         // defaults; the loop re-applies whatever this role sets. (size/weight are always
         // re-applied from locals, so they need no reset.)
         (v as? TextView)?.let { it.gravity = Gravity.CENTER_VERTICAL; it.maxLines = Integer.MAX_VALUE; it.ellipsize = null }
+        // Reused-node completeness: props style() applies only-when-present must be reset
+        // here or a reused node inherits the previous role's value (stale-state bug class,
+        // docs/ui-update-model-vs-rn.md). Text size/weight/decoration/tracking are already
+        // re-applied every pass (post-loop TextView block); transform + alpha are reset in
+        // the post-loop block where `anim` is known so a reset never fights an animation.
+        v.elevation = 0f                                   // shadow
+        v.translationZ = 0f                                // z
+        v.clipToOutline = false                            // overflow / TextureView+ImageView radius outline
+        v.isEnabled = true                                 // dis / edit
+        disabledIds.remove(id)                             // dis (alpha handled post-loop)
+        glassIds.remove(id)                                // glass frosted panel
+        pressOpacity.remove(id); longDelayMs.remove(id)    // Pressable active-alpha / long-press
+        if (!modalIds.contains(id)) v.visibility = View.VISIBLE   // hidden/mvis (modal drives its own)
+        (v as? ImageView)?.let { it.clearColorFilter(); it.scaleType = ImageView.ScaleType.CENTER_CROP }   // tint/filt/rmode
+        imageTint.remove(id); imageBlur.remove(id)         // Image tint/blur (pixels re-driven on load/recycle)
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
@@ -1925,6 +1940,14 @@ class MainActivity : Activity() {
                 if (hasTransform) { v.translationX = dpf(tx); v.translationY = dpf(ty); v.scaleX = sc; v.scaleY = sc; v.rotation = rot }
                 opacity?.let { v.alpha = it }
             }
+        } else {
+            // No transform/opacity/anim keys this role: clear any left by a previous role on
+            // a reused node. Safe here because an animating node always carries the transform
+            // keys or `anim`, so this branch never interrupts an animation.
+            if (v.translationX != 0f || v.translationY != 0f || v.scaleX != 1f || v.scaleY != 1f || v.rotation != 0f) {
+                v.translationX = 0f; v.translationY = 0f; v.scaleX = 1f; v.scaleY = 1f; v.rotation = 0f
+            }
+            if (v.alpha != 1f && !disabledIds.contains(id)) v.alpha = 1f
         }
         // bg + radius + border -> GradientDrawable (a large radius clamps to a pill)
         val hasPerCorner = rcTL >= 0f || rcTR >= 0f || rcBR >= 0f || rcBL >= 0f

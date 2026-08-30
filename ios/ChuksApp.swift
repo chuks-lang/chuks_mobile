@@ -2363,6 +2363,45 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             v.layer.sublayers?.filter { ($0.name ?? "").hasPrefix("chuksDashBorder") || ($0.name ?? "").hasPrefix("chuksSideBorder") }.forEach { $0.removeFromSuperlayer() }
         }
         if let gv = glassViews[id] { gv.removeFromSuperview(); glassViews[id] = nil }
+        // ── Reused-node completeness ──────────────────────────────────────────────
+        // Style.str() omits default-valued props, and the reconciler reuses a native
+        // view for whatever new role sits at a tree position, so every prop that style()
+        // applies ONLY-when-present must be reset here or a reused node inherits the prior
+        // role's value (the stale-state bug class; docs/ui-update-model-vs-rn.md). Kept in
+        // lockstep with the setters in style(); the durable fix is to materialize these
+        // defaults in the reconciler. (transform + alpha are reset in the post-loop block
+        // where `anim` is known, so a reset never fights an in-flight animation.)
+        v.layer.zPosition = 0                                        // z
+        v.layer.shadowRadius = 0; v.layer.shadowOffset = .zero       // shadow (opacity already 0 above)
+        if !modalIds.contains(id) { v.isHidden = false }             // hidden/mvis (modal drives its own)
+        disabledIds.remove(id)                                       // dis: interaction gate + alpha
+        pressOpacity[id] = nil; pressLongDelay[id] = nil             // Pressable active-alpha / long-press
+        imageTint[id] = nil; imageBlur[id] = nil; imageFilter[id] = nil   // Image tint/blur/filter (recycle re-drives the pixels)
+        (v as? UITextView)?.textColor = .label                      // fg on a TextView
+        if let b = v as? UIButton { b.isEnabled = true; b.setTitleColor(.label, for: .normal) }   // dis + fg
+        if let sw = v as? UISwitch { sw.isEnabled = true; sw.onTintColor = nil; sw.thumbTintColor = nil }   // dis + bg/swtc
+        if let sl = v as? UISlider { sl.isEnabled = true; sl.minimumTrackTintColor = nil; sl.thumbTintColor = nil }   // dis + fg
+        (v as? UIProgressView)?.progressTintColor = nil             // fg
+        if let slbl = v as? SelectableLabel { slbl.selectable = false }   // sel
+        if let h = v as? HitSlopView { h.hitSlop = 0 }              // hitslop
+        if let iv = v as? UIImageView { iv.tintColor = nil; iv.contentMode = .scaleAspectFill }   // tint / rmode
+        if let tf = v as? UITextField {                             // Input config: keyboard/secure/caps/etc.
+            tf.textColor = .label
+            tf.isSecureTextEntry = false
+            tf.keyboardType = .default
+            tf.returnKeyType = .default
+            tf.autocorrectionType = .default
+            tf.autocapitalizationType = .sentences
+            tf.isEnabled = true
+            fieldMaxLen[tf] = nil
+        }
+        // Label typography (kern/leading/decoration/transform) is baked into attributedText
+        // by refreshLabel, so clearing the dicts alone leaves a stale attributed string;
+        // re-run refreshLabel when any were set to rebuild plain text.
+        if labelKern[id] != nil || labelLead[id] != nil || labelDeco[id] != nil || labelTransform[id] != nil {
+            labelKern[id] = nil; labelLead[id] = nil; labelDeco[id] = nil; labelTransform[id] = nil
+            refreshLabel(id)
+        }
     }
 
     // parse "k=v;k=v" -> Yoga style (layout) + UIView style (visual)
@@ -2687,6 +2726,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     UIView.animate(withDuration: dur, delay: 0, options: animEz == "linear" ? .curveLinear : .curveEaseInOut, animations: apply)
                 }
             } else { apply() }
+        } else {
+            // No transform/opacity/anim keys this role: clear any left by a previous role
+            // on a reused node. Safe here because an animating node always carries the
+            // transform keys or `anim`, so this branch never interrupts an animation.
+            if !v.transform.isIdentity { v.transform = .identity }
+            if v.alpha != 1.0 && !disabledIds.contains(id) { v.alpha = 1.0 }
         }
         var font: UIFont = customFont.isEmpty
             ? .systemFont(ofSize: fs, weight: fw)
