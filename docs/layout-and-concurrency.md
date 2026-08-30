@@ -235,6 +235,29 @@ Each item: what · why · RN precedent · status.
     layout per frame, cancel in-flight on a newer revision. · Makes #9 safe under rapid
     updates. · RN commit retry + starvation bug #51870.
 
+### Phase 2 benchmark verdict (2026-08-30): PARKED — not justified by the data
+
+Before building the risky off-thread refactor we measured, per RN's own discipline. Added an
+env-gated timer (`CHUKS_LAYOUT_TIMING=1`) around `YGNodeCalculateLayout` (compute) and the
+frame-apply loop, and ran a **300-row wrapping-text stress screen (924 Yoga nodes)** on the
+iOS sim:
+
+- **Steady-state / incremental updates: compute ≈ 1µs, apply ≈ 70-115µs.** Yoga dirty-skips
+  the unchanged subtree, so a normal state change costs ~1µs of layout. The incremental apply
+  (#1) applies 1 view, not 924.
+- **Full layout (mount / rotate, all 924 nodes recompute): compute ≈ 11.3ms, apply ≈ 2.6ms**,
+  a one-time ~14ms cost, and only for an *extreme, non-virtualized* text-heavy screen. A real
+  feed uses a windowed `List`, so it never lays out hundreds of rows at once.
+
+**Conclusion:** for typical usage layout is essentially free (~1µs), so moving it off the UI
+thread would save nothing while carrying high risk (reimplementing UILabel/TextView text
+sizing for thread-safe measurement). The only expensive case is a one-time full mount of an
+extreme screen, which virtualization already avoids. **Phase 2 (items 9-10) is PARKED** until
+a real workload shows sustained UI-thread layout cost. This is a win for the "benchmark first"
+discipline: we avoided a large risky refactor that would have delivered ~nothing. If such a
+workload ever appears, the lower-risk lever is the text-measure cache (#3), not off-thread
+layout. The design below is kept for that day.
+
 ### Phase 2 concrete design (for our CMR host)
 
 Today, one host tick does all of this on the UI thread: `runAsyncQueue` → `renderRoot`
@@ -286,12 +309,37 @@ rendering on both platforms; (b) introduce the layout goroutine behind a flag, k
 synchronous path as fallback; (c) measure the win on a text-heavy screen; (d) make it default
 once stable. Each step tested on iOS + Android.
 
-### Phase 3, the parallel ceiling (research)
+### Phase 3, the parallel / native ceiling — where Chuks actually beats RN (measured)
 
-- Lay out **independent** trees/windows on different goroutines in parallel.
-- Explore snapshotting independent subtrees for parallel layout + merge.
-- Both are only possible because the VM is genuinely parallel; neither is something RN's
-  single shadow-tree commit does.
+Layout is a wash (both engines use Yoga) and is cheap anyway (Phase 2 verdict: ~1µs
+incremental). So the real "faster than RN" edge is **not** layout, it is the **VM / reconcile
+path** (native AOT vs interpreted bytecode) and **parallel app logic** (genuine goroutines,
+no JS bridge). Both are measured, not theorized.
+
+**Measured: reconcile speed (2026-08-30, benchmarks/bench/recon).** Identical memoized
+reconcile (2000 rows, ~100 changes/frame, 30000 frames), checksums identical across all three:
+
+| Engine | µs/frame |
+|---|---|
+| Chuks (native AOT) | **4.33** |
+| V8 / Node (not what RN ships) | 3.97 |
+| **Hermes (RN's on-device engine)** | **41.63** |
+
+**Chuks reconciles ~9.6× faster than Hermes** and is on par with V8. That is the headline
+Chuks-vs-RN number, and it comes from the engine (AOT-native vs interpreted), not from any
+layout trick.
+
+**The parallelism angle, honestly.** Parallelizing layout or reconcile is NOT the win: both
+are already sub-5µs, so splitting them across goroutines saves nothing (same reason Phase 2
+parked). Genuine multi-threading pays off for **heavy app-side work**, data processing, image
+decode, crypto, on-device ML, which Chuks runs on goroutines concurrently with a responsive
+UI and with no bridge serialization, while RN's single JS thread blocks the UI (or must hop to
+a native module). That is the real ceiling to demonstrate next: a "heavy work stays off the UI
+thread" showcase, not parallel layout.
+
+**Far-future research (only if a workload ever demands it):** lay out genuinely independent
+surfaces (multiple windows / split views) on separate goroutines. Possible because the VM is
+parallel; not something RN's single shadow-tree commit does. No current need.
 
 ---
 

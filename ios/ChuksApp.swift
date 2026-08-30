@@ -782,6 +782,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // of the whole tree. `needsFrame` is a belt-and-suspenders set of just-created views that
     // must get their frame at least once even if Yoga's flag says unchanged.
     var needsFrame = Set<String>()
+    // Layout timing (env CHUKS_LAYOUT_TIMING=1): logs Yoga compute vs frame-apply µs per
+    // relayout, to decide whether moving YGNodeCalculateLayout off the UI thread is warranted.
+    let layoutTiming = ProcessInfo.processInfo.environment["CHUKS_LAYOUT_TIMING"] != nil
+    var layoutComputeUs: Double = 0
     let config: YGConfigRef = {
         let c: YGConfigRef = YGConfigNew()
         // Opt into Yoga's 1.x "errata" layout behaviors. The modern default changed the
@@ -3203,7 +3207,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let H = Float(view.bounds.height - topY - insets.bottom - kbHeight)   // shrink for the keyboard
         if W <= 0 || H <= 0 { return }
         YGNodeStyleSetWidth(app, W); YGNodeStyleSetHeight(app, H)
+        let _tc = layoutTiming ? CACurrentMediaTime() : 0
         YGNodeCalculateLayout(app, W, H, YGDirection.LTR)
+        if layoutTiming { layoutComputeUs = (CACurrentMediaTime() - _tc) * 1_000_000 }
         // A visible Modal is a separate full-screen Yoga root (over the whole window,
         // safe area included) — lay it out before copying frames.
         if let mid = activeModal, let mn = ynodes[mid], views[mid]?.isHidden == false {
@@ -3211,6 +3217,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             YGNodeStyleSetWidth(mn, fw); YGNodeStyleSetHeight(mn, fh)
             YGNodeCalculateLayout(mn, fw, fh, YGDirection.LTR)
         }
+        let _ta = layoutTiming ? CACurrentMediaTime() : 0
+        var _applied = 0
         for (id, n) in ynodes {
             if modalIds.contains(id) { continue }   // modal overlay node has no app-tree layout (placed below)
             // Incremental apply: skip nodes Yoga did not re-lay-out this pass (unless the view
@@ -3218,6 +3226,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // insert dirties it), so an unchanged subtree costs nothing here.
             if !YGNodeGetHasNewLayout(n) && !needsFrame.contains(id) { continue }
             YGNodeSetHasNewLayout(n, false)
+            _applied += 1
             let fr = CGRect(x: CGFloat(YGNodeLayoutGetLeft(n)), y: CGFloat(YGNodeLayoutGetTop(n)),
                             width: CGFloat(YGNodeLayoutGetWidth(n)), height: CGFloat(YGNodeLayoutGetHeight(n)))
             if let vv = views[id] {
@@ -3233,6 +3242,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
         }
         needsFrame.removeAll()   // consumed for this pass
+        if layoutTiming {
+            let applyUs = (CACurrentMediaTime() - _ta) * 1_000_000
+            NSLog("chuks-layout compute=%.0fus apply=%.0fus nodes=%d applied=%d", layoutComputeUs, applyUs, ynodes.count, _applied)
+        }
         // place the whole Chuks app in the safe area, below the diagnostics header
         views["app"]?.frame = CGRect(x: insets.left, y: topY, width: CGFloat(W), height: CGFloat(H))
         // a visible modal fills the window and sits on top (its children were laid out above)
