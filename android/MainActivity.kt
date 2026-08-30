@@ -97,6 +97,7 @@ object N {
     external fun yCalc(node: Long, w: Float, h: Float)
     external fun yGet(node: Long, which: Int): Float
     external fun ySetF(node: Long, key: Int, v: Float)
+    external fun yResetStyle(node: Long)   // reset LAYOUT style to Yoga defaults (reused-node hygiene; see jni.cpp)
     external fun ySetTextMeasure(node: Long)
     external fun yMarkDirty(node: Long)
     var measureCb: ((Long, Float, Int) -> Long)? = null
@@ -1618,6 +1619,14 @@ class MainActivity : Activity() {
         // one (e.g. a stray outline around a row that later holds a Switch).
         bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
         borderStyleM.remove(id); bwSideM.remove(id)
+        // Also drop stale LAYOUT geometry (Yoga width/height/grow/basis/padding/…): the visual
+        // removes above didn't touch the Yoga node, so a reused node kept its previous role's
+        // sizing (e.g. a content-sized History container inheriting a stale explicit height ->
+        // taller than its content, or the first flex child not taking its grow share). The
+        // incoming style is complete, so clearing first + re-applying below fully re-describes
+        // the node. minimumHeight/Width mirror the `h`/`w` cases and are re-set there if present.
+        N.yResetStyle(n)
+        v.minimumHeight = 0; v.minimumWidth = 0
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)

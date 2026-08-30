@@ -436,6 +436,9 @@ let measureText: YGMeasureFunc = { node, width, widthMode, _, _ in
     // attributedText and wraps to the given width. This is what makes Text wrap to its
     // container width without an explicit `w` (paired with the Yoga errata config).
     let sz = label.sizeThatFits(CGSize(width: maxW, height: .greatestFiniteMagnitude))
+    if ProcessInfo.processInfo.environment["CHUKS_MEASURE_LOG"] != nil {
+        NSLog("chuks-measure text=%@ mode=%d maxW=%.1f -> %.1fx%.1f", String((label.attributedText?.string ?? label.text ?? "").prefix(12)), widthMode.rawValue, maxW, sz.width, sz.height)
+    }
     return YGSize(width: Float(ceil(sz.width)), height: Float(ceil(sz.height)))
 }
 
@@ -809,6 +812,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var frame = 0
     var taps: [UITapGestureRecognizer: String] = [:]
     var pillIds = Set<String>()   // views wanting a "full" (pill) corner radius, clamped to height/2 after layout
+    var cornerRadii: [String: CGFloat] = [:]   // requested numeric corner radius per id; clamped to min(w,h)/2 in relayout
+                                               // (so `radius: size` renders a circle on iOS, matching Android — never a diamond)
     var videoPlayers: [String: AVPlayer] = [:]        // per-node ATTACHED (visible) players
     var videoPlayerKey: [String: String] = [:]        // node id -> resource key (for pooling)
     var videoPool: [String: [AVPlayer]] = [:]         // idle, still-primed players by resource
@@ -2283,9 +2288,80 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         needsFrame.insert(id)   // a fresh view must get its frame on the next relayout
     }
 
+    // Reset a node's Yoga LAYOUT style to Yoga defaults before (re)applying a style
+    // string. Node ids are STRUCTURAL POSITIONS (e.g. "app.1.0.0.1.0"), so on a screen
+    // swap the reconciler REUSES the node at each position in a new role — and it emits
+    // the COMPLETE non-default style for that new role (Style.str), never a partial diff.
+    // Geometry the node's PREVIOUS role set (an explicit width/height, flex-basis, margin,
+    // min/max, absolute position, …) is simply ABSENT from the new string, and the apply
+    // loop below only SETS the keys it sees — it never clears an omitted one. Left uncleared,
+    // that stale geometry corrupts layout: e.g. the first stat tile in a row reuses a Home
+    // node and keeps sizing that stops it taking its flex-grow share, rendering under-sized
+    // while its freshly-created siblings are correct. Clearing first makes the incoming
+    // string fully describe the node — the model Fabric guarantees by committing a fresh
+    // clone per frame. Only style()-managed geometry is touched; props set in make() (Scroll
+    // overflow, Text measure func) and non-layout visuals are left intact.
+    func resetLayoutStyle(_ n: YGNodeRef) {
+        YGNodeStyleSetFlexDirection(n, YGFlexDirection.column)
+        YGNodeStyleSetJustifyContent(n, YGJustify.flexStart)
+        YGNodeStyleSetAlignItems(n, YGAlign.stretch)     // Yoga (and flexbox) default cross-axis
+        YGNodeStyleSetAlignSelf(n, YGAlign.auto)
+        YGNodeStyleSetFlexGrow(n, 0)
+        YGNodeStyleSetFlexBasisAuto(n)
+        YGNodeStyleSetWidthAuto(n)                        // also clears any wpct
+        YGNodeStyleSetHeightAuto(n)                       // also clears any hpct
+        YGNodeStyleSetMinWidth(n, Float.nan);  YGNodeStyleSetMaxWidth(n, Float.nan)
+        YGNodeStyleSetMinHeight(n, Float.nan); YGNodeStyleSetMaxHeight(n, Float.nan)
+        YGNodeStyleSetAspectRatio(n, Float.nan)
+        for e in [YGEdge.all, .horizontal, .vertical, .top, .right, .bottom, .left] {
+            YGNodeStyleSetPadding(n, e, Float.nan)
+            YGNodeStyleSetMargin(n, e, Float.nan)
+            YGNodeStyleSetPosition(n, e, Float.nan)
+        }
+        YGNodeStyleSetPositionType(n, YGPositionType.relative)   // Yoga default (Style.h)
+        YGNodeStyleSetGap(n, YGGutter.all, 0)
+        YGNodeStyleSetDisplay(n, YGDisplay.flex)
+        YGNodeStyleSetFlexWrap(n, YGWrap.noWrap)
+    }
+
+    // The paint/layer sibling of resetLayoutStyle: clear the decorative UIView/CALayer
+    // properties that style() sets conditionally, so a reused node doesn't keep its
+    // previous role's background, border, corner radius, shadow, dashed/side borders or
+    // glass. Same reasoning and safety as resetLayoutStyle: style() runs only when the
+    // COMPLETE new style is being applied (the reconciler emits Style.str() as a whole,
+    // not a diff), so every prop the node currently wants is in the incoming string and
+    // gets re-established right after this clear — clearing first just drops the residue.
+    // A kind change already remove+remounts the node (reconcile), so this only ever runs
+    // on SAME-kind reuse, where make()'s structural defaults still apply: background and
+    // clipping are reset only for the generic container/Text views (HitSlopView / UILabel),
+    // leaving the Modal scrim, ImageBackground box and media views' make()-set bg/clip intact.
+    func resetPaintStyle(_ id: String, _ v: UIView) {
+        if v is HitSlopView || v is UILabel {   // generic View/Pressable + Text; NOT Modal/media/ImageBackground
+            v.backgroundColor = .clear
+            v.clipsToBounds = false
+        }
+        v.layer.borderWidth = 0
+        v.layer.borderColor = nil
+        pillIds.remove(id); cornerRadii[id] = nil
+        v.layer.cornerRadius = 0
+        v.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        v.layer.shadowOpacity = 0
+        if dashBorders[id] != nil || sideBorders[id] != nil {
+            dashBorders[id] = nil; sideBorders[id] = nil
+            v.layer.sublayers?.filter { ($0.name ?? "").hasPrefix("chuksDashBorder") || ($0.name ?? "").hasPrefix("chuksSideBorder") }.forEach { $0.removeFromSuperlayer() }
+        }
+        if let gv = glassViews[id] { gv.removeFromSuperview(); glassViews[id] = nil }
+    }
+
     // parse "k=v;k=v" -> Yoga style (layout) + UIView style (visual)
     func style(_ id: String, _ s: String) {
         guard let n = ynodes[id], let v = views[id] else { return }
+        // Clear stale layout geometry from any prior role before applying the (complete)
+        // incoming style — see resetLayoutStyle. The app/modal roots re-receive their
+        // width/height from relayout() (which always runs after apply), so clearing them
+        // here is safe.
+        resetLayoutStyle(n)
+        resetPaintStyle(id, v)
         let label = v as? UILabel
         let btn = v as? UIButton
         let field = v as? UITextField
@@ -2533,8 +2609,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         // A huge radius (rounded-full) is a pill: clamp to height/2 in
                         // relayout once the frame is known; a raw 9999 makes the layer
                         // path degenerate and the view stops drawing.
-                        if f >= 9999 { pillIds.insert(id) }
-                        else { pillIds.remove(id); v.layer.cornerRadius = CGFloat(f) }
+                        if f >= 9999 { pillIds.insert(id); cornerRadii[id] = nil }
+                        else {
+                            // Store the REQUESTED radius and clamp to min(w,h)/2 in relayout
+                            // (and provisionally now, if the frame is known). Applying an
+                            // unclamped radius > half the size overlaps the corner arcs into
+                            // a diamond on iOS; Android clamps, so clamping here matches it.
+                            pillIds.remove(id); cornerRadii[id] = CGFloat(f)
+                            let b = v.bounds
+                            v.layer.cornerRadius = b == .zero ? CGFloat(f) : min(CGFloat(f), min(b.width, b.height) / 2)
+                        }
             case "glass":   // Liquid Glass: a UIGlassEffect view behind the content (blur fallback)
                 if val == "1" {
                     if glassViews[id] == nil {
@@ -2753,7 +2837,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 cv.controller?.stop()
                 if cameraController === cv.controller { cameraController = nil }
             }
-            pillIds.remove(k)
+            pillIds.remove(k); cornerRadii[k] = nil
             views[k] = nil
         }
         for k in ynodes.keys.filter({ $0 == id || $0.hasPrefix(prefix) }) { ynodes[k] = nil }
@@ -3238,6 +3322,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // now that the frame is known, decode the image to its display size.
             if imageSrc[id] != nil { ensureSizedImage(id, max(fr.width, fr.height) * UIScreen.main.scale) }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
+            else if let rr = cornerRadii[id] { views[id]?.layer.cornerRadius = min(rr, min(fr.width, fr.height) / 2) }   // clamp numeric radius: never a diamond
             if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
         }
