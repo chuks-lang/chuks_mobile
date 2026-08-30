@@ -2340,6 +2340,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             v.backgroundColor = .clear
             v.clipsToBounds = false
         }
+        // Text properties are neither layout nor the paint props above, but they too must
+        // be reset on a reused node: Style.str() omits defaults, so a role that relies on
+        // default alignment/font/lines would otherwise inherit the previous role's values
+        // (e.g. a reused label keeping textAlignment=.center). Reset to make()'s defaults;
+        // style() re-applies whatever the new role sets.
+        if let l = v as? UILabel {
+            l.textAlignment = .left
+            l.numberOfLines = 0
+            l.lineBreakMode = .byTruncatingTail
+            l.font = .systemFont(ofSize: 14)
+            l.textColor = .label
+        }
         v.layer.borderWidth = 0
         v.layer.borderColor = nil
         pillIds.remove(id); cornerRadii[id] = nil

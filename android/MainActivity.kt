@@ -1627,6 +1627,12 @@ class MainActivity : Activity() {
         // the node. minimumHeight/Width mirror the `h`/`w` cases and are re-set there if present.
         N.yResetStyle(n)
         v.minimumHeight = 0; v.minimumWidth = 0
+        // Text props are set conditionally below (ta/nlines only if present), so a reused
+        // TextView would keep the previous role's alignment/line-clamp when the new role
+        // relies on defaults (e.g. a reused label staying centered). Reset to make()'s
+        // defaults; the loop re-applies whatever this role sets. (size/weight are always
+        // re-applied from locals, so they need no reset.)
+        (v as? TextView)?.let { it.gravity = Gravity.CENTER_VERTICAL; it.maxLines = Integer.MAX_VALUE; it.ellipsize = null }
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
