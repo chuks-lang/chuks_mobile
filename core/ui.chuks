@@ -1402,6 +1402,32 @@ export function DatePicker(p: DatePickerProps): Node {
     applyEventsV(n, p)                                      // onChange(iso) fires on pick
     return n
 }
+
+/**
+ * A time-only picker: a DatePicker with `mode` fixed to "time", so it shows the
+ * native hour/minute UI (UIDatePicker .time / Android TimePickerDialog). `value` and
+ * `onChange` use an ISO-ish "HH:mm" time string. Everything else matches DatePicker
+ * (`display: "" | "inline" | "wheels"`, `bg`, `color`, `radius`, layout props).
+ *
+ * ```chuks
+ * TimePicker({ value: t.get(), onChange: function(v: string): void { t.set(v) } })
+ * ```
+ */
+export function TimePicker(p: DatePickerProps): Node {
+    const s: Style = new Style()
+    s.dpmode = "time"                                       // the whole point: time-only
+    s.dpdisp = pvS(p, "display", "")
+    if (s.dpdisp == "") { s.h = pvI(p, "h", 44) }
+    else if (p["h"] != null) { s.h = pvI(p, "h", -1) }
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
+    const kind: string = (s.dpdisp == "") ? "DatePicker" : "DatePickerInline"
+    const n: Node = mkDatePicker(kind, s, pvS(p, "value", ""))
+    applyEventsV(n, p)
+    return n
+}
 /**
  * A native menu button (UIButton pull-down / SwiftUI Menu / Android PopupMenu). Unlike
  * Select there is no persistent selection: it shows a fixed `label` and its `items` are

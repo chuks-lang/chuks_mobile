@@ -60,6 +60,7 @@ import Security
 import Network
 import CoreBluetooth
 import CoreNFC
+import HealthKit
 
 // ===== Feed-grade image cache (shared by both iOS hosts) =====
 // Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
@@ -1558,6 +1559,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var nfc: NfcReader? = nil           // CoreNFC reader (lazy)
     var recURL: URL? = nil
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
+    let pedometer = CMPedometer()       // step counter / distance / pace (Pedometer)
+    let altimeter = CMAltimeter()       // barometer: pressure + relative altitude
+    var proximityTokens = Set<String>() // motion.proximity subscribers (UIDevice proximity)
+    lazy var healthStore = HKHealthStore()   // HealthKit (Health) — lazy: only if used
 
     // Execute a native capability requested via an `X|` command (F3). Same UIKit
     // implementations as the SwiftUI host; only presentShare differs (this host IS a
@@ -1577,6 +1582,71 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             n.onFail = { [weak self] t, msg in DispatchQueue.main.async { self?.fail(t, msg) } }
             nfc = n
         }
+    }
+
+    // Pedometer -> "steps,distanceMeters,paceSecPerMeter,cadenceStepsPerSec,floorsUp,floorsDown"
+    static func pedStr(_ d: CMPedometerData) -> String {
+        let steps = d.numberOfSteps.intValue
+        let dist = d.distance?.doubleValue ?? 0
+        let pace = d.currentPace?.doubleValue ?? 0          // seconds per meter
+        let cadence = d.currentCadence?.doubleValue ?? 0    // steps per second
+        let up = d.floorsAscended?.intValue ?? 0
+        let down = d.floorsDescended?.intValue ?? 0
+        return "\(steps),\(dist),\(pace),\(cadence),\(up),\(down)"
+    }
+    // A comma list of metric names -> HealthKit read types (drops unknown names).
+    static func hkTypes(_ csv: String) -> Set<HKObjectType> {
+        var out = Set<HKObjectType>()
+        for m in csv.components(separatedBy: ",") {
+            if let t = hkQuantityType(m.trimmingCharacters(in: .whitespaces)) { out.insert(t) }
+        }
+        return out
+    }
+    static func hkQuantityType(_ metric: String) -> HKQuantityType? {
+        switch metric {
+        case "steps": return HKQuantityType.quantityType(forIdentifier: .stepCount)
+        case "distanceMeters": return HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning)
+        case "activeEnergyKcal": return HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)
+        case "heartRate": return HKQuantityType.quantityType(forIdentifier: .heartRate)
+        default: return nil
+        }
+    }
+    // Aggregate one metric over [now-secs, now]: sum for steps/distance/energy, average
+    // bpm for heart rate. Answers with the number as a string.
+    func hkRead(_ token: String, _ metric: String, _ secs: Double) {
+        guard HKHealthStore.isHealthDataAvailable(), let qt = Self.hkQuantityType(metric) else { fail(token, "unsupported health metric: \(metric)"); return }
+        let from = Date(timeIntervalSinceNow: -secs)
+        let pred = HKQuery.predicateForSamples(withStart: from, end: Date(), options: .strictStartDate)
+        let isAvg = (metric == "heartRate")
+        let q = HKStatisticsQuery(quantityType: qt, quantitySamplePredicate: pred, options: isAvg ? .discreteAverage : .cumulativeSum) { [weak self] _, stats, err in
+            DispatchQueue.main.async {
+                if let e = err { self?.fail(token, e.localizedDescription); return }
+                let unit: HKUnit
+                switch metric {
+                case "distanceMeters": unit = HKUnit.meter()
+                case "activeEnergyKcal": unit = HKUnit.kilocalorie()
+                case "heartRate": unit = HKUnit.count().unitDivided(by: .minute())
+                default: unit = HKUnit.count()
+                }
+                let quantity = isAvg ? stats?.averageQuantity() : stats?.sumQuantity()
+                self?.resolve(token, String(quantity?.doubleValue(for: unit) ?? 0))
+            }
+        }
+        healthStore.execute(q)
+    }
+    // Live heart rate: an anchored query that also fires its updateHandler as new
+    // samples land (e.g. from a paired Apple Watch). Emits the latest bpm as an int.
+    func hkHeartRate(_ token: String) {
+        guard HKHealthStore.isHealthDataAvailable(), let hr = HKQuantityType.quantityType(forIdentifier: .heartRate) else { fail(token, "heart rate unavailable"); return }
+        let unit = HKUnit.count().unitDivided(by: .minute())
+        let handler: (HKAnchoredObjectQuery, [HKSample]?, [HKDeletedObject]?, HKQueryAnchor?, Error?) -> Void = { [weak self] _, samples, _, _, _ in
+            guard let s = samples as? [HKQuantitySample], let last = s.last else { return }
+            DispatchQueue.main.async { self?.resolve(token, String(Int(last.quantity.doubleValue(for: unit)))) }
+        }
+        let q = HKAnchoredObjectQuery(type: hr, predicate: nil, anchor: nil, limit: HKObjectQueryNoLimit, resultsHandler: handler)
+        q.updateHandler = handler
+        healthStore.execute(q)
+        streamTeardown[token] = { [weak self] in self?.healthStore.stop(q) }
     }
 
     func handleCommand(_ token: String, _ cap: String, _ args: String) {
@@ -1673,6 +1743,75 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 self?.magTokens.remove(token)
                 if self?.magTokens.isEmpty == true { self?.motion.stopMagnetometerUpdates() }
             }
+        case "motion.proximity":
+            // UIDevice proximity: a boolean near/far. Enable monitoring, observe the change
+            // notification, and emit the current state immediately.
+            proximityTokens.insert(token)
+            UIDevice.current.isProximityMonitoringEnabled = true
+            let o = NotificationCenter.default.addObserver(forName: UIDevice.proximityStateDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                let s = UIDevice.current.proximityState ? "near" : "far"
+                for t in self?.proximityTokens ?? [] { self?.resolve(t, s) }
+            }
+            resolve(token, UIDevice.current.proximityState ? "near" : "far")
+            streamTeardown[token] = { [weak self] in
+                self?.proximityTokens.remove(token)
+                NotificationCenter.default.removeObserver(o)
+                if self?.proximityTokens.isEmpty == true { UIDevice.current.isProximityMonitoringEnabled = false }
+            }
+        case "motion.light":
+            // iOS exposes no public ambient-light API (only ARKit's private estimate).
+            fail(token, "ambient light unavailable on iOS")
+        case "motion.barometer":
+            guard CMAltimeter.isRelativeAltitudeAvailable() else { fail(token, "barometer unavailable"); break }
+            altimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, _ in
+                guard let d = data else { return }
+                // pressure is kPa -> hPa (*10); relativeAltitude is meters from start.
+                self?.resolve(token, "\(d.pressure.doubleValue * 10.0),\(d.relativeAltitude.doubleValue)")
+            }
+            streamTeardown[token] = { [weak self] in self?.altimeter.stopRelativeAltitudeUpdates() }
+        case "pedometer.available":
+            resolve(token, CMPedometer.isStepCountingAvailable() ? "true" : "false")
+        case "pedometer.watch":
+            guard CMPedometer.isStepCountingAvailable() else { fail(token, "step counting unavailable"); break }
+            pedometer.startUpdates(from: Date()) { [weak self] data, err in
+                DispatchQueue.main.async {
+                    if let e = err { self?.fail(token, e.localizedDescription); return }
+                    guard let d = data else { return }
+                    self?.resolve(token, Self.pedStr(d))
+                }
+            }
+            streamTeardown[token] = { [weak self] in self?.pedometer.stopUpdates() }
+        case "pedometer.query":
+            guard CMPedometer.isStepCountingAvailable() else { fail(token, "step counting unavailable"); break }
+            let secs = Double(args) ?? 0
+            let from = Date(timeIntervalSinceNow: -secs)
+            pedometer.queryPedometerData(from: from, to: Date()) { [weak self] data, err in
+                DispatchQueue.main.async {
+                    if let e = err { self?.fail(token, e.localizedDescription); return }
+                    guard let d = data else { self?.fail(token, "no pedometer data"); return }
+                    let dist = d.distance?.doubleValue ?? 0
+                    self?.resolve(token, "\(d.numberOfSteps.intValue),\(dist)")
+                }
+            }
+        case "health.available":
+            resolve(token, HKHealthStore.isHealthDataAvailable() ? "true" : "false")
+        case "health.authorize":
+            guard HKHealthStore.isHealthDataAvailable() else { fail(token, "health data unavailable"); break }
+            let types = Self.hkTypes(args)
+            if types.isEmpty { fail(token, "no valid health metrics: \(args)"); break }
+            healthStore.requestAuthorization(toShare: nil, read: types) { [weak self] ok, err in
+                DispatchQueue.main.async {
+                    if let e = err { self?.fail(token, e.localizedDescription) }
+                    else { self?.resolve(token, ok ? "granted" : "denied") }
+                }
+            }
+        case "health.read":
+            let parts = args.components(separatedBy: "|")   // "metric|secondsAgo"
+            let metric = parts.first ?? ""
+            let secs = Double(parts.count > 1 ? parts[1] : "0") ?? 0
+            hkRead(token, metric, secs)
+        case "health.heartRate":
+            hkHeartRate(token)
         case "deviceinfo.screen":
             let b = UIScreen.main.bounds
             resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")

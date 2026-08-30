@@ -252,6 +252,59 @@ export class Motion {
     public static accelerometer(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.accel", "", onData, onError) }
     public static gyroscope(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.gyro", "", onData, onError) }
     public static magnetometer(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.mag", "", onData, onError) }
+    // Proximity: "near" | "far" as the object in front of the sensor comes and goes
+    // (top-of-screen sensor; the screen usually blanks while "near"). Both platforms.
+    public static proximity(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.proximity", "", onData, onError) }
+    // Ambient light in lux. ANDROID ONLY — iOS exposes no public ambient-light API, so
+    // onError fires with "ambient light unavailable on iOS" there.
+    public static light(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.light", "", onData, onError) }
+    // Barometer: "pressureHpa,relativeAltitudeMeters" (relative altitude is measured
+    // from the moment the stream starts). Needs a device with a pressure sensor.
+    public static barometer(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.barometer", "", onData, onError) }
+}
+
+// ---- Pedometer: the on-device motion coprocessor (steps/distance/pace) ----------
+// Backed by CMPedometer (iOS) and the TYPE_STEP_COUNTER hardware sensor (Android).
+// This is the phone's own low-power step counter — no health database, no wearable.
+// watch() streams a LIVE cumulative count since the stream started; query() reads a
+// past window (iOS only — Android has no on-device history without Health Connect).
+export class Pedometer {
+    // "true"/"false": is a hardware step counter present on this device.
+    public static available(onResult: (string)=> void): void { emitNativeCommand("pedometer.available", "", onResult) }
+    // Live stream. onData payload (comma-separated, since the watch started):
+    //   "steps,distanceMeters,paceSecPerMeter,cadenceStepsPerSec,floorsUp,floorsDown"
+    // Fields the platform can't provide are 0 (Android: floors always 0; distance/pace
+    // are estimated from steps when the OS doesn't report them). Needs the "activity"
+    // permission on Android 10+ (ACTIVITY_RECOGNITION).
+    public static watch(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("pedometer.watch", "", onData, onError) }
+    // One-shot count for the last `secondsAgo` seconds -> "steps,distanceMeters".
+    // iOS only (CMPedometer history); on Android onError fires with a message pointing
+    // to watch() (no on-device history without Health Connect).
+    public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", string(secondsAgo), onResult, onError) }
+}
+
+// ---- Health: the health database + heart rate --------------------------------
+// iOS: HealthKit — aggregated across every source (iPhone, Apple Watch, other apps).
+// Android: no Health Connect in the base runtime (it needs a Gradle/AAR dependency),
+// so only the live heart-rate SENSOR is wired (TYPE_HEART_RATE, present on watches /
+// a few phones); read() of steps/distance/energy fails with a message pointing to
+// Pedometer / Health Connect. Call authorize() once before reading. A device build
+// needs the HealthKit capability in its provisioning profile; the metric strings for
+// read() are "steps" | "distanceMeters" | "activeEnergyKcal" | "heartRate".
+export class Health {
+    // "true"/"false": is health data available at all (HealthKit present / a body sensor).
+    public static available(onResult: (string)=> void): void { emitNativeCommand("health.available", "", onResult) }
+    // Request read access. `metrics` is a comma list ("heartRate,steps,distanceMeters,
+    // activeEnergyKcal"); iOS shows the HealthKit sheet, Android maps to its runtime
+    // permissions. onResult "granted"; onError with the reason if it fails.
+    public static authorize(metrics: string, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("health.authorize", metrics, onResult, onError) }
+    // Aggregate a metric over the last `secondsAgo` seconds -> a number as a string
+    // (steps/energy = sum, heartRate = average bpm, distance = meters). iOS: HealthKit;
+    // Android: onError unless the runtime gains Health Connect.
+    public static read(metric: string, secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("health.read", metric + "|" + string(secondsAgo), onResult, onError) }
+    // Live heart rate in bpm. iOS: HealthKit anchored query (updates as new samples
+    // land, e.g. from a paired Watch). Android: the TYPE_HEART_RATE sensor directly.
+    public static heartRate(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("health.heartRate", "", onData, onError) }
 }
 
 // ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------

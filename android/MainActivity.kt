@@ -787,6 +787,34 @@ class MainActivity : Activity() {
             "motion.accel" -> startSensor(token, android.hardware.Sensor.TYPE_ACCELEROMETER)
             "motion.gyro" -> startSensor(token, android.hardware.Sensor.TYPE_GYROSCOPE)
             "motion.mag" -> startSensor(token, android.hardware.Sensor.TYPE_MAGNETIC_FIELD)
+            "motion.proximity" -> startProximity(token)
+            "motion.light" -> startLightSensor(token, android.hardware.Sensor.TYPE_LIGHT) { v -> v[0].toString() }
+            "motion.barometer" -> startBarometer(token)
+            "pedometer.available" -> {
+                val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+                resolve(token, if (sm.getDefaultSensor(android.hardware.Sensor.TYPE_STEP_COUNTER) != null) "true" else "false")
+            }
+            "pedometer.watch" -> startPedometer(token)
+            "pedometer.query" -> fail(token, "historical steps need Health Connect on Android; use Pedometer.watch for a live count")
+            "health.available" -> {
+                val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+                resolve(token, if (sm.getDefaultSensor(android.hardware.Sensor.TYPE_HEART_RATE) != null) "true" else "false")
+            }
+            "health.authorize" -> {
+                // No Health Connect in the base runtime: the only readable source is the
+                // body heart-rate sensor, gated by the BODY_SENSORS runtime permission.
+                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) == PackageManager.PERMISSION_GRANTED) resolve(token, "granted")
+                else {
+                    val code = ++permSeq
+                    pendingPerms[code] = token       // resolved "granted"/"denied" in onRequestPermissionsResult
+                    requestPermissions(arrayOf(Manifest.permission.BODY_SENSORS), code)
+                }
+            }
+            "health.read" -> fail(token, "reading health totals needs Health Connect on Android; use Pedometer for steps/distance")
+            "health.heartRate" -> {
+                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) { fail(token, "body-sensors permission denied"); return }
+                startLightSensor(token, android.hardware.Sensor.TYPE_HEART_RATE) { v -> v[0].toInt().toString() }
+            }
             "deviceinfo.screen" -> {
                 val dm = resources.displayMetrics
                 val wdp = (dm.widthPixels / dm.density).toInt()
@@ -1128,6 +1156,8 @@ class MainActivity : Activity() {
         "calendar" -> Manifest.permission.READ_CALENDAR
         "notifications" -> Manifest.permission.POST_NOTIFICATIONS   // runtime perm on API 33+
         "photos" -> Manifest.permission.READ_MEDIA_IMAGES           // API 33+
+        "activity" -> Manifest.permission.ACTIVITY_RECOGNITION      // step counter, API 29+
+        "bodySensors" -> Manifest.permission.BODY_SENSORS           // heart-rate sensor
         else -> null
     }
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -1192,6 +1222,87 @@ class MainActivity : Activity() {
             override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
         }
         sm.registerListener(listener, sensor, 50_000)   // 50ms sampling ≈ 20Hz
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // A single-value sensor stream (light lux, heart-rate bpm): register `type` and
+    // emit `fmt(values)` on every reading. NORMAL sampling rate (these change slowly).
+    private fun startLightSensor(token: String, type: Int, fmt: (FloatArray) -> String) {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(type)
+        if (sensor == null) { fail(token, "sensor unavailable"); return }
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) { resolve(token, fmt(e.values)) }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // Proximity: emit "near"/"far". Most phones report a binary near/far (values[0] is
+    // 0 or the max range), so classify against the sensor's maximumRange.
+    private fun startProximity(token: String) {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(android.hardware.Sensor.TYPE_PROXIMITY)
+        if (sensor == null) { fail(token, "proximity sensor unavailable"); return }
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                resolve(token, if (e.values[0] < sensor.maximumRange) "near" else "far")
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // Barometer: emit "pressureHpa,relativeAltitudeMeters". Relative altitude is measured
+    // from the first reading (baseline), matching CMAltimeter's relativeAltitude on iOS.
+    private fun startBarometer(token: String) {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(android.hardware.Sensor.TYPE_PRESSURE)
+        if (sensor == null) { fail(token, "barometer unavailable"); return }
+        val baseline = FloatArray(1) { Float.NaN }
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                val hpa = e.values[0]
+                val alt = android.hardware.SensorManager.getAltitude(android.hardware.SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hpa)
+                if (baseline[0].isNaN()) baseline[0] = alt
+                resolve(token, "$hpa,${alt - baseline[0]}")
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // Pedometer: TYPE_STEP_COUNTER reports cumulative steps since boot, so we baseline
+    // on the first event and stream the delta since the watch started. Distance/pace are
+    // estimated from steps (Android's raw sensor gives no distance); floors are always 0.
+    private fun startPedometer(token: String) {
+        if (android.os.Build.VERSION.SDK_INT >= 29 &&
+            checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED) {
+            fail(token, "activity-recognition permission denied"); return
+        }
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(android.hardware.Sensor.TYPE_STEP_COUNTER)
+        if (sensor == null) { fail(token, "step counter unavailable"); return }
+        val startNanos = System.nanoTime()
+        val base = longArrayOf(-1L)          // cumulative-since-boot baseline (set on first event)
+        val stride = 0.762                   // avg walking stride in meters (distance estimate)
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                val total = e.values[0].toLong()
+                if (base[0] < 0) base[0] = total
+                val steps = total - base[0]
+                val dist = steps * stride
+                val elapsedSec = (System.nanoTime() - startNanos) / 1e9
+                val cadence = if (elapsedSec > 0) steps / elapsedSec else 0.0
+                val pace = if (dist > 0) elapsedSec / dist else 0.0
+                resolve(token, "$steps,$dist,$pace,$cadence,0,0")
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
         streamTeardown[token] = { sm.unregisterListener(listener) }
     }
 
@@ -1377,8 +1488,12 @@ class MainActivity : Activity() {
                 mapIds.add(id)
                 it.settings.javaScriptEnabled = true
                 it.settings.domStorageEnabled = true
+                it.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                it.settings.allowFileAccess = true                       // bundled Leaflet from file:///android_asset/
+                it.settings.setAllowFileAccessFromFileURLs(true)         // the file:// page may load file:// leaflet.js
+                it.settings.setAllowUniversalAccessFromFileURLs(true)    // + cross-origin OSM tiles from the file:// page
                 it.setBackgroundColor(Color.parseColor("#0E1116"))
-                it.webChromeClient = android.webkit.WebChromeClient()   // required for some JS APIs
+                it.webChromeClient = android.webkit.WebChromeClient()   // required for full JS support in the WebView
             }
             "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics / SwiftUI Canvas)
             "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press + continuous pan/pinch/rotate
@@ -2273,25 +2388,25 @@ class MainActivity : Activity() {
                 val pts = segs[1].split(" ").mapNotNull {
                     val ll = it.split(","); if (ll.size == 2) "[${ll[0]},${ll[1]}]" else null
                 }.joinToString(",")
-                // No '#' anywhere in the HTML (CSS class, not id; rgb() not hex): a raw '#'
-                // truncates loadDataWithBaseURL at the first one, and its base64 mode is
-                // ignored when a baseURL is set. Plain utf-8 with a baseURL loads the CDN
-                // script + OSM tiles.
+                // Leaflet is BUNDLED (webassets/ -> file:///android_asset/), not from a CDN:
+                // loadDataWithBaseURL spoofs the page origin, and cross-origin CDN script
+                // requests from it silently hang. Loading Leaflet same-origin from the
+                // file:// base is instant; OSM tiles are cross-origin images, allowed via
+                // setAllowUniversalAccessFromFileURLs. No '#' in the HTML (it truncates the
+                // data at the first one): CSS class not id, rgb() not hex.
                 val html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
-                    "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>" +
-                    "<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>" +
+                    "<link rel='stylesheet' href='leaflet.css'/>" +
                     "<style>html,body,.mp{height:100%;width:100%;margin:0;background:rgb(14,17,22)}</style></head><body><div class='mp'></div><script>" +
-                    "(function(){try{var pts=[$pts];" +
+                    "var ls=document.createElement('script');ls.src='leaflet.js';ls.onerror=function(){console.log('leaflet local FAILED')};" +
+                    "ls.onload=function(){try{var pts=[$pts];" +
                     "var map=L.map(document.getElementsByClassName('mp')[0],{zoomControl:false,attributionControl:false});" +
-                    "L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);" +
+                    "L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);" +
                     "var line=L.polyline(pts,{color:'rgb(46,212,122)',weight:5}).addTo(map);" +
                     "if(pts.length){L.circleMarker(pts[0],{radius:6,color:'rgb(46,212,122)',fillColor:'rgb(46,212,122)',fillOpacity:1}).addTo(map);" +
                     "L.circleMarker(pts[pts.length-1],{radius:6,color:'rgb(255,255,255)',fillColor:'rgb(46,212,122)',fillOpacity:1}).addTo(map);}" +
                     "function fit(){map.invalidateSize();if(pts.length>1)map.fitBounds(line.getBounds(),{padding:[26,26]});else map.setView(pts[0],16);}" +
-                    "fit();setTimeout(fit,250);setTimeout(fit,700);}catch(e){}})();</script></body></html>"
-                // Defer until the WebView is attached + sized: loading before attach can
-                // silently no-op, and Leaflet needs a non-zero container.
-                (views[id] as? android.webkit.WebView)?.let { wv -> wv.post { wv.loadDataWithBaseURL("https://www.openstreetmap.org/", html, "text/html", "utf-8", null) } }
+                    "fit();setTimeout(fit,300);}catch(e){console.log('map err '+e);}};document.head.appendChild(ls);</script></body></html>"
+                (views[id] as? android.webkit.WebView)?.loadDataWithBaseURL("file:///android_asset/", html, "text/html", "utf-8", null)
                 return
             }
             val p = segs[0].split(",")
