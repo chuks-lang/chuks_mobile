@@ -124,6 +124,15 @@ JNIEXPORT jint JNICALL J(cmrApplyDelta)(JNIEnv* e, jobject, jbyteArray d) {
     e->ReleaseByteArrayElements(d, p, JNI_ABORT);
     return rc;
 }
+// The reason the last boot/delta failed (type error, parse error, runtime panic),
+// so the host can show a dev error overlay instead of a blank screen.
+extern "C" char* chuks_cmr_last_error();
+JNIEXPORT jstring JNICALL J(cmrLastError)(JNIEnv* e, jobject) {
+    char* s = chuks_cmr_last_error();
+    jstring r = e->NewStringUTF(s ? s : "");
+    if (s) chuks_free_str(s);
+    return r;
+}
 // Hot-reload state preservation: save before a reboot, restore into the fresh VM.
 extern "C" char* chuks_cmr_save_state();
 extern "C" void chuks_cmr_load_state(char* state);
@@ -238,6 +247,40 @@ JNIEXPORT void JNICALL J(ySetF)(JNIEnv*, jobject, jlong n, jint key, jfloat v) {
         case 33: YGNodeStyleSetAlignSelf(y, (YGAlign)iv); break;                             // align-self
         case 34: YGNodeStyleSetOverflow(y, YGOverflowScroll); break;                         // scroll container: content overflows
     }
+}
+
+// Reset a node's LAYOUT style to Yoga defaults. Node ids are structural positions, so a
+// screen swap reuses a node in a new role; style() emits the COMPLETE style for that new
+// role (never a diff), but geometry the node's PREVIOUS role set (an explicit width/height,
+// flex-basis, margin, absolute position, …) is simply ABSENT from the new string and would
+// otherwise persist — e.g. a content-sized History container keeping a stale height, or the
+// first flex child not taking its grow share. Called at the top of style() so the incoming
+// string fully re-describes the node (the iOS host's resetLayoutStyle, mirrored). Overflow
+// (set in make() for scroll containers) and the text measure func are deliberately NOT reset.
+JNIEXPORT void JNICALL J(yResetStyle)(JNIEnv*, jobject, jlong n) {
+    YGNodeRef y = (YGNodeRef)n;
+    YGNodeStyleSetFlexDirection(y, YGFlexDirectionColumn);
+    YGNodeStyleSetJustifyContent(y, YGJustifyFlexStart);
+    YGNodeStyleSetAlignItems(y, YGAlignStretch);   // Yoga (and flexbox) default cross-axis
+    YGNodeStyleSetAlignSelf(y, YGAlignAuto);
+    YGNodeStyleSetFlexGrow(y, 0);
+    YGNodeStyleSetFlexShrink(y, 0);
+    YGNodeStyleSetFlexBasisAuto(y);
+    YGNodeStyleSetWidthAuto(y);                     // also clears any width-percent (shared field)
+    YGNodeStyleSetHeightAuto(y);
+    YGNodeStyleSetMinWidth(y, YGUndefined);  YGNodeStyleSetMaxWidth(y, YGUndefined);
+    YGNodeStyleSetMinHeight(y, YGUndefined); YGNodeStyleSetMaxHeight(y, YGUndefined);
+    YGNodeStyleSetAspectRatio(y, YGUndefined);
+    const YGEdge edges[] = { YGEdgeAll, YGEdgeHorizontal, YGEdgeVertical, YGEdgeTop, YGEdgeRight, YGEdgeBottom, YGEdgeLeft };
+    for (YGEdge e : edges) {
+        YGNodeStyleSetPadding(y, e, YGUndefined);
+        YGNodeStyleSetMargin(y, e, YGUndefined);
+        YGNodeStyleSetPosition(y, e, YGUndefined);
+    }
+    YGNodeStyleSetPositionType(y, YGPositionTypeRelative);
+    YGNodeStyleSetGap(y, YGGutterAll, 0);
+    YGNodeStyleSetDisplay(y, YGDisplayFlex);
+    YGNodeStyleSetFlexWrap(y, YGWrapNoWrap);
 }
 
 } // extern "C"

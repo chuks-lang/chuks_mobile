@@ -2,7 +2,6 @@
   "name": "__APP_NAME__",
   "version": "0.1.0",
   "entry": ".chuks/entry.chuks",
-  "iosEngine": "swiftui",
   "dependencies": {
     "@chuks/mobile": "^0.1.4",
     "@chuks/lucide": "^1.0.0",

@@ -3,7 +3,7 @@
 # (`bash chuks_packages/@chuks/mobile/ios/build.sh`, or via the chuks.json "ios"
 # script). Reads the Swift host + Yoga from the installed package, AOT-compiles
 # YOUR app (chuks.json entry) through the package, links a native host, and
-# installs on the booted simulator. Engine: chuks.json "iosEngine" (swiftui|uikit).
+# installs on the booted simulator. iOS renders through the UIKit host + Yoga.
 set -euo pipefail
 PKGDIR="$(cd "$(dirname "$0")" && pwd)"       # chuks_packages/@chuks/mobile/ios (host source)
 SDKROOT="$(cd "$PKGDIR/.." && pwd)"           # chuks_packages/@chuks/mobile
@@ -37,7 +37,7 @@ APP_BUILD="$(AJ build)";     APP_BUILD="${APP_BUILD:-1}"
 # the Preview Swift host (ChuksPreview.swift) with its connect/scan screen.
 PREVIEW="${PREVIEW:-0}"
 if [ "$PREVIEW" = "1" ]; then
-    DEV=1; IOS_ENGINE="${IOS_ENGINE:-swiftui}"   # swiftui by default; IOS_ENGINE=uikit for the UIKit renderer
+    DEV=1
     APPNAME="ChuksPreview"; DISPLAY="Chuks Preview"; BID="com.chuks.preview"
     # Preview links no app of its own; a tiny package-local stub supplies the engine
     # symbols (never called in DEV). This decouples the build from the consumer app.
@@ -80,36 +80,20 @@ echo "2. Building the iOS engine ($PLATLABEL)"
     CC="$CLANG -isysroot $SDKPATH -target $TRIPLE" CGO_CFLAGS="-isysroot $SDKPATH -target $TRIPLE" \
     go build -buildmode=c-archive -tags ios -o "$OUTABS/libapp.a" . )   # emits $OUT/libapp.a + $OUT/libapp.h
 
-# Pick the iOS render engine: env IOS_ENGINE wins, else chuks.json "iosEngine", else uikit.
-ENGINE="${IOS_ENGINE:-$(sed -n 's/.*"iosEngine"[^"]*"\([a-z]*\)".*/\1/p' "$PROJDIR/chuks.json" | head -1)}"
-[ -z "$ENGINE" ] && ENGINE="uikit"
-
-if [ "$ENGINE" = "swiftui" ]; then
-    echo "3. Building the SwiftUI host${PREVIEW:+ (Chuks Preview)}"
-    printf '#include "libapp.h"\n' > "$OUT/app_bridge.h"
-    # Preview adds its connect/scan entry and the CHUKS_PREVIEW flag (drops the per-app @main).
-    PREVIEW_SRC=""; PREVIEW_FLAG=""
-    [ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW"; }
-    swiftc "$PKGDIR/ChuksAppSwiftUI.swift" "$PKGDIR/ChuksEffects.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
-        -import-objc-header "$OUT/app_bridge.h" -I "$OUT" \
-        "$OUT/libapp.a" -lc++ \
-        -Xclang-linker -Wno-incompatible-sysroot \
-        -framework SwiftUI -framework UIKit -framework Foundation -framework AVKit -parse-as-library $SWIFT_OPT $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
-        -o "$OUT/$APPNAME"
-else
-    echo "3. Building the UIKit host${PREVIEW:+ (Chuks Preview)}"
-    printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
-    # Preview adds its connect/scan entry; CHUKS_PREVIEW_UIKIT selects the UIKit render gate
-    # (drops the per-app @main, hands the connect screen off to CardsVC). SwiftUI needs SwiftUI framework.
-    PREVIEW_SRC=""; PREVIEW_FLAG=""; PREVIEW_FW=""
-    [ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT"; PREVIEW_FW="-framework SwiftUI -framework AVKit"; }
-    swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
-        -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
-        "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
-        -Xclang-linker -Wno-incompatible-sysroot \
-        -framework UIKit -framework Foundation $PREVIEW_FW -parse-as-library $SWIFT_OPT $SAN_FLAG $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
-        -o "$OUT/$APPNAME"
-fi
+# iOS renders through the UIKit host (ChuksApp.swift) + Yoga. (SwiftUI was dropped.)
+echo "3. Building the UIKit host${PREVIEW:+ (Chuks Preview)}"
+printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
+# Preview adds its connect/scan entry; CHUKS_PREVIEW_UIKIT selects the UIKit render gate
+# (drops the per-app @main, hands the connect screen off to CardsVC). The Preview app's
+# own connect/scan chrome still uses SwiftUI, so its build links the SwiftUI framework.
+PREVIEW_SRC=""; PREVIEW_FLAG=""; PREVIEW_FW=""
+[ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT"; PREVIEW_FW="-framework SwiftUI -framework AVKit"; }
+swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
+    -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
+    "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
+    -Xclang-linker -Wno-incompatible-sysroot \
+    -framework UIKit -framework Foundation $PREVIEW_FW -parse-as-library $SWIFT_OPT $SAN_FLAG $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
+    -o "$OUT/$APPNAME"
 
 echo "4. Assembling the app (+ your assets)"
 mkdir -p "$APP"; cp "$OUT/$APPNAME" "$APP/$APPNAME"

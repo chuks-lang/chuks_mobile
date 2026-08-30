@@ -419,6 +419,25 @@ export function safeTop(): int { return _safeTop }
 export function safeRight(): int { return _safeRight }
 export function safeBottom(): int { return _safeBottom }
 export function safeLeft(): int { return _safeLeft }
+// OS color scheme, reported by the host (via the entry's setColorScheme) so an app can
+// follow the system light/dark setting. Distinct from an in-app theme toggle.
+var _osDark: int = 0
+export function setOsColorScheme(dark: int): void { _osDark = dark }
+export function osColorScheme(): string { return _osDark == 1 ? "dark" : "light" }
+export function osIsDark(): bool { return _osDark == 1 }
+// Platform info, reported by the host (via the entry's setPlatform): OS name, version,
+// device model, and whether it is a tablet. Lets an app branch on the platform.
+var _platOS: string = ""
+var _platVer: string = ""
+var _platModel: string = ""
+var _platTablet: int = 0
+export function setPlatformInfo(os: string, ver: string, model: string, tablet: int): void {
+    _platOS = os; _platVer = ver; _platModel = model; _platTablet = tablet
+}
+export function platformOS(): string { return _platOS }
+export function platformVersion(): string { return _platVer }
+export function deviceModel(): string { return _platModel }
+export function isTablet(): bool { return _platTablet == 1 }
 // The scroll viewport height (points) the host last reported. This is the REAL height a
 // paging List pages by (screen minus safe areas / chrome), so a full-screen feed should
 // size its cells to this, NOT to DeviceInfo.screen (that mismatch offsets every page).
@@ -534,6 +553,17 @@ dataType LayoutProps {
     dir: string?; border: int?; borderColor: string?; shadow: int?; glass: bool?;
     opacity: int?; wrap: string?; font: string?; tx: int?; ty: int?; rotate: int?;
     scale: int?; anim: int?; easing: string?; tw: string?;
+    // Per-side padding + margins (px/py are the axes; pt/pr/pb/pl are the sides).
+    pt: int?; pr: int?; pb: int?; pl: int?; mt: int?; mr: int?; mb: int?; ml: int?;
+    // Min/max size, percentage size, bottom offset, z-index, aspect ratio.
+    minw: int?; maxw: int?; minh: int?; maxh: int?; wpct: int?; hpct: int?; bottom: int?; z: int?; aspect: int?;
+    // Per-corner radius.
+    rtl: int?; rtr: int?; rbr: int?; rbl: int?;
+    // Per-side border widths + border style.
+    borderTop: int?; borderRight: int?; borderBottom: int?; borderLeft: int?; bstyle: string?;
+    // Typography extras, box overflow, self-align, hidden/italic toggles.
+    tracking: int?; leading: int?; deco: string?; transform: string?; fontFamily: string?;
+    overflow: string?; self: string?; hidden: bool?; italic: bool?;
 }
 dataType EventProps {
     onPress: (function(): void)?; onChange: (function(v: string): void)?;
@@ -994,13 +1024,23 @@ dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
     onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
 }
+// Android's ScrollView holds exactly ONE direct child; a Chuks Scroll may take several
+// (iOS UIScrollView allows many). Wrap multiple children in a single content container
+// (like RN's contentContainer) so the host never gets >1 direct scroll child and can't
+// crash. A single child (the common Scroll([Column([...])]) pattern) passes through
+// unchanged, so existing screens and the List windowing path are untouched.
+function scrollContent(kids: []Node, horizontal: bool): []Node {
+    if (kids.length <= 1) { return kids }
+    const cs: Style = new Style(); cs.dir = horizontal ? "row" : "col"
+    return [ mkView(cs, kids) ]
+}
 export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     // props-or-content: `Scroll([...])` is a default vertical scroll of the given content;
     // `Scroll({...}, [...])` configures it. Discriminate by type (array = content, `{...}` = props).
     if (typeof(first) == "array") {
         const c: []Node = first
         const s0: Style = new Style(); s0.dir = "col"; s0.grow = 1; s0.basis = 0
-        return new Node("Scroll", s0, "", c)
+        return new Node("Scroll", s0, "", scrollContent(c, false))
     }
     const p: ScrollProps = first  // narrowed to the dataType arm: typed field access below
     // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
@@ -1023,7 +1063,7 @@ export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
     if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
-    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", kids)
+    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", scrollContent(kids, horizontal))
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
@@ -1362,6 +1402,32 @@ export function DatePicker(p: DatePickerProps): Node {
     applyEventsV(n, p)                                      // onChange(iso) fires on pick
     return n
 }
+
+/**
+ * A time-only picker: a DatePicker with `mode` fixed to "time", so it shows the
+ * native hour/minute UI (UIDatePicker .time / Android TimePickerDialog). `value` and
+ * `onChange` use an ISO-ish "HH:mm" time string. Everything else matches DatePicker
+ * (`display: "" | "inline" | "wheels"`, `bg`, `color`, `radius`, layout props).
+ *
+ * ```chuks
+ * TimePicker({ value: t.get(), onChange: function(v: string): void { t.set(v) } })
+ * ```
+ */
+export function TimePicker(p: DatePickerProps): Node {
+    const s: Style = new Style()
+    s.dpmode = "time"                                       // the whole point: time-only
+    s.dpdisp = pvS(p, "display", "")
+    if (s.dpdisp == "") { s.h = pvI(p, "h", 44) }
+    else if (p["h"] != null) { s.h = pvI(p, "h", -1) }
+    s.bg = pvS(p, "bg", "FFFFFF")
+    s.fg = pvS(p, "color", "111318")
+    s.radius = pvI(p, "radius", 10)
+    applyLayoutV(s, p)
+    const kind: string = (s.dpdisp == "") ? "DatePicker" : "DatePickerInline"
+    const n: Node = mkDatePicker(kind, s, pvS(p, "value", ""))
+    applyEventsV(n, p)
+    return n
+}
 /**
  * A native menu button (UIButton pull-down / SwiftUI Menu / Android PopupMenu). Unlike
  * Select there is no persistent selection: it shows a fixed `label` and its `items` are
@@ -1460,7 +1526,7 @@ export function Grid(first: GridProps | []Node, items: []Node = []): Node {
  * Map({ lat: "37.7749", lng: "-122.4194", zoom: "12", grow: 1 })
  * ```
  */
-dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string? }
+dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string?; path: string? }
 export function Map(p: MapProps): Node {
     const s: Style = new Style()
     s.radius = pvI(p, "radius", 0)
@@ -1468,7 +1534,12 @@ export function Map(p: MapProps): Node {
     const lat: string = pvS(p, "lat", "37.7749")
     const lng: string = pvS(p, "lng", "-122.4194")
     const zoom: string = pvS(p, "zoom", "12")
-    return new Node("Map", s, lat + "," + lng + "," + zoom, [])   // "lat,lng,zoom" in the text channel
+    // Optional route polyline: space-separated "lat,lng" points. When present the host
+    // draws the line and fits the map to it (center/zoom are the fallback). Text channel
+    // is "lat,lng,zoom" or "lat,lng,zoom|p1lat,p1lng p2lat,p2lng ...".
+    const path: string = pvS(p, "path", "")
+    const t: string = path != "" ? lat + "," + lng + "," + zoom + "|" + path : lat + "," + lng + "," + zoom
+    return new Node("Map", s, t, [])
 }
 
 // ---- Canvas / SVG shapes ---------------------------------------------------
@@ -2600,6 +2671,12 @@ export class App {
     // restoring the useState cells captured by saveState().
     public loadState(data: string): void { restoreCells(data) }
     // ---- framework-driven (the native host calls these; don't override) ----
+    // Host reports the OS color scheme / platform / safe-area insets. These update
+    // module state (osIsDark(), platformOS(), safeTop()/… ) that the app can read on
+    // the next render; the host triggers that render via mount/tick/setViewport.
+    public setColorScheme(dark: int): void { setOsColorScheme(dark) }
+    public setPlatform(os: string, ver: string, model: string, tablet: int): void { setPlatformInfo(os, ver, model, tablet) }
+    public setInsets(t: int, r: int, b: int, l: int): void { setSafeInsets(t, r, b, l) }
     // Render the tree and emit the initial mutation stream. Returns mutation count.
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
     // reconnected by identity, and freed when a component leaves the tree.

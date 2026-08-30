@@ -86,6 +86,7 @@ object N {
     external fun drain(): String
     external fun cmrBoot(bundle: ByteArray, tmpdir: String): Int   // CMR: load a chukspack bundle (libcmr only)
     external fun cmrApplyDelta(delta: ByteArray): Int              // CMR: merge only the changed modules + re-init
+    external fun cmrLastError(): String                            // CMR: why the last boot/delta failed (dev error overlay)
     external fun cmrSaveState(): String                            // CMR: serialize app state (cells + nav) before a reload
     external fun cmrLoadState(state: String)                       // CMR: restore it into the fresh VM after a reload
     external fun yNew(): Long
@@ -97,6 +98,7 @@ object N {
     external fun yCalc(node: Long, w: Float, h: Float)
     external fun yGet(node: Long, which: Int): Float
     external fun ySetF(node: Long, key: Int, v: Float)
+    external fun yResetStyle(node: Long)   // reset LAYOUT style to Yoga defaults (reused-node hygiene; see jni.cpp)
     external fun ySetTextMeasure(node: Long)
     external fun yMarkDirty(node: Long)
     var measureCb: ((Long, Float, Int) -> Long)? = null
@@ -120,6 +122,11 @@ object N {
 class MainActivity : Activity() {
     private val views = HashMap<String, View>()
     private val ynodes = HashMap<String, Long>()
+    // Incremental apply: relayout() reassigns a view's LayoutParams (which triggers a child
+    // requestLayout) only when its computed frame actually changed vs the last applied one,
+    // so an incremental update touches a handful of views instead of the whole tree.
+    private val lastFrame = HashMap<String, IntArray>()   // id -> [left, top, width, height] last applied
+    private val needsFrame = HashSet<String>()            // just-created views, force-applied once
     private var density = 1f
 
     private lateinit var root: FrameLayout
@@ -250,6 +257,23 @@ class MainActivity : Activity() {
         N.tick(); applyDrain(); relayout()
     }
 
+    private fun hideKeyboard(v: View) {
+        (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+            ?.hideSoftInputFromWindow(v.windowToken, 0)
+    }
+
+    // Tap outside a focused text field dismisses the keyboard. Android does not do this
+    // on its own (unlike iOS): a DOWN outside the focused EditText clears focus + hides IME.
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (ev.action == android.view.MotionEvent.ACTION_DOWN) {
+            (currentFocus as? EditText)?.let { ed ->
+                val r = android.graphics.Rect(); ed.getGlobalVisibleRect(r)
+                if (!r.contains(ev.rawX.toInt(), ev.rawY.toInt())) { hideKeyboard(ed); ed.clearFocus() }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         density = resources.displayMetrics.density
@@ -260,6 +284,20 @@ class MainActivity : Activity() {
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
+        // Edge-to-edge: draw the app under the status + nav bars (transparent) and let the
+        // reported insets (safeTop/safeBottom) pad the content exactly once, like iOS.
+        // Without this the OS insets the window above an opaque nav bar AND the app pads
+        // by safeBottom -> a doubled gap under a bottom bar. The system bar icons stay
+        // visible over the app; a tab bar's own bg now reaches the true screen edge.
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        @Suppress("DEPRECATION")
+        run {
+            window.decorView.systemUiVisibility = window.decorView.systemUiVisibility or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        }
         // Re-layout when the root's own size changes (keyboard show/hide, rotation): the
         // Chuks tree is laid out to root.height, so the shrink reflows content above the
         // keyboard. Child layout changes don't resize root, so this never loops.
@@ -288,13 +326,14 @@ class MainActivity : Activity() {
             var b: ByteArray? = null; var v = 0
             val t = Thread { val r = cmrFetchBundle(); b = r.first; v = r.second }; t.start(); t.join(8000)
             if (b == null) try { b = assets.open("cmr.bundle").readBytes() } catch (e: Exception) {}   // fallback if server down
-            if (b != null) { val rc = N.cmrBoot(b!!, cacheDir.absolutePath); cmrVersion = v; android.util.Log.i("CMR", "dev boot rc=$rc v=$v (${b!!.size} bytes) from $cmrDevBase") }
+            if (b != null) { val rc = N.cmrBoot(b!!, cacheDir.absolutePath); cmrVersion = v; android.util.Log.i("CMR", "dev boot rc=$rc v=$v (${b!!.size} bytes) from $cmrDevBase"); if (rc != 0) showDevError(N.cmrLastError()) else dismissDevError() }
             startCmrHmr()
         } else {
             try {
                 val bundle = assets.open("cmr.bundle").readBytes()
                 val rc = N.cmrBoot(bundle, cacheDir.absolutePath)   // cacheDir => $TMPDIR for on-device compile
                 android.util.Log.i("CMR", "booted rc=$rc (${bundle.size} bytes)")
+                if (rc != 0) showDevError(N.cmrLastError()) else dismissDevError()
             } catch (_: Throwable) { /* no cmr.bundle, or cmrBoot native absent (AOT) */ }
         }
 
@@ -513,6 +552,154 @@ class MainActivity : Activity() {
         }
     }
 
+    // ================= Dev error overlay ====================================
+    // A boot / hot-reload that fails to compile (type error, parse error) or crashes
+    // at runtime shows this instead of a blank screen: a dark card with a red header
+    // naming the error class and the exact message + file:line underneath. The reason
+    // comes from the VM via cmrLastError(). Dismissed automatically on the next clean
+    // reload. Dev-only surface; a shipped app never carries an unfixed error.
+    private var devErrorOverlay: android.view.View? = null
+    // Renders the structured JSON payload from cmrLastError as a full-screen dev error
+    // screen: an error-class badge, the message, the developer's relative file:line, a
+    // source code frame with the offending line highlighted, and a clean call stack.
+    // Falls back to plain text if the payload is not JSON.
+    private fun showDevError(message: String) {
+        runOnUiThread {
+            dismissDevError()
+            val dm = resources.displayMetrics
+            fun dp(v: Int) = (v * dm.density).toInt()
+
+            // --- parse payload (json) ---
+            var cls = "Error"; var msg = message; var file = ""; var line = 0; var amber = false
+            val frame = ArrayList<Triple<Int, String, Boolean>>()   // n, text, hot
+            val stack = ArrayList<Pair<String, Int>>()              // file, line
+            try {
+                val o = org.json.JSONObject(message)
+                cls = o.optString("class", "Error"); msg = o.optString("message", "")
+                file = o.optString("file", ""); line = o.optInt("line", 0)
+                amber = cls.startsWith("Type", true)
+                o.optJSONArray("frame")?.let { a -> for (i in 0 until a.length()) { val f = a.getJSONObject(i); frame.add(Triple(f.optInt("n"), f.optString("t"), f.optBoolean("hot"))) } }
+                o.optJSONArray("stack")?.let { a -> for (i in 0 until a.length()) { val s = a.getJSONObject(i); stack.add(Pair(s.optString("file"), s.optInt("line"))) } }
+            } catch (e: Throwable) { cls = "Error"; msg = message }
+
+            val red = 0xFFF0616D.toInt(); val redDeep = 0xFFE5484D.toInt(); val amberC = 0xFFF5A524.toInt()
+            val txt = 0xFFE9EDF3.toInt(); val muted = 0xFF98A2B3.toInt(); val dim = 0xFF69727F.toInt()
+            val link = 0xFF4DD08A.toInt(); val gutter = 0xFF4A5464.toInt()
+            val cardBg = 0xFF151A22.toInt(); val frameBg = 0xFF11151C.toInt(); val lineC = 0xFF232A35.toInt()
+            val mono = android.graphics.Typeface.MONOSPACE
+
+            val scrim = android.widget.FrameLayout(this)
+            scrim.setBackgroundColor(0xFF0D1016.toInt())
+            scrim.isClickable = true
+
+            val scroll = android.widget.ScrollView(this)
+            scroll.isFillViewport = true
+            val col = android.widget.LinearLayout(this)
+            col.orientation = android.widget.LinearLayout.VERTICAL
+            val top = dp(56)
+            col.setPadding(dp(22), top, dp(22), dp(28))
+
+            fun tv(text: String, size: Float, color: Int, bold: Boolean = false, monospace: Boolean = false): android.widget.TextView {
+                val t = android.widget.TextView(this); t.text = text; t.textSize = size; t.setTextColor(color)
+                if (monospace) t.typeface = mono else if (bold) t.setTypeface(t.typeface, android.graphics.Typeface.BOLD)
+                return t
+            }
+
+            // badge
+            val badge = tv("⚠  " + cls.uppercase(), 11.5f, 0xFFFFFFFF.toInt(), bold = true)
+            badge.letterSpacing = 0.06f
+            val badgeBg = android.graphics.drawable.GradientDrawable()
+            badgeBg.setColor(if (amber) amberC else red); badgeBg.cornerRadius = dp(999).toFloat()
+            badge.background = badgeBg; badge.setPadding(dp(11), dp(6), dp(12), dp(6))
+            val bl = android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT)
+            col.addView(badge, bl)
+
+            // message
+            val m = tv(if (msg.isBlank()) "Unknown error" else msg, 22f, txt, bold = true)
+            m.setPadding(0, dp(16), 0, dp(4)); m.setLineSpacing(0f, 1.05f)
+            col.addView(m)
+
+            // location
+            if (file.isNotEmpty()) {
+                val loc = tv("$file:$line", 13.5f, link, monospace = true)
+                loc.setPadding(0, dp(2), 0, dp(14))
+                col.addView(loc)
+            }
+
+            // code frame: a fixed line-number gutter + a HORIZONTALLY scrollable code
+            // column, so a long line can be scrolled to instead of being truncated.
+            if (frame.isNotEmpty()) {
+                val rowH = dp(24); val padV = dp(12); val gutterW = dp(40)
+                val contentPx = dm.widthPixels - dp(22) * 2       // col has 22dp side padding
+                val viewportW = contentPx - gutterW - dp(2)       // min width so the hot bar fills the frame
+                val fbox = android.widget.LinearLayout(this)
+                fbox.orientation = android.widget.LinearLayout.HORIZONTAL
+                val fbg = android.graphics.drawable.GradientDrawable()
+                fbg.setColor(frameBg); fbg.cornerRadius = dp(14).toFloat(); fbg.setStroke(dp(1), lineC)
+                fbox.background = fbg; fbox.clipToOutline = true
+
+                val gutterCol = android.widget.LinearLayout(this)
+                gutterCol.orientation = android.widget.LinearLayout.VERTICAL
+                gutterCol.setPadding(0, padV, 0, padV)
+                val codeCol = android.widget.LinearLayout(this)
+                codeCol.orientation = android.widget.LinearLayout.VERTICAL
+                codeCol.setPadding(0, padV, 0, padV)
+                for ((n, t, hot) in frame) {
+                    val g = tv(n.toString(), 12.5f, if (hot) red else gutter, monospace = true)
+                    g.height = rowH; g.gravity = android.view.Gravity.END or android.view.Gravity.CENTER_VERTICAL
+                    g.setPadding(0, 0, dp(10), 0)
+                    if (hot) g.setBackgroundColor(0x24F0616D)
+                    gutterCol.addView(g, android.widget.LinearLayout.LayoutParams(gutterW, rowH))
+
+                    val c = tv(t, 12.5f, if (hot) 0xFFFFFFFF.toInt() else 0xFFC6CFDB.toInt(), monospace = true)
+                    c.height = rowH; c.gravity = android.view.Gravity.CENTER_VERTICAL
+                    c.setPadding(dp(12), 0, dp(16), 0); c.setSingleLine(true); c.ellipsize = null
+                    c.minimumWidth = viewportW                  // hot bar fills the frame even for short lines
+                    if (hot) c.setBackgroundColor(0x24F0616D)
+                    codeCol.addView(c, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, rowH))
+                }
+                val hs = android.widget.HorizontalScrollView(this)
+                hs.isHorizontalScrollBarEnabled = false; hs.addView(codeCol)
+                fbox.addView(gutterCol, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
+                fbox.addView(hs, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                col.addView(fbox)
+            }
+
+            // call stack
+            if (stack.isNotEmpty()) {
+                val sh = tv("CALL STACK", 11f, dim, bold = true)
+                sh.letterSpacing = 0.12f; sh.setPadding(dp(2), dp(20), 0, dp(8))
+                col.addView(sh)
+                for ((sf, sl) in stack) {
+                    val row = tv("$sf:$sl", 12.5f, link, monospace = true)
+                    val rb = android.graphics.drawable.GradientDrawable()
+                    rb.setColor(cardBg); rb.cornerRadius = dp(10).toFloat()
+                    row.background = rb; row.setPadding(dp(12), dp(10), dp(12), dp(10))
+                    val lp = android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT)
+                    lp.topMargin = dp(3)
+                    col.addView(row, lp)
+                }
+            }
+
+            // footer hint
+            val hint = tv("Fix the error and save to reload. Hot reload keeps your state.", 12.5f, dim)
+            hint.setPadding(0, dp(24), 0, 0)
+            col.addView(hint)
+
+            scroll.addView(col)
+            scrim.addView(scroll, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
+            root.addView(scrim, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
+            devErrorOverlay = scrim
+        }
+    }
+    private fun dismissDevError() {
+        runOnUiThread { devErrorOverlay?.let { root.removeView(it) }; devErrorOverlay = null }
+    }
+
     // ================= DEV hot reload =======================================
     // Built with DEV=1, android/build.sh drops assets/chuks-dev.txt holding
     // "<host>:<port>" (e.g. 10.0.2.2:7799, the emulator's alias for the host loopback).
@@ -594,9 +781,19 @@ class MainActivity : Activity() {
         val rc = if (isDelta) N.cmrApplyDelta(payload) else N.cmrBoot(payload, cacheDir.absolutePath)
         cmrVersion = ver
         android.util.Log.i("CMR", "reload ${if (isDelta) "delta" else "full"} rc=$rc v=$ver (${payload.size}B)")
-        try { N.cmrLoadState(saved) } catch (e: Throwable) {}              // restore into the fresh VM before mount
+        if (rc != 0) {
+            // A live edit introduced a type/parse error: show the dev overlay with the
+            // reason (the old tree is already torn down) and wait for the next good save.
+            lastGoodState = saved                                          // keep state to restore after the fix
+            showDevError(N.cmrLastError())
+            return
+        }
+        try { N.cmrLoadState(if (lastGoodState.isNotEmpty()) lastGoodState else saved) } catch (e: Throwable) {}  // restore into the fresh VM before mount
+        lastGoodState = ""
+        dismissDevError()
         hostMount(); relayout(); if (pushViewport()) relayout()
     }
+    private var lastGoodState: String = ""   // app state kept across a failed reload, restored on the fix
 
     // Synchronous HTTP to the dev server. MUST run off the main thread. Returns null on a
     // network error (the server is briefly down while chuks watch restarts it).
@@ -750,6 +947,34 @@ class MainActivity : Activity() {
             "motion.accel" -> startSensor(token, android.hardware.Sensor.TYPE_ACCELEROMETER)
             "motion.gyro" -> startSensor(token, android.hardware.Sensor.TYPE_GYROSCOPE)
             "motion.mag" -> startSensor(token, android.hardware.Sensor.TYPE_MAGNETIC_FIELD)
+            "motion.proximity" -> startProximity(token)
+            "motion.light" -> startLightSensor(token, android.hardware.Sensor.TYPE_LIGHT) { v -> v[0].toString() }
+            "motion.barometer" -> startBarometer(token)
+            "pedometer.available" -> {
+                val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+                resolve(token, if (sm.getDefaultSensor(android.hardware.Sensor.TYPE_STEP_COUNTER) != null) "true" else "false")
+            }
+            "pedometer.watch" -> startPedometer(token)
+            "pedometer.query" -> fail(token, "historical steps need Health Connect on Android; use Pedometer.watch for a live count")
+            "health.available" -> {
+                val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+                resolve(token, if (sm.getDefaultSensor(android.hardware.Sensor.TYPE_HEART_RATE) != null) "true" else "false")
+            }
+            "health.authorize" -> {
+                // No Health Connect in the base runtime: the only readable source is the
+                // body heart-rate sensor, gated by the BODY_SENSORS runtime permission.
+                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) == PackageManager.PERMISSION_GRANTED) resolve(token, "granted")
+                else {
+                    val code = ++permSeq
+                    pendingPerms[code] = token       // resolved "granted"/"denied" in onRequestPermissionsResult
+                    requestPermissions(arrayOf(Manifest.permission.BODY_SENSORS), code)
+                }
+            }
+            "health.read" -> fail(token, "reading health totals needs Health Connect on Android; use Pedometer for steps/distance")
+            "health.heartRate" -> {
+                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) { fail(token, "body-sensors permission denied"); return }
+                startLightSensor(token, android.hardware.Sensor.TYPE_HEART_RATE) { v -> v[0].toInt().toString() }
+            }
             "deviceinfo.screen" -> {
                 val dm = resources.displayMetrics
                 val wdp = (dm.widthPixels / dm.density).toInt()
@@ -1091,6 +1316,8 @@ class MainActivity : Activity() {
         "calendar" -> Manifest.permission.READ_CALENDAR
         "notifications" -> Manifest.permission.POST_NOTIFICATIONS   // runtime perm on API 33+
         "photos" -> Manifest.permission.READ_MEDIA_IMAGES           // API 33+
+        "activity" -> Manifest.permission.ACTIVITY_RECOGNITION      // step counter, API 29+
+        "bodySensors" -> Manifest.permission.BODY_SENSORS           // heart-rate sensor
         else -> null
     }
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -1155,6 +1382,87 @@ class MainActivity : Activity() {
             override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
         }
         sm.registerListener(listener, sensor, 50_000)   // 50ms sampling ≈ 20Hz
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // A single-value sensor stream (light lux, heart-rate bpm): register `type` and
+    // emit `fmt(values)` on every reading. NORMAL sampling rate (these change slowly).
+    private fun startLightSensor(token: String, type: Int, fmt: (FloatArray) -> String) {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(type)
+        if (sensor == null) { fail(token, "sensor unavailable"); return }
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) { resolve(token, fmt(e.values)) }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // Proximity: emit "near"/"far". Most phones report a binary near/far (values[0] is
+    // 0 or the max range), so classify against the sensor's maximumRange.
+    private fun startProximity(token: String) {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(android.hardware.Sensor.TYPE_PROXIMITY)
+        if (sensor == null) { fail(token, "proximity sensor unavailable"); return }
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                resolve(token, if (e.values[0] < sensor.maximumRange) "near" else "far")
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // Barometer: emit "pressureHpa,relativeAltitudeMeters". Relative altitude is measured
+    // from the first reading (baseline), matching CMAltimeter's relativeAltitude on iOS.
+    private fun startBarometer(token: String) {
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(android.hardware.Sensor.TYPE_PRESSURE)
+        if (sensor == null) { fail(token, "barometer unavailable"); return }
+        val baseline = FloatArray(1) { Float.NaN }
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                val hpa = e.values[0]
+                val alt = android.hardware.SensorManager.getAltitude(android.hardware.SensorManager.PRESSURE_STANDARD_ATMOSPHERE, hpa)
+                if (baseline[0].isNaN()) baseline[0] = alt
+                resolve(token, "$hpa,${alt - baseline[0]}")
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
+        streamTeardown[token] = { sm.unregisterListener(listener) }
+    }
+
+    // Pedometer: TYPE_STEP_COUNTER reports cumulative steps since boot, so we baseline
+    // on the first event and stream the delta since the watch started. Distance/pace are
+    // estimated from steps (Android's raw sensor gives no distance); floors are always 0.
+    private fun startPedometer(token: String) {
+        if (android.os.Build.VERSION.SDK_INT >= 29 &&
+            checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED) {
+            fail(token, "activity-recognition permission denied"); return
+        }
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        val sensor = sm.getDefaultSensor(android.hardware.Sensor.TYPE_STEP_COUNTER)
+        if (sensor == null) { fail(token, "step counter unavailable"); return }
+        val startNanos = System.nanoTime()
+        val base = longArrayOf(-1L)          // cumulative-since-boot baseline (set on first event)
+        val stride = 0.762                   // avg walking stride in meters (distance estimate)
+        val listener = object : android.hardware.SensorEventListener {
+            override fun onSensorChanged(e: android.hardware.SensorEvent) {
+                val total = e.values[0].toLong()
+                if (base[0] < 0) base[0] = total
+                val steps = total - base[0]
+                val dist = steps * stride
+                val elapsedSec = (System.nanoTime() - startNanos) / 1e9
+                val cadence = if (elapsedSec > 0) steps / elapsedSec else 0.0
+                val pace = if (dist > 0) elapsedSec / dist else 0.0
+                resolve(token, "$steps,$dist,$pace,$cadence,0,0")
+            }
+            override fun onAccuracyChanged(s: android.hardware.Sensor?, a: Int) {}
+        }
+        sm.registerListener(listener, sensor, android.hardware.SensorManager.SENSOR_DELAY_NORMAL)
         streamTeardown[token] = { sm.unregisterListener(listener) }
     }
 
@@ -1340,6 +1648,12 @@ class MainActivity : Activity() {
                 mapIds.add(id)
                 it.settings.javaScriptEnabled = true
                 it.settings.domStorageEnabled = true
+                it.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                it.settings.allowFileAccess = true                       // bundled Leaflet from file:///android_asset/
+                it.settings.setAllowFileAccessFromFileURLs(true)         // the file:// page may load file:// leaflet.js
+                it.settings.setAllowUniversalAccessFromFileURLs(true)    // + cross-origin OSM tiles from the file:// page
+                it.setBackgroundColor(Color.parseColor("#0E1116"))
+                it.webChromeClient = android.webkit.WebChromeClient()   // required for full JS support in the WebView
             }
             "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics / SwiftUI Canvas)
             "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press + continuous pan/pinch/rotate
@@ -1431,7 +1745,12 @@ class MainActivity : Activity() {
                         applyStream(engInput(action, ed.text.toString()))
                         relayout()
                     } })
-                ed.setOnEditorActionListener { _, _, _ -> fieldSubmit[ed]?.let { hostEvent(it) }; true }   // onSubmit (IME action)
+                ed.setOnEditorActionListener { _, actionId, _ ->   // onSubmit (IME action) + dismiss
+                    fieldSubmit[ed]?.let { hostEvent(it) }
+                    // Done/Go/Send/Search close the keyboard; Next advances to the following field.
+                    if (actionId != android.view.inputmethod.EditorInfo.IME_ACTION_NEXT) { hideKeyboard(ed); ed.clearFocus() }
+                    true
+                }
                 ed.onFocusChangeListener = View.OnFocusChangeListener { _, has ->
                     if (has) fieldFocus[ed]?.let { hostEvent(it) } else fieldBlur[ed]?.let { hostEvent(it) }
                 } }
@@ -1563,6 +1882,7 @@ class MainActivity : Activity() {
         }
         views[id] = v
         ynodes[id] = n
+        needsFrame.add(id); lastFrame.remove(id)   // a fresh view must get its frame next relayout
         if (v is TextView && v !is Button && v !is EditText) { textNodes[n] = v; N.ySetTextMeasure(n) }
     }
 
@@ -1584,9 +1904,12 @@ class MainActivity : Activity() {
     private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
     private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
+    // The color a fresh TextView gets: the default a reused label resets to when its
+    // new role emits no `fg` (a colorless Text uses the theme default).
+    private val defaultTextColor: Int by lazy { TextView(this).currentTextColor }
     private val imageOpChain = HashMap<String, String>()       // id -> Image GPU op-chain (JSON)
     private val imageOrigBmp = HashMap<String, android.graphics.Bitmap>()   // id -> pre-op bitmap, for re-applying a changed chain
-    private val imageSrc = HashMap<String, String>()           // id -> local image source (asset name or file://), for RN-style sized re-decode
+    private val imageSrc = HashMap<String, String>()           // id -> local image source (asset name or file://), for sized re-decode
     private val imageDecodedDim = HashMap<String, Int>()       // id -> power-of-two bucket last decoded at (guards relayout re-decode)
     private val videoSeek = HashMap<String, Int>()             // id -> last-applied seek (seconds)
     private val videoControlsIds = HashSet<String>()           // ids that show a native MediaController
@@ -1612,6 +1935,53 @@ class MainActivity : Activity() {
         // one (e.g. a stray outline around a row that later holds a Switch).
         bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
         borderStyleM.remove(id); bwSideM.remove(id)
+        // Also drop stale LAYOUT geometry (Yoga width/height/grow/basis/padding/…): the visual
+        // removes above didn't touch the Yoga node, so a reused node kept its previous role's
+        // sizing (e.g. a content-sized History container inheriting a stale explicit height ->
+        // taller than its content, or the first flex child not taking its grow share). The
+        // incoming style is complete, so clearing first + re-applying below fully re-describes
+        // the node. minimumHeight/Width mirror the `h`/`w` cases and are re-set there if present.
+        N.yResetStyle(n)
+        v.minimumHeight = 0; v.minimumWidth = 0
+        // Text props are set conditionally below (ta/nlines only if present), so a reused
+        // TextView would keep the previous role's alignment/line-clamp when the new role
+        // relies on defaults (e.g. a reused label staying centered). Reset to make()'s
+        // defaults; the loop re-applies whatever this role sets. (size/weight are always
+        // re-applied from locals, so they need no reset.)
+        (v as? TextView)?.let { it.gravity = Gravity.CENTER_VERTICAL; it.maxLines = Integer.MAX_VALUE; it.ellipsize = null }
+        // Reused-node completeness: props style() applies only-when-present must be reset
+        // here or a reused node inherits the previous role's value (stale-state bug class,
+        // docs/ui-update-model-vs-rn.md). Text size/weight/decoration/tracking are already
+        // re-applied every pass (post-loop TextView block); transform + alpha are reset in
+        // the post-loop block where `anim` is known so a reset never fights an animation.
+        v.elevation = 0f                                   // shadow
+        v.translationZ = 0f                                // z
+        v.clipToOutline = false                            // overflow / TextureView+ImageView radius outline
+        v.isEnabled = true                                 // dis / edit
+        disabledIds.remove(id)                             // dis (alpha handled post-loop)
+        glassIds.remove(id)                                // glass frosted panel
+        pressOpacity.remove(id); longDelayMs.remove(id)    // Pressable active-alpha / long-press
+        if (!modalIds.contains(id)) v.visibility = View.VISIBLE   // hidden/mvis (modal drives its own)
+        (v as? ImageView)?.let { it.clearColorFilter(); it.scaleType = ImageView.ScaleType.CENTER_CROP }   // tint/filt/rmode
+        imageTint.remove(id); imageBlur.remove(id)         // Image tint/blur (pixels re-driven on load/recycle)
+        // Option A: close the Android-only reset gaps the coverage guard tracked
+        // (fg / leading / input config), so a reused node inherits none of them. iOS
+        // resets these in resetPaintStyle; Android now matches. The loop below re-applies
+        // whatever the new role sets.
+        (v as? TextView)?.let {
+            it.setTextColor(defaultTextColor)              // fg: a colorless Text uses the default
+            it.setLineSpacing(0f, 1f)                      // leading: back to the font's natural line height
+        }
+        if (v is SeekBar) { v.progressTintList = null; v.thumbTintList = null }              // fg on a Slider
+        else if (v is ProgressBar) { v.progressTintList = null; v.indeterminateTintList = null }   // fg on Progress
+        (v as? EditText)?.let {                            // input config: kbt/ret/edit/acap/acor/maxlen/sec
+            it.inputType = android.text.InputType.TYPE_CLASS_TEXT
+            it.transformationMethod = null
+            it.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            it.filters = arrayOf()
+            it.isEnabled = true; it.isFocusable = true; it.isFocusableInTouchMode = true
+            it.setSingleLine()
+        }
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
@@ -1627,6 +1997,7 @@ class MainActivity : Activity() {
         // animation: collect transform + opacity, apply (animated) after the loop
         var tx = 0f; var ty = 0f; var sc = 1f; var rot = 0f
         var hasTransform = false; var opacity: Float? = null; var animMs = -1; var animEz = ""
+        var isSecure = false   // password field this pass: keeps the mask through the post-loop transformationMethod set
         for (kv in s.split(";")) {
             if (kv.isEmpty()) continue
             val p = kv.split("="); if (p.size != 2) continue
@@ -1777,7 +2148,8 @@ class MainActivity : Activity() {
                         r.inset(-slop, -slop); p.touchDelegate = android.view.TouchDelegate(r, v) } } }
                 "blur" -> imageBlur[id] = f   // Image blurRadius; applied to the bitmap when it loads (below)
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
-                    if (vl == "1") {
+                    isSecure = (vl == "1")
+                    if (isSecure) {
                         it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
                         it.transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
                     }
@@ -1861,8 +2233,9 @@ class MainActivity : Activity() {
             it.letterSpacing = if (tracking != -9999f && fsPx > 0f) tracking / fsPx else 0f
             // Line height (leading).
             if (leading >= 0f && android.os.Build.VERSION.SDK_INT >= 28) it.lineHeight = leading.toInt()
-            // Case transform.
-            it.transformationMethod = when (txform) {
+            // Case transform. A password field keeps its mask (isSecure) rather than
+            // being unmasked by the default txform=none -> null.
+            it.transformationMethod = if (isSecure) android.text.method.PasswordTransformationMethod.getInstance() else when (txform) {
                 "upper" -> object : android.text.method.ReplacementTransformationMethod() {
                     override fun getOriginal() = CharArray(0); override fun getReplacement() = CharArray(0)
                     override fun getTransformation(source: CharSequence?, v: View?): CharSequence = source?.toString()?.uppercase() ?: ""
@@ -1904,6 +2277,14 @@ class MainActivity : Activity() {
                 if (hasTransform) { v.translationX = dpf(tx); v.translationY = dpf(ty); v.scaleX = sc; v.scaleY = sc; v.rotation = rot }
                 opacity?.let { v.alpha = it }
             }
+        } else {
+            // No transform/opacity/anim keys this role: clear any left by a previous role on
+            // a reused node. Safe here because an animating node always carries the transform
+            // keys or `anim`, so this branch never interrupts an animation.
+            if (v.translationX != 0f || v.translationY != 0f || v.scaleX != 1f || v.scaleY != 1f || v.rotation != 0f) {
+                v.translationX = 0f; v.translationY = 0f; v.scaleX = 1f; v.scaleY = 1f; v.rotation = 0f
+            }
+            if (v.alpha != 1f && !disabledIds.contains(id)) v.alpha = 1f
         }
         // bg + radius + border -> GradientDrawable (a large radius clamps to a pill)
         val hasPerCorner = rcTL >= 0f || rcTR >= 0f || rcBR >= 0f || rcBL >= 0f
@@ -2160,8 +2541,35 @@ class MainActivity : Activity() {
         if (menuIds.contains(id)) { menuData[id] = t.split("\t"); (views[id] as? Button)?.text = menuData[id]?.firstOrNull() ?: "Menu"; return }   // [label, items...]
         if (contextMenuIds.contains(id)) { contextMenuData[id] = t.split("\t"); return }   // items
         if (alertIds.contains(id)) { alertData[id] = t.split("\t"); return }   // Alert's tab-joined fields
-        if (mapIds.contains(id)) {                                              // Map's "text" is "lat,lng,zoom" -> OSM embed
-            val p = t.split(",")
+        if (mapIds.contains(id)) {                                              // Map's "text" is "lat,lng,zoom" [ "|" route ] -> OSM
+            val segs = t.split("|")
+            // Route polyline: "p1lat,p1lng p2lat,p2lng ...". Render via Leaflet + fit to it.
+            if (segs.size >= 2 && segs[1].isNotEmpty()) {
+                val pts = segs[1].split(" ").mapNotNull {
+                    val ll = it.split(","); if (ll.size == 2) "[${ll[0]},${ll[1]}]" else null
+                }.joinToString(",")
+                // Leaflet is BUNDLED (webassets/ -> file:///android_asset/), not from a CDN:
+                // loadDataWithBaseURL spoofs the page origin, and cross-origin CDN script
+                // requests from it silently hang. Loading Leaflet same-origin from the
+                // file:// base is instant; OSM tiles are cross-origin images, allowed via
+                // setAllowUniversalAccessFromFileURLs. No '#' in the HTML (it truncates the
+                // data at the first one): CSS class not id, rgb() not hex.
+                val html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                    "<link rel='stylesheet' href='leaflet.css'/>" +
+                    "<style>html,body,.mp{height:100%;width:100%;margin:0;background:rgb(14,17,22)}</style></head><body><div class='mp'></div><script>" +
+                    "var ls=document.createElement('script');ls.src='leaflet.js';ls.onerror=function(){console.log('leaflet local FAILED')};" +
+                    "ls.onload=function(){try{var pts=[$pts];" +
+                    "var map=L.map(document.getElementsByClassName('mp')[0],{zoomControl:false,attributionControl:false});" +
+                    "L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);" +
+                    "var line=L.polyline(pts,{color:'rgb(46,212,122)',weight:5}).addTo(map);" +
+                    "if(pts.length){L.circleMarker(pts[0],{radius:6,color:'rgb(46,212,122)',fillColor:'rgb(46,212,122)',fillOpacity:1}).addTo(map);" +
+                    "L.circleMarker(pts[pts.length-1],{radius:6,color:'rgb(255,255,255)',fillColor:'rgb(46,212,122)',fillOpacity:1}).addTo(map);}" +
+                    "function fit(){map.invalidateSize();if(pts.length>1)map.fitBounds(line.getBounds(),{padding:[26,26]});else map.setView(pts[0],16);}" +
+                    "fit();setTimeout(fit,300);}catch(e){console.log('map err '+e);}};document.head.appendChild(ls);</script></body></html>"
+                (views[id] as? android.webkit.WebView)?.loadDataWithBaseURL("file:///android_asset/", html, "text/html", "utf-8", null)
+                return
+            }
+            val p = segs[0].split(",")
             if (p.size == 3) {
                 val lat = p[0].toDoubleOrNull(); val lng = p[1].toDoubleOrNull(); val z = p[2].toDoubleOrNull()
                 if (lat != null && lng != null && z != null) {
@@ -2801,7 +3209,7 @@ class MainActivity : Activity() {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
@@ -3133,17 +3541,25 @@ class MainActivity : Activity() {
         for ((id, node) in ynodes) {
             if (modalIds.contains(id)) continue          // modal overlay node placed explicitly below
             val v = views[id] ?: continue
-            val lp = FrameLayout.LayoutParams(N.yGet(node, 2).toInt(), N.yGet(node, 3).toInt())
-            lp.leftMargin = N.yGet(node, 0).toInt()
-            lp.topMargin = N.yGet(node, 1).toInt()
+            val left = N.yGet(node, 0).toInt(); val top = N.yGet(node, 1).toInt()
+            val wd = N.yGet(node, 2).toInt()
             // A horizontal list's content node has an explicit WIDTH but no height (its cells
             // are abs), so Yoga gives it height 0 and Android would clip the cells. Fill it to
             // the scroll's own height (the cross axis); it scrolls sideways only.
-            if (listHoriz && id == contentId) { lp.height = listScroll?.height ?: lp.height }
+            val ht = if (listHoriz && id == contentId) (listScroll?.height ?: N.yGet(node, 3).toInt()) else N.yGet(node, 3).toInt()
+            // Incremental apply: reassign LayoutParams (which triggers a child requestLayout)
+            // only when the frame changed vs the last applied one, or the view is brand new.
+            val prev = lastFrame[id]
+            if (!needsFrame.contains(id) && prev != null && prev[0] == left && prev[1] == top && prev[2] == wd && prev[3] == ht) continue
+            val lp = FrameLayout.LayoutParams(wd, ht)
+            lp.leftMargin = left
+            lp.topMargin = top
             v.layoutParams = lp
-            // RN parity: now that the frame is known, decode the image to its display size.
-            if (imageSrc.containsKey(id)) ensureSizedImage(id, maxOf(lp.width, lp.height))
+            lastFrame[id] = intArrayOf(left, top, wd, ht)
+            // now that the frame is known, decode the image to its display size.
+            if (imageSrc.containsKey(id)) ensureSizedImage(id, maxOf(wd, ht))
         }
+        needsFrame.clear()   // consumed for this pass
         // place the whole Chuks app just below the top inset
         (views["app"]?.layoutParams as? FrameLayout.LayoutParams)?.let { it.leftMargin = 0; it.topMargin = topY }
         // a visible modal fills the window and sits on top (children laid out above)

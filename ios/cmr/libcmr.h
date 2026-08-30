@@ -24,6 +24,10 @@ extern const char *_GoStringPtr(_GoString_ s);
 #line 10 "cabi_compat.go"
 
 #include <stdlib.h>
+// The wake trampoline lets a background Chuks task ask the host to render now.
+// cgo cannot call a stored C function pointer directly, so this tiny shim casts a
+// void* back to a function and calls it. Mirrors the AOT c-archive (cabi_export.go).
+static void chuks_call_wake(void* f){ if (f) ((void(*)(void))f)(); }
 
 #line 1 "cgo-generated-wrapper"
 
@@ -94,6 +98,7 @@ extern "C" {
 #endif
 
 extern void chuks_cmr_set_tmpdir(char* path);
+extern char* chuks_cmr_last_error(void);
 extern int32_t chuks_cmr_boot(char* bundle, int32_t length);
 extern int32_t chuks_cmr_apply_delta(char* delta, int32_t length);
 extern void chuks_init(void);

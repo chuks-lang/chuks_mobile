@@ -16,7 +16,7 @@ import { os } from "std/os";
 
 // A FIXED kind order (not the parsed map's order, which isn't stable) so the generated
 // plist / manifest is deterministic across builds.
-const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "bluetooth", "nfc"]
+const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "bluetooth", "nfc", "activity", "bodySensors", "health"]
 
 // permission kind -> iOS Info.plist usage-description key(s)
 function iosKeysFor(kind: string): []string {
@@ -30,7 +30,9 @@ function iosKeysFor(kind: string): []string {
     if (kind == "faceId") { return ["NSFaceIDUsageDescription"] }
     if (kind == "bluetooth") { return ["NSBluetoothAlwaysUsageDescription"] }
     if (kind == "nfc") { return ["NFCReaderUsageDescription"] }
-    var empty: []string = []          // notifications need no iOS plist string
+    if (kind == "activity") { return ["NSMotionUsageDescription"] }   // pedometer / altimeter
+    if (kind == "health") { return ["NSHealthShareUsageDescription", "NSHealthUpdateUsageDescription"] }
+    var empty: []string = []          // notifications / bodySensors need no iOS plist string
     return empty
 }
 // permission kind -> Android manifest uses-permission name(s)
@@ -45,6 +47,9 @@ function androidPermsFor(kind: string): []string {
     if (kind == "notifications") { return ["POST_NOTIFICATIONS"] }
     if (kind == "bluetooth") { return ["BLUETOOTH_SCAN", "BLUETOOTH_CONNECT"] }
     if (kind == "nfc") { return ["NFC"] }
+    if (kind == "activity") { return ["ACTIVITY_RECOGNITION"] }   // step counter, API 29+
+    if (kind == "bodySensors") { return ["BODY_SENSORS"] }       // heart-rate sensor
+    if (kind == "health") { return ["BODY_SENSORS"] }            // Android health = heart sensor
     var empty: []string = []          // photosAdd (MediaStore) needs no permission on API 29+
     return empty
 }
@@ -122,13 +127,21 @@ function androidPermsStr(perms: any): string {
     return out
 }
 
-// The deep-link <data android:scheme> lines for a VIEW intent-filter.
-function androidSchemesStr(android: any): string {
+// The whole VIEW/BROWSABLE deep-link intent-filter, emitted ONLY when the app declares
+// url schemes. A BROWSABLE filter with no <data> scheme is malformed and API 31+ rejects
+// the activity entirely (it then won't launch at all), so with no schemes we emit nothing.
+function androidViewFilterStr(android: any): string {
     const schemes: []string = schemesOf(android)
-    var out: string = ""
+    if (schemes.length == 0) { return "" }
+    var data: string = ""
     var i: int = 0
-    while (i < schemes.length) { out = out + "                <data android:scheme=\"" + xmlEscape(schemes[i]) + "\" />\n" i = i + 1 }
-    return out
+    while (i < schemes.length) { data = data + "                <data android:scheme=\"" + xmlEscape(schemes[i]) + "\" />\n" i = i + 1 }
+    return "<intent-filter>\n" +
+        "                <action android:name=\"android.intent.action.VIEW\" />\n" +
+        "                <category android:name=\"android.intent.category.DEFAULT\" />\n" +
+        "                <category android:name=\"android.intent.category.BROWSABLE\" />\n" +
+        data +
+        "            </intent-filter>"
 }
 
 // Fill an AndroidManifest.xml in place: the CHUKS_PERMISSIONS / CHUKS_SCHEMES markers and
@@ -136,7 +149,7 @@ function androidSchemesStr(android: any): string {
 function patchManifest(mfPath: string, cfg: any, perms: any, android: any): void {
     var m: string = fs.readFile(mfPath)
     m = m.replace("<!--CHUKS_PERMISSIONS-->", trimEnd(androidPermsStr(perms)))
-    m = m.replace("<!--CHUKS_SCHEMES-->", trimEnd(androidSchemesStr(android)))
+    m = m.replace("<!--CHUKS_VIEW_FILTER-->", trimEnd(androidViewFilterStr(android)))
     m = m.replace("__VERSION_CODE__", strOr(cfg["buildNumber"], "1"))
     m = m.replace("__VERSION_NAME__", strOr(cfg["version"], "1.0"))
     fs.writeFile(mfPath, m)
@@ -168,7 +181,7 @@ function main(): void {
     else if (field == "ios-bundle") { println(ios == null ? "" : strOr(ios["bundleId"], "")) }
     else if (field == "ios-plist") { print(iosPlistStr(perms, ios)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
-    else if (field == "android-schemes") { print(androidSchemesStr(android)) }
+    else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
     else if (field == "patch-manifest") { patchManifest(a[5], cfg, perms, android) }
 }
 

@@ -6,8 +6,8 @@
 // The only node kinds it special-cases are structural: a `Scroll` node whose
 // viewport it reports back to Chuks (virtualization), and an `Input` node whose
 // text it reports back (TextInput). Everything else (the search bar, the list,
-// the cards) is declared in engine.chuks. This is React Native's architecture
-// with Chuks in place of JavaScript, and the layout engine is the real Yoga.
+// the cards) is declared in engine.chuks. The app is written entirely in Chuks; this
+// native layer only renders it, and the layout engine is the real Yoga.
 
 import UIKit
 import AVFoundation
@@ -21,7 +21,7 @@ import CoreLocation
 import CoreMotion
 import ImageIO
 
-// RN/Nuke/SDWebImage parity (WWDC "Image and Graphics Best Practices"): decode a
+// Per WWDC "Image and Graphics Best Practices": decode a
 // large source image downsampled to the target display size via ImageIO, instead
 // of letting UIImageView hold a full-res bitmap. maxPixel is the longest side in
 // PIXELS (points * screen scale).
@@ -60,6 +60,7 @@ import Security
 import Network
 import CoreBluetooth
 import CoreNFC
+import HealthKit
 
 // ===== Feed-grade image cache (shared by both iOS hosts) =====
 // Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
@@ -84,7 +85,7 @@ final class ChuksImageLoader {
     func load(_ urlStr: String, _ done: @escaping (UIImage) -> Void, fail: (() -> Void)? = nil) {
         if let img = mem.object(forKey: urlStr as NSString) { done(img); return }
         guard let url = URL(string: urlStr) else { DispatchQueue.main.async { fail?() }; return }
-        // RN parity: cap the decode near screen size so a huge remote image never
+        // cap the decode near screen size so a huge remote image never
         // holds a full-res bitmap. A generous bound (screen's long side) keeps
         // full-bleed feed images crisp while shielding memory.
         let cap = max(UIScreen.main.bounds.width, UIScreen.main.bounds.height) * UIScreen.main.scale
@@ -436,6 +437,9 @@ let measureText: YGMeasureFunc = { node, width, widthMode, _, _ in
     // attributedText and wraps to the given width. This is what makes Text wrap to its
     // container width without an explicit `w` (paired with the Yoga errata config).
     let sz = label.sizeThatFits(CGSize(width: maxW, height: .greatestFiniteMagnitude))
+    if ProcessInfo.processInfo.environment["CHUKS_MEASURE_LOG"] != nil {
+        NSLog("chuks-measure text=%@ mode=%d maxW=%.1f -> %.1fx%.1f", String((label.attributedText?.string ?? label.text ?? "").prefix(12)), widthMode.rawValue, maxW, sz.width, sz.height)
+    }
     return YGSize(width: Float(ceil(sz.width)), height: Float(ceil(sz.height)))
 }
 
@@ -508,7 +512,15 @@ func cmrBootBundle() {
         chuks_cmr_boot(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
     }
     NSLog("CMR boot rc=%d (%d bytes)", rc, data.count)
+    cmrBootErrorPending = rc != 0 ? cmrLastErrorText() : ""   // shown by the VC after its first mount
 }
+// The reason the last boot/reload failed, from the VM (type error, parse error,
+// runtime panic). Fetched only on the error path; the buffer is freed after read.
+func cmrLastErrorText() -> String {
+    guard let c = chuks_cmr_last_error() else { return "" }
+    let s = String(cString: c); chuks_free_str(c); return s
+}
+var cmrBootErrorPending = ""   // set at initial boot, consumed once the view exists
 #endif
 // The perf/jank harness (auto-scroll sweep + fps header) is a benchmark tool, not
 // app behavior — off unless built with -D BENCHMARK. Without this it grabs whatever
@@ -771,12 +783,21 @@ func chuksWakeThunk() {
     }
 }
 
-final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate {
+final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate {
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
     var views: [String: UIView] = [:]
     var ynodes: [String: YGNodeRef] = [:]
+    // Incremental apply via Yoga's HasNewLayout: relayout() writes a view's frame only when
+    // Yoga recomputed its layout, so an incremental update touches a handful of views instead
+    // of the whole tree. `needsFrame` is a belt-and-suspenders set of just-created views that
+    // must get their frame at least once even if Yoga's flag says unchanged.
+    var needsFrame = Set<String>()
+    // Layout timing (env CHUKS_LAYOUT_TIMING=1): logs Yoga compute vs frame-apply µs per
+    // relayout, to decide whether moving YGNodeCalculateLayout off the UI thread is warranted.
+    let layoutTiming = ProcessInfo.processInfo.environment["CHUKS_LAYOUT_TIMING"] != nil
+    var layoutComputeUs: Double = 0
     let config: YGConfigRef = {
         let c: YGConfigRef = YGConfigNew()
         // Opt into Yoga's 1.x "errata" layout behaviors. The modern default changed the
@@ -800,6 +821,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var frame = 0
     var taps: [UITapGestureRecognizer: String] = [:]
     var pillIds = Set<String>()   // views wanting a "full" (pill) corner radius, clamped to height/2 after layout
+    var cornerRadii: [String: CGFloat] = [:]   // requested numeric corner radius per id; clamped to min(w,h)/2 in relayout
+                                               // (so `radius: size` renders a circle on iOS, matching Android — never a diamond)
     var videoPlayers: [String: AVPlayer] = [:]        // per-node ATTACHED (visible) players
     var videoPlayerKey: [String: String] = [:]        // node id -> resource key (for pooling)
     var videoPool: [String: [AVPlayer]] = [:]         // idle, still-primed players by resource
@@ -889,7 +912,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var sideBorders: [String: (CGFloat, CGFloat, CGFloat, CGFloat, UIColor)] = [:] // id -> (t, r, b, l, color)
     var imageOpChain: [String: String] = [:]                             // id -> Image GPU op-chain (JSON)
     var imageOriginal: [String: UIImage] = [:]                           // id -> pre-filter image, so a filter/op swap re-applies from the original
-    var imageSrc: [String: String] = [:]                                 // id -> local image source (file:// or bundled asset), for RN-style sized re-decode
+    var imageSrc: [String: String] = [:]                                 // id -> local image source (file:// or bundled asset), for sized re-decode
     var imageDecodedDim: [String: Int] = [:]                             // id -> power-of-two px bucket last decoded at (guards relayout re-decode)
     let maxImageDim: CGFloat = 2560                                       // safety cap on decoded image side (px)
     var imageSpinners: [String: UIActivityIndicatorView] = [:]           // id -> loading spinner overlay
@@ -1025,7 +1048,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // dev server returns nil, but a race can also return an empty body — either way
         // leaving connected=false lets step() keep retrying instead of stranding the app
         // on a blank screen with no recovery (AOT is in-process, so it never hits this).
+        #if CMR
+        // A boot that failed to compile / crashed has no VM to mount: show the dev
+        // overlay with the reason and skip eMount (mounting a dead VM strands the app).
+        if !cmrBootErrorPending.isEmpty {
+            showDevError(cmrBootErrorPending)
+        } else if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
+        #else
         if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
+        #endif
         // (dev: if the server isn't up yet / returned empty, step() reconnects + remounts)
 
         // Register the host wake: a spawned Chuks task that posts to the render thread
@@ -1074,9 +1105,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let sc = listScroll else {
             // No scroll/list on screen: still report the full root viewport so
             // viewportWidth()/viewportHeight() are populated (e.g. for a Text wrap width).
-            let insets = view.safeAreaInsets
-            let w = Int32(view.bounds.width - insets.left - insets.right)
-            let h = Int32(view.bounds.height - insets.top - insets.bottom)
+            // Edge-to-edge: the viewport is the full screen (the app pads by safe insets).
+            let w = Int32(view.bounds.width)
+            let h = Int32(view.bounds.height)
             if w <= 0 || h <= 0 { return false }
             guard let s = eViewport(0, h, w) else { connected = false; return false }
             if !s.isEmpty { apply(s); return true }
@@ -1273,9 +1304,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return true
     }
     func cmrBootData(_ data: Data) {
-        _ = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+        let rc = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
             chuks_cmr_boot(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
         }
+        cmrBootErrorPending = rc != 0 ? cmrLastErrorText() : ""
     }
     // GET /bundle -> (data, X-CMR-Version). Synchronous (semaphore).
     func cmrFetchBundle() -> (Data?, Int) {
@@ -1366,8 +1398,177 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                            }
         cmrVersion = ver
         NSLog("CMR reload %@ rc=%d v=%d (%d bytes)", isDelta ? "delta" : "full", rc, ver, data.count)
-        cmrLoadState(saved)                 // restore into the fresh VM before mount
+        if rc != 0 {
+            // A live edit failed to compile: keep the saved state, show the reason, and
+            // wait for the next good save (which dismisses the overlay and restores state).
+            cmrPendingState = saved
+            showDevError(cmrLastErrorText())
+            return
+        }
+        cmrLoadState(cmrPendingState.isEmpty ? saved : cmrPendingState)   // restore before mount
+        cmrPendingState = ""
+        dismissDevError()
         if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
+    }
+    var cmrPendingState = ""   // app state kept across a failed reload, restored on the fix
+
+    // ---- Dev error overlay ----------------------------------------------------
+    // A boot / hot-reload that fails to compile or crashes shows this over the app: a
+    // dark card with a red header naming the error class and the exact message +
+    // file:line underneath (from the VM via cmrLastErrorText). Dismissed on the next
+    // clean reload. Dev-only; a shipped app never carries an unfixed error.
+    weak var devErrorView: UIView?
+    // Renders the structured JSON payload from chuks_cmr_last_error as a full-screen dev
+    // error screen: an error-class badge, the message, the developer's relative file:line,
+    // a source code frame with the offending line highlighted, and a clean call stack.
+    // Built SYNCHRONOUSLY, frame-based (the host runs no Auto Layout pass; a deferred add
+    // or a separate window did not composite, but a synchronous self.view subview does).
+    func showDevError(_ message: String) {
+        dismissDevError()
+        let b = self.view.bounds.isEmpty ? UIScreen.main.bounds : self.view.bounds
+
+        // Parse the JSON payload; fall back to a bare message if it is not JSON.
+        var cls = "Error", msg = message, file = "", line = 0, amber = false
+        var frameRows: [(Int, String, Bool)] = []
+        var stack: [(String, Int)] = []
+        if let data = message.data(using: .utf8),
+           let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            cls = o["class"] as? String ?? "Error"
+            msg = o["message"] as? String ?? ""
+            file = o["file"] as? String ?? ""
+            line = o["line"] as? Int ?? 0
+            amber = cls.lowercased().hasPrefix("type")
+            if let fr = o["frame"] as? [[String: Any]] {
+                frameRows = fr.map { (($0["n"] as? Int) ?? 0, ($0["t"] as? String) ?? "", ($0["hot"] as? Bool) ?? false) }
+            }
+            if let st = o["stack"] as? [[String: Any]] {
+                stack = st.map { (($0["file"] as? String) ?? "", ($0["line"] as? Int) ?? 0) }
+            }
+        }
+
+        let red = UIColor(red: 0.941, green: 0.380, blue: 0.427, alpha: 1)      // #F0616D
+        let amberC = UIColor(red: 0.961, green: 0.647, blue: 0.145, alpha: 1)   // #F5A524
+        let txt = UIColor(red: 0.914, green: 0.929, blue: 0.953, alpha: 1)      // #E9EDF3
+        let dim = UIColor(red: 0.412, green: 0.447, blue: 0.498, alpha: 1)      // #69727F
+        let link = UIColor(red: 0.302, green: 0.816, blue: 0.541, alpha: 1)     // #4DD08A
+        let gutter = UIColor(red: 0.290, green: 0.329, blue: 0.392, alpha: 1)   // #4A5464
+        let frameBg = UIColor(red: 0.067, green: 0.082, blue: 0.110, alpha: 1)  // #11151C
+        let lineC = UIColor(red: 0.137, green: 0.165, blue: 0.208, alpha: 1)    // #232A35
+        let cardBg = UIColor(red: 0.082, green: 0.102, blue: 0.133, alpha: 1)   // #151A22
+        let codeCol = UIColor(red: 0.776, green: 0.812, blue: 0.859, alpha: 1)  // #C6CFDB
+        let mono = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+
+        let scrim = UIView(frame: b)
+        scrim.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        scrim.backgroundColor = UIColor(red: 0.051, green: 0.063, blue: 0.086, alpha: 1) // #0D1016
+
+        let scroll = UIScrollView(frame: b)
+        scroll.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        scroll.alwaysBounceVertical = true
+        scrim.addSubview(scroll)
+
+        let padX: CGFloat = 22
+        let contentW = b.width - padX * 2
+        let safeTop = self.view.safeAreaInsets.top
+        var y: CGFloat = safeTop > 0 ? safeTop + 20 : 52
+
+        func measure(_ s: String, _ font: UIFont, _ w: CGFloat, lines: Int = 0) -> CGFloat {
+            let bound = (s as NSString).boundingRect(with: CGSize(width: w, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: font], context: nil)
+            let h = ceil(bound.height)
+            return lines > 0 ? min(h, font.lineHeight * CGFloat(lines) + 2) : h
+        }
+
+        // badge (pill sized to its text)
+        let badgeText = "⚠  " + cls.uppercased()
+        let badgeFont = UIFont.systemFont(ofSize: 11.5, weight: .bold)
+        let badgeW = ceil((badgeText as NSString).size(withAttributes: [.font: badgeFont]).width) + 24
+        let badge = UILabel(frame: CGRect(x: padX, y: y, width: badgeW, height: 28))
+        badge.text = badgeText; badge.font = badgeFont; badge.textColor = .white; badge.textAlignment = .center
+        badge.backgroundColor = amber ? amberC : red
+        badge.layer.cornerRadius = 14; badge.clipsToBounds = true
+        scroll.addSubview(badge); y += 28 + 16
+
+        // message
+        let msgFont = UIFont.systemFont(ofSize: 22, weight: .bold)
+        let msgText = msg.isEmpty ? "Unknown error" : msg
+        let msgH = measure(msgText, msgFont, contentW)
+        let msgLbl = UILabel(frame: CGRect(x: padX, y: y, width: contentW, height: msgH))
+        msgLbl.numberOfLines = 0; msgLbl.text = msgText; msgLbl.font = msgFont; msgLbl.textColor = txt
+        scroll.addSubview(msgLbl); y += msgH + 6
+
+        // location
+        if !file.isEmpty {
+            let loc = UILabel(frame: CGRect(x: padX, y: y, width: contentW, height: 20))
+            loc.text = "\(file):\(line)"; loc.font = UIFont.monospacedSystemFont(ofSize: 13.5, weight: .medium); loc.textColor = link
+            scroll.addSubview(loc); y += 20 + 14
+        }
+
+        // code frame: a fixed line-number gutter + a HORIZONTALLY scrollable code column,
+        // so a long line can be scrolled to instead of being truncated.
+        if !frameRows.isEmpty {
+            let rowH: CGFloat = 24, padV: CGFloat = 12, gutterW: CGFloat = 44
+            let boxH = CGFloat(frameRows.count) * rowH + padV * 2
+            let box = UIView(frame: CGRect(x: padX, y: y, width: contentW, height: boxH))
+            box.backgroundColor = frameBg; box.layer.cornerRadius = 14; box.layer.borderWidth = 1
+            box.layer.borderColor = lineC.cgColor; box.clipsToBounds = true
+
+            let hs = UIScrollView(frame: CGRect(x: gutterW, y: 0, width: contentW - gutterW, height: boxH))
+            hs.showsHorizontalScrollIndicator = false; hs.bounces = false
+            box.addSubview(hs)
+            var maxTextW: CGFloat = 0
+            for (_, t, _) in frameRows { maxTextW = max(maxTextW, (t as NSString).size(withAttributes: [.font: mono]).width) }
+            let codeW = max(hs.bounds.width, maxTextW + 28)   // hot bar fills the frame even for short lines
+
+            var ry = padV
+            for (n, t, hot) in frameRows {
+                if hot {
+                    let hlG = UIView(frame: CGRect(x: 0, y: ry, width: gutterW, height: rowH))
+                    hlG.backgroundColor = red.withAlphaComponent(0.14); box.addSubview(hlG)
+                    let hlC = UIView(frame: CGRect(x: 0, y: ry, width: codeW, height: rowH))
+                    hlC.backgroundColor = red.withAlphaComponent(0.14); hs.addSubview(hlC)
+                }
+                let g = UILabel(frame: CGRect(x: 0, y: ry, width: gutterW - 10, height: rowH))
+                g.text = "\(n)"; g.font = mono; g.textColor = hot ? red : gutter; g.textAlignment = .right
+                box.addSubview(g)
+                let c = UILabel(frame: CGRect(x: 12, y: ry, width: codeW - 12, height: rowH))
+                c.text = t; c.font = mono; c.textColor = hot ? .white : codeCol
+                hs.addSubview(c)
+                ry += rowH
+            }
+            hs.contentSize = CGSize(width: codeW, height: boxH)
+            scroll.addSubview(box); y += boxH + 20
+        }
+
+        // call stack
+        if !stack.isEmpty {
+            let sh = UILabel(frame: CGRect(x: padX + 2, y: y, width: contentW, height: 16))
+            sh.text = "CALL STACK"; sh.font = UIFont.systemFont(ofSize: 11, weight: .bold); sh.textColor = dim
+            sh.attributedText = NSAttributedString(string: "CALL STACK", attributes: [.font: sh.font!, .foregroundColor: dim, .kern: 1.3])
+            scroll.addSubview(sh); y += 16 + 8
+            for (sf, sl) in stack {
+                let row = UILabel(frame: CGRect(x: padX, y: y, width: contentW, height: 38))
+                row.text = "  \(sf):\(sl)"; row.font = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular); row.textColor = link
+                row.backgroundColor = cardBg; row.layer.cornerRadius = 10; row.clipsToBounds = true
+                scroll.addSubview(row); y += 38 + 3
+            }
+        }
+
+        // hint
+        let hintFont = UIFont.systemFont(ofSize: 12.5)
+        let hintText = "Fix the error and save to reload. Hot reload keeps your state."
+        let hintH2 = measure(hintText, hintFont, contentW)
+        let hint = UILabel(frame: CGRect(x: padX, y: y + 24, width: contentW, height: hintH2))
+        hint.numberOfLines = 0; hint.text = hintText; hint.font = hintFont; hint.textColor = dim
+        scroll.addSubview(hint); y += 24 + hintH2 + 28
+
+        scroll.contentSize = CGSize(width: b.width, height: max(y, b.height + 1))
+        self.view.addSubview(scrim)
+        self.view.bringSubviewToFront(scrim)
+        self.devErrorView = scrim
+    }
+    func dismissDevError() {
+        devErrorView?.removeFromSuperview(); devErrorView = nil
     }
     // Serialize / restore the app's state (useState cells + navigation stack) around
     // a reload, so an edit keeps your current screen instead of resetting to route 0.
@@ -1385,6 +1586,17 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     // return key dismisses the keyboard
+    // Route polyline renderer for a Map with a `path` (the walk route).
+    func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+        if let line = overlay as? MKPolyline {
+            let r = MKPolylineRenderer(polyline: line)
+            r.strokeColor = UIColor(red: 0.18, green: 0.83, blue: 0.55, alpha: 1)   // walkSocials green
+            r.lineWidth = 4
+            r.lineCap = .round
+            return r
+        }
+        return MKOverlayRenderer(overlay: overlay)
+    }
     func textFieldShouldReturn(_ tf: UITextField) -> Bool {
         if let t = fieldSubmit[tf] { fire(t) }   // onSubmit (return key)
         tf.resignFirstResponder(); return true
@@ -1533,6 +1745,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var nfc: NfcReader? = nil           // CoreNFC reader (lazy)
     var recURL: URL? = nil
     let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
+    let pedometer = CMPedometer()       // step counter / distance / pace (Pedometer)
+    let altimeter = CMAltimeter()       // barometer: pressure + relative altitude
+    var proximityTokens = Set<String>() // motion.proximity subscribers (UIDevice proximity)
+    lazy var healthStore = HKHealthStore()   // HealthKit (Health) — lazy: only if used
 
     // Execute a native capability requested via an `X|` command (F3). Same UIKit
     // implementations as the SwiftUI host; only presentShare differs (this host IS a
@@ -1552,6 +1768,71 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             n.onFail = { [weak self] t, msg in DispatchQueue.main.async { self?.fail(t, msg) } }
             nfc = n
         }
+    }
+
+    // Pedometer -> "steps,distanceMeters,paceSecPerMeter,cadenceStepsPerSec,floorsUp,floorsDown"
+    static func pedStr(_ d: CMPedometerData) -> String {
+        let steps = d.numberOfSteps.intValue
+        let dist = d.distance?.doubleValue ?? 0
+        let pace = d.currentPace?.doubleValue ?? 0          // seconds per meter
+        let cadence = d.currentCadence?.doubleValue ?? 0    // steps per second
+        let up = d.floorsAscended?.intValue ?? 0
+        let down = d.floorsDescended?.intValue ?? 0
+        return "\(steps),\(dist),\(pace),\(cadence),\(up),\(down)"
+    }
+    // A comma list of metric names -> HealthKit read types (drops unknown names).
+    static func hkTypes(_ csv: String) -> Set<HKObjectType> {
+        var out = Set<HKObjectType>()
+        for m in csv.components(separatedBy: ",") {
+            if let t = hkQuantityType(m.trimmingCharacters(in: .whitespaces)) { out.insert(t) }
+        }
+        return out
+    }
+    static func hkQuantityType(_ metric: String) -> HKQuantityType? {
+        switch metric {
+        case "steps": return HKQuantityType.quantityType(forIdentifier: .stepCount)
+        case "distanceMeters": return HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning)
+        case "activeEnergyKcal": return HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)
+        case "heartRate": return HKQuantityType.quantityType(forIdentifier: .heartRate)
+        default: return nil
+        }
+    }
+    // Aggregate one metric over [now-secs, now]: sum for steps/distance/energy, average
+    // bpm for heart rate. Answers with the number as a string.
+    func hkRead(_ token: String, _ metric: String, _ secs: Double) {
+        guard HKHealthStore.isHealthDataAvailable(), let qt = Self.hkQuantityType(metric) else { fail(token, "unsupported health metric: \(metric)"); return }
+        let from = Date(timeIntervalSinceNow: -secs)
+        let pred = HKQuery.predicateForSamples(withStart: from, end: Date(), options: .strictStartDate)
+        let isAvg = (metric == "heartRate")
+        let q = HKStatisticsQuery(quantityType: qt, quantitySamplePredicate: pred, options: isAvg ? .discreteAverage : .cumulativeSum) { [weak self] _, stats, err in
+            DispatchQueue.main.async {
+                if let e = err { self?.fail(token, e.localizedDescription); return }
+                let unit: HKUnit
+                switch metric {
+                case "distanceMeters": unit = HKUnit.meter()
+                case "activeEnergyKcal": unit = HKUnit.kilocalorie()
+                case "heartRate": unit = HKUnit.count().unitDivided(by: .minute())
+                default: unit = HKUnit.count()
+                }
+                let quantity = isAvg ? stats?.averageQuantity() : stats?.sumQuantity()
+                self?.resolve(token, String(quantity?.doubleValue(for: unit) ?? 0))
+            }
+        }
+        healthStore.execute(q)
+    }
+    // Live heart rate: an anchored query that also fires its updateHandler as new
+    // samples land (e.g. from a paired Apple Watch). Emits the latest bpm as an int.
+    func hkHeartRate(_ token: String) {
+        guard HKHealthStore.isHealthDataAvailable(), let hr = HKQuantityType.quantityType(forIdentifier: .heartRate) else { fail(token, "heart rate unavailable"); return }
+        let unit = HKUnit.count().unitDivided(by: .minute())
+        let handler: (HKAnchoredObjectQuery, [HKSample]?, [HKDeletedObject]?, HKQueryAnchor?, Error?) -> Void = { [weak self] _, samples, _, _, _ in
+            guard let s = samples as? [HKQuantitySample], let last = s.last else { return }
+            DispatchQueue.main.async { self?.resolve(token, String(Int(last.quantity.doubleValue(for: unit)))) }
+        }
+        let q = HKAnchoredObjectQuery(type: hr, predicate: nil, anchor: nil, limit: HKObjectQueryNoLimit, resultsHandler: handler)
+        q.updateHandler = handler
+        healthStore.execute(q)
+        streamTeardown[token] = { [weak self] in self?.healthStore.stop(q) }
     }
 
     func handleCommand(_ token: String, _ cap: String, _ args: String) {
@@ -1648,6 +1929,75 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 self?.magTokens.remove(token)
                 if self?.magTokens.isEmpty == true { self?.motion.stopMagnetometerUpdates() }
             }
+        case "motion.proximity":
+            // UIDevice proximity: a boolean near/far. Enable monitoring, observe the change
+            // notification, and emit the current state immediately.
+            proximityTokens.insert(token)
+            UIDevice.current.isProximityMonitoringEnabled = true
+            let o = NotificationCenter.default.addObserver(forName: UIDevice.proximityStateDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                let s = UIDevice.current.proximityState ? "near" : "far"
+                for t in self?.proximityTokens ?? [] { self?.resolve(t, s) }
+            }
+            resolve(token, UIDevice.current.proximityState ? "near" : "far")
+            streamTeardown[token] = { [weak self] in
+                self?.proximityTokens.remove(token)
+                NotificationCenter.default.removeObserver(o)
+                if self?.proximityTokens.isEmpty == true { UIDevice.current.isProximityMonitoringEnabled = false }
+            }
+        case "motion.light":
+            // iOS exposes no public ambient-light API (only ARKit's private estimate).
+            fail(token, "ambient light unavailable on iOS")
+        case "motion.barometer":
+            guard CMAltimeter.isRelativeAltitudeAvailable() else { fail(token, "barometer unavailable"); break }
+            altimeter.startRelativeAltitudeUpdates(to: .main) { [weak self] data, _ in
+                guard let d = data else { return }
+                // pressure is kPa -> hPa (*10); relativeAltitude is meters from start.
+                self?.resolve(token, "\(d.pressure.doubleValue * 10.0),\(d.relativeAltitude.doubleValue)")
+            }
+            streamTeardown[token] = { [weak self] in self?.altimeter.stopRelativeAltitudeUpdates() }
+        case "pedometer.available":
+            resolve(token, CMPedometer.isStepCountingAvailable() ? "true" : "false")
+        case "pedometer.watch":
+            guard CMPedometer.isStepCountingAvailable() else { fail(token, "step counting unavailable"); break }
+            pedometer.startUpdates(from: Date()) { [weak self] data, err in
+                DispatchQueue.main.async {
+                    if let e = err { self?.fail(token, e.localizedDescription); return }
+                    guard let d = data else { return }
+                    self?.resolve(token, Self.pedStr(d))
+                }
+            }
+            streamTeardown[token] = { [weak self] in self?.pedometer.stopUpdates() }
+        case "pedometer.query":
+            guard CMPedometer.isStepCountingAvailable() else { fail(token, "step counting unavailable"); break }
+            let secs = Double(args) ?? 0
+            let from = Date(timeIntervalSinceNow: -secs)
+            pedometer.queryPedometerData(from: from, to: Date()) { [weak self] data, err in
+                DispatchQueue.main.async {
+                    if let e = err { self?.fail(token, e.localizedDescription); return }
+                    guard let d = data else { self?.fail(token, "no pedometer data"); return }
+                    let dist = d.distance?.doubleValue ?? 0
+                    self?.resolve(token, "\(d.numberOfSteps.intValue),\(dist)")
+                }
+            }
+        case "health.available":
+            resolve(token, HKHealthStore.isHealthDataAvailable() ? "true" : "false")
+        case "health.authorize":
+            guard HKHealthStore.isHealthDataAvailable() else { fail(token, "health data unavailable"); break }
+            let types = Self.hkTypes(args)
+            if types.isEmpty { fail(token, "no valid health metrics: \(args)"); break }
+            healthStore.requestAuthorization(toShare: nil, read: types) { [weak self] ok, err in
+                DispatchQueue.main.async {
+                    if let e = err { self?.fail(token, e.localizedDescription) }
+                    else { self?.resolve(token, ok ? "granted" : "denied") }
+                }
+            }
+        case "health.read":
+            let parts = args.components(separatedBy: "|")   // "metric|secondsAgo"
+            let metric = parts.first ?? ""
+            let secs = Double(parts.count > 1 ? parts[1] : "0") ?? 0
+            hkRead(token, metric, secs)
+        case "health.heartRate":
+            hkHeartRate(token)
         case "deviceinfo.screen":
             let b = UIScreen.main.bounds
             resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")
@@ -2048,14 +2398,38 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let cv = views[id] as? CameraPreviewUIView { cv.controller?.configure(t.isEmpty ? "back" : t); return }   // CameraView facing
         if let wv = views[id] as? WKWebView { if let u = URL(string: t) { wv.load(URLRequest(url: u)) }; return }   // WebView URL
         if let cv = views[id] as? CanvasView { cv.shapes = t; return }                // Canvas's "text" is the shape list
-        if let mv = views[id] as? MKMapView {                                        // Map's "text" is "lat,lng,zoom"
-            let p = t.components(separatedBy: ",")
+        if let mv = views[id] as? MKMapView {                                        // Map's "text" is "lat,lng,zoom" or "lat,lng,zoom|route"
+            mv.delegate = self                                                       // for the polyline renderer
+            let parts = t.components(separatedBy: "|")
+            let p = parts[0].components(separatedBy: ",")
+            mv.removeAnnotations(mv.annotations)
+            mv.removeOverlays(mv.overlays)
+            // Route polyline: "p1lat,p1lng p2lat,p2lng ...". Draw it and fit the map to it.
+            if parts.count >= 2, !parts[1].isEmpty {
+                var coords: [CLLocationCoordinate2D] = []
+                for pt in parts[1].split(separator: " ") {
+                    let ll = pt.split(separator: ",")
+                    if ll.count == 2, let la = Double(ll[0]), let lo = Double(ll[1]) {
+                        coords.append(CLLocationCoordinate2D(latitude: la, longitude: lo))
+                    }
+                }
+                if coords.count >= 2 {
+                    let line = MKPolyline(coordinates: coords, count: coords.count)
+                    mv.addOverlay(line)
+                    // start (green) + end (checkered) markers
+                    let start = MKPointAnnotation(); start.coordinate = coords.first!; start.title = "Start"
+                    let end = MKPointAnnotation(); end.coordinate = coords.last!; end.title = "Finish"
+                    mv.addAnnotations([start, end])
+                    // fit to the route with padding
+                    mv.setVisibleMapRect(line.boundingMapRect, edgePadding: UIEdgeInsets(top: 30, left: 30, bottom: 30, right: 30), animated: false)
+                    return
+                }
+            }
             if p.count == 3, let lat = Double(p[0]), let lng = Double(p[1]), let z = Double(p[2]) {
                 let span = 360.0 / pow(2.0, z)                                        // degrees visible at this zoom
                 let region = MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: lat, longitude: lng),
                                                 span: MKCoordinateSpan(latitudeDelta: span, longitudeDelta: span))
                 mv.setRegion(region, animated: false)
-                mv.removeAnnotations(mv.annotations)
                 let pin = MKPointAnnotation(); pin.coordinate = CLLocationCoordinate2D(latitude: lat, longitude: lng)
                 mv.addAnnotation(pin)
             }
@@ -2271,11 +2645,134 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         v.translatesAutoresizingMaskIntoConstraints = true   // we drive .frame directly
         views[id] = v
         ynodes[id] = n
+        needsFrame.insert(id)   // a fresh view must get its frame on the next relayout
+    }
+
+    // Reset a node's Yoga LAYOUT style to Yoga defaults before (re)applying a style
+    // string. Node ids are STRUCTURAL POSITIONS (e.g. "app.1.0.0.1.0"), so on a screen
+    // swap the reconciler REUSES the node at each position in a new role — and it emits
+    // the COMPLETE non-default style for that new role (Style.str), never a partial diff.
+    // Geometry the node's PREVIOUS role set (an explicit width/height, flex-basis, margin,
+    // min/max, absolute position, …) is simply ABSENT from the new string, and the apply
+    // loop below only SETS the keys it sees — it never clears an omitted one. Left uncleared,
+    // that stale geometry corrupts layout: e.g. the first stat tile in a row reuses a Home
+    // node and keeps sizing that stops it taking its flex-grow share, rendering under-sized
+    // while its freshly-created siblings are correct. Clearing first makes the incoming
+    // string fully describe the node — the model Fabric guarantees by committing a fresh
+    // clone per frame. Only style()-managed geometry is touched; props set in make() (Scroll
+    // overflow, Text measure func) and non-layout visuals are left intact.
+    func resetLayoutStyle(_ n: YGNodeRef) {
+        YGNodeStyleSetFlexDirection(n, YGFlexDirection.column)
+        YGNodeStyleSetJustifyContent(n, YGJustify.flexStart)
+        YGNodeStyleSetAlignItems(n, YGAlign.stretch)     // Yoga (and flexbox) default cross-axis
+        YGNodeStyleSetAlignSelf(n, YGAlign.auto)
+        YGNodeStyleSetFlexGrow(n, 0)
+        YGNodeStyleSetFlexBasisAuto(n)
+        YGNodeStyleSetWidthAuto(n)                        // also clears any wpct
+        YGNodeStyleSetHeightAuto(n)                       // also clears any hpct
+        YGNodeStyleSetMinWidth(n, Float.nan);  YGNodeStyleSetMaxWidth(n, Float.nan)
+        YGNodeStyleSetMinHeight(n, Float.nan); YGNodeStyleSetMaxHeight(n, Float.nan)
+        YGNodeStyleSetAspectRatio(n, Float.nan)
+        for e in [YGEdge.all, .horizontal, .vertical, .top, .right, .bottom, .left] {
+            YGNodeStyleSetPadding(n, e, Float.nan)
+            YGNodeStyleSetMargin(n, e, Float.nan)
+            YGNodeStyleSetPosition(n, e, Float.nan)
+        }
+        YGNodeStyleSetPositionType(n, YGPositionType.relative)   // Yoga default (Style.h)
+        YGNodeStyleSetGap(n, YGGutter.all, 0)
+        YGNodeStyleSetDisplay(n, YGDisplay.flex)
+        YGNodeStyleSetFlexWrap(n, YGWrap.noWrap)
+    }
+
+    // The paint/layer sibling of resetLayoutStyle: clear the decorative UIView/CALayer
+    // properties that style() sets conditionally, so a reused node doesn't keep its
+    // previous role's background, border, corner radius, shadow, dashed/side borders or
+    // glass. Same reasoning and safety as resetLayoutStyle: style() runs only when the
+    // COMPLETE new style is being applied (the reconciler emits Style.str() as a whole,
+    // not a diff), so every prop the node currently wants is in the incoming string and
+    // gets re-established right after this clear — clearing first just drops the residue.
+    // A kind change already remove+remounts the node (reconcile), so this only ever runs
+    // on SAME-kind reuse, where make()'s structural defaults still apply: background and
+    // clipping are reset only for the generic container/Text views (HitSlopView / UILabel),
+    // leaving the Modal scrim, ImageBackground box and media views' make()-set bg/clip intact.
+    func resetPaintStyle(_ id: String, _ v: UIView) {
+        if v is HitSlopView || v is UILabel {   // generic View/Pressable + Text; NOT Modal/media/ImageBackground
+            v.backgroundColor = .clear
+            v.clipsToBounds = false
+        }
+        // Text properties are neither layout nor the paint props above, but they too must
+        // be reset on a reused node: Style.str() omits defaults, so a role that relies on
+        // default alignment/font/lines would otherwise inherit the previous role's values
+        // (e.g. a reused label keeping textAlignment=.center). Reset to make()'s defaults;
+        // style() re-applies whatever the new role sets.
+        if let l = v as? UILabel {
+            l.textAlignment = .left
+            l.numberOfLines = 0
+            l.lineBreakMode = .byTruncatingTail
+            l.font = .systemFont(ofSize: 14)
+            l.textColor = .label
+        }
+        v.layer.borderWidth = 0
+        v.layer.borderColor = nil
+        pillIds.remove(id); cornerRadii[id] = nil
+        v.layer.cornerRadius = 0
+        v.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        v.layer.shadowOpacity = 0
+        if dashBorders[id] != nil || sideBorders[id] != nil {
+            dashBorders[id] = nil; sideBorders[id] = nil
+            v.layer.sublayers?.filter { ($0.name ?? "").hasPrefix("chuksDashBorder") || ($0.name ?? "").hasPrefix("chuksSideBorder") }.forEach { $0.removeFromSuperlayer() }
+        }
+        if let gv = glassViews[id] { gv.removeFromSuperview(); glassViews[id] = nil }
+        // ── Reused-node completeness ──────────────────────────────────────────────
+        // Style.str() omits default-valued props, and the reconciler reuses a native
+        // view for whatever new role sits at a tree position, so every prop that style()
+        // applies ONLY-when-present must be reset here or a reused node inherits the prior
+        // role's value (the stale-state bug class; docs/ui-update-model-vs-rn.md). Kept in
+        // lockstep with the setters in style(); the durable fix is to materialize these
+        // defaults in the reconciler. (transform + alpha are reset in the post-loop block
+        // where `anim` is known, so a reset never fights an in-flight animation.)
+        v.layer.zPosition = 0                                        // z
+        v.layer.shadowRadius = 0; v.layer.shadowOffset = .zero       // shadow (opacity already 0 above)
+        if !modalIds.contains(id) { v.isHidden = false }             // hidden/mvis (modal drives its own)
+        disabledIds.remove(id)                                       // dis: interaction gate + alpha
+        pressOpacity[id] = nil; pressLongDelay[id] = nil             // Pressable active-alpha / long-press
+        imageTint[id] = nil; imageBlur[id] = nil; imageFilter[id] = nil   // Image tint/blur/filter (recycle re-drives the pixels)
+        (v as? UITextView)?.textColor = .label                      // fg on a TextView
+        if let b = v as? UIButton { b.isEnabled = true; b.setTitleColor(.label, for: .normal) }   // dis + fg
+        if let sw = v as? UISwitch { sw.isEnabled = true; sw.onTintColor = nil; sw.thumbTintColor = nil }   // dis + bg/swtc
+        if let sl = v as? UISlider { sl.isEnabled = true; sl.minimumTrackTintColor = nil; sl.thumbTintColor = nil }   // dis + fg
+        (v as? UIProgressView)?.progressTintColor = nil             // fg
+        if let slbl = v as? SelectableLabel { slbl.selectable = false }   // sel
+        if let h = v as? HitSlopView { h.hitSlop = 0 }              // hitslop
+        if let iv = v as? UIImageView { iv.tintColor = nil; iv.contentMode = .scaleAspectFill }   // tint / rmode
+        if let tf = v as? UITextField {                             // Input config: keyboard/secure/caps/etc.
+            tf.textColor = .label
+            tf.isSecureTextEntry = false
+            tf.keyboardType = .default
+            tf.returnKeyType = .default
+            tf.autocorrectionType = .default
+            tf.autocapitalizationType = .sentences
+            tf.isEnabled = true
+            fieldMaxLen[tf] = nil
+        }
+        // Label typography (kern/leading/decoration/transform) is baked into attributedText
+        // by refreshLabel, so clearing the dicts alone leaves a stale attributed string;
+        // re-run refreshLabel when any were set to rebuild plain text.
+        if labelKern[id] != nil || labelLead[id] != nil || labelDeco[id] != nil || labelTransform[id] != nil {
+            labelKern[id] = nil; labelLead[id] = nil; labelDeco[id] = nil; labelTransform[id] = nil
+            refreshLabel(id)
+        }
     }
 
     // parse "k=v;k=v" -> Yoga style (layout) + UIView style (visual)
     func style(_ id: String, _ s: String) {
         guard let n = ynodes[id], let v = views[id] else { return }
+        // Clear stale layout geometry from any prior role before applying the (complete)
+        // incoming style — see resetLayoutStyle. The app/modal roots re-receive their
+        // width/height from relayout() (which always runs after apply), so clearing them
+        // here is safe.
+        resetLayoutStyle(n)
+        resetPaintStyle(id, v)
         let label = v as? UILabel
         let btn = v as? UIButton
         let field = v as? UITextField
@@ -2523,8 +3020,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         // A huge radius (rounded-full) is a pill: clamp to height/2 in
                         // relayout once the frame is known; a raw 9999 makes the layer
                         // path degenerate and the view stops drawing.
-                        if f >= 9999 { pillIds.insert(id) }
-                        else { pillIds.remove(id); v.layer.cornerRadius = CGFloat(f) }
+                        if f >= 9999 { pillIds.insert(id); cornerRadii[id] = nil }
+                        else {
+                            // Store the REQUESTED radius and clamp to min(w,h)/2 in relayout
+                            // (and provisionally now, if the frame is known). Applying an
+                            // unclamped radius > half the size overlaps the corner arcs into
+                            // a diamond on iOS; Android clamps, so clamping here matches it.
+                            pillIds.remove(id); cornerRadii[id] = CGFloat(f)
+                            let b = v.bounds
+                            v.layer.cornerRadius = b == .zero ? CGFloat(f) : min(CGFloat(f), min(b.width, b.height) / 2)
+                        }
             case "glass":   // Liquid Glass: a UIGlassEffect view behind the content (blur fallback)
                 if val == "1" {
                     if glassViews[id] == nil {
@@ -2581,6 +3086,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     UIView.animate(withDuration: dur, delay: 0, options: animEz == "linear" ? .curveLinear : .curveEaseInOut, animations: apply)
                 }
             } else { apply() }
+        } else {
+            // No transform/opacity/anim keys this role: clear any left by a previous role
+            // on a reused node. Safe here because an animating node always carries the
+            // transform keys or `anim`, so this branch never interrupts an animation.
+            if !v.transform.isIdentity { v.transform = .identity }
+            if v.alpha != 1.0 && !disabledIds.contains(id) { v.alpha = 1.0 }
         }
         var font: UIFont = customFont.isEmpty
             ? .systemFont(ofSize: fs, weight: fw)
@@ -2624,7 +3135,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if (bwSide.t >= 0 || bwSide.r >= 0 || bwSide.b >= 0 || bwSide.l >= 0), !borderColorHex.isEmpty {
             sideBorders[id] = (max(0, bwSide.t), max(0, bwSide.r), max(0, bwSide.b), max(0, bwSide.l), hexColor(borderColorHex))
         } else { sideBorders[id] = nil }
-        if dashBorders[id] != nil || sideBorders[id] != nil { view.setNeedsLayout() }
+        // Border props are PAINT-ONLY: never call setNeedsLayout here. Doing so from
+        // inside a style-apply (which itself runs during the root's viewDidLayoutSubviews
+        // -> pushViewport -> apply cycle) re-arms a full layout pass before the current
+        // one commits, and updateBorderLayers churns a fresh CALayer burst each pass, so
+        // an incrementally-mounted side/dash border never converges and freezes the app.
+        // Draw immediately if the node is already laid out; otherwise the relayout that
+        // follows every apply() draws it (see relayout -> updateBorderLayers).
+        if (dashBorders[id] != nil || sideBorders[id] != nil), v.bounds != .zero { updateBorderLayers(id, v) }
     }
 
     // Draw dashed/dotted and per-side borders as sublayers, sized to the laid-out frame.
@@ -2642,14 +3160,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                                         : [NSNumber(value: Double(w * 3)), NSNumber(value: Double(w * 2))]
             sl.lineCap = dotted ? .round : .butt
         } else { v.layer.sublayers?.first { $0.name == dashKey }?.removeFromSuperlayer() }
-        v.layer.sublayers?.filter { $0.name == sideKey }.forEach { $0.removeFromSuperlayer() }
+        // Per-side borders: reuse ONE persistent named layer per edge, updated in place.
+        // (The old code removed + re-allocated every edge layer on each relayout, which
+        // is the CALayer/autorelease burst that made the freeze loop so violent.)
         if let (t, r, b, l, col) = sideBorders[id] {
             let W = v.bounds.width, H = v.bounds.height
-            func edge(_ rect: CGRect) { let e = CALayer(); e.name = sideKey; e.frame = rect; e.backgroundColor = col.cgColor; v.layer.addSublayer(e) }
-            if t > 0 { edge(CGRect(x: 0, y: 0, width: W, height: t)) }
-            if b > 0 { edge(CGRect(x: 0, y: H - b, width: W, height: b)) }
-            if l > 0 { edge(CGRect(x: 0, y: 0, width: l, height: H)) }
-            if r > 0 { edge(CGRect(x: W - r, y: 0, width: r, height: H)) }
+            func edge(_ suffix: String, _ present: Bool, _ rect: CGRect) {
+                let name = sideKey + suffix
+                let existing = v.layer.sublayers?.first { $0.name == name }
+                if !present { existing?.removeFromSuperlayer(); return }
+                let e = existing ?? { let l = CALayer(); l.name = name; v.layer.addSublayer(l); return l }()
+                e.frame = rect; e.backgroundColor = col.cgColor
+            }
+            edge(".t", t > 0, CGRect(x: 0, y: 0, width: W, height: t))
+            edge(".b", b > 0, CGRect(x: 0, y: H - b, width: W, height: b))
+            edge(".l", l > 0, CGRect(x: 0, y: 0, width: l, height: H))
+            edge(".r", r > 0, CGRect(x: W - r, y: 0, width: r, height: H))
+        } else {
+            v.layer.sublayers?.filter { ($0.name ?? "").hasPrefix(sideKey) }.forEach { $0.removeFromSuperlayer() }
         }
     }
 
@@ -2726,7 +3254,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 cv.controller?.stop()
                 if cameraController === cv.controller { cameraController = nil }
             }
-            pillIds.remove(k)
+            pillIds.remove(k); cornerRadii[k] = nil
             views[k] = nil
         }
         for k in ynodes.keys.filter({ $0 == id || $0.hasPrefix(prefix) }) { ynodes[k] = nil }
@@ -3027,7 +3555,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         c.timeoutIntervalForRequest = 20
         return URLSession(configuration: c)
     }()
-    // RN parity: (re)decode a LOCAL image downsampled to the view's display size.
+    // (re)decode a LOCAL image downsampled to the view's display size.
     // Called provisionally at screen width on load, then refined from the real frame
     // in relayout(). A power-of-two px bucket skips redundant re-decodes.
     func ensureSizedImage(_ id: String, _ targetPx: CGFloat) {
@@ -3175,12 +3703,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // Below the benchmark header when shown; otherwise just below the safe-area top
         // (status bar / notch). Without this the app slides up under the status bar,
         // since a hidden header has a .zero frame.
-        let topY = BENCHMARK_MODE ? header.frame.maxY + 6 : insets.top
-        let W = Float(view.bounds.width - insets.left - insets.right)
-        let H = Float(view.bounds.height - topY - insets.bottom - kbHeight)   // shrink for the keyboard
+        // Edge-to-edge: lay the tree over the FULL screen (under the status bar and home
+        // indicator); the app pads its content by safeTop()/safeBottom() (reported via
+        // setInsets), so an inset is applied ONCE, not twice. Matches the Android host.
+        // Without this the tree is inset AND the app pads -> a gap top and bottom.
+        let topY: CGFloat = BENCHMARK_MODE ? header.frame.maxY + 6 : 0
+        let W = Float(view.bounds.width)
+        let H = Float(view.bounds.height - topY - kbHeight)   // shrink for the keyboard
         if W <= 0 || H <= 0 { return }
         YGNodeStyleSetWidth(app, W); YGNodeStyleSetHeight(app, H)
+        let _tc = layoutTiming ? CACurrentMediaTime() : 0
         YGNodeCalculateLayout(app, W, H, YGDirection.LTR)
+        if layoutTiming { layoutComputeUs = (CACurrentMediaTime() - _tc) * 1_000_000 }
         // A visible Modal is a separate full-screen Yoga root (over the whole window,
         // safe area included) — lay it out before copying frames.
         if let mid = activeModal, let mn = ynodes[mid], views[mid]?.isHidden == false {
@@ -3188,8 +3722,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             YGNodeStyleSetWidth(mn, fw); YGNodeStyleSetHeight(mn, fh)
             YGNodeCalculateLayout(mn, fw, fh, YGDirection.LTR)
         }
+        let _ta = layoutTiming ? CACurrentMediaTime() : 0
+        var _applied = 0
         for (id, n) in ynodes {
             if modalIds.contains(id) { continue }   // modal overlay node has no app-tree layout (placed below)
+            // Incremental apply: skip nodes Yoga did not re-lay-out this pass (unless the view
+            // was just created). Yoga sets HasNewLayout on every node it recomputes (a fresh
+            // insert dirties it), so an unchanged subtree costs nothing here.
+            if !YGNodeGetHasNewLayout(n) && !needsFrame.contains(id) { continue }
+            YGNodeSetHasNewLayout(n, false)
+            _applied += 1
             let fr = CGRect(x: CGFloat(YGNodeLayoutGetLeft(n)), y: CGFloat(YGNodeLayoutGetTop(n)),
                             width: CGFloat(YGNodeLayoutGetWidth(n)), height: CGFloat(YGNodeLayoutGetHeight(n)))
             if let vv = views[id] {
@@ -3198,14 +3740,20 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if vv.transform.isIdentity { vv.frame = fr }
                 else { vv.bounds = CGRect(origin: .zero, size: fr.size); vv.center = CGPoint(x: fr.midX, y: fr.midY) }
             }
-            // RN parity: now that the frame is known, decode the image to its display size.
+            // now that the frame is known, decode the image to its display size.
             if imageSrc[id] != nil { ensureSizedImage(id, max(fr.width, fr.height) * UIScreen.main.scale) }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
+            else if let rr = cornerRadii[id] { views[id]?.layer.cornerRadius = min(rr, min(fr.width, fr.height) / 2) }   // clamp numeric radius: never a diamond
             if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
         }
-        // place the whole Chuks app in the safe area, below the diagnostics header
-        views["app"]?.frame = CGRect(x: insets.left, y: topY, width: CGFloat(W), height: CGFloat(H))
+        needsFrame.removeAll()   // consumed for this pass
+        if layoutTiming {
+            let applyUs = (CACurrentMediaTime() - _ta) * 1_000_000
+            NSLog("chuks-layout compute=%.0fus apply=%.0fus nodes=%d applied=%d", layoutComputeUs, applyUs, ynodes.count, _applied)
+        }
+        // place the whole Chuks app edge-to-edge (below the diagnostics header if shown)
+        views["app"]?.frame = CGRect(x: 0, y: topY, width: CGFloat(W), height: CGFloat(H))
         // a visible modal fills the window and sits on top (its children were laid out above)
         if let mid = activeModal, let mv = views[mid], !mv.isHidden {
             mv.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: view.bounds.height)

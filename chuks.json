@@ -5,13 +5,12 @@
     "@chuks/qr": "^0.1.0",
     "@chuks/websocket": "^1.1.1"
   },
-  "description": "Chuks Mobile SDK: write your whole app in Chuks; it compiles to native and drives real iOS (SwiftUI + UIKit) and Android widgets through one engine. Ships the UI toolkit, navigation, theming, and native capabilities (permissions, file system, secure storage, audio, text-to-speech, local notifications, and battery / network / app-state streams).",
+  "description": "Chuks Mobile SDK: write your whole app in Chuks; it compiles to native and drives real iOS (UIKit) and Android widgets through one engine. Ships the UI toolkit, navigation, theming, and native capabilities (permissions, file system, secure storage, audio, text-to-speech, local notifications, and battery / network / app-state streams).",
   "entry": "src/index.chuks",
   "keywords": [
     "mobile",
     "ios",
     "android",
-    "swiftui",
     "uikit",
     "ui",
     "framework",
@@ -21,5 +20,5 @@
   "license": "MIT",
   "name": "@chuks/mobile",
   "repository": "https://github.com/chuks-lang/chuks_mobile",
-  "version": "0.1.21"
+  "version": "0.1.22"
 }

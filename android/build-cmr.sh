@@ -53,6 +53,8 @@ cp "$CMRLIB" "$OUTABS/libapp.so"
 echo "2. Packing the source bundle (chukspack) -> assets/cmr.bundle"
 chuks pack "$APP_ENTRY" -o "$OUTABS/assets/cmr.bundle"
 echo "   bundle: $(grep -c '^--- module:' "$OUT/assets/cmr.bundle") modules"
+# Framework web assets (Leaflet for the Map route WebView) -> file:///android_asset/
+for wf in "$PKGDIR"/webassets/*; do [ -e "$wf" ] && cp "$wf" "$OUT/assets/"; done
 
 # CMR dev hot reload (DEV=1): point the app at `chukspack serve` so it fetches the
 # source bundle over HTTP and re-boots the on-device VM on each .chuks change. The
@@ -104,6 +106,7 @@ done
     && zip -q base.apk assets/cmr.bundle \
     && { [ -e assets/cmr-dev.txt ] && zip -q base.apk assets/cmr-dev.txt || true; } \
     && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
+    && for wf in assets/*.js assets/*.css; do [ -e "$wf" ] && zip -q base.apk "$wf" || true; done \
     && find assets \( -name "*.png" -o -name "*.jpg" \) -type f | while IFS= read -r im; do zip -q base.apk "$im"; done )
 "$BT/zipalign" -f 4 "$OUT/base.apk" "$OUT/chuks.apk" > "$OUT/zipalign.log" 2>&1
 
