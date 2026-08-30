@@ -15,5 +15,12 @@ for t in tests/*_test.chuks; do
     echo "=== $t ==="
     if ! "$CHUKS" run "$t"; then fail=1; fi
 done
+
+# Static guard: every wire style key must have a documented reset story, so a new
+# prop can't reintroduce the reused-node stale-state bug class (Stage 0). See
+# tests/style_reset_coverage.py and docs/ui-update-model-vs-rn.md.
+echo "=== tests/style_reset_coverage.py ==="
+if ! python3 tests/style_reset_coverage.py; then fail=1; fi
+
 if [ "$fail" -ne 0 ]; then echo "TESTS FAILED"; exit 1; fi
 echo "ALL TESTS PASSED"
