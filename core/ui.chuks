@@ -9,6 +9,7 @@
 // shared mutable state.
 
 import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells } from "./state.chuks";
+import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { host } from "std/host";
 import { Prop } from "./prop.chuks";
 import { tw } from "./tw.chuks";
@@ -425,19 +426,8 @@ var _osDark: int = 0
 export function setOsColorScheme(dark: int): void { _osDark = dark }
 export function osColorScheme(): string { return _osDark == 1 ? "dark" : "light" }
 export function osIsDark(): bool { return _osDark == 1 }
-// Platform info, reported by the host (via the entry's setPlatform): OS name, version,
-// device model, and whether it is a tablet. Lets an app branch on the platform.
-var _platOS: string = ""
-var _platVer: string = ""
-var _platModel: string = ""
-var _platTablet: int = 0
-export function setPlatformInfo(os: string, ver: string, model: string, tablet: int): void {
-    _platOS = os; _platVer = ver; _platModel = model; _platTablet = tablet
-}
-export function platformOS(): string { return _platOS }
-export function platformVersion(): string { return _platVer }
-export function deviceModel(): string { return _platModel }
-export function isTablet(): bool { return _platTablet == 1 }
+// Platform info is owned by core/platform.chuks (the Platform.OS store that isAndroid /
+// isIOS / select read). App.setPlatform below forwards the host's report to it.
 // The scroll viewport height (points) the host last reported. This is the REAL height a
 // paging List pages by (screen minus safe areas / chrome), so a full-screen feed should
 // size its cells to this, NOT to DeviceInfo.screen (that mismatch offsets every page).
@@ -2675,7 +2665,7 @@ export class App {
     // module state (osIsDark(), platformOS(), safeTop()/… ) that the app can read on
     // the next render; the host triggers that render via mount/tick/setViewport.
     public setColorScheme(dark: int): void { setOsColorScheme(dark) }
-    public setPlatform(os: string, ver: string, model: string, tablet: int): void { setPlatformInfo(os, ver, model, tablet) }
+    public setPlatform(os: string, ver: string, model: string, tablet: int): void { setPlatformInfo(os, ver, model, tablet == 1) }
     public setInsets(t: int, r: int, b: int, l: int): void { setSafeInsets(t, r, b, l) }
     // Render the tree and emit the initial mutation stream. Returns mutation count.
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
