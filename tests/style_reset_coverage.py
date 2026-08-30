@@ -119,20 +119,20 @@ MANIFEST = {
     "avis": (IMPERATIVE, "present/dismiss alert"), "spin": (IMPERATIVE, "image loading spinner"),
     "anim": (IMPERATIVE, "animation duration (transient)"), "ez": (IMPERATIVE, "animation easing (transient)"),
 
-    # ---- KNOWN GAPS, tracked for Option A (ratcheted; can only shrink) ----------
-    "fg": (DEFERRED, "text color: reset on iOS; Android relies on every text role emitting fg"),
-    "leading": (DEFERRED, "line height: iOS dict cleared; Android not reset (no clean off value)"),
-    "kbt": (DEFERRED, "input keyboard type: Android apply not total"),
-    "ret": (DEFERRED, "input return key: Android apply not total"),
-    "edit": (DEFERRED, "input editable: not reset"),
-    "acap": (DEFERRED, "input autocapitalization: not reset"),
-    "acor": (DEFERRED, "input autocorrect: not reset"),
-    "maxlen": (DEFERRED, "input max length: Android filter not cleared"),
-    "sec": (DEFERRED, "input secure: Android unset branch missing (also unmasks via post-loop)"),
+    # ---- Closed by Option A: reset on both platforms now -----------------------
+    "fg": (RESET, "text color: iOS resetPaintStyle; Android resets to defaultTextColor + control tints"),
+    "leading": (RESET, "line height: iOS dict cleared; Android setLineSpacing(0,1)"),
+    "kbt": (RESET, "input keyboard type: iOS + Android EditText reset to TYPE_CLASS_TEXT"),
+    "ret": (RESET, "input return key: iOS + Android EditText reset to IME_ACTION_DONE"),
+    "edit": (RESET, "input editable: iOS + Android EditText reset to enabled/focusable"),
+    "acap": (RESET, "input autocapitalization: iOS + Android EditText inputType reset"),
+    "acor": (RESET, "input autocorrect: iOS + Android EditText inputType reset"),
+    "maxlen": (RESET, "input max length: iOS + Android EditText filters cleared"),
+    "sec": (RESET, "input secure: iOS + Android EditText transformationMethod reset (isSecure keeps mask)"),
 }
 
-# Ratchet: the deferred set can only shrink. Lower this as Option A closes each gap.
-DEFERRED_BASELINE = 9
+# Ratchet: the deferred set can only shrink. All Option A gaps closed -> 0.
+DEFERRED_BASELINE = 0
 
 
 def wire_keys_from_str(src: str) -> set:

@@ -266,6 +266,20 @@ class MainActivity : Activity() {
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
+        // Edge-to-edge: draw the app under the status + nav bars (transparent) and let the
+        // reported insets (safeTop/safeBottom) pad the content exactly once, like iOS.
+        // Without this the OS insets the window above an opaque nav bar AND the app pads
+        // by safeBottom -> a doubled gap under a bottom bar. The system bar icons stay
+        // visible over the app; a tab bar's own bg now reaches the true screen edge.
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        @Suppress("DEPRECATION")
+        run {
+            window.decorView.systemUiVisibility = window.decorView.systemUiVisibility or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        }
         // Re-layout when the root's own size changes (keyboard show/hide, rotation): the
         // Chuks tree is laid out to root.height, so the shrink reflows content above the
         // keyboard. Child layout changes don't resize root, so this never loops.
@@ -1591,6 +1605,9 @@ class MainActivity : Activity() {
     private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
     private val imageTint = HashMap<String, Int>()             // id -> Image tintColor
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
+    // The color a fresh TextView gets: the default a reused label resets to when its
+    // new role emits no `fg` (a colorless Text uses the theme default).
+    private val defaultTextColor: Int by lazy { TextView(this).currentTextColor }
     private val imageOpChain = HashMap<String, String>()       // id -> Image GPU op-chain (JSON)
     private val imageOrigBmp = HashMap<String, android.graphics.Bitmap>()   // id -> pre-op bitmap, for re-applying a changed chain
     private val imageSrc = HashMap<String, String>()           // id -> local image source (asset name or file://), for sized re-decode
@@ -1648,6 +1665,24 @@ class MainActivity : Activity() {
         if (!modalIds.contains(id)) v.visibility = View.VISIBLE   // hidden/mvis (modal drives its own)
         (v as? ImageView)?.let { it.clearColorFilter(); it.scaleType = ImageView.ScaleType.CENTER_CROP }   // tint/filt/rmode
         imageTint.remove(id); imageBlur.remove(id)         // Image tint/blur (pixels re-driven on load/recycle)
+        // Option A: close the Android-only reset gaps the coverage guard tracked
+        // (fg / leading / input config), so a reused node inherits none of them. iOS
+        // resets these in resetPaintStyle; Android now matches. The loop below re-applies
+        // whatever the new role sets.
+        (v as? TextView)?.let {
+            it.setTextColor(defaultTextColor)              // fg: a colorless Text uses the default
+            it.setLineSpacing(0f, 1f)                      // leading: back to the font's natural line height
+        }
+        if (v is SeekBar) { v.progressTintList = null; v.thumbTintList = null }              // fg on a Slider
+        else if (v is ProgressBar) { v.progressTintList = null; v.indeterminateTintList = null }   // fg on Progress
+        (v as? EditText)?.let {                            // input config: kbt/ret/edit/acap/acor/maxlen/sec
+            it.inputType = android.text.InputType.TYPE_CLASS_TEXT
+            it.transformationMethod = null
+            it.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            it.filters = arrayOf()
+            it.isEnabled = true; it.isFocusable = true; it.isFocusableInTouchMode = true
+            it.setSingleLine()
+        }
         var fsPx = dpf(14f)
         var bold = false
         var customFont = ""   // a registered font family (e.g. an icon font)
@@ -1663,6 +1698,7 @@ class MainActivity : Activity() {
         // animation: collect transform + opacity, apply (animated) after the loop
         var tx = 0f; var ty = 0f; var sc = 1f; var rot = 0f
         var hasTransform = false; var opacity: Float? = null; var animMs = -1; var animEz = ""
+        var isSecure = false   // password field this pass: keeps the mask through the post-loop transformationMethod set
         for (kv in s.split(";")) {
             if (kv.isEmpty()) continue
             val p = kv.split("="); if (p.size != 2) continue
@@ -1813,7 +1849,8 @@ class MainActivity : Activity() {
                         r.inset(-slop, -slop); p.touchDelegate = android.view.TouchDelegate(r, v) } } }
                 "blur" -> imageBlur[id] = f   // Image blurRadius; applied to the bitmap when it loads (below)
                 "sec" -> (v as? EditText)?.let {         // password field: mask input
-                    if (vl == "1") {
+                    isSecure = (vl == "1")
+                    if (isSecure) {
                         it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
                         it.transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
                     }
@@ -1897,8 +1934,9 @@ class MainActivity : Activity() {
             it.letterSpacing = if (tracking != -9999f && fsPx > 0f) tracking / fsPx else 0f
             // Line height (leading).
             if (leading >= 0f && android.os.Build.VERSION.SDK_INT >= 28) it.lineHeight = leading.toInt()
-            // Case transform.
-            it.transformationMethod = when (txform) {
+            // Case transform. A password field keeps its mask (isSecure) rather than
+            // being unmasked by the default txform=none -> null.
+            it.transformationMethod = if (isSecure) android.text.method.PasswordTransformationMethod.getInstance() else when (txform) {
                 "upper" -> object : android.text.method.ReplacementTransformationMethod() {
                     override fun getOriginal() = CharArray(0); override fun getReplacement() = CharArray(0)
                     override fun getTransformation(source: CharSequence?, v: View?): CharSequence = source?.toString()?.uppercase() ?: ""
