@@ -1377,6 +1377,8 @@ class MainActivity : Activity() {
                 mapIds.add(id)
                 it.settings.javaScriptEnabled = true
                 it.settings.domStorageEnabled = true
+                it.setBackgroundColor(Color.parseColor("#0E1116"))
+                it.webChromeClient = android.webkit.WebChromeClient()   // required for some JS APIs
             }
             "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics / SwiftUI Canvas)
             "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press + continuous pan/pinch/rotate
@@ -2264,8 +2266,35 @@ class MainActivity : Activity() {
         if (menuIds.contains(id)) { menuData[id] = t.split("\t"); (views[id] as? Button)?.text = menuData[id]?.firstOrNull() ?: "Menu"; return }   // [label, items...]
         if (contextMenuIds.contains(id)) { contextMenuData[id] = t.split("\t"); return }   // items
         if (alertIds.contains(id)) { alertData[id] = t.split("\t"); return }   // Alert's tab-joined fields
-        if (mapIds.contains(id)) {                                              // Map's "text" is "lat,lng,zoom" -> OSM embed
-            val p = t.split(",")
+        if (mapIds.contains(id)) {                                              // Map's "text" is "lat,lng,zoom" [ "|" route ] -> OSM
+            val segs = t.split("|")
+            // Route polyline: "p1lat,p1lng p2lat,p2lng ...". Render via Leaflet + fit to it.
+            if (segs.size >= 2 && segs[1].isNotEmpty()) {
+                val pts = segs[1].split(" ").mapNotNull {
+                    val ll = it.split(","); if (ll.size == 2) "[${ll[0]},${ll[1]}]" else null
+                }.joinToString(",")
+                // No '#' anywhere in the HTML (CSS class, not id; rgb() not hex): a raw '#'
+                // truncates loadDataWithBaseURL at the first one, and its base64 mode is
+                // ignored when a baseURL is set. Plain utf-8 with a baseURL loads the CDN
+                // script + OSM tiles.
+                val html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                    "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>" +
+                    "<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>" +
+                    "<style>html,body,.mp{height:100%;width:100%;margin:0;background:rgb(14,17,22)}</style></head><body><div class='mp'></div><script>" +
+                    "(function(){try{var pts=[$pts];" +
+                    "var map=L.map(document.getElementsByClassName('mp')[0],{zoomControl:false,attributionControl:false});" +
+                    "L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);" +
+                    "var line=L.polyline(pts,{color:'rgb(46,212,122)',weight:5}).addTo(map);" +
+                    "if(pts.length){L.circleMarker(pts[0],{radius:6,color:'rgb(46,212,122)',fillColor:'rgb(46,212,122)',fillOpacity:1}).addTo(map);" +
+                    "L.circleMarker(pts[pts.length-1],{radius:6,color:'rgb(255,255,255)',fillColor:'rgb(46,212,122)',fillOpacity:1}).addTo(map);}" +
+                    "function fit(){map.invalidateSize();if(pts.length>1)map.fitBounds(line.getBounds(),{padding:[26,26]});else map.setView(pts[0],16);}" +
+                    "fit();setTimeout(fit,250);setTimeout(fit,700);}catch(e){}})();</script></body></html>"
+                // Defer until the WebView is attached + sized: loading before attach can
+                // silently no-op, and Leaflet needs a non-zero container.
+                (views[id] as? android.webkit.WebView)?.let { wv -> wv.post { wv.loadDataWithBaseURL("https://www.openstreetmap.org/", html, "text/html", "utf-8", null) } }
+                return
+            }
+            val p = segs[0].split(",")
             if (p.size == 3) {
                 val lat = p[0].toDoubleOrNull(); val lng = p[1].toDoubleOrNull(); val z = p[2].toDoubleOrNull()
                 if (lat != null && lng != null && z != null) {

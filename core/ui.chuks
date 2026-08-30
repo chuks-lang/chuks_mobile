@@ -1024,13 +1024,23 @@ dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
     onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
 }
+// Android's ScrollView holds exactly ONE direct child; a Chuks Scroll may take several
+// (iOS UIScrollView allows many). Wrap multiple children in a single content container
+// (like RN's contentContainer) so the host never gets >1 direct scroll child and can't
+// crash. A single child (the common Scroll([Column([...])]) pattern) passes through
+// unchanged, so existing screens and the List windowing path are untouched.
+function scrollContent(kids: []Node, horizontal: bool): []Node {
+    if (kids.length <= 1) { return kids }
+    const cs: Style = new Style(); cs.dir = horizontal ? "row" : "col"
+    return [ mkView(cs, kids) ]
+}
 export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     // props-or-content: `Scroll([...])` is a default vertical scroll of the given content;
     // `Scroll({...}, [...])` configures it. Discriminate by type (array = content, `{...}` = props).
     if (typeof(first) == "array") {
         const c: []Node = first
         const s0: Style = new Style(); s0.dir = "col"; s0.grow = 1; s0.basis = 0
-        return new Node("Scroll", s0, "", c)
+        return new Node("Scroll", s0, "", scrollContent(c, false))
     }
     const p: ScrollProps = first  // narrowed to the dataType arm: typed field access below
     // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
@@ -1053,7 +1063,7 @@ export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
     if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
-    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", kids)
+    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", scrollContent(kids, horizontal))
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
@@ -1490,7 +1500,7 @@ export function Grid(first: GridProps | []Node, items: []Node = []): Node {
  * Map({ lat: "37.7749", lng: "-122.4194", zoom: "12", grow: 1 })
  * ```
  */
-dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string? }
+dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string?; path: string? }
 export function Map(p: MapProps): Node {
     const s: Style = new Style()
     s.radius = pvI(p, "radius", 0)
@@ -1498,7 +1508,12 @@ export function Map(p: MapProps): Node {
     const lat: string = pvS(p, "lat", "37.7749")
     const lng: string = pvS(p, "lng", "-122.4194")
     const zoom: string = pvS(p, "zoom", "12")
-    return new Node("Map", s, lat + "," + lng + "," + zoom, [])   // "lat,lng,zoom" in the text channel
+    // Optional route polyline: space-separated "lat,lng" points. When present the host
+    // draws the line and fits the map to it (center/zoom are the fallback). Text channel
+    // is "lat,lng,zoom" or "lat,lng,zoom|p1lat,p1lng p2lat,p2lng ...".
+    const path: string = pvS(p, "path", "")
+    const t: string = path != "" ? lat + "," + lng + "," + zoom + "|" + path : lat + "," + lng + "," + zoom
+    return new Node("Map", s, t, [])
 }
 
 // ---- Canvas / SVG shapes ---------------------------------------------------

@@ -774,7 +774,7 @@ func chuksWakeThunk() {
     }
 }
 
-final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate {
+final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate {
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
@@ -1399,6 +1399,17 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     // return key dismisses the keyboard
+    // Route polyline renderer for a Map with a `path` (the walk route).
+    func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+        if let line = overlay as? MKPolyline {
+            let r = MKPolylineRenderer(polyline: line)
+            r.strokeColor = UIColor(red: 0.18, green: 0.83, blue: 0.55, alpha: 1)   // walkSocials green
+            r.lineWidth = 4
+            r.lineCap = .round
+            return r
+        }
+        return MKOverlayRenderer(overlay: overlay)
+    }
     func textFieldShouldReturn(_ tf: UITextField) -> Bool {
         if let t = fieldSubmit[tf] { fire(t) }   // onSubmit (return key)
         tf.resignFirstResponder(); return true
@@ -2062,14 +2073,38 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let cv = views[id] as? CameraPreviewUIView { cv.controller?.configure(t.isEmpty ? "back" : t); return }   // CameraView facing
         if let wv = views[id] as? WKWebView { if let u = URL(string: t) { wv.load(URLRequest(url: u)) }; return }   // WebView URL
         if let cv = views[id] as? CanvasView { cv.shapes = t; return }                // Canvas's "text" is the shape list
-        if let mv = views[id] as? MKMapView {                                        // Map's "text" is "lat,lng,zoom"
-            let p = t.components(separatedBy: ",")
+        if let mv = views[id] as? MKMapView {                                        // Map's "text" is "lat,lng,zoom" or "lat,lng,zoom|route"
+            mv.delegate = self                                                       // for the polyline renderer
+            let parts = t.components(separatedBy: "|")
+            let p = parts[0].components(separatedBy: ",")
+            mv.removeAnnotations(mv.annotations)
+            mv.removeOverlays(mv.overlays)
+            // Route polyline: "p1lat,p1lng p2lat,p2lng ...". Draw it and fit the map to it.
+            if parts.count >= 2, !parts[1].isEmpty {
+                var coords: [CLLocationCoordinate2D] = []
+                for pt in parts[1].split(separator: " ") {
+                    let ll = pt.split(separator: ",")
+                    if ll.count == 2, let la = Double(ll[0]), let lo = Double(ll[1]) {
+                        coords.append(CLLocationCoordinate2D(latitude: la, longitude: lo))
+                    }
+                }
+                if coords.count >= 2 {
+                    let line = MKPolyline(coordinates: coords, count: coords.count)
+                    mv.addOverlay(line)
+                    // start (green) + end (checkered) markers
+                    let start = MKPointAnnotation(); start.coordinate = coords.first!; start.title = "Start"
+                    let end = MKPointAnnotation(); end.coordinate = coords.last!; end.title = "Finish"
+                    mv.addAnnotations([start, end])
+                    // fit to the route with padding
+                    mv.setVisibleMapRect(line.boundingMapRect, edgePadding: UIEdgeInsets(top: 30, left: 30, bottom: 30, right: 30), animated: false)
+                    return
+                }
+            }
             if p.count == 3, let lat = Double(p[0]), let lng = Double(p[1]), let z = Double(p[2]) {
                 let span = 360.0 / pow(2.0, z)                                        // degrees visible at this zoom
                 let region = MKCoordinateRegion(center: CLLocationCoordinate2D(latitude: lat, longitude: lng),
                                                 span: MKCoordinateSpan(latitudeDelta: span, longitudeDelta: span))
                 mv.setRegion(region, animated: false)
-                mv.removeAnnotations(mv.annotations)
                 let pin = MKPointAnnotation(); pin.coordinate = CLLocationCoordinate2D(latitude: lat, longitude: lng)
                 mv.addAnnotation(pin)
             }
