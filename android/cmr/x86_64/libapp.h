@@ -98,6 +98,7 @@ extern "C" {
 #endif
 
 extern void chuks_cmr_set_tmpdir(char* path);
+extern char* chuks_cmr_last_error(void);
 extern int32_t chuks_cmr_boot(char* bundle, int32_t length);
 extern int32_t chuks_cmr_apply_delta(char* delta, int32_t length);
 extern void chuks_init(void);

@@ -124,6 +124,15 @@ JNIEXPORT jint JNICALL J(cmrApplyDelta)(JNIEnv* e, jobject, jbyteArray d) {
     e->ReleaseByteArrayElements(d, p, JNI_ABORT);
     return rc;
 }
+// The reason the last boot/delta failed (type error, parse error, runtime panic),
+// so the host can show a dev error overlay instead of a blank screen.
+extern "C" char* chuks_cmr_last_error();
+JNIEXPORT jstring JNICALL J(cmrLastError)(JNIEnv* e, jobject) {
+    char* s = chuks_cmr_last_error();
+    jstring r = e->NewStringUTF(s ? s : "");
+    if (s) chuks_free_str(s);
+    return r;
+}
 // Hot-reload state preservation: save before a reboot, restore into the fresh VM.
 extern "C" char* chuks_cmr_save_state();
 extern "C" void chuks_cmr_load_state(char* state);

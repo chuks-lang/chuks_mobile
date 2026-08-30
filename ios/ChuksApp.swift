@@ -512,7 +512,15 @@ func cmrBootBundle() {
         chuks_cmr_boot(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
     }
     NSLog("CMR boot rc=%d (%d bytes)", rc, data.count)
+    cmrBootErrorPending = rc != 0 ? cmrLastErrorText() : ""   // shown by the VC after its first mount
 }
+// The reason the last boot/reload failed, from the VM (type error, parse error,
+// runtime panic). Fetched only on the error path; the buffer is freed after read.
+func cmrLastErrorText() -> String {
+    guard let c = chuks_cmr_last_error() else { return "" }
+    let s = String(cString: c); chuks_free_str(c); return s
+}
+var cmrBootErrorPending = ""   // set at initial boot, consumed once the view exists
 #endif
 // The perf/jank harness (auto-scroll sweep + fps header) is a benchmark tool, not
 // app behavior — off unless built with -D BENCHMARK. Without this it grabs whatever
@@ -1040,7 +1048,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // dev server returns nil, but a race can also return an empty body — either way
         // leaving connected=false lets step() keep retrying instead of stranding the app
         // on a blank screen with no recovery (AOT is in-process, so it never hits this).
+        #if CMR
+        // A boot that failed to compile / crashed has no VM to mount: show the dev
+        // overlay with the reason and skip eMount (mounting a dead VM strands the app).
+        if !cmrBootErrorPending.isEmpty {
+            showDevError(cmrBootErrorPending)
+        } else if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
+        #else
         if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
+        #endif
         // (dev: if the server isn't up yet / returned empty, step() reconnects + remounts)
 
         // Register the host wake: a spawned Chuks task that posts to the render thread
@@ -1288,9 +1304,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return true
     }
     func cmrBootData(_ data: Data) {
-        _ = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
+        let rc = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
             chuks_cmr_boot(UnsafeMutablePointer(mutating: raw.bindMemory(to: CChar.self).baseAddress), Int32(data.count))
         }
+        cmrBootErrorPending = rc != 0 ? cmrLastErrorText() : ""
     }
     // GET /bundle -> (data, X-CMR-Version). Synchronous (semaphore).
     func cmrFetchBundle() -> (Data?, Int) {
@@ -1381,8 +1398,89 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                            }
         cmrVersion = ver
         NSLog("CMR reload %@ rc=%d v=%d (%d bytes)", isDelta ? "delta" : "full", rc, ver, data.count)
-        cmrLoadState(saved)                 // restore into the fresh VM before mount
+        if rc != 0 {
+            // A live edit failed to compile: keep the saved state, show the reason, and
+            // wait for the next good save (which dismisses the overlay and restores state).
+            cmrPendingState = saved
+            showDevError(cmrLastErrorText())
+            return
+        }
+        cmrLoadState(cmrPendingState.isEmpty ? saved : cmrPendingState)   // restore before mount
+        cmrPendingState = ""
+        dismissDevError()
         if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
+    }
+    var cmrPendingState = ""   // app state kept across a failed reload, restored on the fix
+
+    // ---- Dev error overlay ----------------------------------------------------
+    // A boot / hot-reload that fails to compile or crashes shows this over the app: a
+    // dark card with a red header naming the error class and the exact message +
+    // file:line underneath (from the VM via cmrLastErrorText). Dismissed on the next
+    // clean reload. Dev-only; a shipped app never carries an unfixed error.
+    weak var devErrorView: UIView?
+    func showDevError(_ message: String) {
+        // Built SYNCHRONOUSLY as a subview of self.view. self.view is the visible root; a
+        // deferred (async) add or a separate overlay window did not composite here, but a
+        // synchronous subview does. Frame-based (the host runs no Auto Layout pass).
+        dismissDevError()
+        let b = self.view.bounds.isEmpty ? UIScreen.main.bounds : self.view.bounds
+        let msg = message.isEmpty ? "Error\n(no detail reported)" : message
+        let title: String, body: String
+        if let nl = msg.firstIndex(of: "\n") {
+            title = String(msg[..<nl])
+            body = String(msg[msg.index(after: nl)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else { title = msg; body = "" }
+
+        let scrim = UIView(frame: b)
+        scrim.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        scrim.backgroundColor = UIColor(white: 0.03, alpha: 0.97)
+
+        let margin: CGFloat = 20, pad: CGFloat = 18
+        let cardW = b.width - margin * 2, bodyW = cardW - pad * 2
+        let headerH: CGFloat = 54, hintH: CGFloat = 46
+        let bodyFont = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        let measured = (body as NSString).boundingRect(
+            with: CGSize(width: bodyW, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: bodyFont], context: nil)
+        let bodyH = min(ceil(measured.height), b.height * 0.52)
+        let cardH = headerH + 14 + bodyH + hintH
+        let cardY = max(60, (b.height - cardH) / 2)
+
+        let card = UIView(frame: CGRect(x: margin, y: cardY, width: cardW, height: cardH))
+        card.backgroundColor = UIColor(red: 0.086, green: 0.102, blue: 0.129, alpha: 1) // #161A21
+        card.layer.cornerRadius = 16; card.clipsToBounds = true
+        card.autoresizingMask = [.flexibleTopMargin, .flexibleBottomMargin, .flexibleWidth]
+
+        let header = UIView(frame: CGRect(x: 0, y: 0, width: cardW, height: headerH))
+        header.backgroundColor = UIColor(red: 0.898, green: 0.282, blue: 0.302, alpha: 1) // #E5484D
+        header.autoresizingMask = [.flexibleWidth]
+        let titleLbl = UILabel(frame: CGRect(x: pad, y: 0, width: cardW - pad * 2, height: headerH))
+        titleLbl.text = "⚠  " + title; titleLbl.textColor = .white
+        titleLbl.font = .systemFont(ofSize: 16, weight: .bold)
+        titleLbl.autoresizingMask = [.flexibleWidth]
+        header.addSubview(titleLbl); card.addSubview(header)
+
+        let bodyLbl = UILabel(frame: CGRect(x: pad, y: headerH + 14, width: bodyW, height: bodyH))
+        bodyLbl.numberOfLines = 0; bodyLbl.text = body; bodyLbl.font = bodyFont
+        bodyLbl.textColor = UIColor(red: 0.863, green: 0.890, blue: 0.925, alpha: 1) // #DCE3EC
+        bodyLbl.autoresizingMask = [.flexibleWidth]
+        card.addSubview(bodyLbl)
+
+        let hintLbl = UILabel(frame: CGRect(x: pad, y: cardH - hintH + 8, width: cardW - pad * 2, height: 20))
+        hintLbl.text = "Fix the error and save to reload."
+        hintLbl.font = .systemFont(ofSize: 12.5)
+        hintLbl.textColor = UIColor(red: 0.545, green: 0.584, blue: 0.647, alpha: 1) // #8B95A5
+        hintLbl.autoresizingMask = [.flexibleWidth, .flexibleTopMargin]
+        card.addSubview(hintLbl)
+
+        scrim.addSubview(card)
+        self.view.addSubview(scrim)
+        self.view.bringSubviewToFront(scrim)
+        self.devErrorView = scrim
+    }
+    func dismissDevError() {
+        devErrorView?.removeFromSuperview(); devErrorView = nil
     }
     // Serialize / restore the app's state (useState cells + navigation stack) around
     // a reload, so an edit keeps your current screen instead of resetting to route 0.

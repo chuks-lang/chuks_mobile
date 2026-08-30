@@ -86,6 +86,7 @@ object N {
     external fun drain(): String
     external fun cmrBoot(bundle: ByteArray, tmpdir: String): Int   // CMR: load a chukspack bundle (libcmr only)
     external fun cmrApplyDelta(delta: ByteArray): Int              // CMR: merge only the changed modules + re-init
+    external fun cmrLastError(): String                            // CMR: why the last boot/delta failed (dev error overlay)
     external fun cmrSaveState(): String                            // CMR: serialize app state (cells + nav) before a reload
     external fun cmrLoadState(state: String)                       // CMR: restore it into the fresh VM after a reload
     external fun yNew(): Long
@@ -325,13 +326,14 @@ class MainActivity : Activity() {
             var b: ByteArray? = null; var v = 0
             val t = Thread { val r = cmrFetchBundle(); b = r.first; v = r.second }; t.start(); t.join(8000)
             if (b == null) try { b = assets.open("cmr.bundle").readBytes() } catch (e: Exception) {}   // fallback if server down
-            if (b != null) { val rc = N.cmrBoot(b!!, cacheDir.absolutePath); cmrVersion = v; android.util.Log.i("CMR", "dev boot rc=$rc v=$v (${b!!.size} bytes) from $cmrDevBase") }
+            if (b != null) { val rc = N.cmrBoot(b!!, cacheDir.absolutePath); cmrVersion = v; android.util.Log.i("CMR", "dev boot rc=$rc v=$v (${b!!.size} bytes) from $cmrDevBase"); if (rc != 0) showDevError(N.cmrLastError()) else dismissDevError() }
             startCmrHmr()
         } else {
             try {
                 val bundle = assets.open("cmr.bundle").readBytes()
                 val rc = N.cmrBoot(bundle, cacheDir.absolutePath)   // cacheDir => $TMPDIR for on-device compile
                 android.util.Log.i("CMR", "booted rc=$rc (${bundle.size} bytes)")
+                if (rc != 0) showDevError(N.cmrLastError()) else dismissDevError()
             } catch (_: Throwable) { /* no cmr.bundle, or cmrBoot native absent (AOT) */ }
         }
 
@@ -550,6 +552,81 @@ class MainActivity : Activity() {
         }
     }
 
+    // ================= Dev error overlay ====================================
+    // A boot / hot-reload that fails to compile (type error, parse error) or crashes
+    // at runtime shows this instead of a blank screen: a dark card with a red header
+    // naming the error class and the exact message + file:line underneath. The reason
+    // comes from the VM via cmrLastError(). Dismissed automatically on the next clean
+    // reload. Dev-only surface; a shipped app never carries an unfixed error.
+    private var devErrorOverlay: android.view.View? = null
+    private fun showDevError(message: String) {
+        runOnUiThread {
+            dismissDevError()
+            val dm = resources.displayMetrics
+            fun dp(v: Int) = (v * dm.density).toInt()
+            val msg = if (message.isBlank()) "Error\n(no detail reported)" else message
+            val nl = msg.indexOf('\n')
+            val title = if (nl >= 0) msg.substring(0, nl) else "Error"
+            val bodyText = if (nl >= 0) msg.substring(nl + 1).trim() else ""
+
+            val scrim = android.widget.FrameLayout(this)
+            scrim.setBackgroundColor(0xF20B0E13.toInt())   // ~95% opaque near-black
+            scrim.isClickable = true                       // swallow taps to the app underneath
+
+            val card = android.widget.LinearLayout(this)
+            card.orientation = android.widget.LinearLayout.VERTICAL
+            val cardBg = android.graphics.drawable.GradientDrawable()
+            cardBg.setColor(0xFF161A21.toInt()); cardBg.cornerRadius = dp(16).toFloat()
+            card.background = cardBg
+            card.clipToOutline = true
+            val clp = android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT)
+            clp.gravity = android.view.Gravity.CENTER
+            clp.leftMargin = dp(20); clp.rightMargin = dp(20)
+
+            val header = android.widget.LinearLayout(this)
+            header.orientation = android.widget.LinearLayout.HORIZONTAL
+            header.gravity = android.view.Gravity.CENTER_VERTICAL
+            header.setBackgroundColor(0xFFE5484D.toInt())   // warm red
+            header.setPadding(dp(18), dp(15), dp(18), dp(15))
+            val icon = android.widget.TextView(this)
+            icon.text = "⚠"; icon.setTextColor(0xFFFFFFFF.toInt()); icon.textSize = 17f
+            icon.setPadding(0, 0, dp(10), 0)
+            val titleTv = android.widget.TextView(this)
+            titleTv.text = title; titleTv.setTextColor(0xFFFFFFFF.toInt()); titleTv.textSize = 16f
+            titleTv.setTypeface(titleTv.typeface, android.graphics.Typeface.BOLD)
+            header.addView(icon); header.addView(titleTv)
+            card.addView(header)
+
+            val scroll = android.widget.ScrollView(this)
+            val body = android.widget.TextView(this)
+            body.text = bodyText
+            body.setTextColor(0xFFDCE3EC.toInt()); body.textSize = 13.5f
+            body.typeface = android.graphics.Typeface.MONOSPACE
+            body.setPadding(dp(18), dp(16), dp(18), dp(10))
+            body.setTextIsSelectable(true)
+            scroll.addView(body)
+            card.addView(scroll, android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT, dp(300)))
+
+            val hint = android.widget.TextView(this)
+            hint.text = "Fix the error and save to reload."
+            hint.setTextColor(0xFF8B95A5.toInt()); hint.textSize = 12.5f
+            hint.setPadding(dp(18), dp(2), dp(18), dp(18))
+            card.addView(hint)
+
+            scrim.addView(card, clp)
+            root.addView(scrim, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
+            devErrorOverlay = scrim
+        }
+    }
+    private fun dismissDevError() {
+        runOnUiThread { devErrorOverlay?.let { root.removeView(it) }; devErrorOverlay = null }
+    }
+
     // ================= DEV hot reload =======================================
     // Built with DEV=1, android/build.sh drops assets/chuks-dev.txt holding
     // "<host>:<port>" (e.g. 10.0.2.2:7799, the emulator's alias for the host loopback).
@@ -631,9 +708,19 @@ class MainActivity : Activity() {
         val rc = if (isDelta) N.cmrApplyDelta(payload) else N.cmrBoot(payload, cacheDir.absolutePath)
         cmrVersion = ver
         android.util.Log.i("CMR", "reload ${if (isDelta) "delta" else "full"} rc=$rc v=$ver (${payload.size}B)")
-        try { N.cmrLoadState(saved) } catch (e: Throwable) {}              // restore into the fresh VM before mount
+        if (rc != 0) {
+            // A live edit introduced a type/parse error: show the dev overlay with the
+            // reason (the old tree is already torn down) and wait for the next good save.
+            lastGoodState = saved                                          // keep state to restore after the fix
+            showDevError(N.cmrLastError())
+            return
+        }
+        try { N.cmrLoadState(if (lastGoodState.isNotEmpty()) lastGoodState else saved) } catch (e: Throwable) {}  // restore into the fresh VM before mount
+        lastGoodState = ""
+        dismissDevError()
         hostMount(); relayout(); if (pushViewport()) relayout()
     }
+    private var lastGoodState: String = ""   // app state kept across a failed reload, restored on the fix
 
     // Synchronous HTTP to the dev server. MUST run off the main thread. Returns null on a
     // network error (the server is briefly down while chuks watch restarts it).
