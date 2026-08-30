@@ -1418,63 +1418,139 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // file:line underneath (from the VM via cmrLastErrorText). Dismissed on the next
     // clean reload. Dev-only; a shipped app never carries an unfixed error.
     weak var devErrorView: UIView?
+    // Renders the structured JSON payload from chuks_cmr_last_error as a full-screen dev
+    // error screen: an error-class badge, the message, the developer's relative file:line,
+    // a source code frame with the offending line highlighted, and a clean call stack.
+    // Built SYNCHRONOUSLY, frame-based (the host runs no Auto Layout pass; a deferred add
+    // or a separate window did not composite, but a synchronous self.view subview does).
     func showDevError(_ message: String) {
-        // Built SYNCHRONOUSLY as a subview of self.view. self.view is the visible root; a
-        // deferred (async) add or a separate overlay window did not composite here, but a
-        // synchronous subview does. Frame-based (the host runs no Auto Layout pass).
         dismissDevError()
         let b = self.view.bounds.isEmpty ? UIScreen.main.bounds : self.view.bounds
-        let msg = message.isEmpty ? "Error\n(no detail reported)" : message
-        let title: String, body: String
-        if let nl = msg.firstIndex(of: "\n") {
-            title = String(msg[..<nl])
-            body = String(msg[msg.index(after: nl)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        } else { title = msg; body = "" }
+
+        // Parse the JSON payload; fall back to a bare message if it is not JSON.
+        var cls = "Error", msg = message, file = "", line = 0, amber = false
+        var frameRows: [(Int, String, Bool)] = []
+        var stack: [(String, Int)] = []
+        if let data = message.data(using: .utf8),
+           let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            cls = o["class"] as? String ?? "Error"
+            msg = o["message"] as? String ?? ""
+            file = o["file"] as? String ?? ""
+            line = o["line"] as? Int ?? 0
+            amber = cls.lowercased().hasPrefix("type")
+            if let fr = o["frame"] as? [[String: Any]] {
+                frameRows = fr.map { (($0["n"] as? Int) ?? 0, ($0["t"] as? String) ?? "", ($0["hot"] as? Bool) ?? false) }
+            }
+            if let st = o["stack"] as? [[String: Any]] {
+                stack = st.map { (($0["file"] as? String) ?? "", ($0["line"] as? Int) ?? 0) }
+            }
+        }
+
+        let red = UIColor(red: 0.941, green: 0.380, blue: 0.427, alpha: 1)      // #F0616D
+        let amberC = UIColor(red: 0.961, green: 0.647, blue: 0.145, alpha: 1)   // #F5A524
+        let txt = UIColor(red: 0.914, green: 0.929, blue: 0.953, alpha: 1)      // #E9EDF3
+        let dim = UIColor(red: 0.412, green: 0.447, blue: 0.498, alpha: 1)      // #69727F
+        let link = UIColor(red: 0.302, green: 0.816, blue: 0.541, alpha: 1)     // #4DD08A
+        let gutter = UIColor(red: 0.290, green: 0.329, blue: 0.392, alpha: 1)   // #4A5464
+        let frameBg = UIColor(red: 0.067, green: 0.082, blue: 0.110, alpha: 1)  // #11151C
+        let lineC = UIColor(red: 0.137, green: 0.165, blue: 0.208, alpha: 1)    // #232A35
+        let cardBg = UIColor(red: 0.082, green: 0.102, blue: 0.133, alpha: 1)   // #151A22
+        let codeCol = UIColor(red: 0.776, green: 0.812, blue: 0.859, alpha: 1)  // #C6CFDB
+        let mono = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
 
         let scrim = UIView(frame: b)
         scrim.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        scrim.backgroundColor = UIColor(white: 0.03, alpha: 0.97)
+        scrim.backgroundColor = UIColor(red: 0.051, green: 0.063, blue: 0.086, alpha: 1) // #0D1016
 
-        let margin: CGFloat = 20, pad: CGFloat = 18
-        let cardW = b.width - margin * 2, bodyW = cardW - pad * 2
-        let headerH: CGFloat = 54, hintH: CGFloat = 46
-        let bodyFont = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        let measured = (body as NSString).boundingRect(
-            with: CGSize(width: bodyW, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: bodyFont], context: nil)
-        let bodyH = min(ceil(measured.height), b.height * 0.52)
-        let cardH = headerH + 14 + bodyH + hintH
-        let cardY = max(60, (b.height - cardH) / 2)
+        let scroll = UIScrollView(frame: b)
+        scroll.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        scroll.alwaysBounceVertical = true
+        scrim.addSubview(scroll)
 
-        let card = UIView(frame: CGRect(x: margin, y: cardY, width: cardW, height: cardH))
-        card.backgroundColor = UIColor(red: 0.086, green: 0.102, blue: 0.129, alpha: 1) // #161A21
-        card.layer.cornerRadius = 16; card.clipsToBounds = true
-        card.autoresizingMask = [.flexibleTopMargin, .flexibleBottomMargin, .flexibleWidth]
+        let padX: CGFloat = 22
+        let contentW = b.width - padX * 2
+        let safeTop = self.view.safeAreaInsets.top
+        var y: CGFloat = safeTop > 0 ? safeTop + 20 : 52
 
-        let header = UIView(frame: CGRect(x: 0, y: 0, width: cardW, height: headerH))
-        header.backgroundColor = UIColor(red: 0.898, green: 0.282, blue: 0.302, alpha: 1) // #E5484D
-        header.autoresizingMask = [.flexibleWidth]
-        let titleLbl = UILabel(frame: CGRect(x: pad, y: 0, width: cardW - pad * 2, height: headerH))
-        titleLbl.text = "⚠  " + title; titleLbl.textColor = .white
-        titleLbl.font = .systemFont(ofSize: 16, weight: .bold)
-        titleLbl.autoresizingMask = [.flexibleWidth]
-        header.addSubview(titleLbl); card.addSubview(header)
+        func measure(_ s: String, _ font: UIFont, _ w: CGFloat, lines: Int = 0) -> CGFloat {
+            let bound = (s as NSString).boundingRect(with: CGSize(width: w, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [.font: font], context: nil)
+            let h = ceil(bound.height)
+            return lines > 0 ? min(h, font.lineHeight * CGFloat(lines) + 2) : h
+        }
 
-        let bodyLbl = UILabel(frame: CGRect(x: pad, y: headerH + 14, width: bodyW, height: bodyH))
-        bodyLbl.numberOfLines = 0; bodyLbl.text = body; bodyLbl.font = bodyFont
-        bodyLbl.textColor = UIColor(red: 0.863, green: 0.890, blue: 0.925, alpha: 1) // #DCE3EC
-        bodyLbl.autoresizingMask = [.flexibleWidth]
-        card.addSubview(bodyLbl)
+        // badge (pill sized to its text)
+        let badgeText = "⚠  " + cls.uppercased()
+        let badgeFont = UIFont.systemFont(ofSize: 11.5, weight: .bold)
+        let badgeW = ceil((badgeText as NSString).size(withAttributes: [.font: badgeFont]).width) + 24
+        let badge = UILabel(frame: CGRect(x: padX, y: y, width: badgeW, height: 28))
+        badge.text = badgeText; badge.font = badgeFont; badge.textColor = .white; badge.textAlignment = .center
+        badge.backgroundColor = amber ? amberC : red
+        badge.layer.cornerRadius = 14; badge.clipsToBounds = true
+        scroll.addSubview(badge); y += 28 + 16
 
-        let hintLbl = UILabel(frame: CGRect(x: pad, y: cardH - hintH + 8, width: cardW - pad * 2, height: 20))
-        hintLbl.text = "Fix the error and save to reload."
-        hintLbl.font = .systemFont(ofSize: 12.5)
-        hintLbl.textColor = UIColor(red: 0.545, green: 0.584, blue: 0.647, alpha: 1) // #8B95A5
-        hintLbl.autoresizingMask = [.flexibleWidth, .flexibleTopMargin]
-        card.addSubview(hintLbl)
+        // message
+        let msgFont = UIFont.systemFont(ofSize: 22, weight: .bold)
+        let msgText = msg.isEmpty ? "Unknown error" : msg
+        let msgH = measure(msgText, msgFont, contentW)
+        let msgLbl = UILabel(frame: CGRect(x: padX, y: y, width: contentW, height: msgH))
+        msgLbl.numberOfLines = 0; msgLbl.text = msgText; msgLbl.font = msgFont; msgLbl.textColor = txt
+        scroll.addSubview(msgLbl); y += msgH + 6
 
-        scrim.addSubview(card)
+        // location
+        if !file.isEmpty {
+            let loc = UILabel(frame: CGRect(x: padX, y: y, width: contentW, height: 20))
+            loc.text = "\(file):\(line)"; loc.font = UIFont.monospacedSystemFont(ofSize: 13.5, weight: .medium); loc.textColor = link
+            scroll.addSubview(loc); y += 20 + 14
+        }
+
+        // code frame
+        if !frameRows.isEmpty {
+            let rowH: CGFloat = 24, padV: CGFloat = 12
+            let boxH = CGFloat(frameRows.count) * rowH + padV * 2
+            let box = UIView(frame: CGRect(x: padX, y: y, width: contentW, height: boxH))
+            box.backgroundColor = frameBg; box.layer.cornerRadius = 14; box.layer.borderWidth = 1
+            box.layer.borderColor = lineC.cgColor; box.clipsToBounds = true
+            var ry = padV
+            for (n, t, hot) in frameRows {
+                if hot {
+                    let hl = UIView(frame: CGRect(x: 0, y: ry, width: contentW, height: rowH))
+                    hl.backgroundColor = red.withAlphaComponent(0.14); box.addSubview(hl)
+                }
+                let g = UILabel(frame: CGRect(x: 0, y: ry, width: 34, height: rowH))
+                g.text = "\(n)"; g.font = mono; g.textColor = hot ? red : gutter; g.textAlignment = .right
+                box.addSubview(g)
+                let c = UILabel(frame: CGRect(x: 48, y: ry, width: contentW - 56, height: rowH))
+                c.text = t; c.font = mono; c.textColor = hot ? .white : codeCol; c.lineBreakMode = .byTruncatingTail
+                box.addSubview(c)
+                ry += rowH
+            }
+            scroll.addSubview(box); y += boxH + 20
+        }
+
+        // call stack
+        if !stack.isEmpty {
+            let sh = UILabel(frame: CGRect(x: padX + 2, y: y, width: contentW, height: 16))
+            sh.text = "CALL STACK"; sh.font = UIFont.systemFont(ofSize: 11, weight: .bold); sh.textColor = dim
+            sh.attributedText = NSAttributedString(string: "CALL STACK", attributes: [.font: sh.font!, .foregroundColor: dim, .kern: 1.3])
+            scroll.addSubview(sh); y += 16 + 8
+            for (sf, sl) in stack {
+                let row = UILabel(frame: CGRect(x: padX, y: y, width: contentW, height: 38))
+                row.text = "  \(sf):\(sl)"; row.font = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular); row.textColor = link
+                row.backgroundColor = cardBg; row.layer.cornerRadius = 10; row.clipsToBounds = true
+                scroll.addSubview(row); y += 38 + 3
+            }
+        }
+
+        // hint
+        let hintFont = UIFont.systemFont(ofSize: 12.5)
+        let hintText = "Fix the error and save to reload. Hot reload keeps your state."
+        let hintH2 = measure(hintText, hintFont, contentW)
+        let hint = UILabel(frame: CGRect(x: padX, y: y + 24, width: contentW, height: hintH2))
+        hint.numberOfLines = 0; hint.text = hintText; hint.font = hintFont; hint.textColor = dim
+        scroll.addSubview(hint); y += 24 + hintH2 + 28
+
+        scroll.contentSize = CGSize(width: b.width, height: max(y, b.height + 1))
         self.view.addSubview(scrim)
         self.view.bringSubviewToFront(scrim)
         self.devErrorView = scrim

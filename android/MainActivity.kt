@@ -559,64 +559,122 @@ class MainActivity : Activity() {
     // comes from the VM via cmrLastError(). Dismissed automatically on the next clean
     // reload. Dev-only surface; a shipped app never carries an unfixed error.
     private var devErrorOverlay: android.view.View? = null
+    // Renders the structured JSON payload from cmrLastError as a full-screen dev error
+    // screen: an error-class badge, the message, the developer's relative file:line, a
+    // source code frame with the offending line highlighted, and a clean call stack.
+    // Falls back to plain text if the payload is not JSON.
     private fun showDevError(message: String) {
         runOnUiThread {
             dismissDevError()
             val dm = resources.displayMetrics
             fun dp(v: Int) = (v * dm.density).toInt()
-            val msg = if (message.isBlank()) "Error\n(no detail reported)" else message
-            val nl = msg.indexOf('\n')
-            val title = if (nl >= 0) msg.substring(0, nl) else "Error"
-            val bodyText = if (nl >= 0) msg.substring(nl + 1).trim() else ""
+
+            // --- parse payload (json) ---
+            var cls = "Error"; var msg = message; var file = ""; var line = 0; var amber = false
+            val frame = ArrayList<Triple<Int, String, Boolean>>()   // n, text, hot
+            val stack = ArrayList<Pair<String, Int>>()              // file, line
+            try {
+                val o = org.json.JSONObject(message)
+                cls = o.optString("class", "Error"); msg = o.optString("message", "")
+                file = o.optString("file", ""); line = o.optInt("line", 0)
+                amber = cls.startsWith("Type", true)
+                o.optJSONArray("frame")?.let { a -> for (i in 0 until a.length()) { val f = a.getJSONObject(i); frame.add(Triple(f.optInt("n"), f.optString("t"), f.optBoolean("hot"))) } }
+                o.optJSONArray("stack")?.let { a -> for (i in 0 until a.length()) { val s = a.getJSONObject(i); stack.add(Pair(s.optString("file"), s.optInt("line"))) } }
+            } catch (e: Throwable) { cls = "Error"; msg = message }
+
+            val red = 0xFFF0616D.toInt(); val redDeep = 0xFFE5484D.toInt(); val amberC = 0xFFF5A524.toInt()
+            val txt = 0xFFE9EDF3.toInt(); val muted = 0xFF98A2B3.toInt(); val dim = 0xFF69727F.toInt()
+            val link = 0xFF4DD08A.toInt(); val gutter = 0xFF4A5464.toInt()
+            val cardBg = 0xFF151A22.toInt(); val frameBg = 0xFF11151C.toInt(); val lineC = 0xFF232A35.toInt()
+            val mono = android.graphics.Typeface.MONOSPACE
 
             val scrim = android.widget.FrameLayout(this)
-            scrim.setBackgroundColor(0xF20B0E13.toInt())   // ~95% opaque near-black
-            scrim.isClickable = true                       // swallow taps to the app underneath
-
-            val card = android.widget.LinearLayout(this)
-            card.orientation = android.widget.LinearLayout.VERTICAL
-            val cardBg = android.graphics.drawable.GradientDrawable()
-            cardBg.setColor(0xFF161A21.toInt()); cardBg.cornerRadius = dp(16).toFloat()
-            card.background = cardBg
-            card.clipToOutline = true
-            val clp = android.widget.FrameLayout.LayoutParams(
-                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                android.widget.FrameLayout.LayoutParams.WRAP_CONTENT)
-            clp.gravity = android.view.Gravity.CENTER
-            clp.leftMargin = dp(20); clp.rightMargin = dp(20)
-
-            val header = android.widget.LinearLayout(this)
-            header.orientation = android.widget.LinearLayout.HORIZONTAL
-            header.gravity = android.view.Gravity.CENTER_VERTICAL
-            header.setBackgroundColor(0xFFE5484D.toInt())   // warm red
-            header.setPadding(dp(18), dp(15), dp(18), dp(15))
-            val icon = android.widget.TextView(this)
-            icon.text = "⚠"; icon.setTextColor(0xFFFFFFFF.toInt()); icon.textSize = 17f
-            icon.setPadding(0, 0, dp(10), 0)
-            val titleTv = android.widget.TextView(this)
-            titleTv.text = title; titleTv.setTextColor(0xFFFFFFFF.toInt()); titleTv.textSize = 16f
-            titleTv.setTypeface(titleTv.typeface, android.graphics.Typeface.BOLD)
-            header.addView(icon); header.addView(titleTv)
-            card.addView(header)
+            scrim.setBackgroundColor(0xFF0D1016.toInt())
+            scrim.isClickable = true
 
             val scroll = android.widget.ScrollView(this)
-            val body = android.widget.TextView(this)
-            body.text = bodyText
-            body.setTextColor(0xFFDCE3EC.toInt()); body.textSize = 13.5f
-            body.typeface = android.graphics.Typeface.MONOSPACE
-            body.setPadding(dp(18), dp(16), dp(18), dp(10))
-            body.setTextIsSelectable(true)
-            scroll.addView(body)
-            card.addView(scroll, android.widget.LinearLayout.LayoutParams(
-                android.widget.LinearLayout.LayoutParams.MATCH_PARENT, dp(300)))
+            scroll.isFillViewport = true
+            val col = android.widget.LinearLayout(this)
+            col.orientation = android.widget.LinearLayout.VERTICAL
+            val top = dp(56)
+            col.setPadding(dp(22), top, dp(22), dp(28))
 
-            val hint = android.widget.TextView(this)
-            hint.text = "Fix the error and save to reload."
-            hint.setTextColor(0xFF8B95A5.toInt()); hint.textSize = 12.5f
-            hint.setPadding(dp(18), dp(2), dp(18), dp(18))
-            card.addView(hint)
+            fun tv(text: String, size: Float, color: Int, bold: Boolean = false, monospace: Boolean = false): android.widget.TextView {
+                val t = android.widget.TextView(this); t.text = text; t.textSize = size; t.setTextColor(color)
+                if (monospace) t.typeface = mono else if (bold) t.setTypeface(t.typeface, android.graphics.Typeface.BOLD)
+                return t
+            }
 
-            scrim.addView(card, clp)
+            // badge
+            val badge = tv("⚠  " + cls.uppercase(), 11.5f, 0xFFFFFFFF.toInt(), bold = true)
+            badge.letterSpacing = 0.06f
+            val badgeBg = android.graphics.drawable.GradientDrawable()
+            badgeBg.setColor(if (amber) amberC else red); badgeBg.cornerRadius = dp(999).toFloat()
+            badge.background = badgeBg; badge.setPadding(dp(11), dp(6), dp(12), dp(6))
+            val bl = android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT)
+            col.addView(badge, bl)
+
+            // message
+            val m = tv(if (msg.isBlank()) "Unknown error" else msg, 22f, txt, bold = true)
+            m.setPadding(0, dp(16), 0, dp(4)); m.setLineSpacing(0f, 1.05f)
+            col.addView(m)
+
+            // location
+            if (file.isNotEmpty()) {
+                val loc = tv("$file:$line", 13.5f, link, monospace = true)
+                loc.setPadding(0, dp(2), 0, dp(14))
+                col.addView(loc)
+            }
+
+            // code frame
+            if (frame.isNotEmpty()) {
+                val fbox = android.widget.LinearLayout(this)
+                fbox.orientation = android.widget.LinearLayout.VERTICAL
+                val fbg = android.graphics.drawable.GradientDrawable()
+                fbg.setColor(frameBg); fbg.cornerRadius = dp(14).toFloat(); fbg.setStroke(dp(1), lineC)
+                fbox.background = fbg; fbox.clipToOutline = true
+                val padV = dp(12)
+                fbox.setPadding(0, padV, 0, padV)
+                for ((n, t, hot) in frame) {
+                    val rowV = android.widget.LinearLayout(this)
+                    rowV.orientation = android.widget.LinearLayout.HORIZONTAL
+                    if (hot) rowV.setBackgroundColor(0x24F0616D)   // ~14% red
+                    rowV.setPadding(0, dp(2), 0, dp(2))
+                    val g = tv(n.toString(), 12.5f, if (hot) red else gutter, monospace = true)
+                    g.width = dp(44); g.gravity = android.view.Gravity.END; g.setPadding(0, 0, dp(12), 0)
+                    val c = tv(t, 12.5f, if (hot) 0xFFFFFFFF.toInt() else 0xFFC6CFDB.toInt(), monospace = true)
+                    c.setPadding(dp(12), 0, dp(14), 0); c.maxLines = 1; c.ellipsize = android.text.TextUtils.TruncateAt.END
+                    rowV.addView(g); rowV.addView(c)
+                    fbox.addView(rowV)
+                }
+                col.addView(fbox)
+            }
+
+            // call stack
+            if (stack.isNotEmpty()) {
+                val sh = tv("CALL STACK", 11f, dim, bold = true)
+                sh.letterSpacing = 0.12f; sh.setPadding(dp(2), dp(20), 0, dp(8))
+                col.addView(sh)
+                for ((sf, sl) in stack) {
+                    val row = tv("$sf:$sl", 12.5f, link, monospace = true)
+                    val rb = android.graphics.drawable.GradientDrawable()
+                    rb.setColor(cardBg); rb.cornerRadius = dp(10).toFloat()
+                    row.background = rb; row.setPadding(dp(12), dp(10), dp(12), dp(10))
+                    val lp = android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT)
+                    lp.topMargin = dp(3)
+                    col.addView(row, lp)
+                }
+            }
+
+            // footer hint
+            val hint = tv("Fix the error and save to reload. Hot reload keeps your state.", 12.5f, dim)
+            hint.setPadding(0, dp(24), 0, 0)
+            col.addView(hint)
+
+            scroll.addView(col)
+            scrim.addView(scroll, android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
             root.addView(scrim, android.widget.FrameLayout.LayoutParams(
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT))
