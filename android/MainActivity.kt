@@ -626,27 +626,42 @@ class MainActivity : Activity() {
                 col.addView(loc)
             }
 
-            // code frame
+            // code frame: a fixed line-number gutter + a HORIZONTALLY scrollable code
+            // column, so a long line can be scrolled to instead of being truncated.
             if (frame.isNotEmpty()) {
+                val rowH = dp(24); val padV = dp(12); val gutterW = dp(40)
+                val contentPx = dm.widthPixels - dp(22) * 2       // col has 22dp side padding
+                val viewportW = contentPx - gutterW - dp(2)       // min width so the hot bar fills the frame
                 val fbox = android.widget.LinearLayout(this)
-                fbox.orientation = android.widget.LinearLayout.VERTICAL
+                fbox.orientation = android.widget.LinearLayout.HORIZONTAL
                 val fbg = android.graphics.drawable.GradientDrawable()
                 fbg.setColor(frameBg); fbg.cornerRadius = dp(14).toFloat(); fbg.setStroke(dp(1), lineC)
                 fbox.background = fbg; fbox.clipToOutline = true
-                val padV = dp(12)
-                fbox.setPadding(0, padV, 0, padV)
+
+                val gutterCol = android.widget.LinearLayout(this)
+                gutterCol.orientation = android.widget.LinearLayout.VERTICAL
+                gutterCol.setPadding(0, padV, 0, padV)
+                val codeCol = android.widget.LinearLayout(this)
+                codeCol.orientation = android.widget.LinearLayout.VERTICAL
+                codeCol.setPadding(0, padV, 0, padV)
                 for ((n, t, hot) in frame) {
-                    val rowV = android.widget.LinearLayout(this)
-                    rowV.orientation = android.widget.LinearLayout.HORIZONTAL
-                    if (hot) rowV.setBackgroundColor(0x24F0616D)   // ~14% red
-                    rowV.setPadding(0, dp(2), 0, dp(2))
                     val g = tv(n.toString(), 12.5f, if (hot) red else gutter, monospace = true)
-                    g.width = dp(44); g.gravity = android.view.Gravity.END; g.setPadding(0, 0, dp(12), 0)
+                    g.height = rowH; g.gravity = android.view.Gravity.END or android.view.Gravity.CENTER_VERTICAL
+                    g.setPadding(0, 0, dp(10), 0)
+                    if (hot) g.setBackgroundColor(0x24F0616D)
+                    gutterCol.addView(g, android.widget.LinearLayout.LayoutParams(gutterW, rowH))
+
                     val c = tv(t, 12.5f, if (hot) 0xFFFFFFFF.toInt() else 0xFFC6CFDB.toInt(), monospace = true)
-                    c.setPadding(dp(12), 0, dp(14), 0); c.maxLines = 1; c.ellipsize = android.text.TextUtils.TruncateAt.END
-                    rowV.addView(g); rowV.addView(c)
-                    fbox.addView(rowV)
+                    c.height = rowH; c.gravity = android.view.Gravity.CENTER_VERTICAL
+                    c.setPadding(dp(12), 0, dp(16), 0); c.setSingleLine(true); c.ellipsize = null
+                    c.minimumWidth = viewportW                  // hot bar fills the frame even for short lines
+                    if (hot) c.setBackgroundColor(0x24F0616D)
+                    codeCol.addView(c, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, rowH))
                 }
+                val hs = android.widget.HorizontalScrollView(this)
+                hs.isHorizontalScrollBarEnabled = false; hs.addView(codeCol)
+                fbox.addView(gutterCol, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
+                fbox.addView(hs, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
                 col.addView(fbox)
             }
 

@@ -1504,27 +1504,39 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             scroll.addSubview(loc); y += 20 + 14
         }
 
-        // code frame
+        // code frame: a fixed line-number gutter + a HORIZONTALLY scrollable code column,
+        // so a long line can be scrolled to instead of being truncated.
         if !frameRows.isEmpty {
-            let rowH: CGFloat = 24, padV: CGFloat = 12
+            let rowH: CGFloat = 24, padV: CGFloat = 12, gutterW: CGFloat = 44
             let boxH = CGFloat(frameRows.count) * rowH + padV * 2
             let box = UIView(frame: CGRect(x: padX, y: y, width: contentW, height: boxH))
             box.backgroundColor = frameBg; box.layer.cornerRadius = 14; box.layer.borderWidth = 1
             box.layer.borderColor = lineC.cgColor; box.clipsToBounds = true
+
+            let hs = UIScrollView(frame: CGRect(x: gutterW, y: 0, width: contentW - gutterW, height: boxH))
+            hs.showsHorizontalScrollIndicator = false; hs.bounces = false
+            box.addSubview(hs)
+            var maxTextW: CGFloat = 0
+            for (_, t, _) in frameRows { maxTextW = max(maxTextW, (t as NSString).size(withAttributes: [.font: mono]).width) }
+            let codeW = max(hs.bounds.width, maxTextW + 28)   // hot bar fills the frame even for short lines
+
             var ry = padV
             for (n, t, hot) in frameRows {
                 if hot {
-                    let hl = UIView(frame: CGRect(x: 0, y: ry, width: contentW, height: rowH))
-                    hl.backgroundColor = red.withAlphaComponent(0.14); box.addSubview(hl)
+                    let hlG = UIView(frame: CGRect(x: 0, y: ry, width: gutterW, height: rowH))
+                    hlG.backgroundColor = red.withAlphaComponent(0.14); box.addSubview(hlG)
+                    let hlC = UIView(frame: CGRect(x: 0, y: ry, width: codeW, height: rowH))
+                    hlC.backgroundColor = red.withAlphaComponent(0.14); hs.addSubview(hlC)
                 }
-                let g = UILabel(frame: CGRect(x: 0, y: ry, width: 34, height: rowH))
+                let g = UILabel(frame: CGRect(x: 0, y: ry, width: gutterW - 10, height: rowH))
                 g.text = "\(n)"; g.font = mono; g.textColor = hot ? red : gutter; g.textAlignment = .right
                 box.addSubview(g)
-                let c = UILabel(frame: CGRect(x: 48, y: ry, width: contentW - 56, height: rowH))
-                c.text = t; c.font = mono; c.textColor = hot ? .white : codeCol; c.lineBreakMode = .byTruncatingTail
-                box.addSubview(c)
+                let c = UILabel(frame: CGRect(x: 12, y: ry, width: codeW - 12, height: rowH))
+                c.text = t; c.font = mono; c.textColor = hot ? .white : codeCol
+                hs.addSubview(c)
                 ry += rowH
             }
+            hs.contentSize = CGSize(width: codeW, height: boxH)
             scroll.addSubview(box); y += boxH + 20
         }
 
