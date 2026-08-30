@@ -256,6 +256,23 @@ class MainActivity : Activity() {
         N.tick(); applyDrain(); relayout()
     }
 
+    private fun hideKeyboard(v: View) {
+        (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+            ?.hideSoftInputFromWindow(v.windowToken, 0)
+    }
+
+    // Tap outside a focused text field dismisses the keyboard. Android does not do this
+    // on its own (unlike iOS): a DOWN outside the focused EditText clears focus + hides IME.
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        if (ev.action == android.view.MotionEvent.ACTION_DOWN) {
+            (currentFocus as? EditText)?.let { ed ->
+                val r = android.graphics.Rect(); ed.getGlobalVisibleRect(r)
+                if (!r.contains(ev.rawX.toInt(), ev.rawY.toInt())) { hideKeyboard(ed); ed.clearFocus() }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         density = resources.displayMetrics.density
@@ -1451,7 +1468,12 @@ class MainActivity : Activity() {
                         applyStream(engInput(action, ed.text.toString()))
                         relayout()
                     } })
-                ed.setOnEditorActionListener { _, _, _ -> fieldSubmit[ed]?.let { hostEvent(it) }; true }   // onSubmit (IME action)
+                ed.setOnEditorActionListener { _, actionId, _ ->   // onSubmit (IME action) + dismiss
+                    fieldSubmit[ed]?.let { hostEvent(it) }
+                    // Done/Go/Send/Search close the keyboard; Next advances to the following field.
+                    if (actionId != android.view.inputmethod.EditorInfo.IME_ACTION_NEXT) { hideKeyboard(ed); ed.clearFocus() }
+                    true
+                }
                 ed.onFocusChangeListener = View.OnFocusChangeListener { _, has ->
                     if (has) fieldFocus[ed]?.let { hostEvent(it) } else fieldBlur[ed]?.let { hostEvent(it) }
                 } }

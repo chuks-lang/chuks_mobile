@@ -1088,9 +1088,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let sc = listScroll else {
             // No scroll/list on screen: still report the full root viewport so
             // viewportWidth()/viewportHeight() are populated (e.g. for a Text wrap width).
-            let insets = view.safeAreaInsets
-            let w = Int32(view.bounds.width - insets.left - insets.right)
-            let h = Int32(view.bounds.height - insets.top - insets.bottom)
+            // Edge-to-edge: the viewport is the full screen (the app pads by safe insets).
+            let w = Int32(view.bounds.width)
+            let h = Int32(view.bounds.height)
             if w <= 0 || h <= 0 { return false }
             guard let s = eViewport(0, h, w) else { connected = false; return false }
             if !s.isEmpty { apply(s); return true }
@@ -3343,9 +3343,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // Below the benchmark header when shown; otherwise just below the safe-area top
         // (status bar / notch). Without this the app slides up under the status bar,
         // since a hidden header has a .zero frame.
-        let topY = BENCHMARK_MODE ? header.frame.maxY + 6 : insets.top
-        let W = Float(view.bounds.width - insets.left - insets.right)
-        let H = Float(view.bounds.height - topY - insets.bottom - kbHeight)   // shrink for the keyboard
+        // Edge-to-edge: lay the tree over the FULL screen (under the status bar and home
+        // indicator); the app pads its content by safeTop()/safeBottom() (reported via
+        // setInsets), so an inset is applied ONCE, not twice. Matches the Android host.
+        // Without this the tree is inset AND the app pads -> a gap top and bottom.
+        let topY: CGFloat = BENCHMARK_MODE ? header.frame.maxY + 6 : 0
+        let W = Float(view.bounds.width)
+        let H = Float(view.bounds.height - topY - kbHeight)   // shrink for the keyboard
         if W <= 0 || H <= 0 { return }
         YGNodeStyleSetWidth(app, W); YGNodeStyleSetHeight(app, H)
         let _tc = layoutTiming ? CACurrentMediaTime() : 0
@@ -3388,8 +3392,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let applyUs = (CACurrentMediaTime() - _ta) * 1_000_000
             NSLog("chuks-layout compute=%.0fus apply=%.0fus nodes=%d applied=%d", layoutComputeUs, applyUs, ynodes.count, _applied)
         }
-        // place the whole Chuks app in the safe area, below the diagnostics header
-        views["app"]?.frame = CGRect(x: insets.left, y: topY, width: CGFloat(W), height: CGFloat(H))
+        // place the whole Chuks app edge-to-edge (below the diagnostics header if shown)
+        views["app"]?.frame = CGRect(x: 0, y: topY, width: CGFloat(W), height: CGFloat(H))
         // a visible modal fills the window and sits on top (its children were laid out above)
         if let mid = activeModal, let mv = views[mid], !mv.isHidden {
             mv.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: view.bounds.height)
