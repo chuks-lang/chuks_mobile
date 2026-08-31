@@ -7,7 +7,7 @@ A Chuks Mobile app. Your code lives in `app/` (screens in `app/views/`, root in
 
 ```
 chuks install          # fetch @chuks/mobile
-chuks ios              # build + launch on the iOS simulator (iosEngine in chuks.json)
+chuks ios              # build + launch on the iOS simulator (UIKit host)
 chuks android          # build + launch on an Android device / emulator
 ```
 

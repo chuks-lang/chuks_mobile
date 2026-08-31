@@ -1092,7 +1092,7 @@ export function Pressable(first: PressableProps | []Node, kids: []Node = []): No
     return n
 }
 /**
- * An indeterminate activity spinner (UIActivityIndicatorView / SwiftUI ProgressView
+ * An indeterminate activity spinner (UIActivityIndicatorView
  * / Android ProgressBar). Display-only — it just spins to signal work in progress.
  *
  * Props: `size` (px diameter, default 24), `color` (hex; omit for the platform tint).
@@ -1113,7 +1113,7 @@ export function Spinner(p: ViewProps): Node {
 }
 dataType ProgressProps { ViewProps; value: int?; max: int? }
 /**
- * A determinate progress bar (native UIProgressView / SwiftUI linear ProgressView /
+ * A determinate progress bar (native UIProgressView /
  * horizontal ProgressBar). Display-only; the parent owns `value`. For an
  * indeterminate spinner use `Spinner`.
  *
@@ -1200,7 +1200,7 @@ dataType AlertProps {
     onButton: (function(v: string): void)?; onSubmit: (function(v: string): void)?;
 }
 /**
- * A NATIVE alert / confirm dialog (UIAlertController / SwiftUI .alert / AlertDialog).
+ * A NATIVE alert / confirm dialog (UIAlertController / AlertDialog).
  * Declarative like Modal: the parent owns `visible` and passes it; the host presents
  * the OS alert when it flips true. Renders nothing inline.
  *
@@ -1281,7 +1281,7 @@ function routeAlert(v: string, ob: any, oc: any, ox: any, os: any, confirmIdx: i
 function callOpt(cb: any): void { if (cb != null) { const f: any = cb; f() } }
 dataType ToggleProps { ViewProps; on: bool?; thumbColor: string?; disabled: bool? }
 /**
- * A native on/off switch (UISwitch / SwiftUI Toggle / Android Switch/SwitchMaterial).
+ * A native on/off switch (UISwitch / Android Switch/SwitchMaterial).
  * Controlled: the parent owns `on` and passes it; `onPress` fires when the user flips
  * it. The host reports the change (dispatch), the parent updates its own state in
  * onPress, and the re-render syncs the control to that state, so the switch always
@@ -1307,7 +1307,7 @@ export function Toggle(p: ToggleProps): Node {
 }
 dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?; onSlidingComplete: (function(v: string): void)? }
 /**
- * A native value slider (UISlider / SwiftUI Slider / Android SeekBar). Controlled,
+ * A native value slider (UISlider / Android SeekBar). Controlled,
  * like Switch: the parent owns `value` and passes it; `onChange` fires with the new
  * value (as a string; parse with int()) as the user drags. Integer range, `min` >= 0.
  *
@@ -1340,7 +1340,7 @@ export function Slider(p: SliderProps): Node {
 }
 dataType SelectProps { ViewProps; value: int? }
 /**
- * A native select / dropdown (UIButton pull-down menu / SwiftUI Menu / Android
+ * A native select / dropdown (UIButton pull-down menu / Android
  * PopupMenu). Controlled, like Switch: the parent owns the selected index (`value`)
  * and passes `options`; `onChange` fires with the newly-picked index (as a string,
  * parse with int()). The field shows the current option's label.
@@ -1368,7 +1368,7 @@ export function Select(p: SelectProps, options: []string): Node {
 }
 dataType DatePickerProps { ViewProps; mode: string?; display: string?; value: string? }
 /**
- * A native date / time picker (UIDatePicker .compact / SwiftUI DatePicker / Android
+ * A native date / time picker (UIDatePicker .compact / Android
  * DatePickerDialog + TimePickerDialog). Controlled, like Select: the parent owns the
  * `value` (an ISO string) and passes it; `onChange` fires with the newly-picked value
  * as an ISO string. The field shows the current value.
@@ -1436,7 +1436,7 @@ export function TimePicker(p: DatePickerProps): Node {
 }
 dataType MenuProps { ViewProps; label: string? }
 /**
- * A native menu button (UIButton pull-down / SwiftUI Menu / Android PopupMenu). Unlike
+ * A native menu button (UIButton pull-down / Android PopupMenu). Unlike
  * Select there is no persistent selection: it shows a fixed `label` and its `items` are
  * one-shot actions. `onChange` fires with the picked item's index (as a string; parse
  * with int()). `items` is a separate arg (the Prop union has no list type).
@@ -1463,7 +1463,7 @@ export function Menu(p: MenuProps, items: []string): Node {
 }
 /**
  * A context menu: long-press the wrapped `kids` to open a native action menu
- * (UIContextMenuInteraction / SwiftUI .contextMenu / Android long-press PopupMenu).
+ * (UIContextMenuInteraction / Android long-press PopupMenu).
  * `onChange` fires with the picked item's index (as a string). `items` is a separate
  * arg before the children.
  *
@@ -1582,7 +1582,7 @@ export function Path(p: ShapeProps): string {
 }
 /**
  * A native drawing surface. Renders a list of vector shapes (Rect / Circle / Line /
- * Path) with native drawing — Core Graphics on UIKit, SwiftUI `Canvas`, and
+ * Path) with native drawing: Core Graphics on UIKit and
  * `android.graphics` on Android. Shapes use pixel coordinates within the canvas; give
  * it a size or let it `grow`. Colors are hex without a leading `#`.
  *
@@ -1613,7 +1613,7 @@ dataType GestureProps {
  * Recognizes gestures beyond a tap on its children and reports them through one
  * `onGesture(g)` callback. `g` is an encoded string the host dispatches: "swipe:left",
  * "swipe:right", "swipe:up", "swipe:down", "doubletap", or "longpress". Native
- * recognizers on each engine (UISwipe/UITap/UILongPress, SwiftUI gestures, Android
+ * recognizers on each engine (UISwipe/UITap/UILongPress, Android
  * GestureDetector), so each fires once, with no per-frame round-trip.
  *
  * ```chuks
@@ -1830,7 +1830,7 @@ export function KeyedComp(key: string, render: any): Node {
 }
 
 /**
- * A class-based component (the SwiftUI/React model). `new MyComponent(props)`
+ * A class-based component (the React-style class-component model). `new MyComponent(props)`
  * builds a LAZY placeable node: its render() is NOT called until the framework
  * reaches its position in the tree, so the component knows its identity when it
  * runs (which is what makes useState() work with no key). Subclasses override
@@ -2047,6 +2047,14 @@ export class Reconciler {
         if (n.onScroll != null) { this.handlers[id + ":scroll"] = n.onScroll; this.emit("SS|" + id) }
     }
 
+    // Rebind an event handler under `key` when present, or DROP a stale entry when the
+    // reused node lost that handler — so a late native event can't resolve to a prior
+    // role's closure (mirrors React Native dropping a recycled view's handler mapping).
+    rebindOrDrop(key: string, h: any): void {
+        if (h != null) { this.handlers[key] = h }
+        else if (this.handlers.has(key)) { this.handlers.delete(key) }
+    }
+
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
     // event binding, recursing into children. Used for first mount and remounts.
     public mountNode(n: Node, id: string, parent: string, index: int): void {
@@ -2119,21 +2127,27 @@ export class Reconciler {
         const prevTag: string = (p.onPress != null || p.onChange != null) ? id : p.action
         const nextTag: string = (next.onPress != null || next.onChange != null) ? id : next.action
         if (prevTag != nextTag) { this.emit("T|" + id + "|" + nextTag) }
-        // the closure is recreated each render; rebind it (tag/id unchanged)
+        // The closure is recreated each render: rebind it when present, and DROP the
+        // entry when this node no longer has that handler. A reused slot (a tappable
+        // card becomes an inert stat row at the same id) must NOT keep a prior role's
+        // closure — otherwise a late native event resolves to it and fires the wrong
+        // action. React Native drops a view's handler mapping when it unmounts / is
+        // recycled; we do the same per binding.
         if (next.onPress != null) { this.handlers[id] = next.onPress }
         else if (next.onChange != null) { this.handlers[id] = next.onChange }
-        if (next.onSubmit != null) { this.handlers[id + ":submit"] = next.onSubmit }
-        if (next.onFocus != null) { this.handlers[id + ":focus"] = next.onFocus }
-        if (next.onBlur != null) { this.handlers[id + ":blur"] = next.onBlur }
-        if (next.onLongPress != null) { this.handlers[id + ":longpress"] = next.onLongPress }
-        if (next.onPressIn != null) { this.handlers[id + ":pressin"] = next.onPressIn }
-        if (next.onPressOut != null) { this.handlers[id + ":pressout"] = next.onPressOut }
-        if (next.onLoad != null) { this.handlers[id + ":load"] = next.onLoad }
-        if (next.onError != null) { this.handlers[id + ":error"] = next.onError }
-        if (next.onEnd != null) { this.handlers[id + ":end"] = next.onEnd }
-        if (next.onProgress != null) { this.handlers[id + ":progress"] = next.onProgress }
-        if (next.onSlideDone != null) { this.handlers[id + ":slidedone"] = next.onSlideDone }
-        if (next.onScroll != null) { this.handlers[id + ":scroll"] = next.onScroll }
+        else if (this.handlers.has(id)) { this.handlers.delete(id) }
+        this.rebindOrDrop(id + ":submit", next.onSubmit)
+        this.rebindOrDrop(id + ":focus", next.onFocus)
+        this.rebindOrDrop(id + ":blur", next.onBlur)
+        this.rebindOrDrop(id + ":longpress", next.onLongPress)
+        this.rebindOrDrop(id + ":pressin", next.onPressIn)
+        this.rebindOrDrop(id + ":pressout", next.onPressOut)
+        this.rebindOrDrop(id + ":load", next.onLoad)
+        this.rebindOrDrop(id + ":error", next.onError)
+        this.rebindOrDrop(id + ":end", next.onEnd)
+        this.rebindOrDrop(id + ":progress", next.onProgress)
+        this.rebindOrDrop(id + ":slidedone", next.onSlideDone)
+        this.rebindOrDrop(id + ":scroll", next.onScroll)
         // scrollTo: imperatively scroll when the target changes (reuses the List LS op).
         if (next.scrollTo >= 0 && next.scrollTo != this.scrollToPos.getOr(id, -1)) {
             this.scrollToPos[id] = next.scrollTo
@@ -2413,7 +2427,7 @@ export class Reconciler {
             if (lpBool(d, "paging", false)) { listS.paging = 1 }   // snap one item per screen
             // A distinct kind so a host that needs a different scroll class for the x-axis
             // (Android's HorizontalScrollView) creates the right view; the `horiz` style tells
-            // the others (UIKit/SwiftUI reuse their vertical scroll view on the x-axis).
+            // the others (UIKit reuses its vertical scroll view on the x-axis).
             this.emit("C|" + id + "|HScroll"); this.emit("S|" + id + "|" + listS.str())
             this.emit("I|" + id + "|" + parent + "|" + string(index))
             const cS: Style = new Style(); cS.w = contentW           // content is WIDE; height fills

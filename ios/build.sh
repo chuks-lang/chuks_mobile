@@ -80,14 +80,14 @@ echo "2. Building the iOS engine ($PLATLABEL)"
     CC="$CLANG -isysroot $SDKPATH -target $TRIPLE" CGO_CFLAGS="-isysroot $SDKPATH -target $TRIPLE" \
     go build -buildmode=c-archive -tags ios -o "$OUTABS/libapp.a" . )   # emits $OUT/libapp.a + $OUT/libapp.h
 
-# iOS renders through the UIKit host (ChuksApp.swift) + Yoga. (SwiftUI was dropped.)
+# iOS renders through the UIKit host (ChuksApp.swift) + Yoga.
 echo "3. Building the UIKit host${PREVIEW:+ (Chuks Preview)}"
 printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
 # Preview adds its connect/scan entry; CHUKS_PREVIEW_UIKIT selects the UIKit render gate
-# (drops the per-app @main, hands the connect screen off to CardsVC). The Preview app's
-# own connect/scan chrome still uses SwiftUI, so its build links the SwiftUI framework.
+# (drops the per-app @main, hands the connect screen off to CardsVC). The connect/scan
+# chrome is plain UIKit; the scanner links AVKit for the camera capture stack.
 PREVIEW_SRC=""; PREVIEW_FLAG=""; PREVIEW_FW=""
-[ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT"; PREVIEW_FW="-framework SwiftUI -framework AVKit"; }
+[ "$PREVIEW" = "1" ] && { PREVIEW_SRC="$PKGDIR/ChuksPreview.swift"; PREVIEW_FLAG="-D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT"; PREVIEW_FW="-framework AVKit"; }
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
     "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \

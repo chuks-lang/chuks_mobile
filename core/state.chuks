@@ -2,7 +2,7 @@
 //
 // The reconciler calls hookEnter(path) before it runs each component, so a
 // component's useState() needs NO key: identity comes from the component's
-// position in the tree (like SwiftUI's @State / React's fiber). State persists in
+// position in the tree (keyed by tree position, like React's fiber). State persists in
 // `_cells` across renders and is reconnected by identity every render.
 //
 // App developers use `useState` / `useKeyedState`; the leading-underscore context

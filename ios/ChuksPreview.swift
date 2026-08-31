@@ -8,9 +8,9 @@
 //
 // Built with -D CHUKS_PREVIEW -D CHUKS_PREVIEW_UIKIT (so ChuksApp.swift drops its own
 // @main) and -D DEV (so the engine bridge always talks to the dev server). The connect
-// screen itself is a small hosted SwiftUI view; the app content renders through UIKit.
+// screen is a plain UIKit view controller (ConnectVC); the app content renders through
+// the same UIKit host.
 #if CHUKS_PREVIEW
-import SwiftUI
 import UIKit
 import AVFoundation
 import AudioToolbox
@@ -32,8 +32,8 @@ func parseDevServer(_ raw: String) -> String? {
 }
 
 // ─── UIKit render gate ────────────────────────────────────────────────────────
-// The Preview built with the UIKit engine: a UIKit @main that shows the shared SwiftUI
-// ConnectView (hosted) until a server is chosen, then swaps the root to CardsVC.
+// The Preview built with the UIKit engine: a UIKit @main that shows the ConnectVC
+// screen until a server is chosen, then swaps the root to CardsVC.
 #if CHUKS_PREVIEW_UIKIT
 @main
 class ChuksPreviewAppDelegate: UIResponder, UIApplicationDelegate {
@@ -46,8 +46,7 @@ class ChuksPreviewAppDelegate: UIResponder, UIApplicationDelegate {
         } else if let url = o?[.url] as? URL, let host = parseDevServer(url.absoluteString) {
             connect(host)
         } else {
-            window?.rootViewController = UIHostingController(
-                rootView: ConnectView(onConnect: { [weak self] host in self?.connect(host) }))
+            window?.rootViewController = ConnectVC(onConnect: { [weak self] host in self?.connect(host) })
         }
         w.makeKeyAndVisible()
         return true
@@ -68,140 +67,208 @@ class ChuksPreviewAppDelegate: UIResponder, UIApplicationDelegate {
 }
 #endif
 
-// ─── Connect screen ─────────────────────────────────────────────────────────
-struct ConnectView: View {
-    let onConnect: (String) -> Void
-    @State private var manual = ""
-    @State private var showScanner = false
-    @State private var error: String?
+// ─── Connect screen (UIKit) ─────────────────────────────────────────────────
+// A dark, centered screen: the Chuks mark, a "Scan QR code" button, a manual
+// host field + Connect, an optional reconnect shortcut, and an error line.
+final class ConnectVC: UIViewController, UITextFieldDelegate {
+    private let onConnect: (String) -> Void
     private let last = UserDefaults.standard.string(forKey: "chuks.preview.lastHost")
+    private let field = UITextField()
+    private let errorLabel = UILabel()
+    private let gradient = CAGradientLayer()
 
-    var body: some View {
-        ZStack {
-            LinearGradient(colors: [Color(hex: "0B1120"), Color(hex: "111a2e")],
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea()
-            VStack(spacing: 22) {
-                Spacer()
-                VStack(spacing: 10) {
-                    ChuksMark().frame(width: 72, height: 72)
-                    Text("Chuks Preview").font(.system(size: 28, weight: .bold)).foregroundColor(.white)
-                    Text("Run your Chuks app on this device.\nScan the QR from `chuks dev`.")
-                        .font(.system(size: 15)).multilineTextAlignment(.center)
-                        .foregroundColor(Color.white.opacity(0.6))
-                }
+    init(onConnect: @escaping (String) -> Void) {
+        self.onConnect = onConnect
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
-                Button(action: { error = nil; showScanner = true }) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "qrcode.viewfinder").font(.system(size: 20, weight: .semibold))
-                        Text("Scan QR code").font(.system(size: 17, weight: .semibold))
-                    }
-                    .frame(maxWidth: .infinity).padding(.vertical, 15)
-                    .background(Color(hex: "4F7DFF")).foregroundColor(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                }
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        gradient.colors = [UIColor(hex: "0B1120").cgColor, UIColor(hex: "111a2e").cgColor]
+        gradient.startPoint = CGPoint(x: 0.5, y: 0); gradient.endPoint = CGPoint(x: 0.5, y: 1)
+        view.layer.insertSublayer(gradient, at: 0)
 
-                HStack {
-                    // Custom placeholder overlay: the default one is near-invisible on the
-                    // dark field, so draw our own at a legible opacity when empty.
-                    ZStack(alignment: .leading) {
-                        if manual.isEmpty {
-                            Text("192.168.1.5:7799").foregroundColor(Color.white.opacity(0.45))
-                        }
-                        TextField("", text: $manual)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                            .keyboardType(.URL).submitLabel(.go)
-                            .foregroundColor(.white)
-                            .onSubmit(connectManual)
-                    }
-                    .padding(.horizontal, 14).padding(.vertical, 13)
-                    .background(Color.white.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    Button("Connect", action: connectManual)
-                        .font(.system(size: 16, weight: .semibold)).foregroundColor(Color(hex: "4F7DFF"))
-                }
-
-                if let last = last, !last.isEmpty {
-                    Button(action: { connect(last) }) {
-                        Label("Reconnect to \(last)", systemImage: "clock.arrow.circlepath")
-                            .font(.system(size: 14)).foregroundColor(Color.white.opacity(0.55))
-                    }
-                }
-                if let error = error {
-                    Text(error).font(.system(size: 13)).foregroundColor(Color(hex: "FF6B6B"))
-                }
-                Spacer()
-                Text("On the same Wi-Fi as your computer")
-                    .font(.system(size: 12)).foregroundColor(Color.white.opacity(0.35))
-                    .padding(.bottom, 8)
-            }
-            .padding(.horizontal, 28)
+        // The Chuks logo (bundled ChuksLogo.png, same image as the app icon) in a
+        // rounded square; falls back to a blue tile if the asset is missing.
+        let logo = UIImageView()
+        logo.contentMode = .scaleAspectFit
+        logo.clipsToBounds = true
+        logo.layer.cornerRadius = 18
+        if let p = Bundle.main.path(forResource: "ChuksLogo", ofType: "png"), let img = UIImage(contentsOfFile: p) {
+            logo.image = img
+        } else {
+            logo.backgroundColor = UIColor(hex: "4F7DFF")
         }
-        .sheet(isPresented: $showScanner) {
-            QRScanner(onScan: { value in
-                showScanner = false
-                if let host = parseDevServer(value) { connect(host) }
-                else { error = "That QR is not a Chuks dev server." }
-            }, onCancel: { showScanner = false })
+        logo.translatesAutoresizingMaskIntoConstraints = false
+        logo.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        logo.heightAnchor.constraint(equalToConstant: 72).isActive = true
+
+        let title = UILabel()
+        title.text = "Chuks Preview"
+        title.font = .systemFont(ofSize: 28, weight: .bold)
+        title.textColor = .white
+        title.textAlignment = .center
+
+        let subtitle = UILabel()
+        subtitle.text = "Run your Chuks app on this device.\nScan the QR from `chuks dev`."
+        subtitle.numberOfLines = 0
+        subtitle.font = .systemFont(ofSize: 15)
+        subtitle.textColor = UIColor.white.withAlphaComponent(0.6)
+        subtitle.textAlignment = .center
+
+        let header = UIStackView(arrangedSubviews: [logo, title, subtitle])
+        header.axis = .vertical; header.alignment = .center; header.spacing = 10
+
+        // Manual host field: a dark rounded field + a blue "Connect".
+        field.attributedPlaceholder = NSAttributedString(
+            string: "192.168.1.5:7799",
+            attributes: [.foregroundColor: UIColor.white.withAlphaComponent(0.45)])
+        field.textColor = .white
+        field.keyboardType = .URL
+        field.autocapitalizationType = .none
+        field.autocorrectionType = .no
+        field.returnKeyType = .go
+        field.delegate = self
+        field.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        field.layer.cornerRadius = 12
+        field.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 1)); field.leftViewMode = .always
+        field.rightView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 1)); field.rightViewMode = .always
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.heightAnchor.constraint(equalToConstant: 46).isActive = true
+
+        let connect = UIButton(type: .system)
+        connect.setTitle("Connect", for: .normal)
+        connect.setTitleColor(UIColor(hex: "4F7DFF"), for: .normal)
+        connect.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+        connect.setContentHuggingPriority(.required, for: .horizontal)
+        connect.setContentCompressionResistancePriority(.required, for: .horizontal)
+        connect.addAction(UIAction { [weak self] _ in self?.connectManual() }, for: .touchUpInside)
+
+        let row = UIStackView(arrangedSubviews: [field, connect])
+        row.axis = .horizontal; row.alignment = .center; row.spacing = 8
+
+        errorLabel.font = .systemFont(ofSize: 13)
+        errorLabel.textColor = UIColor(hex: "FF6B6B")
+        errorLabel.textAlignment = .center
+        errorLabel.numberOfLines = 0
+        errorLabel.isHidden = true
+
+        let stack = UIStackView(arrangedSubviews: [header, makeScanButton(), row, errorLabel])
+        stack.axis = .vertical; stack.alignment = .fill; stack.spacing = 22
+        if let last = last, !last.isEmpty { stack.addArrangedSubview(makeReconnectButton(last)) }
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -28),
+        ])
+
+        let footer = UILabel()
+        footer.text = "On the same Wi-Fi as your computer"
+        footer.font = .systemFont(ofSize: 12)
+        footer.textColor = UIColor.white.withAlphaComponent(0.35)
+        footer.textAlignment = .center
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(footer)
+        NSLayoutConstraint.activate([
+            footer.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            footer.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+        ])
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        gradient.frame = view.bounds
+    }
+
+    // A filled, tappable "Scan QR code" button (a rounded view + an icon/label row).
+    private func makeScanButton() -> UIView {
+        let container = UIView()
+        container.backgroundColor = UIColor(hex: "4F7DFF")
+        container.layer.cornerRadius = 14
+        let icon = UIImageView(image: UIImage(systemName: "qrcode.viewfinder"))
+        icon.tintColor = .white
+        icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
+        let label = UILabel(); label.text = "Scan QR code"
+        label.font = .systemFont(ofSize: 17, weight: .semibold); label.textColor = .white
+        let hs = UIStackView(arrangedSubviews: [icon, label])
+        hs.axis = .horizontal; hs.spacing = 10; hs.alignment = .center
+        hs.isUserInteractionEnabled = false
+        hs.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(hs)
+        NSLayoutConstraint.activate([
+            hs.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            hs.topAnchor.constraint(equalTo: container.topAnchor, constant: 15),
+            hs.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -15),
+        ])
+        container.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(scanTapped)))
+        return container
+    }
+
+    // The optional "Reconnect to <host>" shortcut shown when a last host is known.
+    private func makeReconnectButton(_ host: String) -> UIView {
+        let icon = UIImageView(image: UIImage(systemName: "clock.arrow.circlepath"))
+        icon.tintColor = UIColor.white.withAlphaComponent(0.55)
+        icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 13)
+        let label = UILabel(); label.text = "Reconnect to \(host)"
+        label.font = .systemFont(ofSize: 14); label.textColor = UIColor.white.withAlphaComponent(0.55)
+        let hs = UIStackView(arrangedSubviews: [icon, label])
+        hs.axis = .horizontal; hs.spacing = 6; hs.alignment = .center
+        hs.isUserInteractionEnabled = false
+        hs.translatesAutoresizingMaskIntoConstraints = false
+        let wrap = UIView()
+        wrap.addSubview(hs)
+        NSLayoutConstraint.activate([
+            hs.centerXAnchor.constraint(equalTo: wrap.centerXAnchor),
+            hs.topAnchor.constraint(equalTo: wrap.topAnchor),
+            hs.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
+        ])
+        wrap.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(reconnectTapped)))
+        return wrap
+    }
+
+    @objc private func scanTapped() {
+        errorLabel.isHidden = true
+        let vc = ScannerVC()
+        vc.onScan = { [weak self] value in
+            self?.dismiss(animated: true)
+            guard let self = self else { return }
+            if let host = parseDevServer(value) { self.onConnect(host) }
+            else { self.showError("That QR is not a Chuks dev server.") }
         }
+        vc.onCancel = { [weak self] in self?.dismiss(animated: true) }
+        vc.modalPresentationStyle = .fullScreen
+        present(vc, animated: true)
+    }
+
+    @objc private func reconnectTapped() {
+        if let last = last, !last.isEmpty { onConnect(last) }
     }
 
     private func connectManual() {
-        guard let host = parseDevServer(manual) else { error = "Enter a host like 192.168.1.5:7799"; return }
-        connect(host)
-    }
-    private func connect(_ host: String) { error = nil; onConnect(host) }
-}
-
-// The Chuks logo, loaded from the bundled ChuksLogo.png (the same image as the app icon),
-// shown in a rounded square. Falls back to a blue tile if the asset is missing.
-struct ChuksMark: View {
-    private var logo: UIImage? {
-        Bundle.main.path(forResource: "ChuksLogo", ofType: "png").flatMap(UIImage.init(contentsOfFile:))
-    }
-    var body: some View {
-        Group {
-            if let img = logo {
-                Image(uiImage: img).resizable().scaledToFit()
-            } else {
-                RoundedRectangle(cornerRadius: 18).fill(Color(hex: "4F7DFF"))
-            }
+        guard let host = parseDevServer(field.text ?? "") else {
+            showError("Enter a host like 192.168.1.5:7799"); return
         }
+        errorLabel.isHidden = true
+        onConnect(host)
     }
+
+    private func showError(_ msg: String) { errorLabel.text = msg; errorLabel.isHidden = false }
+
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool { connectManual(); return true }
 }
 
 // ─── QR scanner ───────────────────────────────────────────────────────────────
-struct QRScanner: UIViewControllerRepresentable {
-    let onScan: (String) -> Void
-    let onCancel: () -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(onScan: onScan) }
-    func makeUIViewController(context: Context) -> ScannerVC {
-        let vc = ScannerVC(); vc.delegate = context.coordinator; return vc
-    }
-    func updateUIViewController(_ vc: ScannerVC, context: Context) {}
-
-    final class Coordinator: NSObject, AVCaptureMetadataOutputObjectsDelegate {
-        let onScan: (String) -> Void
-        private var done = false
-        init(onScan: @escaping (String) -> Void) { self.onScan = onScan }
-        func metadataOutput(_ output: AVCaptureMetadataOutput,
-                            didOutput objects: [AVMetadataObject],
-                            from connection: AVCaptureConnection) {
-            guard !done,
-                  let obj = objects.first as? AVMetadataMachineReadableCodeObject,
-                  let value = obj.stringValue else { return }
-            done = true
-            AudioServicesPlaySystemSound(1057)   // capture tick
-            DispatchQueue.main.async { self.onScan(value) }
-        }
-    }
-}
-
-final class ScannerVC: UIViewController {
-    weak var delegate: AVCaptureMetadataOutputObjectsDelegate?
+// A full-screen camera that reads a QR and hands its value back through onScan; the
+// close button (or a failed camera) reports onCancel.
+final class ScannerVC: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+    var onScan: ((String) -> Void)?
+    var onCancel: (() -> Void)?
     private let session = AVCaptureSession()
     private var preview: AVCaptureVideoPreviewLayer?
+    private var done = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -220,6 +287,19 @@ final class ScannerVC: UIViewController {
             box.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.65),
             box.heightAnchor.constraint(equalTo: box.widthAnchor),
         ])
+        // Close (cancel) button.
+        let close = UIButton(type: .system)
+        close.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
+        close.tintColor = UIColor.white.withAlphaComponent(0.9)
+        close.translatesAutoresizingMaskIntoConstraints = false
+        close.addAction(UIAction { [weak self] _ in self?.onCancel?() }, for: .touchUpInside)
+        view.addSubview(close)
+        NSLayoutConstraint.activate([
+            close.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            close.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            close.widthAnchor.constraint(equalToConstant: 32),
+            close.heightAnchor.constraint(equalToConstant: 32),
+        ])
     }
 
     private func configure() {
@@ -230,13 +310,24 @@ final class ScannerVC: UIViewController {
         let output = AVCaptureMetadataOutput()
         guard session.canAddOutput(output) else { showNoCamera(); return }
         session.addOutput(output)
-        output.setMetadataObjectsDelegate(delegate, queue: .main)
+        output.setMetadataObjectsDelegate(self, queue: .main)
         output.metadataObjectTypes = [.qr]
         let layer = AVCaptureVideoPreviewLayer(session: session)
         layer.videoGravity = .resizeAspectFill; layer.frame = view.layer.bounds
         view.layer.insertSublayer(layer, at: 0)
         preview = layer
         DispatchQueue.global(qos: .userInitiated).async { self.session.startRunning() }
+    }
+
+    func metadataOutput(_ output: AVCaptureMetadataOutput,
+                        didOutput objects: [AVMetadataObject],
+                        from connection: AVCaptureConnection) {
+        guard !done,
+              let obj = objects.first as? AVMetadataMachineReadableCodeObject,
+              let value = obj.stringValue else { return }
+        done = true
+        AudioServicesPlaySystemSound(1057)   // capture tick
+        DispatchQueue.main.async { self.onScan?(value) }
     }
 
     private func showNoCamera() {
@@ -261,15 +352,14 @@ final class ScannerVC: UIViewController {
 }
 
 // Local hex helper so this file is self-contained even if the shared one is private.
-private extension Color {
-    init(hex: String) {
+private extension UIColor {
+    convenience init(hex: String) {
         var h = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
         if h.count == 3 { h = h.map { "\($0)\($0)" }.joined() }
         var v: UInt64 = 0; Scanner(string: h).scanHexInt64(&v)
-        self = Color(.sRGB,
-                     red: Double((v >> 16) & 0xff) / 255,
-                     green: Double((v >> 8) & 0xff) / 255,
-                     blue: Double(v & 0xff) / 255, opacity: 1)
+        self.init(red: CGFloat((v >> 16) & 0xff) / 255,
+                  green: CGFloat((v >> 8) & 0xff) / 255,
+                  blue: CGFloat(v & 0xff) / 255, alpha: 1)
     }
 }
 #endif

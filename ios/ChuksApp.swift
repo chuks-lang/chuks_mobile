@@ -65,8 +65,8 @@ import HealthKit
 // ===== Feed-grade image cache (shared by both iOS hosts) =====
 // Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
 // (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
-// re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
-// uncached SwiftUI AsyncImage.
+// re-downloads nor janks the main thread decoding. Replaces the earlier unbounded,
+// uncached image dictionary.
 final class ChuksImageLoader {
     static let shared = ChuksImageLoader()
     private let mem = NSCache<NSString, UIImage>()
@@ -1755,9 +1755,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var proximityTokens = Set<String>() // motion.proximity subscribers (UIDevice proximity)
     lazy var healthStore = HKHealthStore()   // HealthKit (Health) — lazy: only if used
 
-    // Execute a native capability requested via an `X|` command (F3). Same UIKit
-    // implementations as the SwiftUI host; only presentShare differs (this host IS a
-    // UIViewController, so it presents directly).
+    // Execute a native capability requested via an `X|` command (F3). This host IS a
+    // UIViewController, so capabilities that present UI (e.g. presentShare) present
+    // directly.
     func ensureBle() {
         if ble == nil {
             let m = BleManager()
@@ -2569,7 +2569,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let dp = UIDatePicker()
             if #available(iOS 14.0, *) { dp.preferredDatePickerStyle = .compact }   // a tappable native field
             dp.datePickerMode = .date                                               // refined by the "dp" style
-            dp.contentHorizontalAlignment = .leading                                // hug the leading edge (match Android/SwiftUI)
+            dp.contentHorizontalAlignment = .leading                                // hug the leading edge (match Android)
             dp.addTarget(self, action: #selector(dateChanged(_:)), for: .valueChanged)
             datePickerModes[dp] = "date"
             let sz = dp.intrinsicContentSize                                        // Yoga needs a leaf size
@@ -3308,6 +3308,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let dp = v as? UIDatePicker { datePickerActions[dp] = action; return }
         if let tv = v as? UITextView { textAreaActions[tv] = action; return }
         v.isUserInteractionEnabled = true
+        // Reset any tap/press recognizer WE previously attached to this view before
+        // (re)binding. Node ids are reused when a screen swaps in place, so a tappable
+        // card can become an inert row at the same id; without this the old recognizer
+        // survives and keeps firing the previous role's action (RN resets a recycled
+        // view to its defaults — this is that reset). Only our own recognizers are
+        // touched (guarded by the taps/pressGestures maps), so a Text's copy long-press
+        // or a Gesture node's recognizers are preserved.
+        for g in (v.gestureRecognizers ?? []) {
+            if let t = g as? UITapGestureRecognizer, taps[t] != nil { taps[t] = nil; v.removeGestureRecognizer(t) }
+            else if let lp = g as? UILongPressGestureRecognizer, pressGestures[lp] != nil { pressGestures[lp] = nil; v.removeGestureRecognizer(lp) }
+        }
+        if action.isEmpty { return }   // binding removed: leave the view non-interactive (no recognizer)
         if let ao = pressOpacity[id] {                          // Pressable: press-feedback gesture, not a plain tap
             let g = UILongPressGestureRecognizer(target: self, action: #selector(handlePress(_:)))
             g.minimumPressDuration = 0

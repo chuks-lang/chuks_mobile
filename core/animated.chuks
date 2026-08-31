@@ -4,7 +4,7 @@
 // The insight: the Style model ALREADY carries opacity / tx / ty / rotate / scale
 // plus a transition (anim = duration ms, easing = ""|linear|spring), and all three
 // native hosts already interpolate those to their target at 60fps (UIView.animate,
-// SwiftUI .animation, Android ViewPropertyAnimator). So an animation is just:
+// Android ViewPropertyAnimator). So an animation is just:
 //   1. hold a value that persists across renders   (useAnimated)
 //   2. read it into a prop + set anim/easing        (.value()/.dur()/.easing())
 //   3. move its target                              (.timing()/.spring()/.setValue())

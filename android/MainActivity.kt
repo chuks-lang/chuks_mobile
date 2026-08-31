@@ -1670,7 +1670,7 @@ class MainActivity : Activity() {
                 it.setBackgroundColor(Color.parseColor("#0E1116"))
                 it.webChromeClient = android.webkit.WebChromeClient()   // required for full JS support in the WebView
             }
-            "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics / SwiftUI Canvas)
+            "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics)
             "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press + continuous pan/pinch/rotate
                 gestureIds.add(id)
                 val detector = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
@@ -2137,7 +2137,7 @@ class MainActivity : Activity() {
                 }
                 "stick" -> if (v is ScrollView) stickBottomOn = (vl == "1")   // Scroll stickBottom (chat)
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
-                "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (UIKit/SwiftUI do), an explicit `ellip` overrides
+                "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (as UIKit does), an explicit `ellip` overrides
                     val n = f.toInt()                 // nlines=-1 means "no cap" -> unlimited, and no forced ellipsis
                     if (n > 0) { it.maxLines = n; if (it.ellipsize == null) it.ellipsize = android.text.TextUtils.TruncateAt.END }
                     else { it.maxLines = Integer.MAX_VALUE }
@@ -3240,6 +3240,14 @@ class MainActivity : Activity() {
             is EditText -> v.setTag(TAG, action)
             is SeekBar -> v.setTag(TAG, action)      // Slider: the change listener reads this
             else -> {
+                // Reset any prior interaction binding before (re)binding. Node ids are
+                // reused when a screen swaps in place, so a Pressable can become an inert
+                // row at the same id; its old touch listener consumes ACTION_UP and fires
+                // the PREVIOUS action, so it must be cleared or the reused view keeps
+                // firing it (RN resets a recycled view to defaults — this is that reset).
+                v.setOnTouchListener(null)
+                v.setOnClickListener(null)
+                v.isClickable = false
                 val ao = pressOpacity[id]
                 if (ao != null) {
                     // Pressable: dim on touch-down, restore on release/cancel, fire only
@@ -3277,7 +3285,8 @@ class MainActivity : Activity() {
                             else -> false
                         }
                     }
-                } else { v.isClickable = true; v.setOnClickListener { if (!disabledIds.contains(id)) fire(action) } }
+                } else if (action.isNotEmpty()) { v.isClickable = true; v.setOnClickListener { if (!disabledIds.contains(id)) fire(action) } }
+                // else: empty action + not pressable -> leave the view non-interactive (default)
             }
         }
     }

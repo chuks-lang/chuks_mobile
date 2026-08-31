@@ -3,7 +3,7 @@
 // and styled entirely through semantic theme tokens (see theme.chuks), so every
 // one of them reskins with setTheme("light") and stays consistent by default.
 //
-// API convention (RN/SwiftUI props model): every component takes a SINGLE props
+// API convention (single props-map model): every component takes a SINGLE props
 // `dataType`, so callers set only what they need by name (no positional nulls).
 // Required content is a plain field; optional config is a nullable field (`T?`,
 // `function?(...)`) that defaults to null when omitted. Every component accepts an
@@ -149,7 +149,7 @@ export dataType SwitchProps {
     onToggle: function?(): void,
 }
 export function Switch(p: SwitchProps): Node {
-    // A real native switch (UISwitch / SwiftUI Toggle / Android Switch), tinted with
+    // A real native switch (UISwitch / Android Switch), tinted with
     // the theme primary. Controlled: the parent owns `on`, onToggle fires on flip.
     return Toggle({ on: p.on, bg: tk("primary"), onPress: p.onToggle })
 }

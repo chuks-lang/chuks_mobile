@@ -365,7 +365,7 @@ repro set is in the session scratchpad (nulltest/a-h).
 ## Phase 3.5: RN/Compose-shaped component API (DONE)
 
 The low-level engine got a declarative authoring layer on top (in `core/ui.chuks`),
-so app code reads like Compose/Flutter/SwiftUI. The engine underneath (reconciler,
+so app code reads like Compose/Flutter. The engine underneath (reconciler,
 mutation stream, Yoga, hot reload, both hosts) is unchanged.
 
 - [x] **Named-prop builders**: `Row`/`Column`/`Text`/`Icon`/`Button`/`Pill`/
@@ -433,7 +433,7 @@ helper); container-instance-vs-builder-call mental model (documented rule:
       (the start of a `@chuks/ui` vocabulary) so `render()` composes a tree
       instead of building Style objects field-by-field. `Card.render()` dropped
       from ~30 lines of `new Style(); s.x=...` to an 8-line composed tree that
-      reads like Flutter/SwiftUI. Renders identically (verified iOS).
+      reads like Flutter. Renders identically (verified iOS).
 - [x] **Self-contained component state (setState)**: a persistent `Toolbar`
       component owns its own `count`; its `onTap()` mutates it and the framework
       re-renders ONLY its subtree (one diff), with the parent threading no props.

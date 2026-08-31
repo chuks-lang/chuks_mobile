@@ -1,8 +1,8 @@
 # @chuks/mobile
 
 The Chuks Mobile SDK. Write your whole app in Chuks; it compiles to native and drives
-real iOS and Android widgets through one shared engine, with two iOS render engines
-(SwiftUI and UIKit) behind the same code.
+real iOS and Android widgets through one shared engine: a UIKit host on iOS and a JNI
+host on Android, behind the same code.
 
 > **Requires Chuks v0.1.1 or newer.** The referenced-package build (a project consuming
 > `@chuks/mobile` from `chuks_packages/`) and the native host build scripts rely on
@@ -17,8 +17,8 @@ real iOS and Android widgets through one shared engine, with two iOS render engi
 - **Platform info** — `core/platform.chuks` (`getPlatform`, `isIOS`, device info)
 - **Native capabilities** — `core/native.chuks`: permissions, file system, secure storage,
   audio playback, text-to-speech, local notifications, and battery / network / app-state
-  streams, each working on all three engines
-- **Native hosts + build** — `ios/` (SwiftUI + UIKit), `android/` (JNI), and the build
+  streams, each working on both hosts
+- **Native hosts + build** — `ios/` (UIKit), `android/` (JNI), and the build
   scripts that compile your app through the package
 
 ## Using it
@@ -44,7 +44,7 @@ the native host out of `chuks_packages/@chuks/mobile/` and compile your app thro
 package):
 
 ```
-bash chuks_packages/@chuks/mobile/ios/build.sh       # iOS simulator (iosEngine in chuks.json)
+bash chuks_packages/@chuks/mobile/ios/build.sh       # iOS simulator (UIKit host)
 bash chuks_packages/@chuks/mobile/android/build.sh   # Android device / emulator
 ```
 
@@ -53,6 +53,6 @@ project `chuks.json` scripts to build — is being wired up in the CLI.
 
 ## Engines
 
-Your Chuks code is identical across all three. `iosEngine` in your project's `chuks.json`
-selects `swiftui` (native SwiftUI layout) or `uikit` (UIViews + Yoga flexbox); Android is
-a single JNI host.
+Your Chuks code is identical across both hosts. iOS renders through a UIKit host
+(UIViews + Yoga flexbox); Android renders through a single JNI host (Android Views +
+Yoga). One codebase, native widgets on each.
