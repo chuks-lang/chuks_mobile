@@ -402,6 +402,7 @@ export unionType ListProp = int | bool | function(r: int): string | function(r: 
 function pInt(p: map[string]Prop, k: string, def: int): int { const v: Prop? = p.get(k); if (v != null) { return int(v) } return def }
 // Read a string prop `k` from the props map, or return `def` if it is absent.
 function pStr(p: map[string]Prop, k: string, def: string): string { const v: Prop? = p.get(k); if (v != null) { return string(v) } return def }
+// Read a bool prop `k` from the props map, or return `def` if it is absent.
 function pBool(p: map[string]Prop, k: string, def: bool): bool { const v: Prop? = p.get(k); if (v != null) { return v == true } return def }
 
 // ---- Safe-area insets --------------------------------------------------------
@@ -416,15 +417,22 @@ var _safeLeft: int = 0
 export function setSafeInsets(t: int, r: int, b: int, l: int): void {
     _safeTop = t; _safeRight = r; _safeBottom = b; _safeLeft = l
 }
+// The last-reported top safe-area inset (notch / status bar), in points.
 export function safeTop(): int { return _safeTop }
+// The last-reported right safe-area inset (rounded corner / landscape), in points.
 export function safeRight(): int { return _safeRight }
+// The last-reported bottom safe-area inset (home indicator / gesture bar), in points.
 export function safeBottom(): int { return _safeBottom }
+// The last-reported left safe-area inset (rounded corner / landscape), in points.
 export function safeLeft(): int { return _safeLeft }
 // OS color scheme, reported by the host (via the entry's setColorScheme) so an app can
 // follow the system light/dark setting. Distinct from an in-app theme toggle.
 var _osDark: int = 0
+// Called by the host (via the entry's setColorScheme) when the OS light/dark setting is known/changes.
 export function setOsColorScheme(dark: int): void { _osDark = dark }
+// The OS color scheme as a string: "dark" or "light". Follows the system setting, not any in-app toggle.
 export function osColorScheme(): string { return _osDark == 1 ? "dark" : "light" }
+// True when the OS is in dark mode. Convenience over osColorScheme() for a boolean check.
 export function osIsDark(): bool { return _osDark == 1 }
 // Platform info is owned by core/platform.chuks (the Platform.OS store that isAndroid /
 // isIOS / select read). App.setPlatform below forwards the host's report to it.
@@ -432,11 +440,15 @@ export function osIsDark(): bool { return _osDark == 1 }
 // paging List pages by (screen minus safe areas / chrome), so a full-screen feed should
 // size its cells to this, NOT to DeviceInfo.screen (that mismatch offsets every page).
 var _vpH: int = 0
+// The scroll viewport height (points) the host last reported; 0 until first reported.
+// Size a full-screen paging feed's cells to this, not to DeviceInfo.screen.
 export function viewportHeight(): int { return _vpH }
 // The cross-axis viewport size the host reports alongside the scroll window: the list's
 // WIDTH for a vertical list (used to size grid columns for `numColumns`), or its height for
 // a horizontal list. 0 until the host first reports it.
 var _vpW: int = 0
+// The cross-axis viewport size the host last reported: the list WIDTH for a vertical list
+// (used to size grid columns for `numColumns`), or its height for a horizontal list.
 export function viewportWidth(): int { return _vpW }
 // Read an int config value `k` from a List's ListProp map, or `def` if absent.
 function lpInt(d: map[string]ListProp, k: string, def: int): int { const v: ListProp? = d.get(k); if (v != null) { return int(v) } return def }
@@ -513,20 +525,6 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
     const en: Prop? = p.get("onEnd"); if (en != null) { n.onEnd = en }
     const pr: Prop? = p.get("onProgress"); if (pr != null) { n.onProgress = pr }
 }
-/**
- * A horizontal row (flex-direction: row): lays its children left-to-right.
- *
- * Props: `gap`, `pad`, `align` ("start"|"center"|"end"|"stretch"),
- * `justify` ("start"|"center"|"end"|"between"|"around"), `bg`, `radius`,
- * `w`, `h`, `grow`, `onPress`.
- *
- * ```chuks
- * Row({ align: "center", justify: "between", gap: 12 }, [
- *     Text({ weight: "bold", size: 16 }, "Title"),
- *     Button({ onPress: onOpen }, "Open"),
- * ])
- * ```
- */
 // ── Typed component props ────────────────────────────────────────────────────
 // ViewProps is the shared, all-optional prop bag: every layout field, a Tailwind
 // `tw` string, and events. Per-component types EMBED it and add their own fields
@@ -564,7 +562,9 @@ export dataType TextProps { ViewProps; numberOfLines: int?; ellipsizeMode: strin
 
 // By-key field readers over an `any` (a map-backed dataType), mirroring pInt/pStr/pBool.
 function pvI(p: any, k: string, d: int): int { const v: any = p[k]; return v != null ? int(v) : d }
+// Read a string field `k` from an `any` (map-backed dataType), or `d` if absent/null.
 function pvS(p: any, k: string, d: string): string { const v: any = p[k]; return v != null ? string(v) : d }
+// Read a bool field `k` from an `any` (map-backed dataType), or `d` if absent/null.
 function pvB(p: any, k: string, d: bool): bool { const v: any = p[k]; return v != null ? (int(v) != 0) : d }
 
 // The typed-props twin of applyLayout: a Tailwind `tw` string first (so explicit
@@ -619,6 +619,8 @@ function applyLayoutV(s: Style, p: any): void {
     s.animMs = pvI(p, "anim", s.animMs)
     s.animEz = pvS(p, "easing", s.animEz)
 }
+// The typed-props twin of applyEvents: wire onPress/onChange/onLongPress/onPressIn/onPressOut
+// closures from a typed props bag (read by key) onto a node.
 function applyEventsV(n: Node, p: any): void {
     const a: any = p["onPress"]; if (a != null) { n.onPress = a }
     const b: any = p["onChange"]; if (b != null) { n.onChange = b }
@@ -626,6 +628,8 @@ function applyEventsV(n: Node, p: any): void {
     const d: any = p["onPressIn"]; if (d != null) { n.onPressIn = d }
     const e: any = p["onPressOut"]; if (e != null) { n.onPressOut = e }
 }
+// The typed-props twin of applyMediaEvents: wire onLoad/onError/onEnd/onProgress (Image/Video)
+// from a typed props bag (read by key) onto a node.
 function applyMediaEventsV(n: Node, p: any): void {
     const ld: any = p["onLoad"]; if (ld != null) { n.onLoad = ld }
     const er: any = p["onError"]; if (er != null) { n.onError = er }
@@ -638,6 +642,20 @@ dataType MediaEventProps {
     onEnd: (function(): void)?; onProgress: (function(v: int): void)?;
 }
 
+/**
+ * A horizontal row (flex-direction: row): lays its children left-to-right.
+ *
+ * Props: `gap`, `pad`, `align` ("start"|"center"|"end"|"stretch"),
+ * `justify` ("start"|"center"|"end"|"between"|"around"), `bg`, `radius`,
+ * `w`, `h`, `grow`, `onPress`.
+ *
+ * ```chuks
+ * Row({ align: "center", justify: "between", gap: 12 }, [
+ *     Text({ weight: "bold", size: 16 }, "Title"),
+ *     Button({ onPress: onOpen }, "Open"),
+ * ])
+ * ```
+ */
 export function Row(first: ViewProps | []Node, kids: []Node = []): Node {
     const s: Style = new Style(); s.dir = "row"
     // props-or-content: `Row([...])` (no config) passes children first; `Row({...}, [...])`
@@ -705,36 +723,25 @@ export function Text(first: TextProps | string, body: string = ""): Node {
     applyEventsV(n, p)                                        // onPress makes the text tappable (a link)
     return n
 }
-/**
- * A circular icon backed by an SF Symbol.
- *
- * Props: `name` (SF Symbol id, e.g. "bolt.fill"), `size` (px; also the circle
- * diameter), `bg` (circle fill hex), `color` (glyph hex, default white).
- *
- * ```chuks
- * Icon({ name: "bolt.fill", size: 40, bg: ACCENT })
- * ```
- */
-/**
- * A looping, muted video surface (native AVPlayer / ExoPlayer). `src` is a
- * bundled video filename. Only mounted (visible) videos play, so a virtualized
- * List keeps just the on-screen ones alive.
- *
- * ```chuks
- * Video({ src: "sample.mp4", h: 320, radius: 12 })
- * ```
- */
-/**
- * A video surface. Controllable like RN's Video so you can compose a feed: put one in
- * each cell of a paging List and drive `playing` from the visible index.
- * Props: `src` (bundled name, "file://…", or http(s) URL), `playing` (default true),
- * `loop` (default true), `muted` (default true), `resizeMode` ("cover" | "contain").
- */
 dataType VideoProps {
     ViewProps; MediaEventProps;
     src: string?; playing: bool?; loop: bool?; muted: bool?; resizeMode: string?;
     seek: int?; volume: int?; rate: int?; controls: bool?; poster: string?;
 }
+/**
+ * A video surface (native AVPlayer / ExoPlayer), controllable so you can compose a feed:
+ * put one in each cell of a paging List and drive `playing` from the visible index. Only
+ * mounted (visible) videos play, so a virtualized List keeps just the on-screen ones alive.
+ * With `controls: true` it renders the platform's full native player UI instead.
+ *
+ * Props: `src` (bundled name, "file://…", or http(s) URL), `playing` (default true),
+ * `loop` (default true), `muted` (default true), `resizeMode` ("cover" | "contain"),
+ * `controls`, `poster`.
+ *
+ * ```chuks
+ * Video({ src: "sample.mp4", h: 320, radius: 12 })
+ * ```
+ */
 export function Video(p: VideoProps): Node {
     const s: Style = new Style(); applyLayoutV(s, p)
     s.vid = pvS(p, "src", "")
@@ -757,12 +764,27 @@ export function Video(p: VideoProps): Node {
     return n
 }
 dataType IconProps { ViewProps; name: string? }
+/**
+ * A circular icon backed by an SF Symbol.
+ *
+ * Props: `name` (SF Symbol id, e.g. "bolt.fill"), `size` (px; also the circle
+ * diameter), `bg` (circle fill hex), `color` (glyph hex, default white).
+ *
+ * ```chuks
+ * Icon({ name: "bolt.fill", size: 40, bg: ACCENT })
+ * ```
+ */
 export function Icon(p: IconProps): Node {
     const s: Style = new Style()
     const sz: int = pvI(p, "size", 24); s.w = sz; s.h = sz; s.radius = sz / 2
     s.bg = pvS(p, "bg", "")
     s.img = pvS(p, "name", ""); s.fg = pvS(p, "color", "FFFFFF")
     return mkImage(s)
+}
+dataType ImageProps {
+    ViewProps; MediaEventProps;
+    src: string?; resize: string?; tintColor: string?; blurRadius: int?;
+    filter: string?; spinner: bool?; ops: string?;
 }
 /**
  * A remote (network) image loaded from a URL. The host fetches + caches the
@@ -780,11 +802,6 @@ export function Icon(p: IconProps): Node {
  * Image({ src: "https://picsum.photos/200", w: 96, h: 96, radius: 12, filter: "vivid" })
  * ```
  */
-dataType ImageProps {
-    ViewProps; MediaEventProps;
-    src: string?; resize: string?; tintColor: string?; blurRadius: int?;
-    filter: string?; spinner: bool?; ops: string?;
-}
 export function Image(p: ImageProps): Node {
     const s: Style = new Style()
     s.resize = pvS(p, "resize", "cover")
@@ -800,10 +817,10 @@ export function Image(p: ImageProps): Node {
     applyMediaEventsV(n, p)                               // onLoad / onError
     return n
 }
+dataType ImageBackgroundProps { ViewProps; src: string?; resize: string? }
 /**
- * A container whose BACKGROUND is a remote image, with `kids` rendered on top
- * (like RN's ImageBackground). The host loads the URL and paints it behind the
- * content; `resize` controls the fill mode.
+ * A container whose BACKGROUND is a remote image, with `kids` rendered on top of it.
+ * The host loads the URL and paints it behind the content; `resize` controls the fill mode.
  *
  * Props: `src` (URL), `resize`, plus layout (`pad`, `gap`, `w`, `h`, `radius`).
  *
@@ -811,7 +828,6 @@ export function Image(p: ImageProps): Node {
  * ImageBackground({ src: HERO_URL, pad: 24, radius: 16 }, [ Text(...), ... ])
  * ```
  */
-dataType ImageBackgroundProps { ViewProps; src: string?; resize: string? }
 export function ImageBackground(first: ImageBackgroundProps | []Node, kids: []Node = []): Node {
     if (typeof(first) == "array") { return ImageBackground({}, first) }   // content-only
     const p: ImageBackgroundProps = first
@@ -821,6 +837,7 @@ export function ImageBackground(first: ImageBackgroundProps | []Node, kids: []No
     applyLayoutV(s, p)
     return new Node("ImageBackground", s, pvS(p, "src", ""), kids)   // URL in text; children on top
 }
+dataType WebViewProps { ViewProps; url: string? }
 /**
  * A native web view (WKWebView on iOS, android.webkit.WebView on Android) that
  * loads a URL. Give it a size (`w`/`h`) or let it `grow` to fill, plus optional
@@ -833,7 +850,6 @@ export function ImageBackground(first: ImageBackgroundProps | []Node, kids: []No
  * WebView({ url: "https://chuks.dev", grow: 1, radius: 12 })
  * ```
  */
-dataType WebViewProps { ViewProps; url: string? }
 export function WebView(p: WebViewProps): Node {
     const s: Style = new Style()
     if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
@@ -841,6 +857,7 @@ export function WebView(p: WebViewProps): Node {
     return new Node("WebView", s, pvS(p, "url", ""), [])   // URL in the text channel
 }
 
+dataType CameraViewProps { ViewProps; facing: string? }
 /**
  * A live camera preview surface. `facing` selects the lens: "back" (default) or "front".
  * Needs the "camera" permission (request it with Permission.request("camera", ...) first).
@@ -848,13 +865,13 @@ export function WebView(p: WebViewProps): Node {
  * Camera2 preview on a TextureView. Grab a still from the running preview with
  * Camera.capturePreview(onResult, onError), which resolves a file:// path you can hand to Image.
  */
-dataType CameraViewProps { ViewProps; facing: string? }
 export function CameraView(p: CameraViewProps): Node {
     const s: Style = new Style()
     if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
     applyLayoutV(s, p)
     return new Node("CameraView", s, pvS(p, "facing", "back"), [])   // facing in the text channel
 }
+dataType ButtonBaseProps { ViewProps; disabled: bool? }
 /**
  * A tappable button showing title `t`. Pass `onPress` as a () -> void closure;
  * the framework registers it by node id and calls it on tap.
@@ -866,7 +883,6 @@ export function CameraView(p: CameraViewProps): Node {
  *          bg: ACCENT, color: "FFFFFF", h: 52, radius: 12 }, "Log in")
  * ```
  */
-dataType ButtonBaseProps { ViewProps; disabled: bool? }
 export function Button(first: ButtonBaseProps | string, t: string = ""): Node {
     if (typeof(first) == "string") { return Button({}, first) }   // label-only: `Button("Save")`
     const p: ButtonBaseProps = first
@@ -892,6 +908,13 @@ export function Pill(first: ViewProps | string, t: string = ""): Node {
     applyLayoutV(s, p)
     const n: Node = mkButton(s, t); applyEventsV(n, p); return n
 }
+dataType TextInputProps {
+    ViewProps;
+    placeholder: string?; value: string?; secure: bool?; multiline: bool?;
+    keyboardType: string?; returnKeyType: string?; editable: bool?; autoFocus: bool?;
+    autoCapitalize: string?; autoCorrect: bool?; maxLength: int?;
+    onSubmit: (function(): void)?; onFocus: (function(): void)?; onBlur: (function(): void)?;
+}
 /**
  * A single-line text field. Pass `onChange` as a (string) -> void closure that
  * receives the current text on every edit. Renders as a light field by default.
@@ -910,13 +933,6 @@ export function Pill(first: ViewProps | string, t: string = ""): Node {
  *             onSubmit: function(): void { send() } })
  * ```
  */
-dataType TextInputProps {
-    ViewProps;
-    placeholder: string?; value: string?; secure: bool?; multiline: bool?;
-    keyboardType: string?; returnKeyType: string?; editable: bool?; autoFocus: bool?;
-    autoCapitalize: string?; autoCorrect: bool?; maxLength: int?;
-    onSubmit: (function(): void)?; onFocus: (function(): void)?; onBlur: (function(): void)?;
-}
 export function TextInput(p: TextInputProps): Node {
     const s: Style = new Style()
     const multi: bool = pvB(p, "multiline", false)   // a multi-line text area vs a single-line field
@@ -940,25 +956,11 @@ export function TextInput(p: TextInputProps): Node {
     n.onBlur = p["onBlur"]
     applyEventsV(n, p); return n
 }
-/**
- * A native on/off switch (UISwitch / SwiftUI Toggle / Android Switch/SwitchMaterial).
- * Controlled, like RN's Switch: the parent owns `on` and passes it; `onPress` fires
- * when the user flips it. The host reports the change (dispatch), the parent updates
- * its own state in onPress, and the re-render syncs the control to that state — so
- * the switch always reflects Chuks state, never drifts. `bg` is the on-tint (the
- * track color when on); omit for the platform default.
- *
- * Props: `on` (bool), `onPress` (() -> void), `bg` (on-tint hex),
- *        `thumbColor` (knob color hex), `disabled` (bool: dim + block taps).
- *
- * ```chuks
- * Toggle({ on: enabled, onPress: function(): void { enabled = !enabled }, bg: ACCENT })
- * ```
- */
+dataType SafeAreaViewProps { ViewProps; edges: string? }
 /**
  * Insets its children clear of the device safe area (notch/status bar, home
  * indicator). Composed from the host-reported insets, so it's cross-platform and
- * needs no host code. Use it for EDGE-TO-EDGE content — a full-bleed screen, or an
+ * needs no host code. Use it for EDGE-TO-EDGE content: a full-bleed screen, or an
  * overlay/modal that spans the whole window. (Regular screens are already inset by
  * the app root, so a SafeAreaView there is a no-op.)
  *
@@ -969,7 +971,6 @@ export function TextInput(p: TextInputProps): Node {
  * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
  * ```
  */
-dataType SafeAreaViewProps { ViewProps; edges: string? }
 export function SafeAreaView(first: SafeAreaViewProps | []Node, kids: []Node = []): Node {
     if (typeof(first) == "array") { return SafeAreaView({}, first) }   // content-only (default edges)
     const p: SafeAreaViewProps = first
@@ -988,6 +989,20 @@ export function SafeAreaView(first: SafeAreaViewProps | []Node, kids: []Node = [
 // A fixed-height empty row (a safe-area spacer).
 function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
 
+dataType ScrollProps {
+    ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
+    onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
+}
+// Android's ScrollView holds exactly ONE direct child; a Chuks Scroll may take several
+// (iOS UIScrollView allows many). Wrap multiple children in a single content container
+// (like RN's contentContainer) so the host never gets >1 direct scroll child and can't
+// crash. A single child (the common Scroll([Column([...])]) pattern) passes through
+// unchanged, so existing screens and the List windowing path are untouched.
+function scrollContent(kids: []Node, horizontal: bool): []Node {
+    if (kids.length <= 1) { return kids }
+    const cs: Style = new Style(); cs.dir = horizontal ? "row" : "col"
+    return [ mkView(cs, kids) ]
+}
 /**
  * A scroll container: children stack and scroll when they overflow. Grows to fill
  * its parent's main axis. For long UNIFORM lists prefer `List` (which virtualizes);
@@ -1010,20 +1025,6 @@ function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return m
  *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
  *     Scroll({ horizontal: true, paging: true }, [ Row([ page0, page1, page2 ]) ])
  */
-dataType ScrollProps {
-    ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
-    onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
-}
-// Android's ScrollView holds exactly ONE direct child; a Chuks Scroll may take several
-// (iOS UIScrollView allows many). Wrap multiple children in a single content container
-// (like RN's contentContainer) so the host never gets >1 direct scroll child and can't
-// crash. A single child (the common Scroll([Column([...])]) pattern) passes through
-// unchanged, so existing screens and the List windowing path are untouched.
-function scrollContent(kids: []Node, horizontal: bool): []Node {
-    if (kids.length <= 1) { return kids }
-    const cs: Style = new Style(); cs.dir = horizontal ? "row" : "col"
-    return [ mkView(cs, kids) ]
-}
 export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     // props-or-content: `Scroll([...])` is a default vertical scroll of the given content;
     // `Scroll({...}, [...])` configures it. Discriminate by type (array = content, `{...}` = props).
@@ -1062,12 +1063,13 @@ export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     n.scrollTo = p.scrollTo ?? -1
     return n
 }
+dataType PressableProps { ViewProps; activeOpacity: int?; delayLongPress: int?; hitSlop: int?; disabled: bool? }
 /**
  * A pressable surface: wraps content and gives instant press feedback (dims to
- * `activeOpacity`% while held), firing `onPress` on release. The RN Pressable /
- * TouchableOpacity. The dim is applied NATIVELY by each host on touch-down (no
- * round-trip to Chuks), so it stays responsive. Put anything inside — a card, a
- * row, an icon. Children stack vertically by default (`dir` overrides).
+ * `activeOpacity`% while held), firing `onPress` on release. The dim is applied
+ * NATIVELY by each host on touch-down (no round-trip to Chuks), so it stays
+ * responsive. Put anything inside: a card, a row, an icon. Children stack vertically
+ * by default (`dir` overrides).
  *
  * Props: `onPress` (() -> void), `activeOpacity` (0-100, default 60), plus any
  * layout/style prop (bg, radius, pad, gap, dir, align, justify, ...).
@@ -1076,7 +1078,6 @@ export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
  * Pressable({ onPress: open, bg: CARD, radius: 12, pad: 16 }, [ Text(...) ])
  * ```
  */
-dataType PressableProps { ViewProps; activeOpacity: int?; delayLongPress: int?; hitSlop: int?; disabled: bool? }
 export function Pressable(first: PressableProps | []Node, kids: []Node = []): Node {
     if (typeof(first) == "array") { return Pressable({}, first) }   // content-only
     const p: PressableProps = first
@@ -1110,6 +1111,7 @@ export function Spinner(p: ViewProps): Node {
     s.w = sz; s.h = sz; s.fs = -1
     return mkSpinner(s)
 }
+dataType ProgressProps { ViewProps; value: int?; max: int? }
 /**
  * A determinate progress bar (native UIProgressView / SwiftUI linear ProgressView /
  * horizontal ProgressBar). Display-only; the parent owns `value`. For an
@@ -1121,7 +1123,6 @@ export function Spinner(p: ViewProps): Node {
  * Progress({ value: pct.get(), max: 100, color: ACCENT })
  * ```
  */
-dataType ProgressProps { ViewProps; value: int?; max: int? }
 export function Progress(p: ProgressProps): Node {
     const val: int = pvI(p, "value", 0)
     const mx: int = pvI(p, "max", 100)
@@ -1135,13 +1136,14 @@ export function Progress(p: ProgressProps): Node {
     s.prog = pct                    // set after applyLayout (which doesn't touch prog)
     return mkProgress(s)
 }
+dataType StatusBarProps { ViewProps; hidden: bool?; style: string?; navColor: string? }
 /**
- * Controls the OS status bar (a host-global directive, like RN's StatusBar). Renders
- * nothing — put it anywhere in a screen. `hidden` hides the bar (fullscreen media);
- * `style` forces the content color: "light" (white text, for a dark header), "dark"
- * (dark text), or omit to follow the app theme automatically. `color` sets the bar's
- * background (a hex string, e.g. tk("primary")); on iOS it fills the top safe area,
- * on Android it sets the OS status-bar color.
+ * Controls the OS status bar (a host-global directive). Renders nothing: put it
+ * anywhere in a screen. `hidden` hides the bar (fullscreen media); `style` forces the
+ * content color: "light" (white text, for a dark header), "dark" (dark text), or omit
+ * to follow the app theme automatically. `color` sets the bar's background (a hex
+ * string, e.g. tk("primary")); on iOS it fills the top safe area, on Android it sets
+ * the OS status-bar color.
  *
  * Props: `hidden` (bool, default false), `style` ("light" | "dark", default auto),
  * `color` (hex, default none).
@@ -1151,7 +1153,6 @@ export function Progress(p: ProgressProps): Node {
  * StatusBar({ style: "light", color: tk("primary") })
  * ```
  */
-dataType StatusBarProps { ViewProps; hidden: bool?; style: string?; navColor: string? }
 export function StatusBar(p: StatusBarProps): Node {
     const s: Style = new Style()
     s.sbHide = pvB(p, "hidden", false) ? 1 : 0
@@ -1161,6 +1162,7 @@ export function StatusBar(p: StatusBarProps): Node {
     s.w = 0; s.h = 0
     return mkStatusBar(s)
 }
+dataType ModalProps { ViewProps; visible: bool?; position: string?; onDismiss: (function(): void)? }
 /**
  * A modal overlay: `kids` render on top of everything, over a dimmed scrim, when
  * `visible`. Tapping the scrim fires `onDismiss`. `position` centers the content
@@ -1177,7 +1179,6 @@ export function StatusBar(p: StatusBarProps): Node {
  * ])
  * ```
  */
-dataType ModalProps { ViewProps; visible: bool?; position: string?; onDismiss: (function(): void)? }
 export function Modal(first: ModalProps | []Node, kids: []Node = []): Node {
     if (typeof(first) == "array") { return Modal({}, first) }   // content-only (hidden until visible)
     const p: ModalProps = first
@@ -1190,6 +1191,13 @@ export function Modal(first: ModalProps | []Node, kids: []Node = []): Node {
     const od: any = p["onDismiss"]           // scrim tap fires onDismiss (wired as onPress)
     if (od != null) { n.onPress = od }
     return n
+}
+dataType AlertProps {
+    visible: bool?; title: string?; message: string?;
+    confirmText: string?; cancelText: string?; destructive: bool?;
+    buttons: string?; prompt: bool?; placeholder: string?; promptValue: string?;
+    onConfirm: (function(): void)?; onCancel: (function(): void)?;
+    onButton: (function(v: string): void)?; onSubmit: (function(v: string): void)?;
 }
 /**
  * A NATIVE alert / confirm dialog (UIAlertController / SwiftUI .alert / AlertDialog).
@@ -1218,13 +1226,6 @@ export function Modal(first: ModalProps | []Node, kids: []Node = []): Node {
  *         onCancel:  function(): void { confirming.set(false) } })
  * ```
  */
-dataType AlertProps {
-    visible: bool?; title: string?; message: string?;
-    confirmText: string?; cancelText: string?; destructive: bool?;
-    buttons: string?; prompt: bool?; placeholder: string?; promptValue: string?;
-    onConfirm: (function(): void)?; onCancel: (function(): void)?;
-    onButton: (function(v: string): void)?; onSubmit: (function(v: string): void)?;
-}
 export function Alert(p: AlertProps): Node {
     const s: Style = new Style()
     s.avis = pvB(p, "visible", false) ? 1 : 0
@@ -1279,6 +1280,21 @@ function routeAlert(v: string, ob: any, oc: any, ox: any, os: any, confirmIdx: i
 // Invoke an optional Prop closure (a () -> void callback), if present.
 function callOpt(cb: any): void { if (cb != null) { const f: any = cb; f() } }
 dataType ToggleProps { ViewProps; on: bool?; thumbColor: string?; disabled: bool? }
+/**
+ * A native on/off switch (UISwitch / SwiftUI Toggle / Android Switch/SwitchMaterial).
+ * Controlled: the parent owns `on` and passes it; `onPress` fires when the user flips
+ * it. The host reports the change (dispatch), the parent updates its own state in
+ * onPress, and the re-render syncs the control to that state, so the switch always
+ * reflects Chuks state and never drifts. `bg` is the on-tint (the track color when on);
+ * omit for the platform default.
+ *
+ * Props: `on` (bool), `onPress` (() -> void), `bg` (on-tint hex),
+ *        `thumbColor` (knob color hex), `disabled` (bool: dim + block taps).
+ *
+ * ```chuks
+ * Toggle({ on: enabled, onPress: function(): void { enabled = !enabled }, bg: ACCENT })
+ * ```
+ */
 export function Toggle(p: ToggleProps): Node {
     const s: Style = new Style()
     s.swOn = pvB(p, "on", false) ? 1 : 0
@@ -1289,6 +1305,7 @@ export function Toggle(p: ToggleProps): Node {
     applyEventsV(n, p)
     return n
 }
+dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?; onSlidingComplete: (function(v: string): void)? }
 /**
  * A native value slider (UISlider / SwiftUI Slider / Android SeekBar). Controlled,
  * like Switch: the parent owns `value` and passes it; `onChange` fires with the new
@@ -1305,7 +1322,6 @@ export function Toggle(p: ToggleProps): Node {
  *          onChange: function(v: string): void { vol.set(int(v)) } })
  * ```
  */
-dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?; onSlidingComplete: (function(v: string): void)? }
 export function Slider(p: SliderProps): Node {
     const s: Style = new Style()
     s.slmin = pvI(p, "min", 0)
@@ -1322,6 +1338,7 @@ export function Slider(p: SliderProps): Node {
     if (sc != null) { n.onSlideDone = sc }      // fires once with the final value on release
     return n
 }
+dataType SelectProps { ViewProps; value: int? }
 /**
  * A native select / dropdown (UIButton pull-down menu / SwiftUI Menu / Android
  * PopupMenu). Controlled, like Switch: the parent owns the selected index (`value`)
@@ -1336,7 +1353,6 @@ export function Slider(p: SliderProps): Node {
  *        ["Low", "Medium", "High"])
  * ```
  */
-dataType SelectProps { ViewProps; value: int? }
 export function Select(p: SelectProps, options: []string): Node {
     const s: Style = new Style()
     s.seli = pvI(p, "value", 0)
@@ -1350,6 +1366,7 @@ export function Select(p: SelectProps, options: []string): Node {
     applyEventsV(n, p)                                // onChange(index) fires on pick
     return n
 }
+dataType DatePickerProps { ViewProps; mode: string?; display: string?; value: string? }
 /**
  * A native date / time picker (UIDatePicker .compact / SwiftUI DatePicker / Android
  * DatePickerDialog + TimePickerDialog). Controlled, like Select: the parent owns the
@@ -1372,7 +1389,6 @@ export function Select(p: SelectProps, options: []string): Node {
  *              onChange: function(v: string): void { born.set(v) } })
  * ```
  */
-dataType DatePickerProps { ViewProps; mode: string?; display: string?; value: string? }
 export function DatePicker(p: DatePickerProps): Node {
     const s: Style = new Style()
     s.dpmode = pvS(p, "mode", "date")           // date | time | datetime
@@ -1418,6 +1434,7 @@ export function TimePicker(p: DatePickerProps): Node {
     applyEventsV(n, p)
     return n
 }
+dataType MenuProps { ViewProps; label: string? }
 /**
  * A native menu button (UIButton pull-down / SwiftUI Menu / Android PopupMenu). Unlike
  * Select there is no persistent selection: it shows a fixed `label` and its `items` are
@@ -1432,7 +1449,6 @@ export function TimePicker(p: DatePickerProps): Node {
  *      ["Share", "Rename", "Delete"])
  * ```
  */
-dataType MenuProps { ViewProps; label: string? }
 export function Menu(p: MenuProps, items: []string): Node {
     const s: Style = new Style()
     s.h = pvI(p, "h", 44)
@@ -1464,6 +1480,7 @@ export function ContextMenu(p: ViewProps, items: []string, kids: []Node): Node {
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
+dataType GridProps { ViewProps; cols: int? }
 /**
  * A grid: lays `items` into `cols` equal-width columns with `gap` between cells and
  * rows. Composed from Row/Column/View, so it works on every engine with no host code.
@@ -1478,7 +1495,6 @@ export function ContextMenu(p: ViewProps, items: []string, kids: []Node): Node {
  * Grid({ cols: 3, gap: 10 }, [ tileA, tileB, tileC, tileD, tileE ])
  * ```
  */
-dataType GridProps { ViewProps; cols: int? }
 export function Grid(first: GridProps | []Node, items: []Node = []): Node {
     if (typeof(first) == "array") { return Grid({}, first) }   // content-only: `Grid([...])`
     const p: GridProps = first
@@ -1504,6 +1520,7 @@ export function Grid(first: GridProps | []Node, items: []Node = []): Node {
     const s: Style = new Style(); s.dir = "col"; applyLayoutV(s, p); s.gap = gap
     return mkView(s, rows)
 }
+dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string?; path: string? }
 /**
  * A native map centered on a coordinate. iOS renders a real `MKMapView` (MapKit, no
  * API key); Android renders an interactive OpenStreetMap in a web view (a native Google
@@ -1516,7 +1533,6 @@ export function Grid(first: GridProps | []Node, items: []Node = []): Node {
  * Map({ lat: "37.7749", lng: "-122.4194", zoom: "12", grow: 1 })
  * ```
  */
-dataType MapProps { ViewProps; lat: string?; lng: string?; zoom: string?; path: string? }
 export function Map(p: MapProps): Node {
     const s: Style = new Style()
     s.radius = pvI(p, "radius", 0)
@@ -1547,22 +1563,22 @@ dataType ShapeProps {
 /** A rectangle. Props: `x`, `y`, `w`, `h`, `fill`, `stroke`, `strokeWidth`, `radius`. */
 export function Rect(p: ShapeProps): string {
     return "rect," + si(p, "x") + "," + si(p, "y") + "," + si(p, "w") + "," + si(p, "h") + "," +
-        pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth") + "," + si(p, "radius")
+    pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth") + "," + si(p, "radius")
 }
 /** A circle. Props: `cx`, `cy`, `r`, `fill`, `stroke`, `strokeWidth`. */
 export function Circle(p: ShapeProps): string {
     return "circle," + si(p, "cx") + "," + si(p, "cy") + "," + si(p, "r") + "," +
-        pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
+    pvS(p, "fill", "") + "," + pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
 }
 /** A line. Props: `x1`, `y1`, `x2`, `y2`, `stroke`, `strokeWidth`. */
 export function Line(p: ShapeProps): string {
     return "line," + si(p, "x1") + "," + si(p, "y1") + "," + si(p, "x2") + "," + si(p, "y2") + "," +
-        pvS(p, "stroke", "") + "," + string(pvI(p, "strokeWidth", 1))
+    pvS(p, "stroke", "") + "," + string(pvI(p, "strokeWidth", 1))
 }
 /** An SVG path (M / L / Z subset). Props: `d` (path data), `fill`, `stroke`, `strokeWidth`. */
 export function Path(p: ShapeProps): string {
     return "path," + pvS(p, "d", "") + "," + pvS(p, "fill", "") + "," +
-        pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
+    pvS(p, "stroke", "") + "," + si(p, "strokeWidth")
 }
 /**
  * A native drawing surface. Renders a list of vector shapes (Rect / Circle / Line /
@@ -1588,12 +1604,17 @@ export function Canvas(first: ViewProps | []string, shapes: []string = []): Node
     applyLayoutV(s, p)
     return new Node("Canvas", s, shapes.join(";"), [])   // shapes joined in the text channel
 }
+dataType GestureProps {
+    ViewProps;
+    onGesture: (function(v: string): void)?; onPan: (function(v: string): void)?;
+    onPinch: (function(v: string): void)?; onRotate: (function(v: string): void)?;
+}
 /**
  * Recognizes gestures beyond a tap on its children and reports them through one
  * `onGesture(g)` callback. `g` is an encoded string the host dispatches: "swipe:left",
  * "swipe:right", "swipe:up", "swipe:down", "doubletap", or "longpress". Native
  * recognizers on each engine (UISwipe/UITap/UILongPress, SwiftUI gestures, Android
- * GestureDetector), so each fires once — no per-frame round-trip.
+ * GestureDetector), so each fires once, with no per-frame round-trip.
  *
  * ```chuks
  * Gesture({ onGesture: function(g: string): void {
@@ -1602,11 +1623,6 @@ export function Canvas(first: ViewProps | []string, shapes: []string = []): Node
  * } }, [ card ])
  * ```
  */
-dataType GestureProps {
-    ViewProps;
-    onGesture: (function(v: string): void)?; onPan: (function(v: string): void)?;
-    onPinch: (function(v: string): void)?; onRotate: (function(v: string): void)?;
-}
 export function Gesture(first: GestureProps | []Node, kids: []Node = []): Node {
     if (typeof(first) == "array") { return Gesture({}, first) }   // content-only (no recognizers)
     const p: GestureProps = first
@@ -1668,6 +1684,8 @@ export class RotateEvent {
     var vdeg: int
     constructor() { this.phase = 0; this.deg = 0; this.vdeg = 0 }
 }
+// Split the part of an encoded gesture value after the first ":" into its comma-separated
+// fields (e.g. "pan:1,4,5" -> ["1","4","5"]); returns [] when there is no ":".
 function _afterColon(v: string): []string {
     const ci: int = v.indexOf(":")
     if (ci < 0) { return [] }
@@ -2058,6 +2076,8 @@ export class Reconciler {
             this.mountNode(n.kids[i], id + "." + string(i), id, i)
         }
     }
+    // Diff `prev` against `next` at tree position `id` and emit the minimal mutation
+    // stream (mount when prev is null, else patch style/text/children in place).
     public reconcile(prev: Node?, next: Node, id: string, parent: string, index: int): void {
         if (prev == null) { this.mountNode(next, id, parent, index); return }
         const p: Node = prev
@@ -2596,6 +2616,7 @@ var HOST: App? = null
 class AsyncQueue {
     var _q: []function(): void
     constructor() { this._q = [] }
+    // Queue a closure to run on the render thread, then wake the host so it runs within a frame.
     public post(fn: function(): void): void {
         lock (this) { this._q.push(fn) }
         wakeHost()
@@ -2608,6 +2629,7 @@ class AsyncQueue {
         lock (this) { out = this._q; this._q = [] }
         return out
     }
+    // The number of closures currently queued (read under the lock).
     public pending(): int { var n: int = 0; lock (this) { n = this._q.length }; return n }
 }
 
@@ -2640,6 +2662,8 @@ function wakeHost(): void { host.wake() }
 // values still animating. When that count crosses 0<->N, App.tick emits FA|1 / FA|0 so
 // the host runs its display-link only while physics is live.
 var _frameStepper: any = null
+// Register the per-frame animation stepper (called once by core/animated.chuks). See the
+// note on _frameStepper above for how App.tick drives the host display-link from it.
 export function setFrameStepper(fn: any): void { _frameStepper = fn }
 
 export class App {
@@ -2665,7 +2689,9 @@ export class App {
     // module state (osIsDark(), platformOS(), safeTop()/… ) that the app can read on
     // the next render; the host triggers that render via mount/tick/setViewport.
     public setColorScheme(dark: int): void { setOsColorScheme(dark) }
+    // Host reports the platform: OS name, version, device model, and tablet flag.
     public setPlatform(os: string, ver: string, model: string, tablet: int): void { setPlatformInfo(os, ver, model, tablet == 1) }
+    // Host reports the safe-area insets (top, right, bottom, left) in points.
     public setInsets(t: int, r: int, b: int, l: int): void { setSafeInsets(t, r, b, l) }
     // Render the tree and emit the initial mutation stream. Returns mutation count.
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
@@ -2742,6 +2768,7 @@ export class App {
 export class NativeSub {
     var token: string
     constructor(token: string) { this.token = token }
+    // Drop the callback and tell the host to tear down the native op/subscription.
     public cancel(): void { const h: App? = HOST; if (h != null) { h.recon.cancelStream(this.token) } }
 }
 
