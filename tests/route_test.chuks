@@ -327,6 +327,65 @@ function main(): void {
     check(SEC_ROWS.length > 0, "it mounts rows after the scroll, got " + string(SEC_ROWS.length))
     check(lowest > 80, "and they are the rows for where it was scrolled to, first " + string(lowest))
 
+    // 14. A REMEMBERED OFFSET MUST NOT OUTLIVE THE CONTENT. Scroll a long list, then
+    //     come back to it holding far fewer rows: windowing at the old offset would
+    //     land past the end and show nothing at all.
+    var shrink: int = 300
+    var sk: map[string]function(r: Route): Node = {}
+    sk["s"] = function(_: Route): Node {
+        return Column({ dir: "col", grow: 1 }, [
+            List({ count: shrink, rowHeight: 60,
+                   key:  function(i: int): string { return "k" + string(i) },
+                   item: function(i: int, top: int): Node {
+                       SEC_ROWS.push(i)
+                       return Row({ abs: true, top: top, left: 0, right: 0, h: 60 }, [ Text({}, "r" + string(i)) ]) } }),
+        ])
+    }
+    const nv9: NavStack = new NavStack(sk, "s")
+    const rc9: Reconciler = new Reconciler()
+    rc9.setViewport(0, 600, 400)
+    rc9.begin(); rc9.renderRoot(nv9.render())
+    rc9.setViewport(15000, 600, 400)                  // scrolled deep into 300 rows
+    rc9.begin(); rc9.renderRoot(nv9.render())
+    shrink = 3                                        // now the list holds three rows
+    var sr9: []int = []; SEC_ROWS = sr9
+    rc9.begin(); rc9.renderRoot(nv9.render())
+    check(SEC_ROWS.length > 0, "a shrunken list still mounts its rows, got " + string(SEC_ROWS.length))
+    var low9: int = 99999
+    for (var z: int = 0; z < SEC_ROWS.length; z = z + 1) { if (SEC_ROWS[z] < low9) { low9 = SEC_ROWS[z] } }
+    check(low9 == 0, "and starts from the top, first row " + string(low9))
+
+    // 15. THE SAME FOR A SECTION LIST, which is where it actually bites: a plain List
+    //     clamps its window into range on its own, but a section list scans section
+    //     ranges, so an offset past the end matches NOTHING and the screen is blank.
+    var secN: int = 200
+    var sq: map[string]function(r: Route): Node = {}
+    sq["s"] = function(_: Route): Node {
+        return Column({ dir: "col", grow: 1 }, [
+            SectionList({ sectionCount: 1,
+                rows:   function(sx: int): int { return secN },
+                header: function(sx: int, top: int): Node { return Row({ abs: true, top: top, left: 0, right: 0, h: 30 }, [ Text({}, "H") ]) },
+                item:   function(sx: int, r: int, top: int): Node {
+                            SEC_ROWS.push(r)
+                            return Row({ abs: true, top: top, left: 0, right: 0, h: 60 }, [ Text({}, "s" + string(r)) ]) },
+                key:    function(sx: int, r: int): string { return "s" + string(r) },
+                rowHeight: 60, headerHeight: 30 }),
+        ])
+    }
+    const nvA: NavStack = new NavStack(sq, "s")
+    const rcA: Reconciler = new Reconciler()
+    rcA.setViewport(0, 600, 400)
+    rcA.begin(); rcA.renderRoot(nvA.render())
+    rcA.setViewport(9000, 600, 400)                   // scrolled deep into 200 rows
+    rcA.begin(); rcA.renderRoot(nvA.render())
+    secN = 4                                          // the list now holds four rows
+    var srA: []int = []; SEC_ROWS = srA
+    rcA.begin(); rcA.renderRoot(nvA.render())
+    check(SEC_ROWS.length > 0, "a shrunken SECTION list still mounts rows, got " + string(SEC_ROWS.length))
+    var lowA: int = 99999
+    for (var y: int = 0; y < SEC_ROWS.length; y = y + 1) { if (SEC_ROWS[y] < lowA) { lowA = SEC_ROWS[y] } }
+    check(lowA == 0, "and starts from the top, first row " + string(lowA))
+
     println("route_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "route_test failed" }
 }

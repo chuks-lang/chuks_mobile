@@ -2362,6 +2362,15 @@ export class Reconciler {
             st.count = count; st.contentH = contentH
         }
 
+        // A remembered offset is only valid against the content it was taken from. The
+        // list may be shorter now (fewer rows, a filter applied, a fetch that returned
+        // less), and windowing at a stale offset lands PAST THE END: no rows mount and
+        // the screen reads as blank, or as a list missing everything above the fold.
+        // The host clamps its own scroll the same way.
+        const maxTop: int = contentH - this.vpH > 0 ? contentH - this.vpH : 0
+        if (st.top > maxTop) { st.top = maxTop }
+        if (st.top < 0) { st.top = 0 }
+
         // Which rows fall in the viewport (± buffer). Inverted flips the mapping: top
         // decreases as r grows, so the near/far viewport edges swap which r they bound.
         // Window on GRID ROWS (each holds `ncol` cells), then expand to item ranks. For a plain
@@ -2748,12 +2757,18 @@ export class Reconciler {
 
         // total content height (uniform cells, so a single pass over sections)
         var total: int = pad
+        var totalRows: int = 0
         for (var s0: int = 0; s0 < sectionCount; s0 = s0 + 1) {
             const nr0: int = int(rowsFn(s0))
+            totalRows = totalRows + nr0
             total = total + headerH + nr0 * stride
         }
         total = total + pad
-        const contentH: int = total
+        // Nothing to show: give the empty state the viewport to fill, the way a plain
+        // List does. Without this a sectioned list with no sections rendered LITERALLY
+        // NOTHING -- a blank screen where the app had asked for an empty state, which is
+        // what a list looks like before its first fetch lands or after one fails.
+        const contentH: int = totalRows == 0 ? this.vpH : total
 
         if (prev == null) {
             st.reset()
@@ -2770,6 +2785,24 @@ export class Reconciler {
             const cS: Style = new Style(); cS.h = contentH
             this.emit("S|" + contentId + "|" + cS.str())
             st.count = contentH
+        }
+
+        // Same clamp as the plain list: a remembered offset must not survive the content
+        // getting shorter, or the window lands past the end and the screen looks blank.
+        const maxTop2: int = contentH - this.vpH > 0 ? contentH - this.vpH : 0
+        if (st.top > maxTop2) { st.top = maxTop2 }
+        if (st.top < 0) { st.top = 0 }
+
+        // empty state: same contract as List's.
+        const emptyFn: any = d.get("empty")
+        const emptyId: string = contentId + ".empty"
+        if (totalRows == 0 && emptyFn != null) {
+            const enode: Node = emptyFn(this.vpH)
+            const pe: Node? = st.itemNodes.get(emptyId)
+            this.reconcile(pe, enode, emptyId, contentId, 0)
+            st.itemNodes[emptyId] = enode
+        } else if (st.itemNodes.has(emptyId)) {
+            this.emit("R|" + emptyId); st.itemNodes.delete(emptyId)
         }
 
         const vpLo: int = st.top - buffer * stride
