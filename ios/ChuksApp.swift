@@ -2077,6 +2077,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
+            // LV|<id>: the engine names the LIVE list, i.e. the one on the screen that is
+            // on top. Several screens are mounted at once, so "the most recently created
+            // scroll view" is the wrong guess: the covered screen's list would receive the
+            // viewport reports and scroll itself. An empty id means the top screen has no
+            // list, and the viewport is the plain root.
+            case "LV":
+                let lid = f.count >= 2 ? f[1] : ""
+                if lid.isEmpty { listScroll = nil; scrollId = ""; contentId = "" }
+                else if let sc = views[lid] as? UIScrollView {
+                    listScroll = sc; scrollId = lid; contentId = lid + ".0"
+                    listHoriz = (sc.contentSize.width > sc.bounds.width && sc.contentSize.height <= sc.bounds.height)
+                }
             case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             case "X" where f.count >= 3:
                 // Async host->engine command: X|token|capability|args. Run AFTER this
@@ -3024,7 +3036,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // (overflowing) size along the scroll axis instead of being clamped to the scroll's
             // own bounds. Without this, the content's top/bottom become unreachable.
             YGNodeStyleSetOverflow(n, YGOverflow.scroll)
-            listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll"); v = sc   // horiz confirmed by the style too
+            // NB: creation does NOT make this the live list any more -- the engine says
+            // which one is live with LV|, since several screens can be mounted at once.
+            if listScroll == nil { listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll") }
+            v = sc
         case "Modal":
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
             mv.isHidden = true                     // shown when mvis=1

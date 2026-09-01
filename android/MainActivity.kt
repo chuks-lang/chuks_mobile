@@ -573,6 +573,14 @@ class MainActivity : Activity() {
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
+                // LV|<id>: the engine names the LIVE list (the one on the top screen).
+                // With several screens mounted, "most recently created scroll" is wrong:
+                // a covered screen's list would take the viewport reports and scroll.
+                "LV" -> {
+                    val lid = if (f.size >= 2) f[1] else ""
+                    if (lid.isEmpty()) { listScroll = null; scrollId = ""; contentId = "" }
+                    else (views[lid] as? FrameLayout)?.let { sc -> listScroll = sc; scrollId = lid; contentId = "$lid.0" }
+                }
                 "FA" -> if (f.size >= 2) setFrameDriver(f[1] == "1")   // per-frame physics on/off
                 "X" -> if (f.size >= 3) {
                     // Async host->engine command: X|token|capability|args. Run AFTER this
@@ -1915,13 +1923,13 @@ class MainActivity : Activity() {
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
-                listScroll = sc; scrollId = id; listHoriz = false }
+                if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = false } }
             "HScroll" -> SnapHScrollView(this).also { sc ->   // horizontal list (carousel); snaps when paging=1
                 N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full width
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
-                listScroll = sc; scrollId = id; listHoriz = true }
+                if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = true } }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
                 it.setBackgroundColor(Color.argb(128, 0, 0, 0))
                 it.visibility = View.GONE                // shown when mvis=1

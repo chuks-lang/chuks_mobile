@@ -41,6 +41,21 @@ function screen(r: Route): Node {
     return Text({}, "club " + SEEN_ID)
 }
 
+// Two screens that each own a long list, recording the FIRST row each pass builds, so a
+// test can see where each list is windowed.
+var FIRST_ROW: map[string]int = {}
+function listScreen(r: Route): Node {
+    const who: string = r.str("who", "?")
+    return Column({ dir: "col", grow: 1 }, [
+        List({ count: 300, rowHeight: 60,
+               key:  function(i: int): string { return who + "-" + string(i) },
+               item: function(i: int, top: int): Node {
+                   if (!FIRST_ROW.has(who) || i < FIRST_ROW.getOr(who, 999999)) { FIRST_ROW[who] = i }
+                   return Row({ abs: true, top: top, left: 0, right: 0, h: 60 }, [ Text({}, who + string(i)) ])
+               } }),
+    ])
+}
+
 var DEEP_CELL: Cell<int>? = null
 var DEEP_SEEN: int = -1
 var DEEP_STATE: any = 0
@@ -213,6 +228,46 @@ function main(): void {
     check(ok, "every level revealed by a pop is the right one, with its state")
     check(noChurn, "no mutation churn while unwinding the stack")
     check(nv5.depth() == 1, "back at the root, got depth " + string(nv5.depth()))
+
+    // 10. A COVERED LIST KEEPS ITS OWN POSITION. The host reports one viewport, for the
+    //     list on screen; without routing that to the right list, a covered screen's list
+    //     would follow the visible one's scrolling and mount rows for a place it is not at.
+    var lr: map[string]function(r: Route): Node = {}
+    lr["scr"] = listScreen
+    const nv6: NavStack = new NavStack(lr, "scr")
+    const rc6: Reconciler = new Reconciler()
+    rc6.setViewport(0, 600, 400)
+    var f0: map[string]int = {}; FIRST_ROW = f0
+    rc6.begin(); rc6.renderRoot(nv6.render())          // one screen, at the top
+    nv6.push("scr", { "who": "B" }, null)              // B over A (A has who="?")
+    rc6.begin(); rc6.renderRoot(nv6.render())
+    rc6.setViewport(6000, 600, 400)                    // the user scrolls B a long way down
+    var f1: map[string]int = {}; FIRST_ROW = f1
+    rc6.begin(); rc6.renderRoot(nv6.render())
+    check(FIRST_ROW.getOr("B", -1) > 80, "the visible list follows the scroll, first row " + string(FIRST_ROW.getOr("B", -1)))
+    check(FIRST_ROW.getOr("?", -1) == 0, "the covered list stays where it was, first row " + string(FIRST_ROW.getOr("?", -1)))
+
+    // 11. A RELEASED SCREEN COMES BACK WHERE YOU LEFT IT. Push far enough that the
+    //     scrolled screen falls out of the live window and is released, then pop back:
+    //     it re-mounts windowed at its old position, and asks the host to set the same
+    //     offset without animation. That lands while the screen is still covered, which
+    //     is why the position is never seen being restored.
+    nv6.push("scr", { "who": "C" }, null)
+    rc6.begin(); rc6.renderRoot(nv6.render())
+    nv6.push("scr", { "who": "D" }, null)              // now B is third from the top: released
+    rc6.begin(); rc6.renderRoot(nv6.render())
+    // Popping to C re-mounts B UNDERNEATH it -- one gesture before B could be revealed.
+    nv6.popStack(null)
+    var f2: map[string]int = {}; FIRST_ROW = f2
+    rc6.begin(); rc6.renderRoot(nv6.render())
+    const restored: string = rc6.drain()
+    check(FIRST_ROW.getOr("B", -1) > 80, "the re-mounted list windows at its old position, first row " + string(FIRST_ROW.getOr("B", -1)))
+    check(has(restored, "LS|"), "the host is asked to restore the offset, while the screen is still covered")
+    // And by the time it IS revealed, nothing further is needed: no second restore, no jump.
+    nv6.popStack(null)
+    rc6.begin(); rc6.renderRoot(nv6.render())
+    const revealed: string = rc6.drain()
+    check(!has(revealed, "LS|"), "revealing it asks for no further scrolling")
 
     println("route_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "route_test failed" }

@@ -1906,6 +1906,12 @@ export class Reconciler {
     // WITHOUT re-rendering the app. Cleared by every renderRoot and set again by
     // reconcileList, so it is null whenever the current screen has no List.
     var lastList: Node?
+    // The node-id prefix of the screen ON TOP. Several screens are mounted at once (the
+    // navigator keeps the one a back gesture would reveal), and only the top screen's
+    // list is the one the user is scrolling: without this, a list on a COVERED screen
+    // would claim the viewport, and the host's scroll reports would move it.
+    var topScope: string
+    var liveListId: string          // the list the host is currently reporting scroll for
     var lastListId: string
     var lastListParent: string
     var lastListIndex: int
@@ -1935,6 +1941,7 @@ export class Reconciler {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
         this.lastList = null; this.lastListId = ""; this.lastListParent = ""; this.lastListIndex = 0
+        this.topScope = ""; this.liveListId = ""
         this.lists = {}
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
         this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
@@ -1960,7 +1967,13 @@ export class Reconciler {
     // Join the buffered mutations into the newline-delimited stream the host applies.
     public drain(): string { return this.lines.join("\n") }
     // Record the visible scroll window used by reconcileList to pick the mount range.
-    public setViewport(top: int, h: int, w: int): void { this.vpTop = top; this.vpH = h; if (w > 0) { this.vpW = w } }
+    public setViewport(top: int, h: int, w: int): void {
+        this.vpTop = top; this.vpH = h; if (w > 0) { this.vpW = w }
+        // The host reports the scroll of the list ON SCREEN, which is the last one
+        // rendered (screens render bottom-up, so the top screen's list is last). Record
+        // it there, so a covered list is not dragged along by the visible one's scrolling.
+        if (this.lastListId != "") { this.listOf(this.lastListId + ".0").top = top }
+    }
     // Fire any onVisible callbacks queued during this render (a paging List's centered row
     // changed). Called AFTER renderRoot so the closures can setState safely; returns true if
     // any fired, so the caller re-renders to reflect the new state (e.g. play the settled cell).
@@ -1978,7 +1991,17 @@ export class Reconciler {
         this.lastList = null                     // re-set by reconcileList if this tree has one
         this.reconcile(this.rootPrev, next, "app", "root", 0)
         this.rootPrev = next
+        // Tell the host WHICH scroll is the live one, so its viewport reports and ours
+        // mean the same list. It used to infer that from whichever scroll view was
+        // created most recently, which is the wrong one as soon as two screens are up.
+        if (this.lastListId != this.liveListId) {
+            this.liveListId = this.lastListId
+            this.emit("LV|" + this.liveListId)
+        }
     }
+    // The navigator names the screen on top (its container's node id); "" means no
+    // navigator, in which case any list may claim the viewport as before.
+    public setTopScope(p: string): void { this.topScope = p }
 
     // Re-window the mounted List for the current viewport, without re-rendering the app.
     // A scroll changes WHICH rows are mounted, nothing else: the tree the app would
@@ -2258,8 +2281,12 @@ export class Reconciler {
     // rest. Item identity comes from key(rank), so a row survives when a filter
     // moves it to a different rank (its id "c<key>" is stable, only its top moves).
     reconcileList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
-        // Remember it so a viewport change can come straight back here (see rewindow).
-        this.lastList = next; this.lastListId = id; this.lastListParent = parent; this.lastListIndex = index
+        // Remember it so a viewport change can come straight back here (see rewindow) --
+        // but only when it belongs to the screen on top. A covered screen's list must not
+        // claim the viewport, or the host's scroll reports would drag it along.
+        if (this.topScope == "" || _prefix(id, this.topScope)) {
+            this.lastList = next; this.lastListId = id; this.lastListParent = parent; this.lastListIndex = index
+        }
         const d0: map[string]ListProp = next.data
         if (lpBool(d0, "horizontal", false)) { this.reconcileHList(prev, next, id, parent, index); return }
         const d: map[string]ListProp = next.data
@@ -2305,6 +2332,13 @@ export class Reconciler {
             this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
             this.emit("I|" + contentId + "|" + id + "|0")
             st.count = count; st.contentH = contentH
+            // A list this screen had before: put it back where it was. The window above
+            // is already computed from st.top, so the right rows mount straight away
+            // rather than mounting row 0 and correcting once the host reports a scroll.
+            // This lands while the screen is still COVERED (a route mounts one gesture
+            // before it can be revealed), so it is never seen as a jump; the host sets
+            // the offset without animation.
+            if (st.top > 0) { this.emit("LS|" + id + "|" + string(st.top)) }
         } else if (contentH != st.contentH) {   // count, header, or footer changed the height
             const cS: Style = new Style(); cS.h = contentH
             this.emit("S|" + contentId + "|" + cS.str())
@@ -2326,11 +2360,11 @@ export class Reconciler {
         var gr0: int = 0
         var gr1: int = 0
         if (inverted) {
-            gr0 = (invBase - (this.vpTop + this.vpH)) / stride - buffer
-            gr1 = (invBase - this.vpTop) / stride + buffer + 1
+            gr0 = (invBase - (st.top + this.vpH)) / stride - buffer
+            gr1 = (invBase - st.top) / stride + buffer + 1
         } else {
-            gr0 = (this.vpTop - rowsTop) / stride - buffer
-            gr1 = (this.vpTop + this.vpH - rowsTop) / stride + buffer + 1
+            gr0 = (st.top - rowsTop) / stride - buffer
+            gr1 = (st.top + this.vpH - rowsTop) / stride + buffer + 1
         }
         if (gr0 < 0) { gr0 = 0 }
         if (gr1 > gridRows) { gr1 = gridRows }
@@ -2441,7 +2475,7 @@ export class Reconciler {
         // inline, so the closure's setState runs after this render (see flushVisible).
         const vf: any = d.get("onVisible")
         if (vf != null && count > 0 && stride > 0) {
-            var centered: int = inverted ? (invBase - (this.vpTop + this.vpH / 2)) / stride : (this.vpTop + this.vpH / 2 - rowsTop) / stride
+            var centered: int = inverted ? (invBase - (st.top + this.vpH / 2)) / stride : (st.top + this.vpH / 2 - rowsTop) / stride
             if (centered < 0) { centered = 0 }
             if (centered >= count) { centered = count - 1 }
             if (centered != this.listVisible.getOr(id, -1)) {
@@ -2460,7 +2494,7 @@ export class Reconciler {
             // The "end" is the far edge of the data: the bottom row normally, or the TOP row
             // when inverted (a chat scrolling up to load older messages). In a grid the last
             // visible GRID ROW covers up to `ncol` ranks, so convert to the last visible rank.
-            const lastGridRow: int = inverted ? (invBase - this.vpTop) / stride : (this.vpTop + this.vpH - rowsTop) / stride
+            const lastGridRow: int = inverted ? (invBase - st.top) / stride : (st.top + this.vpH - rowsTop) / stride
             const lastVisible: int = ncol > 1 ? (lastGridRow + 1) * ncol - 1 : lastGridRow
             if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
                 this.listEndFired[id] = count
@@ -2544,9 +2578,9 @@ export class Reconciler {
         // a parallax header, a scroll-to-top button, etc. Queued like onVisible (fired after
         // render); opt-in, so a list without onScroll pays nothing.
         const osf: any = d.get("onScroll")
-        if (osf != null && this.vpTop != this.listScrollPos.getOr(id, -1)) {
-            this.listScrollPos[id] = this.vpTop
-            const off: int = this.vpTop
+        if (osf != null && st.top != this.listScrollPos.getOr(id, -1)) {
+            this.listScrollPos[id] = st.top
+            const off: int = st.top
             this.pendingVisible.push(function(): void { osf(off) })
         }
     }
@@ -2591,9 +2625,9 @@ export class Reconciler {
 
         // Windowing runs along the X axis: vpTop is the scroll's x-offset and vpW the
         // viewport WIDTH (the host reports true width/height; it does not swap them).
-        var c0: int = (this.vpTop - leftStart) / stride - buffer
+        var c0: int = (st.top - leftStart) / stride - buffer
         if (c0 < 0) { c0 = 0 }
-        var c1: int = (this.vpTop + this.vpW - leftStart) / stride + buffer + 1
+        var c1: int = (st.top + this.vpW - leftStart) / stride + buffer + 1
         if (c1 > count) { c1 = count }
         if (c1 < c0) { c1 = c0 }
 
@@ -2627,7 +2661,7 @@ export class Reconciler {
         // onVisible: the item under the horizontal center.
         const vf: any = d.get("onVisible")
         if (vf != null && count > 0 && stride > 0) {
-            var centered: int = (this.vpTop + this.vpH / 2 - leftStart) / stride
+            var centered: int = (st.top + this.vpH / 2 - leftStart) / stride
             if (centered < 0) { centered = 0 }
             if (centered >= count) { centered = count - 1 }
             if (centered != this.listVisible.getOr(id, -1)) {
@@ -2640,7 +2674,7 @@ export class Reconciler {
         const ef: any = d.get("onEndReached")
         if (ef != null && count > 0 && stride > 0) {
             const threshold: int = lpInt(d, "endThreshold", 0)
-            const lastVisible: int = (this.vpTop + this.vpH - leftStart) / stride
+            const lastVisible: int = (st.top + this.vpH - leftStart) / stride
             if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
                 this.listEndFired[id] = count
                 this.pendingVisible.push(function(): void { ef() })
@@ -2661,9 +2695,9 @@ export class Reconciler {
         }
         // onScroll: report the x offset when it changes.
         const osf: any = d.get("onScroll")
-        if (osf != null && this.vpTop != this.listScrollPos.getOr(id, -1)) {
-            this.listScrollPos[id] = this.vpTop
-            const off: int = this.vpTop
+        if (osf != null && st.top != this.listScrollPos.getOr(id, -1)) {
+            this.listScrollPos[id] = st.top
+            const off: int = st.top
             this.pendingVisible.push(function(): void { osf(off) })
         }
     }
@@ -2712,8 +2746,8 @@ export class Reconciler {
             st.count = contentH
         }
 
-        const vpLo: int = this.vpTop - buffer * stride
-        const vpHi: int = this.vpTop + this.vpH + buffer * stride
+        const vpLo: int = st.top - buffer * stride
+        const vpHi: int = st.top + this.vpH + buffer * stride
         const desired: []string = []
 
         var off: int = pad
@@ -3166,11 +3200,18 @@ class ListState {
     var cellIds: []string           // pool slot -> its cell id, built once instead of per frame
     var lastWinRange: int           // r0*100000+r1 of the last window, to skip unchanged passes
     var poolSize: int               // how many pool cells have been created
+    // Where THIS list is scrolled. The host reports one viewport, for the list on screen,
+    // so a covered list has to keep its own offset or it would follow the visible list's
+    // scrolling and mount rows for a position it is not at. It also outlives the cells:
+    // a screen released deeper in the stack comes back to the row you left it on.
+    var top: int
     constructor() {
         this.itemNodes = {}; this.mounted = []; this.count = -1; this.contentH = -1
         this.cellRank = {}; this.cellIds = []; this.lastWinRange = -1; this.poolSize = 0
+        this.top = 0
     }
-    // Start over: a fresh mount, so no cell from the previous life is still live.
+    // Start over: a fresh mount, so no cell from the previous life is still live. `top`
+    // deliberately survives -- it is what puts a re-mounted screen back where it was.
     public reset(): void {
         this.itemNodes = {}; this.mounted = []; this.cellRank = {}; this.cellIds = []
         this.poolSize = 0; this.lastWinRange = -1
@@ -3312,6 +3353,8 @@ export class NavStack extends App {
             kids.push(box)
         }
         hookPark(parked)
+        // Name the screen on top, so a list on a covered screen cannot claim the viewport.
+        this.recon.setTopScope("app." + string(n - 1))
         const rs: Style = new Style(); rs.grow = 1; rs.basis = 0
         return new Node("View", rs, "", kids)
     }
