@@ -1988,7 +1988,11 @@ export class Reconciler {
     // Reconcile the whole app tree from the root; the app calls this after any
     // state change and the memoization makes everything unchanged bail.
     public renderRoot(next: Node): void {
-        this.lastList = null                     // re-set by reconcileList if this tree has one
+        // Both cleared: re-set by reconcileList if the screen on top has a List. Leaving
+        // the id behind meant a screen with no list (or with a SectionList, which does not
+        // claim the viewport) kept the PREVIOUS screen's list named as live -- so the host
+        // went on sizing a list that was covered, or destroyed.
+        this.lastList = null; this.lastListId = ""
         this.reconcile(this.rootPrev, next, "app", "root", 0)
         this.rootPrev = next
         // Tell the host WHICH scroll is the live one, so its viewport reports and ours
@@ -2332,6 +2336,12 @@ export class Reconciler {
             this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
             this.emit("I|" + contentId + "|" + id + "|0")
             st.count = count; st.contentH = contentH
+            // This list's scroll view is BRAND NEW, even if its id is one the host has
+            // seen before (pop a screen and open it again and the id comes back with a
+            // different view behind it). The live-list announcement is edge-triggered on
+            // the id, so force it to fire: otherwise the host keeps sizing the destroyed
+            // view and the new list cannot scroll at all.
+            this.liveListId = "?"
             // A list this screen had before: put it back where it was. The window above
             // is already computed from st.top, so the right rows mount straight away
             // rather than mounting row 0 and correcting once the host reports a scroll.

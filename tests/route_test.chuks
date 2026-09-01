@@ -269,6 +269,29 @@ function main(): void {
     const revealed: string = rc6.drain()
     check(!has(revealed, "LS|"), "revealing it asks for no further scrolling")
 
+    // 12. RE-OPENING THE SAME ROUTE RE-ANNOUNCES ITS LIST. The id comes back identical
+    //     but the scroll view behind it is new, so an announcement that only fires when
+    //     the id CHANGES would leave the host sizing a destroyed view -- and the list
+    //     would not scroll at all.
+    // The screen underneath has NO list of its own (like a tab shell whose visible tab
+    // is a SectionList), which is what makes the id come back identical.
+    var lr2: map[string]function(r: Route): Node = {}
+    lr2["plain"] = function(_: Route): Node { return Column({ dir: "col", grow: 1 }, [ Text({}, "no list here") ]) }
+    lr2["scr"] = listScreen
+    const nv7: NavStack = new NavStack(lr2, "plain")
+    const rc7: Reconciler = new Reconciler()
+    rc7.setViewport(0, 600, 400)
+    rc7.begin(); rc7.renderRoot(nv7.render())
+    nv7.push("scr", { "who": "X" }, null)
+    rc7.begin(); rc7.renderRoot(nv7.render())
+    const first: string = rc7.drain()
+    nv7.popStack(null)
+    rc7.begin(); rc7.renderRoot(nv7.render())
+    check(has(rc7.drain(), "LV|"), "popping to a screen with no list clears the live list")
+    nv7.push("scr", { "who": "X" }, null)          // the SAME route again: same id, new view
+    rc7.begin(); rc7.renderRoot(nv7.render())
+    check(has(rc7.drain(), "LV|"), "re-opening the same route re-announces its live list")
+
     println("route_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "route_test failed" }
 }
