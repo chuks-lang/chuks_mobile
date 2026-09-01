@@ -30,8 +30,12 @@ APP_BUILD="$(AJ build)";     APP_BUILD="${APP_BUILD:-1}"
 OUT="$PROJDIR/.chuks/ios-cmr-out"; APP="$OUT/$APPNAME.app"
 rm -rf "$OUT"; mkdir -p "$OUT"; OUTABS="$(cd "$OUT" && pwd)"
 
-# ---- toolchain: booted simulator (default) or a paired device (IOS_TARGET=device) ----
+# ---- toolchain: the simulator (default) or a paired device (IOS_TARGET=device) ----
+# shellcheck source=simulator.sh
+source "$PKGDIR/simulator.sh"
 IOS_TARGET="${IOS_TARGET:-sim}"
+# Boot the simulator up front so it is ready by the time the build finishes.
+[ "$IOS_TARGET" = "device" ] || chuks_ensure_sim || exit 1
 if [ "$IOS_TARGET" = "device" ]; then
     SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"; CLANG="$(xcrun --sdk iphoneos --find clang)"
     TRIPLE="arm64-apple-ios15.0"; CMRLIB="$PKGDIR/cmr/device/libcmr.a"
@@ -103,8 +107,7 @@ $IOS_PLIST_EXTRA
 PLIST
 
 echo "5. Installing + launching (CMR — the VM runs on the device)"
-UDID="$(xcrun simctl list devices | awk -F'[()]' '/Booted/{print $2; exit}')"
-[ -z "$UDID" ] && { echo "no booted simulator"; exit 1; }
+chuks_ensure_sim || exit 1
 xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
 xcrun simctl install "$UDID" "$APP"
 xcrun simctl launch "$UDID" "$BID"

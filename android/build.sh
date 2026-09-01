@@ -19,6 +19,10 @@ BT="$SDK/build-tools/35.0.0"; AJAR="$SDK/platforms/android-35/android.jar"
 BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 CC="$BIN/aarch64-linux-android24-clang"; CXX="$BIN/aarch64-linux-android24-clang++"
 ADB="$SDK/platform-tools/adb"
+# shellcheck source=device.sh
+source "$PKGDIR/device.sh"
+# Start the device/emulator up front so it is ready by the time the build finishes.
+chuks_ensure_device || exit 1
 # App identity from chuks.json: displayName (launcher label), bundleId (applicationId).
 # CODEPKG is the host's fixed Kotlin package; --rename-manifest-package keeps components
 # resolving to it while the app installs under APPID.
@@ -57,7 +61,8 @@ echo "2. Building the Android engine (arm64)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC" CXX="$CXX" \
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" . )
 
-echo "3. Building the Android host${PREVIEW:+ (Chuks Preview)}"
+PREVIEW_LABEL=""; [ "$PREVIEW" = "1" ] && PREVIEW_LABEL=" (Chuks Preview)"
+echo "3. Building the Android host$PREVIEW_LABEL"
 KT_SRC="$PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
 if [ "$PREVIEW" = "1" ]; then
     KT_SRC="$KT_SRC $PKGDIR/ConnectActivity.kt $PKGDIR/ScannerActivity.kt"   # + in-app QR scanner
@@ -114,12 +119,11 @@ mkdir -p "$OUT/assets"
 # emulator reaches the host loopback via 10.0.2.2; a real device reaches the Mac over
 # Wi-Fi at its LAN IP (needs the dev server bound to 0.0.0.0, which it is).
 if [ "${DEV:-0}" = "1" ]; then
-    DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
     case "$DEV_ID" in
         emulator-*) DEV_HOST="10.0.2.2" ;;   # emulator's alias for the host loopback
         *) # Real device: tunnel its localhost to the Mac over the adb (USB) link — no Wi-Fi,
            # LAN IP, or firewall needed. Fall back to the Mac's LAN IP if the tunnel fails.
-           if "$ADB" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then DEV_HOST="localhost"
+           if "$ADB" -s "$DEV_ID" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then DEV_HOST="localhost"
            else DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)"; fi ;;
     esac
     printf '%s:7799' "$DEV_HOST" > "$OUT/assets/chuks-dev.txt"
@@ -144,7 +148,8 @@ done
     || { echo "  Signing failed:"; cat "$OUT/apksigner.log"; exit 1; }
 
 echo "7. Installing + launching"
-"$ADB" install -r "$OUT/chuks.apk" > "$OUT/adb.log" 2>&1 || { echo "  Install failed:"; cat "$OUT/adb.log"; exit 1; }
-"$ADB" shell am force-stop "$PKG" > /dev/null 2>&1 || true
-"$ADB" shell am start -n "$PKG/$CODEPKG.$LAUNCH_ACTIVITY" > /dev/null 2>&1
+chuks_ensure_device || exit 1
+"$ADB" -s "$DEV_ID" install -r "$OUT/chuks.apk" > "$OUT/adb.log" 2>&1 || { echo "  Install failed:"; cat "$OUT/adb.log"; exit 1; }
+"$ADB" -s "$DEV_ID" shell am force-stop "$PKG" > /dev/null 2>&1 || true
+"$ADB" -s "$DEV_ID" shell am start -n "$PKG/$CODEPKG.$LAUNCH_ACTIVITY" > /dev/null 2>&1
 echo "   Done."

@@ -16,7 +16,8 @@ DEVSERVER="../core/devserver.chuks"
 STATE="/tmp/chuks-mobile-state.txt"
 PORT=7799
 BID="com.chuks.dashboard"
-UDID="$(xcrun simctl list devices | awk -F'[()]' '/Booted/{print $2; exit}')"
+source ./simulator.sh   # cwd is this script's dir (cd above)
+chuks_ensure_sim || exit 1
 export CHUKS_NO_WARNINGS=1
 
 sig() { stat -f '%m' "$ENGINE" 2>/dev/null; }

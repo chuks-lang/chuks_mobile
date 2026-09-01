@@ -18,12 +18,16 @@ SDK="$HOME/Library/Android/sdk"; NDK="$SDK/ndk/27.1.12297006"
 BT="$SDK/build-tools/35.0.0"; AJAR="$SDK/platforms/android-35/android.jar"
 BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 ADB="$SDK/platform-tools/adb"
+# shellcheck source=device.sh
+source "$PKGDIR/device.sh"
+# Start the device/emulator up front: it is ready by the time the build finishes,
+# and the ABI probe below reads the real target instead of guessing.
+chuks_ensure_device || exit 1
 # Match the connected device/emulator ABI (arm64 on real phones and Apple-Silicon
 # emulators; x86_64 on emulators run on Intel Mac / Windows / Linux). Override with
 # CMR_ABI. The prebuilt libapp.so + libc++_shared.so are picked for this ABI.
 if [ -n "${CMR_ABI:-}" ]; then ABI="$CMR_ABI"; else
-    _dev="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
-    ABI="$("$ADB" -s "${_dev:-none}" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+    ABI="$("$ADB" -s "$DEV_ID" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
     ABI="${ABI:-arm64-v8a}"
 fi
 case "$ABI" in
@@ -60,7 +64,6 @@ for wf in "$PKGDIR"/webassets/*; do [ -e "$wf" ] && cp "$wf" "$OUT/assets/"; don
 # source bundle over HTTP and re-boots the on-device VM on each .chuks change. The
 # baked bundle above stays as a fallback for the first launch if the server is down.
 if [ "${DEV:-0}" = "1" ]; then
-    DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
     # Prefer an `adb reverse` tunnel (works for emulators AND USB devices): the app
     # then talks to localhost, which handles the held-open /hmr long-poll reliably.
     # The emulator's 10.0.2.2 NAT stalls long-polls, so use it only as a fallback.
@@ -115,8 +118,7 @@ echo "7. Signing + installing + launching (CMR — the VM runs on the device)"
     -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
     -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
 "$BT/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android "$OUT/chuks.apk" >/dev/null 2>&1
-DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
-[ -z "$DEV_ID" ] && { echo "no android device/emulator (adb devices)"; exit 1; }
+chuks_ensure_device || exit 1
 "$ADB" -s "$DEV_ID" install -r "$OUT/chuks.apk"
 "$ADB" -s "$DEV_ID" shell am start -n "$APPID/$CODEPKG.MainActivity"
 echo "   launched $APPID on $DEV_ID"

@@ -3,7 +3,8 @@
 # (`bash chuks_packages/@chuks/mobile/ios/build.sh`, or via the chuks.json "ios"
 # script). Reads the Swift host + Yoga from the installed package, AOT-compiles
 # YOUR app (chuks.json entry) through the package, links a native host, and
-# installs on the booted simulator. iOS renders through the UIKit host + Yoga.
+# installs on the simulator (booting one if none is running). iOS renders through
+# the UIKit host + Yoga.
 set -euo pipefail
 PKGDIR="$(cd "$(dirname "$0")" && pwd)"       # chuks_packages/@chuks/mobile/ios (host source)
 SDKROOT="$(cd "$PKGDIR/.." && pwd)"           # chuks_packages/@chuks/mobile
@@ -53,9 +54,13 @@ DEV_FLAG=""; [ "${DEV:-0}" = "1" ] && DEV_FLAG="-D DEV"
 BENCH_FLAG=""; [ "${BENCHMARK:-0}" = "1" ] && BENCH_FLAG="-D BENCHMARK"
 SAN_FLAG=""; [ "${ASAN:-0}" = "1" ] && SAN_FLAG="-sanitize=address -g"   # AddressSanitizer diagnostic build
 
-# Target: the booted simulator (default) or a paired physical device (IOS_TARGET=device).
+# Target: the simulator (default) or a paired physical device (IOS_TARGET=device).
 # A device build compiles against the iphoneos SDK and is code-signed before install.
+# shellcheck source=simulator.sh
+source "$PKGDIR/simulator.sh"
 IOS_TARGET="${IOS_TARGET:-sim}"
+# Boot the simulator up front so it is ready by the time the build finishes.
+[ "$IOS_TARGET" = "device" ] || chuks_ensure_sim || exit 1
 if [ "$IOS_TARGET" = "device" ]; then
     SDKPATH="$(xcrun --sdk iphoneos --show-sdk-path)"
     CLANG="$(xcrun --sdk iphoneos --find clang)"
@@ -81,7 +86,8 @@ echo "2. Building the iOS engine ($PLATLABEL)"
     go build -buildmode=c-archive -tags ios -o "$OUTABS/libapp.a" . )   # emits $OUT/libapp.a + $OUT/libapp.h
 
 # iOS renders through the UIKit host (ChuksApp.swift) + Yoga.
-echo "3. Building the UIKit host${PREVIEW:+ (Chuks Preview)}"
+PREVIEW_LABEL=""; [ "$PREVIEW" = "1" ] && PREVIEW_LABEL=" (Chuks Preview)"
+echo "3. Building the UIKit host$PREVIEW_LABEL"
 printf '#include "libapp.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
 # Preview adds its connect/scan entry; CHUKS_PREVIEW_UIKIT selects the UIKit render gate
 # (drops the per-app @main, hands the connect screen off to CardsVC). The connect/scan
@@ -221,8 +227,7 @@ ENT
     xcrun devicectl device install app --device "$DEVID" "$APP" >/dev/null
     xcrun devicectl device process launch --device "$DEVID" "$BID" >/dev/null && echo "   launched on device"
 else
-    UDID="$(xcrun simctl list devices | awk -F'[()]' '/Booted/{print $2; exit}')"
-    [ -z "$UDID" ] && { echo "no booted simulator"; exit 1; }
+    chuks_ensure_sim || exit 1
     echo "5. Installing + launching"
     xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
     xcrun simctl install "$UDID" "$APP"
