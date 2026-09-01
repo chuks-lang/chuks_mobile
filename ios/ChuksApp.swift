@@ -3509,6 +3509,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Recycle a subtree: detach + free its Yoga nodes, remove the views, and drop
     // every id under this prefix from both maps (and its recognizers/actions).
     func remove(_ id: String) {
+        // Unknown id: nothing to tear down. Every mount now emits R| before C| (a mount
+        // must not inherit a stale subtree at the same path id), so this is the hot case
+        // and must stay a dictionary miss -- never the O(views) prefix sweep below.
+        if views[id] == nil && ynodes[id] == nil { return }
         if let v = views[id] {
             for g in v.gestureRecognizers ?? [] {
                 if let t = g as? UITapGestureRecognizer { taps[t] = nil }
@@ -3594,7 +3598,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // or a Gesture node's recognizers are preserved.
         for g in (v.gestureRecognizers ?? []) {
             if let t = g as? UITapGestureRecognizer, taps[t] != nil { taps[t] = nil; v.removeGestureRecognizer(t) }
-            else if let lp = g as? UILongPressGestureRecognizer, pressGestures[lp] != nil { pressGestures[lp] = nil; v.removeGestureRecognizer(lp) }
+            else if let lp = g as? UILongPressGestureRecognizer, pressGestures[lp] != nil {
+                // A press that is IN FLIGHT when we rebind never gets its .ended:
+                // removing the recognizer cancels the touch silently, so the press dim
+                // would stick on the view forever (and that press is lost -- RN cancels
+                // it the same way when a view is recycled mid-touch). Undo the visual
+                // and drop any pending long-press so it can't fire on a stale binding.
+                let gid = ObjectIdentifier(lp)
+                pressLongTimers[gid]?.invalidate(); pressLongTimers[gid] = nil
+                pressLongFired.remove(gid)
+                if (lp.state == .began || lp.state == .changed), !disabledIds.contains(id) { v.alpha = 1.0 }
+                pressGestures[lp] = nil; v.removeGestureRecognizer(lp)
+            }
         }
         if action.isEmpty { return }   // binding removed: leave the view non-interactive (no recognizer)
         if let ao = pressOpacity[id] {                          // Pressable: press-feedback gesture, not a plain tap

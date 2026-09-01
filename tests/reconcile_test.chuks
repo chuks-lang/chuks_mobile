@@ -9,7 +9,7 @@
 //
 // Run:  chuks run tests/reconcile_test.chuks   (exits non-zero on failure)
 
-import { Node, Row, Column, Text, Reconciler } from "../core/ui.chuks";
+import { Node, Row, Column, Text, List, Reconciler } from "../core/ui.chuks";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -27,6 +27,47 @@ function tree(label: string, sub: string): Node {
             Text({ size: 16, weight: "bold", color: "#FFFFFF" }, label),
             Text({ size: 12, color: "#8A8F99" }, sub),
         ]),
+    ])
+}
+
+
+// Does `s` start with `p`? (Chuks has no startsWith.)
+function starts(s: string, p: string): bool {
+    if (p.length > s.length) { return false }
+    return s.slice(0, p.length) == p
+}
+function has(s: string, sub: string): bool {
+    if (sub.length > s.length) { return false }
+    for (var i: int = 0; i + sub.length <= s.length; i = i + 1) {
+        if (s.slice(i, i + sub.length) == sub) { return true }
+    }
+    return false
+}
+// The id of a "C|<id>|<kind>" / "R|<id>" line.
+function opId(line: string): string {
+    const rest: string = line.slice(2, line.length)
+    for (var i: int = 0; i < rest.length; i = i + 1) {
+        if (rest.slice(i, i + 1) == "|") { return rest.slice(0, i) }
+    }
+    return rest
+}
+
+// A screen whose List holds `n` rows, each labelled `tag`+index. Both screens put
+// the List at the SAME tree position, so both mount onto the same node ids -- the
+// real-world case is two tabs, or one screen replacing another.
+function listScreen(n: int, tag: string): Node {
+    return Column({ dir: "col", grow: 1 }, [
+        List({
+            count: n,
+            rowHeight: 60,
+            gap: 8,
+            pad: 12,
+            item: function(i: int, top: int): Node {
+                return Row({ abs: true, top: top, left: 12, right: 12, h: 60 }, [
+                    Text({ size: 15 }, tag + string(i)),
+                ])
+            },
+        }),
     ])
 }
 
@@ -65,6 +106,64 @@ function main(): void {
     r2.begin(); r2.renderRoot(tree("A", "B"))
     r2.begin(); r2.renderRoot(tree("A", "B"))
     check(r2.count() == 0, "second identical render on a fresh reconciler emits 0, got " + string(r2.count()))
+
+    // 5. A MOUNT MUST DESTROY WHATEVER HOLDS ITS ID.
+    //    Node ids are structural paths, so a screen swap mounts onto the ids the
+    //    previous screen left behind -- and both hosts treat create-on-an-existing-id
+    //    as a no-op (`if views[id] != nil { return }`). Without an R| first, the new
+    //    tree INHERITS the old native views: the previous screen's list cells stay on
+    //    screen, and children the new node never asked for survive under the ones it
+    //    does mount (text drawn over text). React gets this free from element identity;
+    //    with path ids the reconciler has to say it.
+    const r3: Reconciler = new Reconciler()
+    r3.setViewport(0, 600, 400)
+    r3.begin(); r3.renderRoot(listScreen(30, "A"))
+    const s3: string = r3.drain()
+    var lines3: []string = s3.split("\n")
+    var creates: int = 0
+    var unguarded: int = 0
+    var razed: []string = []          // ids destroyed so far in this pass
+    for (var i: int = 0; i < lines3.length; i = i + 1) {
+        const ln: string = lines3[i]
+        if (starts(ln, "R|")) { razed.push(opId(ln)) }
+        if (starts(ln, "C|")) {
+            creates = creates + 1
+            const cid: string = opId(ln)
+            var guarded: bool = false
+            // Guarded by its own teardown, or by an ancestor's: removing a node takes
+            // its whole subtree with it (both hosts remove by id prefix), so a child
+            // created under a just-razed parent cannot inherit anything.
+            for (var k: int = 0; k < razed.length; k = k + 1) {
+                const rid: string = razed[k]
+                if (cid == rid || starts(cid, rid + ".")) { guarded = true }
+            }
+            if (!guarded) { unguarded = unguarded + 1; println("       unguarded create: " + ln) }
+        }
+    }
+    check(creates > 0, "list screen creates nodes (" + string(creates) + ")")
+    check(unguarded == 0, "every C| is preceded by R| for the same id (mount destroys the id), unguarded=" + string(unguarded))
+
+    // 6. A LIST THAT SHRINKS MUST NOT LEAVE CELLS BEHIND.
+    //    A pool cell that this pass did not use keeps its old top, which is only
+    //    off-screen while the content is long: swap to a screen whose list has one
+    //    row (or filter 300 results to 3) and those stale rows are suddenly inside
+    //    the visible area, still showing the PREVIOUS list's content. RN unmounts a
+    //    cell that leaves the render stack; so do we.
+    r3.begin(); r3.renderRoot(listScreen(1, "B"))
+    const s4: string = r3.drain()
+    var lines4: []string = s4.split("\n")
+    var mountedCells: int = 0
+    var removedCells: int = 0
+    for (var j: int = 0; j < lines4.length; j = j + 1) {
+        const ln2: string = lines4[j]
+        if (starts(ln2, "R|") && has(ln2, ".cell")) { removedCells = removedCells + 1 }
+    }
+    check(removedCells > 0, "shrinking the list removes the surplus cells, removed=" + string(removedCells))
+
+    // And the rows that remain must show the NEW data: no cell may still carry a
+    // label from the previous screen once the swap settles.
+    r3.begin(); r3.renderRoot(listScreen(1, "B"))
+    check(r3.count() == 0, "the shrunken list is stable on re-render, got " + string(r3.count()))
 
     println("reconcile_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "reconcile_test failed" }

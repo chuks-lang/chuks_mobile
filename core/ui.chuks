@@ -2112,6 +2112,16 @@ export class Reconciler {
             this.mountNode(produced, id, parent, index)
             return
         }
+        // A mount must DESTROY whatever holds this id. Node ids are structural paths
+        // ("app.0.1.content.cell3"), so two different screens routinely mount at the
+        // SAME id -- and the host's create is idempotent (`if views[id] != nil { return }`),
+        // so without this the new tree silently INHERITS the old screen's native views:
+        // its leftover list cells stay on screen showing the previous screen's rows, and
+        // children the new node never asked for survive underneath the ones it does mount
+        // (text drawn on top of text). React has this for free -- identity is element
+        // identity, so unmounting a screen unmounts its subtree -- but with path ids the
+        // engine has to say it. R| on an unknown id is a dictionary miss in both hosts.
+        this.emit("R|" + id)
         if (n.kind == "List") { this.reconcileList(null, n, id, parent, index); return }
         if (n.kind == "SectionList") { this.reconcileSectionList(null, n, id, parent, index); return }
         this.emit("C|" + id + "|" + n.kind)
@@ -2371,9 +2381,25 @@ export class Reconciler {
             this.cellRank[cid] = r
             newMounted.push(cid)
         }
-        // Leftover free cells (a shrinking window) stay mounted but off-screen at their
-        // stale top — reusable next frame. They keep their cellRank, so if that rank
-        // scrolls back in they're kept in place. No churn.
+        // Leftover cells: ones the pool holds that this pass did not use. A list can
+        // SHRINK (switch screens, or filter 300 results down to 3) and then their old
+        // tops are inside the visible area, still showing the previous rows. Parking
+        // them off-screen is not enough -- a parked cell keeps a whole stale subtree
+        // alive -- so destroy them, which is what RN does when a cell leaves the render
+        // stack. This costs nothing on the scroll path: at a constant window capacity
+        // no cell is ever surplus during a fling. Dropping a middle cell leaves a hole
+        // in the pool, which is fine: it has no rank, so the next pass hands it out as
+        // free and re-mounts it.
+        var used: map[string]bool = {}
+        for (var u: int = 0; u < newMounted.length; u = u + 1) { used[newMounted[u]] = true }
+        for (var c: int = 0; c < this.poolSize; c = c + 1) {
+            const cid2: string = this.cellIdAt(contentId, c)
+            if (used.getOr(cid2, false)) { continue }
+            if (this.cellRank.getOr(cid2, -1) == -1) { continue }   // already released
+            this.emit("R|" + cid2)
+            this.itemNodes.delete(cid2)
+            this.cellRank[cid2] = -1
+        }
         this.mounted = newMounted
 
         // onVisible: report the centered row (the one under the middle of the viewport) when

@@ -2113,6 +2113,12 @@ class MainActivity : Activity() {
                 }
                 "fg" -> { val c = Color.parseColor("#$vl")
                     (v as? TextView)?.setTextColor(c); (v as? EditText)?.setTextColor(c)
+                    // A field's placeholder must follow its text color. The platform default
+                    // hint color comes from the Activity theme, not from the field's own
+                    // colors, so on a light surface under a dark theme (or the reverse) the
+                    // hint renders invisible. iOS's UITextField.placeholder derives from the
+                    // text color for the same reason; match it at ~45% alpha.
+                    (v as? EditText)?.setHintTextColor(Color.argb(115, Color.red(c), Color.green(c), Color.blue(c)))
                     if (v is SeekBar) { v.progressTintList = ColorStateList.valueOf(c); v.thumbTintList = ColorStateList.valueOf(c) }
                     else if (v is ProgressBar) { if (v.isIndeterminate) v.indeterminateTintList = ColorStateList.valueOf(c) else v.progressTintList = ColorStateList.valueOf(c) } }
                 "ta" -> (v as? TextView)?.gravity =
@@ -3219,6 +3225,9 @@ class MainActivity : Activity() {
     private fun ensureNfc(): NfcReader { val n = nfcReader ?: NfcReader().also { nfcReader = it }; return n }
 
     private fun remove(id: String) {
+        // Unknown id: nothing to tear down. Mounts emit R| before C| (see mountNode in
+        // core/ui.chuks), so keep this a map miss rather than the O(views) sweep below.
+        if (!views.containsKey(id) && !ynodes.containsKey(id)) return
         views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
         ynodes[id]?.let { textNodes.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
@@ -3246,6 +3255,11 @@ class MainActivity : Activity() {
                 // row at the same id; its old touch listener consumes ACTION_UP and fires
                 // the PREVIOUS action, so it must be cleared or the reused view keeps
                 // firing it (RN resets a recycled view to defaults — this is that reset).
+                // A press that is IN FLIGHT when we rebind never gets its ACTION_UP:
+                // clearing the listener cancels the touch silently, so the press dim
+                // would stick on the view forever (and that press is lost -- RN cancels
+                // it the same way when a view is recycled mid-touch).
+                if (v.alpha != 1f && !disabledIds.contains(id)) { v.animate().cancel(); v.alpha = 1f }
                 v.setOnTouchListener(null)
                 v.setOnClickListener(null)
                 v.isClickable = false
