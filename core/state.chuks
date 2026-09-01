@@ -43,20 +43,45 @@ var _pendingFx: []PendingFx = []        // effects to run after this render pass
 // Framework-internal: called before a component renders to set its identity.
 export function hookEnter(path: string): void { _path = path; _slot = 0; _fxSlot = 0 }
 
-// A typed handle to one state cell. `Cell<T>` is purely a handle: the value lives
-// in the shared `_cells` store, so T only types the get/set surface (get() returns
-// T, no cast). Read with get(), write set(v). Inference usually fills T from the
-// initial value (useState(0) -> Cell<int>); annotate or pass an explicit type arg
-// for empty collections (useState<[]string>([]) -> Cell<[]string>).
 // Set by any state write, cleared after a render. The heartbeat reads it to decide
 // whether an idle beat needs a render at all: without it the only way to answer that
 // question was to render and diff, which is what made a scrolling app drop frames
 // twice a second.
 var _dirty: bool = false
+/**
+ * Framework-internal: mark that state changed, so the next beat renders. `Cell.set`
+ * calls this for you; call it by hand only when you hold state OUTSIDE the cell
+ * system (a module-level store) and need the heartbeat to notice a change to it.
+ * `requestRender()` in core/ui.chuks is the app-facing form.
+ */
 export function markDirty(): void { _dirty = true }
+/**
+ * Framework-internal: whether a state write has landed since the last render. The
+ * host's idle beat asks this to skip rendering entirely when nothing changed.
+ */
 export function isDirty(): bool { return _dirty }
+/** Framework-internal: clear the dirty flag, called by the render pass once it commits. */
 export function clearDirty(): void { _dirty = false }
 
+/**
+ * A typed handle to one piece of component state, returned by `useState`.
+ *
+ * `Cell<T>` is purely a handle: the value lives in the shared cell store keyed by the
+ * component's identity, so `T` types only the get/set surface (`get()` returns T, no
+ * cast). Inference usually fills T from the initial value (`useState(0)` gives
+ * `Cell<int>`); annotate, or pass an explicit type argument, for empty collections
+ * (`useState<[]string>([])`).
+ *
+ * `set()` on a cell whose component has unmounted is a deliberate no-op rather than
+ * an error or a resurrected cell, so a late async or stream callback firing into a
+ * screen the user already left is harmless.
+ *
+ * ```chuks
+ * const count: Cell<int> = useState(0)
+ * const n: int = count.get()
+ * count.set(n + 1)                      // marks state dirty; the next beat renders
+ * ```
+ */
 export class Cell<T> {
     var k: string
     constructor(k: string) { this.k = k }
