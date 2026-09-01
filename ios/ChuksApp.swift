@@ -1058,6 +1058,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if DEV_MODE { return devHTTP("/tick", "") }
         _ = chuks_tick(); return drainStr()
     }
+    // System back (the left-edge swipe here; Android's button/gesture on that host).
+    // Returns true when the app consumed it.
+    func eBack() -> Bool {
+        if DEV_MODE { return (devHTTP("/back", "") ?? "").isEmpty == false }
+        let handled = chuks_back() > 0
+        let s = drainStr()               // drainStr returns "" when there is nothing
+        if !s.isEmpty { apply(s); relayout() }
+        return handled
+    }
     func eViewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String? {
         if DEV_MODE { return devHTTP("/viewport", "\(top) \(h) \(w)") }
         _ = chuks_setViewport(top, h, w); return drainStr()
@@ -1164,6 +1173,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
         // Register the host wake: a spawned Chuks task that posts to the render thread
         // (dispatchAsync) fires this so we tick immediately instead of on the heartbeat.
+        installBackSwipe()
         gChuksWakeVC = self
         chuks_set_wake(unsafeBitCast(chuksWakeThunk as (@convention(c) () -> Void), to: UnsafeMutableRawPointer.self))
 
@@ -1857,6 +1867,30 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let cur = tf.text ?? ""
         let next = (cur as NSString).replacingCharacters(in: range, with: string)
         return next.count <= max
+    }
+
+    // The iOS way back: a swipe from the left edge. This fires the same event Android's
+    // system back does, so an app writes ONE handler. What it does not give you is the
+    // interactive drag with parallax and cancel-on-release; that comes from a real
+    // UINavigationController driving its own interactivePopGestureRecognizer (which is
+    // how SwiftUI and react-native-screens get it) and is a separate piece of work.
+    // Ask UIKit to let OUR left-edge gesture win over the system's edge handling. Without
+    // this the first touch of an edge swipe is withheld from the app (the event log shows
+    // systemGestureStateChange with shouldSend: 0) and the recognizer never starts.
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .left }
+
+    func installBackSwipe() {
+        let g = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleBackSwipe(_:)))
+        g.edges = .left
+        g.delegate = self
+        view.addGestureRecognizer(g)
+    }
+    @objc func handleBackSwipe(_ g: UIScreenEdgePanGestureRecognizer) {
+        guard g.state == .ended else { return }
+        let dx = g.translation(in: g.view).x, vx = g.velocity(in: g.view).x
+        // Committed swipe: far enough, or short but fast (the thresholds UIKit uses for
+        // its own pop feel right here too).
+        if dx > 60 || (dx > 20 && vx > 300) { _ = eBack() }
     }
 
     // Dismiss the keyboard when tapping outside any field.

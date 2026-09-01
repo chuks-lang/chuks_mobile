@@ -2883,6 +2883,22 @@ export class App {
     // heartbeat keeps rendering for this app. Defaults to false: an app that only reacts
     // to events, streams and animations never re-renders on an idle beat.
     public ticksOnBeat(): bool { return false }
+    // The user asked to go back (Android's button/gesture, or the iOS edge swipe).
+    // Returns 1 when the app handled it and the host should stay put, 0 when the host
+    // should do its platform default. Re-renders only when something actually changed.
+    public dispatchBack(): int {
+        runAsyncQueue()
+        this.recon.begin()
+        var handled: bool = runBackHandlers()
+        if (!handled) { handled = this.popRoute() }
+        if (!handled) { return 0 }
+        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        clearDirty()
+        return 1
+    }
+    // A plain App has no route stack; NavStack overrides this to pop one.
+    public popRoute(): bool { return false }
+
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
         runAsyncQueue()
@@ -2993,6 +3009,14 @@ export class NavStack extends App {
             this.stack = s
         }
     }
+    // The system back gesture/button pops a route when one is stacked, so a pushed
+    // screen is dismissable the way the platform expects without the app wiring
+    // anything. Returns false at the root, which lets the host do its default.
+    public override popRoute(): bool {
+        if (this.stack.length <= 1) { return false }
+        this.popStack()
+        return true
+    }
     // The current screen function (top of the stack).
     cur(): any { return this.routes[this.stack[this.stack.length - 1]] }
     // Render the current screen LAZILY: wrap it in a Comp so the screen function
@@ -3024,6 +3048,42 @@ export class NavStack extends App {
  * Button({ onPress: function(): void { navigate("settings") } }, "Settings")
  * ```
  */
+// ---- back: the system gesture and button ------------------------------------
+// One event for "the user asked to go back", however they asked: Android's system
+// back button or gesture, and the iOS left-edge swipe. Handlers are consulted in
+// REVERSE registration order (the most recently mounted screen decides first) and the
+// first one returning true consumes the event. If none do, a NavStack pops; if there is
+// nothing to pop, the host does its platform default (on Android, leave the app).
+// This mirrors the contract RN's BackHandler uses, because apps already expect it:
+// return true to say "I handled it", and the app only exits when nobody did.
+var BACK_HANDLERS: []function(): bool = []
+
+/**
+ * Register a handler for the system back gesture/button. Return true to consume it.
+ *
+ * ```chuks
+ * onBackPress(function(): bool {
+ *     if (detailWalk() != null) { closeDetail(); return true }   // close the sheet
+ *     return false                                               // let back go on
+ * })
+ * ```
+ * Register from a screen's setup (not per render), and remove with offBackPress when
+ * that screen goes away, or the handler keeps voting after it is gone.
+ */
+export function onBackPress(fn: function(): bool): void { BACK_HANDLERS.push(fn) }
+
+/** Remove every registered back handler (call when tearing a screen down). */
+export function clearBackHandlers(): void { var e: []function(): bool = []; BACK_HANDLERS = e }
+
+// Ask the handlers, most recent first. True when one of them consumed the event.
+function runBackHandlers(): bool {
+    for (var i: int = BACK_HANDLERS.length - 1; i >= 0; i = i - 1) {
+        const f: function(): bool = BACK_HANDLERS[i]
+        if (f()) { return true }
+    }
+    return false
+}
+
 export function navigate(name: string): void { const nv: NavStack? = NAV; if (nv != null) { nv.push(name) } }
 /**
  * Replace the whole stack with a single page, so Back cannot return to what came

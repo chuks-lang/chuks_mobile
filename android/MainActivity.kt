@@ -76,6 +76,7 @@ object N {
     external fun tick(): Int
     external fun viewport(top: Int, h: Int, w: Int): Int
     external fun event(action: String): Int
+    external fun back(): Int                                    // system back: 1 = the app handled it
     external fun input(action: String, value: String): Int
     external fun resolve(token: String, payload: String): Int   // F3: async capability result
     external fun fail(token: String, message: String): Int      // F3: capability failure (error channel)
@@ -3306,6 +3307,11 @@ class MainActivity : Activity() {
             modalActions[mid]?.let { fire(it) }   // parent flips `visible` false; the re-render hides it
             return
         }
+        // Ask the app before leaving. A registered back handler or a stacked route
+        // consumes the press; only when nothing does are we really at the root, and the
+        // default (finish the activity) is correct. Without this, back exited the app
+        // from any pushed screen, which is not what any Android user expects.
+        if (N.back() > 0) { applyDrain(); relayout(); return }
         super.onBackPressed()
     }
 

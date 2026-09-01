@@ -22,6 +22,10 @@ JNIEXPORT jstring JNICALL J(drain)(JNIEnv* e, jobject) {
     chuks_free_str(s);
     return r;
 }
+// System back button / gesture. Returns 1 when the app consumed it, so the activity
+// knows whether to fall through to the default (leave the app).
+JNIEXPORT jint JNICALL J(back)(JNIEnv*, jobject) { return chuks_back(); }
+
 JNIEXPORT jint JNICALL J(event)(JNIEnv* e, jobject, jstring a) {
     const char* c = e->GetStringUTFChars(a, 0);
     int m = chuks_dispatch((char*)c);
