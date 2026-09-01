@@ -354,6 +354,29 @@ class MainActivity : Activity() {
 
         // first layout after the window is measured
         root.post { reportInsets(); relayout(); if (pushViewport()) relayout() }
+        // Predictive back: ride the system's own gesture progress so the pop is
+        // interactive and cancellable, instead of happening all at once on release.
+        if (Build.VERSION.SDK_INT >= 34) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                object : android.window.OnBackAnimationCallback {
+                    override fun onBackStarted(e: android.window.BackEvent) {
+                        val mid = activeModal
+                        if (mid != null && views[mid]?.visibility == View.VISIBLE) return
+                        if (backLayers()) backProgress(0f)
+                    }
+                    override fun onBackProgressed(e: android.window.BackEvent) { backProgress(e.progress) }
+                    override fun onBackCancelled() { backSettle(false) }
+                    override fun onBackInvoked() {
+                        val mid = activeModal
+                        if (mid != null && views[mid]?.visibility == View.VISIBLE) {
+                            modalActions[mid]?.let { fire(it) }   // parent flips `visible`; the re-render hides it
+                            return
+                        }
+                        if (backTop != null) backSettle(true) else doBack()
+                    }
+                })
+        }
         root.setOnApplyWindowInsetsListener { _, insets ->                            // update on inset changes
             reportInsets()
             if (Build.VERSION.SDK_INT >= 30) applyKeyboard(insets.getInsets(WindowInsets.Type.ime()).bottom)
@@ -3325,6 +3348,47 @@ class MainActivity : Activity() {
     // consume the press, matching iOS's expectation that back closes the top sheet
     // first. Only when no Modal is showing does back fall through to the default
     // (finish the activity).
+    // ---- predictive back (API 34+): an INTERACTIVE pop ------------------------
+    // The engine mounts the top two routes as full-screen sibling containers under the
+    // app root (see NavStack.render), so the system's back progress can drag the top
+    // screen off and slide the one beneath it in, and cancelling puts it back. Below
+    // API 34 the platform reports no progress, so back stays instant there (onBackPressed).
+    private var backTop: View? = null
+    private var backBelow: View? = null
+    private val backParallax = 0.28f
+
+    private fun backLayers(): Boolean {
+        val appRoot = views["app"] as? ViewGroup ?: return false
+        if (appRoot.childCount < 2) return false
+        backTop = appRoot.getChildAt(appRoot.childCount - 1)
+        backBelow = appRoot.getChildAt(appRoot.childCount - 2)
+        return true
+    }
+    private fun backProgress(p: Float) {
+        val w = root.width.toFloat().coerceAtLeast(1f)
+        val t = (p.coerceIn(0f, 1f)) * w
+        backTop?.translationX = t
+        backBelow?.translationX = -w * backParallax * (1f - t / w)
+    }
+    private fun backSettle(commit: Boolean) {
+        val w = root.width.toFloat().coerceAtLeast(1f)
+        val top = backTop; val below = backBelow
+        backTop = null; backBelow = null
+        if (top == null || below == null) { if (commit) doBack(); return }
+        top.animate().translationX(if (commit) w else 0f).setDuration(180).withEndAction {
+            top.translationX = 0f
+            below.translationX = 0f
+            if (commit) doBack()
+        }.start()
+        below.animate().translationX(if (commit) 0f else -w * backParallax).setDuration(180).start()
+    }
+    // The pop itself: ask the app first (a handler or a stacked route consumes it);
+    // only when nothing does are we really at the root and the activity should finish.
+    private fun doBack() {
+        if (N.back() > 0) { applyDrain(); relayout(); return }
+        finish()
+    }
+
     override fun onBackPressed() {
         val mid = activeModal
         if (mid != null && views[mid]?.visibility == View.VISIBLE) {

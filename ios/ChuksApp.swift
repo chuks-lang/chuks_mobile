@@ -1889,12 +1889,62 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         g.delegate = self
         view.addGestureRecognizer(g)
     }
+    // An INTERACTIVE pop: the top screen follows the finger, the one beneath it slides
+    // in behind, and letting go part-way puts it back. The engine mounts the top two
+    // routes as full-screen sibling containers under "app" (see NavStack.render), which
+    // is what makes this possible at all -- with only the top screen mounted there is
+    // nothing to reveal, and the best you can do is fire back on release.
+    //
+    // The two containers are simply the last two subviews of the app root, so this
+    // needs no extra protocol: the stack's shape is already in the view tree. When
+    // there are not two (the root screen), it falls back to the release-threshold
+    // behaviour so an app that handles back itself still gets the gesture.
+    var swipeTop: UIView?
+    var swipeBelow: UIView?
+    let swipeParallax: CGFloat = 0.28      // how far the revealed screen sits left, as a fraction of width
     @objc func handleBackSwipe(_ g: UIScreenEdgePanGestureRecognizer) {
-        guard g.state == .ended else { return }
-        let dx = g.translation(in: g.view).x, vx = g.velocity(in: g.view).x
-        // Committed swipe: far enough, or short but fast (the thresholds UIKit uses for
-        // its own pop feel right here too).
-        if dx > 60 || (dx > 20 && vx > 300) { _ = eBack() }
+        let w = max(1, view.bounds.width)
+        switch g.state {
+        case .began:
+            let kids = views["app"]?.subviews ?? []
+            guard kids.count >= 2 else { swipeTop = nil; swipeBelow = nil; return }
+            swipeTop = kids[kids.count - 1]
+            swipeBelow = kids[kids.count - 2]
+            // Park the revealed screen at its start offset. It is fully covered right
+            // now, so this never shows as a jump.
+            swipeBelow?.transform = CGAffineTransform(translationX: -w * swipeParallax, y: 0)
+        case .changed:
+            guard let top = swipeTop, let below = swipeBelow else { return }
+            let t = min(w, max(0, g.translation(in: g.view).x))
+            top.transform = CGAffineTransform(translationX: t, y: 0)
+            below.transform = CGAffineTransform(translationX: -w * swipeParallax * (1 - t / w), y: 0)
+        case .ended, .cancelled, .failed:
+            guard let top = swipeTop, let below = swipeBelow else {
+                if g.state == .ended {          // no stack to pop: the app may still handle back
+                    let dx = g.translation(in: g.view).x, vx = g.velocity(in: g.view).x
+                    if dx > 60 || (dx > 20 && vx > 300) { _ = eBack() }
+                }
+                return
+            }
+            swipeTop = nil; swipeBelow = nil
+            let t = max(0, g.translation(in: g.view).x), vx = g.velocity(in: g.view).x
+            // Committed: past the half-way-ish mark, or short but thrown (the thresholds
+            // UIKit uses for its own pop feel right here too).
+            let commit = (g.state == .ended) && (t > w * 0.4 || (t > 20 && vx > 300))
+            let rest = max(0.12, min(0.35, Double((w - t) / max(300, vx))))   // shorter throw, shorter animation
+            UIView.animate(withDuration: rest, delay: 0, options: [.curveEaseOut], animations: {
+                top.transform = CGAffineTransform(translationX: commit ? w : 0, y: 0)
+                below.transform = commit ? .identity : CGAffineTransform(translationX: -w * self.swipeParallax, y: 0)
+            }, completion: { _ in
+                // Whatever happened, both screens go back to untransformed: on a commit
+                // the top one is about to be torn down and the revealed one becomes the
+                // top; on a cancel the revealed one is covered again.
+                top.transform = .identity
+                below.transform = .identity
+                if commit { _ = self.eBack() }
+            })
+        default: break
+        }
     }
 
     // Dismiss the keyboard when tapping outside any field.

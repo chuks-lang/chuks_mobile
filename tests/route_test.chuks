@@ -8,8 +8,16 @@
 //
 // Run:  chuks run tests/route_test.chuks   (exits non-zero on failure)
 
-import { Node, Text, Route, NavStack, Reconciler } from "../core/ui.chuks";
+import { Node, Column, Row, Text, List, Route, NavStack, Reconciler } from "../core/ui.chuks";
 import { useState, Cell } from "../core/state.chuks";
+
+function has(s: string, sub: string): bool {
+    if (sub.length > s.length) { return false }
+    for (var i: int = 0; i + sub.length <= s.length; i = i + 1) {
+        if (s.slice(i, i + sub.length) == sub) { return true }
+    }
+    return false
+}
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -20,15 +28,39 @@ function check(cond: bool, name: string): void {
 
 dataType Club { id: string; name: string }
 
+var RENDERED: []string = []
 var SEEN_ID: string = ""
 var SEEN_BODY: bool = false
 var SEEN_RESULT: string = ""
 
 function screen(r: Route): Node {
+    RENDERED.push(r.name + ":" + r.str("id", ""))
     SEEN_ID = r.str("id", "")
     SEEN_BODY = r.body != null
     SEEN_RESULT = r.result != null ? string(r.result) : ""
     return Text({}, "club " + SEEN_ID)
+}
+
+var DEEP_CELL: Cell<int>? = null
+var DEEP_SEEN: int = -1
+var DEEP_STATE: any = 0
+var DEEP_RENDERED: []string = []
+// A level of a deep stack: stateful, and carrying a virtualized List, so a pop has to
+// restore both the level's own state and its list's bookkeeping.
+function deepScreen(r: Route): Node {
+    const c: Cell<int> = useState(0)
+    const n: int = r.int("n", 0)
+    DEEP_RENDERED.push("lvl" + string(n))
+    DEEP_CELL = c
+    DEEP_SEEN = n
+    DEEP_STATE = c.get()
+    return Column({ dir: "col", grow: 1 }, [
+        List({ count: 30, rowHeight: 40,
+               key:  function(i: int): string { return "l" + string(n) + "-" + string(i) },
+               item: function(i: int, top: int): Node {
+                   return Row({ abs: true, top: top, left: 0, right: 0, h: 40 }, [ Text({}, "row " + string(i)) ])
+               } }),
+    ])
 }
 
 var TAB: Cell<int>? = null
@@ -114,6 +146,73 @@ function main(): void {
     nv3.popStack(null)                               // and come back
     rc3.begin(); rc3.renderRoot(nv3.render())
     check(SEEN_TAB == 2, "state under the top survives a push and pop, got " + string(SEEN_TAB))
+
+    // 7. TWO SCREENS ARE MOUNTED AT ONCE: the visible one and the one a back gesture
+    //    would reveal. Each is its own full-screen container, stacked in order, and
+    //    each renders ITS OWN route -- a loop-body closure in Chuks is one hoisted
+    //    slot, so binding the wrong way makes every layer render the topmost route.
+    const nv4: NavStack = nav()
+    const rc4: Reconciler = new Reconciler()
+    nv4.push("club", { "id": "c-1" }, null)
+    var e1: []string = []; RENDERED = e1
+    rc4.begin(); rc4.renderRoot(nv4.render())
+    check(RENDERED.length == 2, "the top two entries both render, got " + string(RENDERED.length))
+    check(RENDERED.length == 2 && RENDERED[0] == "home:" && RENDERED[1] == "club:c-1",
+          "each layer renders its OWN route, got " + RENDERED.join(" | "))
+
+    // 8. A push does not renumber the screens below it: a route's node id follows its
+    //    DEPTH, so the reconciler leaves an unchanged screen alone instead of tearing
+    //    it down and rebuilding it (which would drop native scroll position).
+    rc4.begin(); rc4.renderRoot(nv4.render())
+    check(rc4.count() == 0, "re-rendering the stack emits 0 mutations, got " + string(rc4.count()))
+    nv4.push("club", { "id": "c-2" }, null)
+    rc4.begin(); rc4.renderRoot(nv4.render())
+    const churn: string = rc4.drain()
+    // The screen a back gesture would reveal keeps its id and its subtree: it is not
+    // torn down and rebuilt just because something was pushed over it.
+    check(!has(churn, "R|app.1"), "pushing leaves the revealed screen's tree intact")
+    // The screen that fell out of the live window IS released (its state is parked,
+    // its native views are not kept): that is the point of only rendering two.
+    check(has(churn, "R|app.0."), "a screen pushed out of the live window is released")
+
+    // 9. A DEEP STACK, POPPED ALL THE WAY BACK. Every level keeps its own params, its
+    //    own state and its own list bookkeeping, and each pop reveals the level below
+    //    intact -- no churn, no screen coming back empty.
+    var deepRoutes: map[string]function(r: Route): Node = {}
+    deepRoutes["lvl"] = deepScreen
+    const nv5: NavStack = new NavStack(deepRoutes, "lvl")
+    const rc5: Reconciler = new Reconciler()
+    rc5.setViewport(0, 600, 400)
+    rc5.begin(); rc5.renderRoot(nv5.render())
+    if (DEEP_CELL != null) { DEEP_CELL.set(100) }            // stamp the root level
+    for (var d: int = 1; d <= 4; d = d + 1) {
+        nv5.push("lvl", { "n": d }, null)
+        rc5.begin(); rc5.renderRoot(nv5.render())
+        if (DEEP_CELL != null) { DEEP_CELL.set(100 + d) }    // stamp this level
+        rc5.begin(); rc5.renderRoot(nv5.render())
+    }
+    check(nv5.depth() == 5, "five levels deep, got " + string(nv5.depth()))
+    check(DEEP_SEEN == 4, "the top level is the one on screen, got " + string(DEEP_SEEN))
+    // Only the top two render, however deep the stack is.
+    var e2: []string = []; DEEP_RENDERED = e2
+    rc5.begin(); rc5.renderRoot(nv5.render())
+    check(DEEP_RENDERED.length == 2, "only the top two levels render at depth 5, got " + string(DEEP_RENDERED.length))
+    check(rc5.count() == 0, "a settled deep stack emits 0 mutations, got " + string(rc5.count()))
+
+    // Now unwind the whole way, checking each revealed level as it appears.
+    var ok: bool = true
+    var noChurn: bool = true
+    for (var b: int = 3; b >= 0; b = b - 1) {
+        nv5.popStack(null)
+        rc5.begin(); rc5.renderRoot(nv5.render())
+        if (DEEP_SEEN != b) { ok = false }                   // the right level is on screen
+        if (int(DEEP_STATE) != 100 + b) { ok = false }       // and it kept the state it had
+        rc5.begin(); rc5.renderRoot(nv5.render())
+        if (rc5.count() != 0) { noChurn = false }            // and settles with no churn
+    }
+    check(ok, "every level revealed by a pop is the right one, with its state")
+    check(noChurn, "no mutation churn while unwinding the stack")
+    check(nv5.depth() == 1, "back at the root, got depth " + string(nv5.depth()))
 
     println("route_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "route_test failed" }

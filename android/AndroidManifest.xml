@@ -4,7 +4,7 @@
     android:versionCode="__VERSION_CODE__" android:versionName="__VERSION_NAME__">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
     <!--CHUKS_PERMISSIONS-->
-    <application
+    <application android:enableOnBackInvokedCallback="true"
         android:label="Chuks"
         android:hasCode="true"
         android:usesCleartextTraffic="true"
