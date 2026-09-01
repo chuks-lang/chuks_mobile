@@ -2,7 +2,7 @@
 // change the copy, restyle it, or replace it entirely. Colors come from theme
 // tokens (tk) so it adapts to light/dark, and icons come from @chuks/lucide via
 // utils/icons.chuks.
-import { Node, Column, Row, Text, Pressable, Image, Scroll, Comp } from "pkg/@chuks/mobile/core/ui.chuks";
+import { Node, Column, Row, Text, Pressable, Image, Scroll, Comp, Route } from "pkg/@chuks/mobile/core/ui.chuks";
 import { useState, Cell } from "pkg/@chuks/mobile/core/state.chuks";
 import { tk } from "pkg/@chuks/mobile/core/theme.chuks";
 import { lucide } from "../../utils/icons.chuks";
@@ -74,4 +74,6 @@ function step(icon: string, title: string, desc: string): Node {
                     ])
                 }
 
-                export function Home(): Node { return Comp(body) }
+                // A screen takes its Route (params, body, result). This one needs nothing
+                // from it, so it takes `_`.
+                export function Home(_: Route): Node { return Comp(body) }

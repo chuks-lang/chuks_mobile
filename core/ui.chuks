@@ -8,11 +8,12 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { host } from "std/host";
 import { Prop } from "./prop.chuks";
 import { tw } from "./tw.chuks";
+import { json } from "std/json";   // route params ride the hot-reload snapshot
 
 // ---- Style: a compact subset of the flexbox + visual model -----------------
 export class Style {
@@ -3012,56 +3013,172 @@ export function emitNativeStream(cap: string, args: string, cb: any, onErr: any)
 
 var NAV: NavStack? = null    // the active NavStack (so pages can navigate from anywhere)
 
+/**
+ * One entry on the navigation stack: the route's name, its PARAMS, and an optional
+ * BODY.
+ *
+ * `params` are the restorable half: strings, ints and bools, serialized with the
+ * stack, so hot reload (and a later cold restore or deep link) puts you back on the
+ * same screen with the same identity. They answer WHICH thing this screen is for.
+ *
+ * `body` is the fast half: a typed value handed straight to the next screen so it can
+ * render real content immediately instead of a spinner. It lives in memory only, so
+ * it is NULL after a hot reload. A screen must always be able to rebuild itself from
+ * `params` alone and treat `body` as a head start, never as the source of truth.
+ *
+ * `result` is what a popped screen handed back (see the two-argument `back`).
+ *
+ * Read params through the typed accessors, never as a raw map: a missing key in a
+ * typed map reads back differently under the VM and AOT, and `string(null)` is the
+ * text "null", not "".
+ */
+export class Route {
+    var name: string
+    var params: map[string]any
+    var body: any?              // in-memory only: null after a reload
+    var result: any?            // handed back by a screen this one pushed
+    constructor(name: string, params: (map[string]any)?, body: any?) {
+        this.name = name
+        this.params = params != null ? params : {}
+        this.body = body
+        this.result = null
+    }
+    // A param as text, or `dflt` when absent.
+    public str(key: string, dflt: string): string {
+        const v: any = this.params.getOr(key, null)
+        if (v == null) { return dflt }
+        return string(v)
+    }
+    // A param as a number, or `dflt` when absent.
+    public int(key: string, dflt: int): int {
+        const v: any = this.params.getOr(key, null)
+        if (v == null) { return dflt }
+        return int(v)
+    }
+    // A param as a flag, or `dflt` when absent.
+    public bool(key: string, dflt: bool): bool {
+        const v: any = this.params.getOr(key, null)
+        if (v == null) { return dflt }
+        return bool(v)
+    }
+    public has(key: string): bool { return this.params.getOr(key, null) != null }
+}
+
 export class NavStack extends App {
     // Routes map a name to a screen: a function () -> Node. (Like RN, a screen is
     // just a function that returns Node; there is no page base class to extend.)
-    var routes: map[string]function(): Node   // route name -> screen function () -> Node
-    var stack: []string           // route-name stack; last = visible page
-    constructor(routes: map[string]function(): Node, initial: string) {
+    // A screen takes its Route: which entry it is, with what params and body. Uniform,
+    // so routes stay one type, and explicit, so a screen is callable in a test with no
+    // navigator around it. Screens that need nothing from it take `_: Route`.
+    var routes: map[string]function(r: Route): Node   // route name -> screen
+    var stack: []Route            // the route stack; last = visible page
+    constructor(routes: map[string]function(r: Route): Node, initial: string) {
         super()
         this.routes = routes
-        this.stack = [initial]
+        this.stack = [new Route(initial, null, null)]
         NAV = this
     }
-    // Push a route name onto the stack (prefer the navigate() free function).
-    public push(name: string): void { this.stack.push(name) }
+    // Push a route (prefer the navigate() free function).
+    public push(name: string, params: (map[string]any)?, body: any?): void {
+        this.stack.push(new Route(name, params, body))
+    }
     // Reset the stack to a single route (prefer the navReplace() free function).
-    public replace(name: string): void { this.stack = [name] }
+    public replace(name: string, params: (map[string]any)?, body: any?): void {
+        this.stack = [new Route(name, params, body)]
+    }
     // Pop the top route, if any remains below it (prefer the back() free function).
-    public popStack(): void {
+    // `result` is handed to the screen underneath, which reads it as `r.result`.
+    public popStack(result: any?): void {
         if (this.stack.length > 1) {
-            const s: []string = []
+            const s: []Route = []
             for (var i: int = 0; i < this.stack.length - 1; i = i + 1) { s.push(this.stack[i]) }
             this.stack = s
+            if (result != null) { this.stack[this.stack.length - 1].result = result }
         }
     }
+    // The entry on top of the stack: what is on screen right now.
+    public top(): Route { return this.stack[this.stack.length - 1] }
+    public depth(): int { return this.stack.length }
     // The system back gesture/button pops a route when one is stacked, so a pushed
     // screen is dismissable the way the platform expects without the app wiring
     // anything. Returns false at the root, which lets the host do its default.
     public override popRoute(): bool {
         if (this.stack.length <= 1) { return false }
-        this.popStack()
+        this.popStack(null)
         return true
     }
     // The current screen function (top of the stack).
-    cur(): any { return this.routes[this.stack[this.stack.length - 1]] }
+    cur(): any { return this.routes[this.top().name] }
     // Render the current screen LAZILY: wrap it in a Comp so the screen function
     // runs inside the reconciler's top-down walk, with identity "app". This is what
     // lets screens and their components use useState() with no key.
-    override render(): Node { const f: any = this.cur(); return Comp(f) }
+    override render(): Node {
+        const f: any = this.cur()
+        const r: Route = this.top()
+        // A stable, per-ENTRY hook identity. Every route mounts at the same tree
+        // position, so without a key two screens would share one set of useState
+        // cells: push a detail screen and its counter would already hold the list
+        // screen's value. Depth + name also separates the same route pushed twice
+        // (club A over club B).
+        const k: string = "route:" + string(this.stack.length - 1) + ":" + r.name
+        // Screens under the top one are not rendered, but they are still on the stack:
+        // park their identities so their state (and their effects) survive until they
+        // are actually popped, the way a pushed screen leaves the one below it intact.
+        var parked: []string = []
+        for (var i: int = 0; i < this.stack.length - 1; i = i + 1) {
+            parked.push("key:route:" + string(i) + ":" + this.stack[i].name + "#")
+        }
+        hookPark(parked)
+        return KeyedComp(k, function(): Node { return f(r) })
+    }
     override setup(_n: int): void { }
     // Hot reload also preserves the current screen: serialize the route stack ahead
     // of the useState cells so an edit keeps you on the page you were on, not route 0.
     // Format: "<route\t...>\n<cellsJSON>" (cell JSON is single-line, no raw newlines).
-    override saveState(): string { return this.stack.join("\t") + "\n" + serializeCells() }
+    // The route stack rides the hot-reload snapshot as JSON: name + params per entry.
+    // `body` and `result` are deliberately dropped -- they are in-memory only, which is
+    // exactly why a screen must be able to rebuild itself from params (see Route).
+    override saveState(): string {
+        var arr: []any = []
+        for (var i: int = 0; i < this.stack.length; i = i + 1) {
+            var e: map[string]any = {}
+            e["n"] = this.stack[i].name
+            e["p"] = this.stack[i].params
+            arr.push(e)
+        }
+        return json.stringify(arr) + "\n" + serializeCells()
+    }
     override loadState(data: string): void {
         if (data == "") { return }
         const parts: []string = data.split("\n")
         if (parts.length < 2) { restoreCells(data); return }   // old format: cells only
-        if (parts[0] != "") { this.stack = parts[0].split("\t") }
+        if (parts[0] != "") { this.restoreStack(parts[0]) }
         var cells: string = parts[1]
         for (var i: int = 2; i < parts.length; i = i + 1) { cells = cells + "\n" + parts[i] }
         restoreCells(cells)
+    }
+    // Rebuild the stack from a snapshot. A snapshot written before params existed is a
+    // plain tab-joined list of names, so read that too rather than dropping the user
+    // back on route 0 the first time they reload across the upgrade.
+    restoreStack(snap: string): void {
+        if (snap.slice(0, 1) != "[") {
+            var names: []string = snap.split("\t")
+            var plain: []Route = []
+            for (var i: int = 0; i < names.length; i = i + 1) { plain.push(new Route(names[i], null, null)) }
+            if (plain.length > 0) { this.stack = plain }
+            return
+        }
+        const arr: []any = json.parse(snap)
+        var out: []Route = []
+        for (var j: int = 0; j < arr.length; j = j + 1) {
+            const e: any = arr[j]
+            if (e == null || e["n"] == null) { continue }
+            var pm: map[string]any = {}
+            const raw: any = e["p"]
+            if (raw != null) { pm = raw }
+            out.push(new Route(string(e["n"]), pm, null))
+        }
+        if (out.length > 0) { this.stack = out }
     }
 }
 
@@ -3110,7 +3227,10 @@ function runBackHandlers(): bool {
     return false
 }
 
-export function navigate(name: string): void { const nv: NavStack? = NAV; if (nv != null) { nv.push(name) } }
+export function navigate(name: string, params: (map[string]any)?, body: any?): void {
+    const nv: NavStack? = NAV
+    if (nv != null) { nv.push(name, params, body) }
+}
 /**
  * Replace the whole stack with a single page, so Back cannot return to what came
  * before. Use it for login -> home and logout -> login transitions.
@@ -3119,7 +3239,10 @@ export function navigate(name: string): void { const nv: NavStack? = NAV; if (nv
  * Button({ onPress: function(): void { navReplace("home") } }, "Log in")
  * ```
  */
-export function navReplace(name: string): void { const nv: NavStack? = NAV; if (nv != null) { nv.replace(name) } }
+export function navReplace(name: string, params: (map[string]any)?, body: any?): void {
+    const nv: NavStack? = NAV
+    if (nv != null) { nv.replace(name, params, body) }
+}
 /**
  * Pop the top page and return to the previous one. No-op at the root page.
  *
@@ -3127,7 +3250,26 @@ export function navReplace(name: string): void { const nv: NavStack? = NAV; if (
  * Button({ onPress: function(): void { back() } }, "< Back")
  * ```
  */
-export function back(): void { const nv: NavStack? = NAV; if (nv != null) { nv.popStack() } }
+export function back(result: any?): void {
+    const nv: NavStack? = NAV
+    if (nv != null) { nv.popStack(result) }
+}
+
+/**
+ * The route this screen is running under: its params, its body, and any result a
+ * screen it pushed handed back. A screen already receives its Route as an argument;
+ * this is for components deeper in the tree that would otherwise have to thread it
+ * through every level (the same reason useState() needs no key).
+ *
+ * ```chuks
+ * const id: string = currentRoute() != null ? currentRoute().str("id", "") : ""
+ * ```
+ */
+export function currentRoute(): Route? {
+    const nv: NavStack? = NAV
+    if (nv == null) { return null }
+    return nv.top()
+}
 
 // NOTE: the native host contract (set_count/mount/tick/...) can't live here --
 // the transpiler tree-shakes exported functions that no Chuks code calls (the C

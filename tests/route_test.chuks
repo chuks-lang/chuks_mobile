@@ -1,0 +1,121 @@
+// Route params + body: the contract a screen can rely on.
+//
+// Params are the RESTORABLE half (they ride the hot-reload snapshot, so a screen
+// comes back with the same identity); body is the FAST half (in memory only, so a
+// screen must always be able to rebuild itself from params alone). These tests pin
+// that difference down, because the day it silently stops holding, every screen
+// quietly becomes un-reloadable.
+//
+// Run:  chuks run tests/route_test.chuks   (exits non-zero on failure)
+
+import { Node, Text, Route, NavStack, Reconciler } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+dataType Club { id: string; name: string }
+
+var SEEN_ID: string = ""
+var SEEN_BODY: bool = false
+var SEEN_RESULT: string = ""
+
+function screen(r: Route): Node {
+    SEEN_ID = r.str("id", "")
+    SEEN_BODY = r.body != null
+    SEEN_RESULT = r.result != null ? string(r.result) : ""
+    return Text({}, "club " + SEEN_ID)
+}
+
+var TAB: Cell<int>? = null
+var SEEN_TAB: int = -1
+// A stateful screen, the way a tab shell is: it remembers which tab you were on.
+function statefulScreen(_: Route): Node {
+    const t: Cell<int> = useState(0)
+    TAB = t
+    SEEN_TAB = int(t.get())
+    return Text({}, "tab " + string(SEEN_TAB))
+}
+function navStateful(): NavStack {
+    var routes: map[string]function(r: Route): Node = {}
+    routes["home"] = statefulScreen
+    routes["club"] = screen
+    return new NavStack(routes, "home")
+}
+
+function nav(): NavStack {
+    var routes: map[string]function(r: Route): Node = {}
+    routes["home"] = screen
+    routes["club"] = screen
+    return new NavStack(routes, "home")
+}
+
+function main(): void {
+    println("route_test")
+
+    // 1. Typed accessors, with defaults for what was never passed. Never a raw map
+    //    read: a missing key in a typed map reads back differently on VM vs AOT, and
+    //    string(null) is the text "null".
+    const r: Route = new Route("club", { "id": "c-7", "page": 3, "edit": true }, null)
+    check(r.str("id", "") == "c-7", "str() reads a param")
+    check(r.int("page", 1) == 3, "int() reads a param")
+    check(r.bool("edit", false), "bool() reads a param")
+    check(r.str("nope", "dflt") == "dflt", "str() falls back when absent")
+    check(r.int("nope", 42) == 42, "int() falls back when absent")
+    check(!r.bool("nope", false), "bool() falls back when absent")
+    check(r.has("id") && !r.has("nope"), "has() reports presence")
+
+    // 2. A push carries params and body to the screen.
+    const nv: NavStack = nav()
+    const c: Club = { id: "c-7", name: "Riverside Walkers" }
+    nv.push("club", { "id": c.id }, c)
+    check(nv.depth() == 2, "push deepens the stack")
+    const rc: Reconciler = new Reconciler()
+    rc.begin(); rc.renderRoot(nv.render())
+    check(SEEN_ID == "c-7", "the screen reads its param, got '" + SEEN_ID + "'")
+    check(SEEN_BODY, "the screen receives the body")
+
+    // 3. THE CONTRACT: params survive a reload, body does not. A screen that leans on
+    //    body alone comes back empty; one that reads params comes back whole.
+    const snap: string = nv.saveState()
+    const nv2: NavStack = nav()
+    nv2.loadState(snap)
+    check(nv2.depth() == 2, "the reloaded stack keeps its depth")
+    check(nv2.top().name == "club", "the reloaded stack keeps the route")
+    check(nv2.top().str("id", "") == "c-7", "params survive the reload")
+    check(nv2.top().body == null, "body does NOT survive the reload")
+
+    // 4. back(result) hands a value to the screen underneath.
+    nv.popStack("chosen")
+    check(nv.depth() == 1, "pop shrinks the stack")
+    check(nv.top().result != null && string(nv.top().result) == "chosen", "the popped screen's result lands on the one below")
+    rc.begin(); rc.renderRoot(nv.render())
+    check(SEEN_RESULT == "chosen", "the screen below reads the result, got '" + SEEN_RESULT + "'")
+
+    // 5. A pop at the root is refused, so the host can do its platform default.
+    check(!nv.popRoute(), "popRoute() at the root returns false")
+
+    // 6. A SCREEN UNDER THE TOP KEEPS ITS STATE. Only the visible route renders, so
+    //    without parking, pushing a detail screen would sweep the list screen's cells
+    //    and popping back would land on a screen that had forgotten its tab, its
+    //    scroll position, everything the user had set up.
+    const nv3: NavStack = navStateful()
+    const rc3: Reconciler = new Reconciler()
+    rc3.begin(); rc3.renderRoot(nv3.render())        // home mounts, tab defaults to 0
+    if (TAB != null) { TAB.set(2) }                  // the user picks the third tab
+    rc3.begin(); rc3.renderRoot(nv3.render())
+    check(SEEN_TAB == 2, "the screen's own state applies, got " + string(SEEN_TAB))
+    nv3.push("club", { "id": "c-1" }, null)          // push a detail over it
+    rc3.begin(); rc3.renderRoot(nv3.render())
+    nv3.popStack(null)                               // and come back
+    rc3.begin(); rc3.renderRoot(nv3.render())
+    check(SEEN_TAB == 2, "state under the top survives a push and pop, got " + string(SEEN_TAB))
+
+    println("route_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "route_test failed" }
+}
+main()

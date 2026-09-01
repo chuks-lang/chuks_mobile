@@ -104,11 +104,29 @@ export function useKeyedState<T>(key: string, initial: T): Cell<T> {
     return new Cell<T>(k)
 }
 
+// Identities that are MOUNTED BUT NOT RENDERED this pass, and whose state must
+// survive anyway: the screens stacked under the visible one. Only the top route runs,
+// so without this the sweep would treat every screen below it as unmounted, drop its
+// cells and run its effect cleanups -- and popping back would land on a screen that
+// had forgotten which tab you were on. A navigator declares them each pass (they are
+// cell-key prefixes, i.e. a keyed component's path); hookBegin clears the list, so an
+// app with no navigator retains nothing.
+var _parked: []string = []
+export function hookPark(prefixes: []string): void { _parked = prefixes }
+function isParked(key: string): bool {
+    for (var i: int = 0; i < _parked.length; i = i + 1) {
+        const p: string = _parked[i]
+        if (key.length >= p.length && key.slice(0, p.length) == p) { return true }
+    }
+    return false
+}
+
 // Framework-internal: begin a render pass (clear the visited sets + effect queue).
 export function hookBegin(): void {
     var e1: map[string]bool = {}; _seen = e1
     var e2: map[string]bool = {}; _fxSeen = e2
     var e3: []PendingFx = []; _pendingFx = e3
+    var e4: []string = []; _parked = e4
 }
 
 // Framework-internal: after a render, drop cells whose identity was not visited
@@ -119,7 +137,7 @@ export function hookSweep(): void {
     var ks: []string = _cells.keys()
     for (var i: int = 0; i < ks.length; i = i + 1) {
         var key: string = ks[i]
-        if (_seen.getOr(key, false)) { live[key] = _cells[key] }
+        if (_seen.getOr(key, false) || isParked(key)) { live[key] = _cells[key] }
     }
     _cells = live
     // effects: run cleanup for identities not visited this render, then drop them.
@@ -129,7 +147,7 @@ export function hookSweep(): void {
         var fk: string = fks[j]
         var ev: Effect? = _effects.get(fk)
         if (ev != null) {
-            if (_fxSeen.getOr(fk, false)) { liveFx[fk] = ev }
+            if (_fxSeen.getOr(fk, false) || isParked(fk)) { liveFx[fk] = ev }
             else { if (ev.cleanup != null) { var c: any = ev.cleanup; c() } }
         }
     }
