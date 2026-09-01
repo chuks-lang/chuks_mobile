@@ -8,7 +8,7 @@
 //
 // Run:  chuks run tests/route_test.chuks   (exits non-zero on failure)
 
-import { Node, Column, Row, Text, List, Route, NavStack, Reconciler } from "../core/ui.chuks";
+import { Node, Column, Row, Text, List, SectionList, Route, NavStack, Reconciler } from "../core/ui.chuks";
 import { useState, Cell } from "../core/state.chuks";
 
 function has(s: string, sub: string): bool {
@@ -53,6 +53,21 @@ function listScreen(r: Route): Node {
                    if (!FIRST_ROW.has(who) || i < FIRST_ROW.getOr(who, 999999)) { FIRST_ROW[who] = i }
                    return Row({ abs: true, top: top, left: 0, right: 0, h: 60 }, [ Text({}, who + string(i)) ])
                } }),
+    ])
+}
+
+var SEC_ROWS: []int = []
+// A screen whose list is a SECTION list, like a tab shell's Clubs index.
+function sectionScreen(_: Route): Node {
+    return Column({ dir: "col", grow: 1 }, [
+        SectionList({ sectionCount: 1,
+            rows:   function(sx: int): int { return 200 },
+            header: function(sx: int, top: int): Node { return Row({ abs: true, top: top, left: 0, right: 0, h: 30 }, [ Text({}, "H") ]) },
+            item:   function(sx: int, r: int, top: int): Node {
+                        SEC_ROWS.push(r)
+                        return Row({ abs: true, top: top, left: 0, right: 0, h: 60 }, [ Text({}, "s" + string(r)) ]) },
+            key:    function(sx: int, r: int): string { return "s" + string(r) },
+            rowHeight: 60, headerHeight: 30 }),
     ])
 }
 
@@ -291,6 +306,26 @@ function main(): void {
     nv7.push("scr", { "who": "X" }, null)          // the SAME route again: same id, new view
     rc7.begin(); rc7.renderRoot(nv7.render())
     check(has(rc7.drain(), "LV|"), "re-opening the same route re-announces its live list")
+
+    // 13. A SECTION LIST IS A LIST TOO. It has to claim the viewport when it is the
+    //     screen on top, or the host's scroll reports never reach it: you scroll and
+    //     rows stop mounting below the first screenful. And re-windowing one through
+    //     the plain-list path reads props it does not have and blanks the screen.
+    var sr: map[string]function(r: Route): Node = {}
+    sr["sec"] = sectionScreen
+    const nv8: NavStack = new NavStack(sr, "sec")
+    const rc8: Reconciler = new Reconciler()
+    rc8.setViewport(0, 600, 400)
+    rc8.begin(); rc8.renderRoot(nv8.render())
+    check(has(rc8.drain(), "LV|"), "a section list claims the live list")
+    rc8.setViewport(6000, 600, 400)                  // the user scrolls it a long way down
+    var sr0: []int = []; SEC_ROWS = sr0
+    const rewound: bool = rc8.rewindow()
+    check(rewound, "scrolling a section list re-windows it")
+    var lowest: int = 99999
+    for (var q: int = 0; q < SEC_ROWS.length; q = q + 1) { if (SEC_ROWS[q] < lowest) { lowest = SEC_ROWS[q] } }
+    check(SEC_ROWS.length > 0, "it mounts rows after the scroll, got " + string(SEC_ROWS.length))
+    check(lowest > 80, "and they are the rows for where it was scrolled to, first " + string(lowest))
 
     println("route_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "route_test failed" }

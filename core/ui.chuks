@@ -2033,7 +2033,14 @@ export class Reconciler {
         const lst: Node? = this.lastList
         if (lst == null) { return false }
         const l: Node = lst
-        this.reconcileList(l, l, this.lastListId, this.lastListParent, this.lastListIndex)
+        // Dispatch by kind: a SectionList re-windowed through the plain-list path reads
+        // props it does not have (count instead of sectionCount), comes out with zero
+        // rows, and the screen goes blank.
+        if (l.kind == "SectionList") {
+            this.reconcileSectionList(l, l, this.lastListId, this.lastListParent, this.lastListIndex)
+        } else {
+            this.reconcileList(l, l, this.lastListId, this.lastListParent, this.lastListIndex)
+        }
         return true
     }
 
@@ -2717,6 +2724,13 @@ export class Reconciler {
     // running offset; only the on-screen window (± buffer) is mounted. Reuses the
     // shared windowing state (mounted / itemNodes / listCount / vpTop / vpH).
     reconcileSectionList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        // Claim the viewport, exactly as a plain List does. Without this the host's
+        // scroll reports went to whichever OTHER list was live (or to none at all), so
+        // this list's window never followed the scroll: you scrolled and rows simply
+        // stopped mounting below the first screenful.
+        if (this.topScope == "" || _prefix(id, this.topScope)) {
+            this.lastList = next; this.lastListId = id; this.lastListParent = parent; this.lastListIndex = index
+        }
         const d: map[string]ListProp = next.data
         const sectionCount: int = lpInt(d, "sectionCount", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
@@ -2750,6 +2764,8 @@ export class Reconciler {
             this.emit("C|" + contentId + "|View"); this.emit("S|" + contentId + "|" + cS.str())
             this.emit("I|" + contentId + "|" + id + "|0")
             st.count = contentH
+            this.liveListId = "?"                       // new scroll view, even at a known id
+            if (st.top > 0) { this.emit("LS|" + id + "|" + string(st.top)) }
         } else if (contentH != st.count) {
             const cS: Style = new Style(); cS.h = contentH
             this.emit("S|" + contentId + "|" + cS.str())
