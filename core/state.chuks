@@ -48,6 +48,15 @@ export function hookEnter(path: string): void { _path = path; _slot = 0; _fxSlot
 // T, no cast). Read with get(), write set(v). Inference usually fills T from the
 // initial value (useState(0) -> Cell<int>); annotate or pass an explicit type arg
 // for empty collections (useState<[]string>([]) -> Cell<[]string>).
+// Set by any state write, cleared after a render. The heartbeat reads it to decide
+// whether an idle beat needs a render at all: without it the only way to answer that
+// question was to render and diff, which is what made a scrolling app drop frames
+// twice a second.
+var _dirty: bool = false
+export function markDirty(): void { _dirty = true }
+export function isDirty(): bool { return _dirty }
+export function clearDirty(): void { _dirty = false }
+
 export class Cell<T> {
     var k: string
     constructor(k: string) { this.k = k }
@@ -57,7 +66,7 @@ export class Cell<T> {
     // is a no-op instead of resurrecting a dead cell. This makes a late async/stream
     // callback firing into an unmounted component harmless (React's "setState on an
     // unmounted component is a no-op"): the fire-after-unmount race lands here.
-    public set(v: T): void { if (_cells.has(this.k)) { _cells[this.k] = v } }
+    public set(v: T): void { if (_cells.has(this.k)) { _cells[this.k] = v; markDirty() } }
 }
 
 /**

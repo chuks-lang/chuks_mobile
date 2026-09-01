@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { host } from "std/host";
 import { Prop } from "./prop.chuks";
@@ -1740,10 +1740,16 @@ export function Screen(first: ViewProps | []Node, kids: []Node = []): Node {
  * Props:
  *   - `count`     total number of rows
  *   - `key`       (rank: int) -> string    stable identity for the row at `rank`
- *   - `item`      (rank: int, top: int) -> Node    builds the row's node
- *   - `rowHeight` row height in px
+ *   - `item`      (rank: int, top: int) -> Node    builds the row's node. The row
+ *                 POSITIONS ITSELF: `abs: true, top: top` plus its horizontal
+ *                 insets (`left`/`right`, or `left` + `w`). An absolutely
+ *                 positioned node has no width of its own, so a row that omits
+ *                 them renders flush left and only as wide as its content.
+ *   - `rowHeight` row height in px, matching the row's real height (rows sit at
+ *                 rank * (rowHeight + gap), so a mismatch drifts)
  *   - `gap`       vertical gap between rows
- *   - `pad`       top/bottom padding (optional)
+ *   - `pad`       top/bottom padding (optional). VERTICAL only: horizontal
+ *                 padding belongs on the row, via its left/right insets.
  *   - `buffer`    extra rows kept above/below the window (optional, default 3)
  *   - `paging`    snap one full screen per swipe (video feeds)
  *   - `onVisible` (rank: int) -> void    the centered row changed (autoplay-follows-visible)
@@ -1759,6 +1765,10 @@ export function Screen(first: ViewProps | []Node, kids: []Node = []): Node {
  *        key:  function(r: int): string { return string(self.filtered[r]) },
  *        item: function(r: int, top: int): Node { return self.rowAt(r, top) },
  *        rowHeight: 72, gap: 10, pad: 8 })
+ * // ...and the row builder places itself:
+ * function rowAt(r: int, top: int): Node {
+ *     return Row({ abs: true, top: top, left: 16, right: 16, h: 72 }, [ ... ])
+ * }
  * ```
  */
 export function List(p: map[string]ListProp): Node {
@@ -1865,6 +1875,13 @@ export class Reconciler {
     var vpH: int
     var vpW: int                    // cross-axis viewport size (list width for a vertical list; grid columns)
     var rootPrev: Node?             // last rendered root, for diffing
+    // The virtualized List mounted by the last render, so a scroll can re-window it
+    // WITHOUT re-rendering the app. Cleared by every renderRoot and set again by
+    // reconcileList, so it is null whenever the current screen has no List.
+    var lastList: Node?
+    var lastListId: string
+    var lastListParent: string
+    var lastListIndex: int
     var itemNodes: map[string]Node  // List cell id -> last node it showed (for reconcile prev)
     var mounted: []string           // List cell ids in use this frame
     var listCount: int              // last content count (to re-emit content height only on change)
@@ -1872,6 +1889,8 @@ export class Reconciler {
     var listHeaderShown: map[string]bool  // List id -> header node currently mounted
     var listFooterShown: map[string]bool  // List id -> footer node currently mounted
     var cellRank: map[string]int    // recycling: cell id -> the row rank it currently shows (-1 = free)
+    var cellIds: []string           // pool slot -> its cell id, built once instead of per frame
+    var lastWinRange: int           // r0*100000+r1 of the last window, to skip unchanged passes
     var poolSize: int               // recycling: how many pool cells have been created
     var pending: map[string]any     // async bridge: token -> result closure (survives frames, unlike handlers)
     var pendingErr: map[string]any  // async bridge: token -> OPTIONAL error closure (host reports a failure)
@@ -1889,8 +1908,9 @@ export class Reconciler {
     constructor() {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
+        this.lastList = null; this.lastListId = ""; this.lastListParent = ""; this.lastListIndex = 0
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
-        this.cellRank = {}; this.poolSize = 0
+        this.cellRank = {}; this.poolSize = 0; this.cellIds = []
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
         this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
         this.listRefreshing = {}; this.listEmpty = {}; this.listContentH = -1
@@ -1907,7 +1927,7 @@ export class Reconciler {
     public forgetCommitted(): void {
         this.rootPrev = null
         this.itemNodes = {}; this.mounted = []; this.listCount = -1
-        this.cellRank = {}; this.poolSize = 0
+        this.cellRank = {}; this.poolSize = 0; this.cellIds = []
     }
     // Append one mutation line ("C|id|kind", "S|id|style", "I|id|parent|idx", "R|id", ...).
     public emit(s: string): void { this.lines.push(s) }
@@ -1931,8 +1951,30 @@ export class Reconciler {
     // Reconcile the whole app tree from the root; the app calls this after any
     // state change and the memoization makes everything unchanged bail.
     public renderRoot(next: Node): void {
+        this.lastList = null                     // re-set by reconcileList if this tree has one
         this.reconcile(this.rootPrev, next, "app", "root", 0)
         this.rootPrev = next
+    }
+
+    // Re-window the mounted List for the current viewport, without re-rendering the app.
+    // A scroll changes WHICH rows are mounted, nothing else: the tree the app would
+    // produce is identical, so rebuilding it every scroll frame is pure waste (it was
+    // also the bulk of the per-frame allocation behind the scroll-time heap growth).
+    // Returns false when the current screen has no List, so the caller can fall back to
+    // a full render.
+    // The id of pool slot `i`, built once and kept. Cell ids are stable for the life of
+    // the pool, so rebuilding them per frame was pure allocation.
+    cellIdAt(contentId: string, i: int): string {
+        while (this.cellIds.length <= i) { this.cellIds.push(contentId + ".cell" + string(this.cellIds.length)) }
+        return this.cellIds[i]
+    }
+
+    public rewindow(): bool {
+        const lst: Node? = this.lastList
+        if (lst == null) { return false }
+        const l: Node = lst
+        this.reconcileList(l, l, this.lastListId, this.lastListParent, this.lastListIndex)
+        return true
     }
 
     // Fire the closure bound to a node id. `fire` for onPress, `fireValue` for
@@ -2173,6 +2215,8 @@ export class Reconciler {
     // rest. Item identity comes from key(rank), so a row survives when a filter
     // moves it to a different rank (its id "c<key>" is stable, only its top moves).
     reconcileList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        // Remember it so a viewport change can come straight back here (see rewindow).
+        this.lastList = next; this.lastListId = id; this.lastListParent = parent; this.lastListIndex = index
         const d0: map[string]ListProp = next.data
         if (lpBool(d0, "horizontal", false)) { this.reconcileHList(prev, next, id, parent, index); return }
         const d: map[string]ListProp = next.data
@@ -2208,7 +2252,7 @@ export class Reconciler {
         if (prev == null) {
             // fresh mount (first render, or remount after a page swap tore this List
             // down): start from a clean pool so stale cells can't suppress mounts.
-            this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
+            this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0; this.cellIds = []
             const listS: Style = new Style(); listS.grow = 1; listS.basis = 0
             if (lpBool(d, "paging", false)) { listS.paging = 1 }   // snap per screen (video feeds)
             this.emit("C|" + id + "|Scroll"); this.emit("S|" + id + "|" + listS.str())
@@ -2227,6 +2271,14 @@ export class Reconciler {
         // decreases as r grows, so the near/far viewport edges swap which r they bound.
         // Window on GRID ROWS (each holds `ncol` cells), then expand to item ranks. For a plain
         // list ncol==1, so a grid row is a row and this is unchanged.
+        // NOTE: windowing AHEAD of the scroll (projecting by velocity and leaning the
+        // buffer into the direction of travel, as FlashList does) was measured and
+        // REVERTED. It pays for them because an unchanged cell costs nothing to
+        // re-render; here every row the window newly covers is rebuilt and diffed, so
+        // shifting the window further each frame only enlarges the per-frame work. On an
+        // iPhone 12 Pro it took the fastest phase from 60fps/24ms/1 janky to
+        // 58fps/45ms/10 janky and tripled the mutation stream. Window on where the list
+        // actually is.
         var gr0: int = 0
         var gr1: int = 0
         if (inverted) {
@@ -2239,6 +2291,24 @@ export class Reconciler {
         if (gr0 < 0) { gr0 = 0 }
         if (gr1 > gridRows) { gr1 = gridRows }
         if (gr1 < gr0) { gr1 = gr0 }
+        // Hold the window at a CONSTANT number of grid rows. Derived purely from the
+        // viewport, it is the most the list can ever need: fully visible rows, plus one
+        // for a partial row at each edge, plus the buffer above and below. Without this
+        // the range grows by a row whenever the scroll position straddles differently,
+        // and each growth creates a pool cell — native views and layout nodes built in
+        // the middle of a scrolling frame. On an iPhone 12 Pro that showed up as 36-65ms
+        // frames and 8-12 janky frames per phase while the pool filled; once it stopped
+        // growing the same sweep held a clean 60fps. A constant window means every cell
+        // is created in the first frames after the viewport is known, then only rebound.
+        const capacity: int = (this.vpH / stride) + 2 + 2 * buffer
+        if (gr1 - gr0 < capacity) {
+            gr1 = gr0 + capacity
+            if (gr1 > gridRows) {                    // near the end: take the slack above
+                gr1 = gridRows
+                gr0 = gr1 - capacity
+                if (gr0 < 0) { gr0 = 0 }
+            }
+        }
         var r0: int = gr0 * ncol
         var r1: int = gr1 * ncol
         if (r1 > count) { r1 = count }
@@ -2250,22 +2320,40 @@ export class Reconciler {
         // one and emits only the changed text / position (S|/P|), reusing the native
         // view. Result: during a fling, ~zero Create/Remove mutations — only cheap
         // content updates — so the native side never churns view + Yoga-node allocs.
-        var freeCells: []string = []           // cells whose current rank fell out of the window
-        var rankCell: map[string]string = {}    // rank (as string) still on-screen -> the cell showing it
+        var freeCells: []string = []          // cells whose current rank fell out of the window
+        var rankCell: map[int]string = {}     // rank still on-screen -> the cell showing it
         for (var i: int = 0; i < this.poolSize; i = i + 1) {
-            const cid: string = contentId + ".cell" + string(i)
+            const cid: string = this.cellIdAt(contentId, i)
             const cr: int = this.cellRank.getOr(cid, -1)
-            if (cr >= r0 && cr < r1) { rankCell[string(cr)] = cid } else { freeCells.push(cid) }
+            if (cr >= r0 && cr < r1) { rankCell[cr] = cid } else { freeCells.push(cid) }
         }
 
+        // A SCROLL cannot change a row's content: a row's node is a function of its rank
+        // and its top, and both are unchanged for a row still in the window. Only a state
+        // change can alter content, and that arrives through renderRoot with a fresh List
+        // node. So on the scroll path (rewindow passes the SAME node as prev and next) a
+        // row that is already mounted at this rank is left completely alone: no item()
+        // call, no node build, no diff. Without this, every frame rebuilt and re-diffed the
+        // whole window (~19 rows, each several nodes plus the app's own string work),
+        // which measured 9-14ms per frame on an iPhone 12 Pro and produced the visible
+        // stutter. Only rows ENTERING the window cost anything now.
+        const scrollOnly: bool = prev != null && prev == next
+        // Same rows as last pass and nothing else changed: no rebuild, no diff, no
+        // mutations. This is the common case between row boundaries at ordinary speeds.
+        const range: int = r0 * 100000 + r1
+        if (scrollOnly && range == this.lastWinRange) { return }
+        this.lastWinRange = range
         const newMounted: []string = []
         var fi: int = 0                          // next free cell to hand out
         for (var r: int = r0; r < r1; r = r + 1) {
             var cid: string = ""
-            const kept: string? = rankCell.get(string(r))
-            if (kept != null) { cid = kept }                  // this row is already on a cell: reuse in place
+            const kept: string? = rankCell.get(r)
+            if (kept != null) {
+                cid = kept                                    // this row is already on a cell: reuse in place
+                if (scrollOnly) { newMounted.push(cid); continue }
+            }
             else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }   // recycle a leaving cell
-            else { cid = contentId + ".cell" + string(this.poolSize); this.poolSize = this.poolSize + 1 }  // grow the pool
+            else { cid = this.cellIdAt(contentId, this.poolSize); this.poolSize = this.poolSize + 1 }  // grow the pool
             const gridRow: int = r / ncol
             const top: int = inverted ? invBase - r * stride : rowsTop + gridRow * stride
             const node: Node = itemFn(r, top)
@@ -2422,7 +2510,7 @@ export class Reconciler {
         const contentW: int = leftStart + count * stride + pad
 
         if (prev == null) {
-            this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0
+            this.mounted = []; this.itemNodes = {}; this.cellRank = {}; this.poolSize = 0; this.cellIds = []
             const listS: Style = new Style(); listS.grow = 1; listS.basis = 0; listS.horiz = 1
             if (lpBool(d, "paging", false)) { listS.paging = 1 }   // snap one item per screen
             // A distinct kind so a host that needs a different scroll class for the x-axis
@@ -2659,16 +2747,40 @@ export function asyncPending(): int { return ASYNC.pending() }
 
 // Run all queued closures on the CURRENT (render) thread, before the render that
 // follows, so their state changes are reflected this frame.
-function runAsyncQueue(): void {
+// Returns true when it actually ran something, so callers can tell a tick that DID
+// work from one that found an empty queue.
+function runAsyncQueue(): bool {
     var fns: []function(): void = ASYNC.take()
+    if (fns.length == 0) { return false }
     var i: int = 0
     while (i < fns.length) { fns[i](); i = i + 1 }
+    return true
 }
 
 // Ask the native host to call tick() promptly. Wired to the C-ABI wake callback via
 // a runtime builtin; until that lands (and on hosts that never register one) this is
 // a no-op and the host's idle heartbeat drains the queue instead.
-function wakeHost(): void { host.wake() }
+function wakeHost(): void { markDirty(); host.wake() }
+
+/**
+ * Ask for a re-render after changing state the framework cannot see.
+ *
+ * State held in a `useState` cell announces itself, so a component that calls
+ * `cell.set(...)` re-renders without help. MODULE-level state (a store, a cache, a
+ * subscription's latest value) is invisible to the framework, so after mutating it from
+ * a background task or a native callback, call this. It marks the app dirty and asks the
+ * host to render promptly.
+ *
+ * Calling `host.wake()` directly is not enough: an idle heartbeat no longer re-renders
+ * the whole app to discover whether anything changed (that cost ~20-38ms and dropped
+ * frames while scrolling), so a wake with nothing marked dirty does nothing.
+ *
+ * ```chuks
+ * REMOTE = walks          // module state the UI reads
+ * requestRender()         // ...now show it
+ * ```
+ */
+export function requestRender(): void { markDirty(); host.wake() }
 
 // The per-frame animation stepper. core/animated.chuks wires this (via setFrameStepper)
 // the first time an app starts a physics animation (decay/spring); until then it is a
@@ -2720,7 +2832,19 @@ export class App {
         runAsyncQueue()
         if (h > 0) { _vpH = h }   // expose the real viewport height (viewportHeight()) for full-screen feeds
         if (w > 0) { _vpW = w }   // expose the list width (viewportWidth()) for grid column sizing
-        this.recon.begin(); hookBegin(); this.recon.setViewport(top, h, w); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        this.recon.begin()
+        this.recon.setViewport(top, h, w)
+        // Scrolling does not change app state, so re-window the mounted List in place
+        // instead of rebuilding the whole app tree for every scroll frame. The hook
+        // lifecycle is deliberately skipped on this path: nothing re-rendered, so there
+        // is nothing to sweep (a sweep here would drop every cell). Effects still run,
+        // because a row entering the window may have registered one. When the screen has
+        // no List there is nothing to re-window and we fall back to a full render.
+        if (this.recon.rewindow()) {
+            runEffects()
+        } else {
+            hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        }
         // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
         // then re-render (WITHOUT begin, so the windowing mutations above are kept) so the newly
         // visible cell's state change (e.g. Video playing) lands in the same frame.
@@ -2732,16 +2856,33 @@ export class App {
     // Advance one frame: step per-frame physics, then onTick() + re-render. Emits
     // FA|1 / FA|0 when physics starts / stops so the host runs a display-link only
     // while it is live. Returns the mutation count.
+    // The host's heartbeat calls this a few times a second. It used to re-render the
+    // WHOLE app every time, whether or not anything had changed, which on an iPhone 12
+    // Pro cost 20-38ms and was the single source of dropped frames while scrolling: a
+    // 309-row feed went from 10 janky frames per 240 to ZERO once this stopped rendering
+    // on an idle beat. A tick only has work to do when the async queue ran a
+    // continuation, an animation is stepping (or just stopped), or the app's own onTick
+    // changed something. Otherwise it costs a queue check and returns.
     public tick(): int {
-        runAsyncQueue()
+        const ran: bool = runAsyncQueue()
         this.recon.begin()
         var active: int = 0                            // advance decay/spring values (updates their cur)
         if (_frameStepper != null) { const f: any = _frameStepper; active = int(f()) }
-        if ((active > 0) != (this.prevFrameActive > 0)) { this.recon.emit("FA|" + (active > 0 ? "1" : "0")) }
+        const flipped: bool = (active > 0) != (this.prevFrameActive > 0)
+        if (flipped) { this.recon.emit("FA|" + (active > 0 ? "1" : "0")) }
         this.prevFrameActive = active
+        // `onTick` is the app's hook; a default (empty) one cannot dirty anything, so an
+        // app that does not override it never pays for a render here.
+        const ticks: bool = this.ticksOnBeat()
+        if (!ran && active == 0 && !flipped && !ticks && !isDirty()) { return this.recon.count() }
         hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        clearDirty()
         return this.recon.count()
     }
+    // Override alongside onTick to say "my onTick changes state every beat", so the
+    // heartbeat keeps rendering for this app. Defaults to false: an app that only reacts
+    // to events, streams and animations never re-renders on an idle beat.
+    public ticksOnBeat(): bool { return false }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
         runAsyncQueue()
