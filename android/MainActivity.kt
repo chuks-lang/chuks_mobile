@@ -50,6 +50,7 @@ import android.nfc.NdefRecord
 import android.nfc.tech.Ndef
 import java.util.UUID
 import android.view.WindowManager
+import android.view.WindowInsets
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -278,10 +279,15 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         density = resources.displayMetrics.density
-        // Keyboard avoidance: adjustResize shrinks the window content when the keyboard
-        // shows, so a bottom input bar rises above it (set here too, not only in the
-        // manifest, in case the manifest is regenerated from app.json).
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        // Keyboard avoidance. adjustResize shrinks the WHOLE window, which lifts every
+        // bottom-anchored thing -- typing in a field at the top of the screen dragged the
+        // tab bar up over the keyboard. Let the keyboard overlay instead and lift only
+        // what it actually covers (see applyKeyboard). Needs ime() insets to know the
+        // keyboard's height, which is API 30+; older devices keep the resize behaviour,
+        // where the platform gives no reliable height with ADJUST_NOTHING.
+        window.setSoftInputMode(
+            if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            else WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
@@ -348,7 +354,11 @@ class MainActivity : Activity() {
 
         // first layout after the window is measured
         root.post { reportInsets(); relayout(); if (pushViewport()) relayout() }
-        root.setOnApplyWindowInsetsListener { _, insets -> reportInsets(); insets }   // update on inset changes
+        root.setOnApplyWindowInsetsListener { _, insets ->                            // update on inset changes
+            reportInsets()
+            if (Build.VERSION.SDK_INT >= 30) applyKeyboard(insets.getInsets(WindowInsets.Type.ime()).bottom)
+            insets
+        }
 
         // Text measure callback: needed in BOTH dev and production (the wake/heartbeat setup
         // below is split by devMode, but Yoga's text measurement is not).
@@ -3566,10 +3576,50 @@ class MainActivity : Activity() {
     }
 
     // ---- Yoga layout -> Android frames ------------------------------------
+    // How far the tree is lifted for the keyboard: the OVERLAP of the focused field, not
+    // the keyboard height. See applyKeyboard.
+    private var kbShift = 0
+    private var kbScroll: ScrollView? = null
+
+    // The keyboard overlays the app; lift only what it covers, and only as much as it
+    // takes. A focused field inside a Scroll gets bottom padding on that scroll and is
+    // scrolled into view (nothing else moves); a field pinned to the bottom outside a
+    // scroll (a chat composer) shifts the tree by exactly the overlap; a field already
+    // above the keyboard moves nothing. Mirrors the iOS host.
+    private fun applyKeyboard(imeH: Int) {
+        kbScroll?.let { it.setPadding(it.paddingLeft, it.paddingTop, it.paddingRight, 0) }
+        kbScroll = null
+        if (imeH <= 0) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
+        val f = currentFocus
+        if (f == null) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
+        val loc = IntArray(2); f.getLocationInWindow(loc)
+        val rootLoc = IntArray(2); root.getLocationInWindow(rootLoc)
+        // Measured against the UNLIFTED layout (add back the current shift), so repeated
+        // inset callbacks can't measure the field where the previous pass put it and
+        // collapse the lift to nothing.
+        val bottomInRoot = loc[1] - rootLoc[1] + f.height + kbShift
+        val overlap = maxOf(0, bottomInRoot + dp(8) - (root.height - imeH))
+
+        var p: View? = f.parent as? View
+        while (p != null && p !is ScrollView) { p = p.parent as? View }
+        if (p is ScrollView) {
+            val isNew = (kbScroll !== p)                              // scroll only on the way in
+            kbScroll = p
+            p.clipToPadding = false
+            p.setPadding(p.paddingLeft, p.paddingTop, p.paddingRight, imeH)
+            if (isNew && overlap > 0) p.smoothScrollBy(0, overlap)
+            if (kbShift != 0) { kbShift = 0; relayout() }
+            return
+        }
+        if (overlap == kbShift) return
+        kbShift = overlap
+        relayout()
+    }
+
     private fun relayout() {
         val app = ynodes["app"] ?: return
         val topY = dp(6)
-        val w = root.width; val h = root.height - topY
+        val w = root.width; val h = root.height - topY - kbShift
         if (w <= 0 || h <= 0) return
         N.ySetF(app, 5, w.toFloat()); N.ySetF(app, 6, h.toFloat())
         N.yCalc(app, w.toFloat(), h.toFloat())

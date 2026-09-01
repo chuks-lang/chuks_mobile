@@ -1143,6 +1143,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             name: UIResponder.keyboardWillShowNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(kbHide(_:)),
             name: UIResponder.keyboardWillHideNotification, object: nil)
+        // Moving focus between fields with the keyboard already up changes its frame
+        // without a new Show, so re-evaluate the overlap for the newly focused field.
+        NotificationCenter.default.addObserver(self, selector: #selector(kbShow(_:)),
+            name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
 
         // Tap anywhere outside a text field to dismiss the keyboard. cancelsTouchesInView
         // = false + simultaneous recognition so it never swallows a node's onPress tap
@@ -1914,23 +1918,62 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return (g is UIPanGestureRecognizer) && (other.view is UIScrollView)
     }
 
-    // Keyboard avoidance (adjust-resize): shrink the app's usable height by the keyboard
-    // height and relayout, so bottom-anchored content (a chat input bar) sits above the
-    // keyboard and scrollable content fits the reduced area. Automatic for every app, no
-    // KeyboardAvoidingView needed. Animated to match the keyboard's own curve.
-    var kbHeight: CGFloat = 0
+    // Keyboard avoidance. The keyboard OVERLAYS the app; it does not resize it. Shrinking
+    // the whole tree by the keyboard height (what this used to do) lifts EVERY
+    // bottom-anchored thing, so typing in a field at the top of the screen dragged the tab
+    // bar up over the keyboard -- which no platform does: a tab bar stays put and the
+    // keyboard covers it.
+    //
+    // So lift only what is actually covered, and only as much as it takes:
+    //   - focused field inside a Scroll: give that scroll a bottom inset and scroll the
+    //     field into view (what UIKit itself does). Nothing else moves.
+    //   - focused field not in a scroll (a chat composer pinned to the bottom): shift the
+    //     tree by exactly the overlap, so the composer clears the keyboard and no more.
+    //   - focused field already above the keyboard: nothing moves at all.
+    var kbHeight: CGFloat = 0            // the SHIFT applied to the tree, not the keyboard height
+    var kbScroll: UIScrollView?          // the scroll we inset, to undo on hide
     @objc func kbShow(_ n: Notification) {
         guard let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
-        let h = max(0, end.height - view.safeAreaInsets.bottom)
-        if h == kbHeight { return }
-        kbHeight = h
+        let kbTop = view.bounds.height - max(0, end.height)          // keyboard's top edge, in view coords
         let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        // The focused field: we own every input view, so find it rather than reaching for
+        // a private first-responder API.
+        var field: UIView? = nil
+        for (_, v) in views where (v is UITextField || v is UITextView) && v.isFirstResponder { field = v; break }
+        guard let f = field else { return }
+        // Measure against the UNLIFTED layout: the tree is already shifted by kbHeight, so
+        // add it back. The keyboard sends several notifications (show, then frame changes
+        // as it settles or as focus moves), and without this each pass would measure the
+        // field where the previous pass put it -- the lift would collapse to nothing.
+        let fFrame = f.convert(f.bounds, to: view)
+        let overlap = max(0, fFrame.maxY + kbHeight + 8 - kbTop)     // 8pt of breathing room
+
+        var scroll: UIScrollView? = nil                              // nearest scrollable ancestor
+        var p: UIView? = f.superview
+        while let cur = p { if let sc = cur as? UIScrollView { scroll = sc; break }; p = cur.superview }
+
+        if let sc = scroll {
+            let inset = max(0, end.height - view.safeAreaInsets.bottom)
+            let isNew = (kbScroll !== sc)                             // scroll only on the way in
+            kbScroll = sc
+            sc.contentInset.bottom = inset
+            sc.verticalScrollIndicatorInsets.bottom = inset
+            if isNew && overlap > 0 { sc.setContentOffset(CGPoint(x: sc.contentOffset.x, y: sc.contentOffset.y + overlap), animated: true) }
+            if kbHeight != 0 { kbHeight = 0; UIView.animate(withDuration: dur) { self.relayout() } }
+            return
+        }
+        if overlap == kbHeight { return }
+        kbHeight = overlap
         UIView.animate(withDuration: dur) { self.relayout() }
     }
     @objc func kbHide(_ n: Notification) {
+        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        if let sc = kbScroll {
+            kbScroll = nil
+            UIView.animate(withDuration: dur) { sc.contentInset.bottom = 0; sc.verticalScrollIndicatorInsets.bottom = 0 }
+        }
         if kbHeight == 0 { return }
         kbHeight = 0
-        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
         UIView.animate(withDuration: dur) { self.relayout() }
     }
 
@@ -4044,7 +4087,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // Without this the tree is inset AND the app pads -> a gap top and bottom.
         let topY: CGFloat = 0
         let W = Float(view.bounds.width)
-        let H = Float(view.bounds.height - topY - kbHeight)   // shrink for the keyboard
+        let H = Float(view.bounds.height - topY - kbHeight)   // kbHeight: only the keyboard OVERLAP of a focused bottom field
         if W <= 0 || H <= 0 { return }
         YGNodeStyleSetWidth(app, W); YGNodeStyleSetHeight(app, H)
         let _tc = layoutTiming ? CACurrentMediaTime() : 0
