@@ -104,14 +104,20 @@ export function useKeyedState<T>(key: string, initial: T): Cell<T> {
     return new Cell<T>(k)
 }
 
-// Identities that are MOUNTED BUT NOT RENDERED this pass, and whose state must
-// survive anyway: the screens stacked under the visible one. Only the top route runs,
-// so without this the sweep would treat every screen below it as unmounted, drop its
-// cells and run its effect cleanups -- and popping back would land on a screen that
-// had forgotten which tab you were on. A navigator declares them each pass (they are
-// cell-key prefixes, i.e. a keyed component's path); hookBegin clears the list, so an
-// app with no navigator retains nothing.
 var _parked: []string = []
+/**
+ * Framework-internal (a navigator calls this; apps do not). Declare the identities
+ * that are MOUNTED BUT NOT RENDERED this pass, so their state survives the sweep.
+ *
+ * Only the visible route renders. Without this the sweep would treat every screen
+ * stacked beneath it as unmounted, drop its cells and run its effect cleanups, and
+ * popping back would land on a screen that had forgotten which tab you were on, where
+ * it was scrolled, everything the user had set up.
+ *
+ * `prefixes` are cell-key prefixes, i.e. a keyed component's path. hookBegin clears
+ * the list every pass, so an app with no navigator retains nothing and a route that
+ * is actually popped is swept the moment it stops being declared.
+ */
 export function hookPark(prefixes: []string): void { _parked = prefixes }
 function isParked(key: string): bool {
     for (var i: int = 0; i < _parked.length; i = i + 1) {

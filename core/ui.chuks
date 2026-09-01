@@ -3043,27 +3043,81 @@ export class Route {
         this.body = body
         this.result = null
     }
-    // A param as text, or `dflt` when absent.
+    /**
+     * A param as text, or `dflt` when the key was not passed.
+     *
+     * Always give a default. There is no raw-map read on purpose: a miss on a typed
+     * map reads back as null under the VM and as a zero value under AOT, and
+     * `string(null)` is the four characters "null", not "". A default makes the
+     * absent case explicit and identical on both.
+     *
+     * ```chuks
+     * const id: string = r.str("id", "")
+     * ```
+     */
     public str(key: string, dflt: string): string {
         const v: any = this.params.getOr(key, null)
         if (v == null) { return dflt }
         return string(v)
     }
-    // A param as a number, or `dflt` when absent.
+    /**
+     * A param as a number, or `dflt` when the key was not passed.
+     *
+     * ```chuks
+     * const page: int = r.int("page", 1)
+     * ```
+     */
     public int(key: string, dflt: int): int {
         const v: any = this.params.getOr(key, null)
         if (v == null) { return dflt }
         return int(v)
     }
-    // A param as a flag, or `dflt` when absent.
+    /**
+     * A param as a flag, or `dflt` when the key was not passed.
+     *
+     * ```chuks
+     * const editing: bool = r.bool("edit", false)
+     * ```
+     */
     public bool(key: string, dflt: bool): bool {
         const v: any = this.params.getOr(key, null)
         if (v == null) { return dflt }
         return bool(v)
     }
+    /**
+     * Whether a param was passed at all. Use it when "absent" and "the default value"
+     * mean different things (an unset filter versus one explicitly set to zero).
+     *
+     * ```chuks
+     * const limited: bool = r.has("max")
+     * ```
+     */
     public has(key: string): bool { return this.params.getOr(key, null) != null }
 }
 
+/**
+ * The app's navigator: a stack of routes, where the top one is on screen.
+ *
+ * Register a screen per route name in createRoot and pick the one to open with.
+ * Push with `navigate()`, pop with `back()`; the system back gesture and Android's
+ * back button pop it too, and at the root they fall through to the platform default
+ * (on Android, leaving the app), so an app gets platform-correct back for free.
+ *
+ * Each entry carries its own params and body (see Route) and its own hook identity,
+ * so two screens never share useState cells. Screens under the top keep their state
+ * until they are actually popped, so returning to a list finds it as you left it.
+ * The route stack (names and params) rides the hot-reload snapshot, so an edit keeps
+ * you on the screen you were on.
+ *
+ * ```chuks
+ * export function createRoot(): NavStack {
+ *     var routes: map[string]function(r: Route): Node = {}
+ *     routes["home"] = Home                     // a screen takes its Route
+ *     routes["club"] = ClubScreen
+ *     return new NavStack(routes, "home")
+ * }
+ * ```
+ */
 export class NavStack extends App {
     // Routes map a name to a screen: a function () -> Node. (Like RN, a screen is
     // just a function that returns Node; there is no page base class to extend.)
@@ -3078,16 +3132,26 @@ export class NavStack extends App {
         this.stack = [new Route(initial, null, null)]
         NAV = this
     }
-    // Push a route (prefer the navigate() free function).
+    /**
+     * Push a route onto the stack. Prefer the `navigate()` free function, which finds
+     * the active navigator for you so a screen deep in the tree need not hold one.
+     * See navigate() for what params and body mean.
+     */
     public push(name: string, params: (map[string]any)?, body: any?): void {
         this.stack.push(new Route(name, params, body))
     }
-    // Reset the stack to a single route (prefer the navReplace() free function).
+    /**
+     * Reset the stack to a single route, so back cannot return to what came before.
+     * Prefer the `navReplace()` free function.
+     */
     public replace(name: string, params: (map[string]any)?, body: any?): void {
         this.stack = [new Route(name, params, body)]
     }
-    // Pop the top route, if any remains below it (prefer the back() free function).
-    // `result` is handed to the screen underneath, which reads it as `r.result`.
+    /**
+     * Pop the top route when one remains below it; a no-op at the root, so the host
+     * can fall through to its platform default. `result` is handed to the screen
+     * underneath, which reads it as `r.result`. Prefer the `back()` free function.
+     */
     public popStack(result: any?): void {
         if (this.stack.length > 1) {
             const s: []Route = []
@@ -3096,8 +3160,18 @@ export class NavStack extends App {
             if (result != null) { this.stack[this.stack.length - 1].result = result }
         }
     }
-    // The entry on top of the stack: what is on screen right now.
+    /**
+     * The entry on top of the stack: the route on screen right now, with its params,
+     * body and result. `currentRoute()` is the free-function form.
+     */
     public top(): Route { return this.stack[this.stack.length - 1] }
+    /**
+     * How many routes are stacked. 1 means the root, where back has nothing to pop.
+     *
+     * ```chuks
+     * const canGoBack: bool = nav.depth() > 1
+     * ```
+     */
     public depth(): int { return this.stack.length }
     // The system back gesture/button pops a route when one is stacked, so a pushed
     // screen is dismissable the way the platform expects without the app wiring
@@ -3182,15 +3256,6 @@ export class NavStack extends App {
     }
 }
 
-/**
- * Push a page onto the navigation stack by its route name (the name you
- * registered in createRoot). Back returns to the current page. Call from any
- * event closure; the re-render after the event shows the new top page.
- *
- * ```chuks
- * Button({ onPress: function(): void { navigate("settings") } }, "Settings")
- * ```
- */
 // ---- back: the system gesture and button ------------------------------------
 // One event for "the user asked to go back", however they asked: Android's system
 // back button or gesture, and the iOS left-edge swipe. Handlers are consulted in
@@ -3227,6 +3292,36 @@ function runBackHandlers(): bool {
     return false
 }
 
+/**
+ * Push a page onto the navigation stack by its route name (the name you registered
+ * in createRoot). Back returns to the current page. Call from any event closure; the
+ * re-render after the event shows the new top page.
+ *
+ * `params` and `body` are the two halves of what the next screen is given, and they
+ * behave differently on purpose:
+ *
+ * - `params` say WHICH thing the screen is for (an id, a page number, a flag). They
+ *   are serialized with the stack, so a hot reload puts you back on the same screen
+ *   with the same identity. Keep them to strings, ints and bools.
+ * - `body` is a value you already hold, handed straight over so the screen paints
+ *   real content on its first frame instead of a spinner. It lives in memory only:
+ *   after a reload it is null, which is exactly why the id belongs in `params`. A
+ *   screen must be able to rebuild itself from params alone.
+ *
+ * Both are optional: `navigate("settings")` is still a plain push.
+ *
+ * ```chuks
+ * navigate("settings")                                  // no arguments
+ * navigate("club", { id: c.id })                        // identity only
+ * navigate("club", { id: c.id }, c)                     // + a head start
+ *
+ * routes["club"] = function(r: Route): Node {           // and on the other side
+ *     const seed: Club? = r.body                        // null after a reload
+ *     const club: Club? = seed != null ? seed : clubById(r.str("id", ""))
+ *     ...
+ * }
+ * ```
+ */
 export function navigate(name: string, params: (map[string]any)?, body: any?): void {
     const nv: NavStack? = NAV
     if (nv != null) { nv.push(name, params, body) }
@@ -3235,8 +3330,12 @@ export function navigate(name: string, params: (map[string]any)?, body: any?): v
  * Replace the whole stack with a single page, so Back cannot return to what came
  * before. Use it for login -> home and logout -> login transitions.
  *
+ * Takes the same optional `params` and `body` as navigate: params ride the stack and
+ * survive a reload, body is an in-memory head start for the first frame.
+ *
  * ```chuks
  * Button({ onPress: function(): void { navReplace("home") } }, "Log in")
+ * Button({ onPress: function(): void { navReplace("club", { id: c.id }, c) } }, "Open")
  * ```
  */
 export function navReplace(name: string, params: (map[string]any)?, body: any?): void {
@@ -3246,8 +3345,18 @@ export function navReplace(name: string, params: (map[string]any)?, body: any?):
 /**
  * Pop the top page and return to the previous one. No-op at the root page.
  *
+ * `result` is optional, and is how a screen pushed to CHOOSE something answers the
+ * screen that pushed it: it lands on that screen's route as `r.result` (null when
+ * nothing was handed back, and cleared once that route is popped in turn).
+ *
  * ```chuks
  * Button({ onPress: function(): void { back() } }, "< Back")
+ * Button({ onPress: function(): void { back(club.id) } }, "Use this club")
+ *
+ * routes["home"] = function(r: Route): Node {           // the screen that pushed it
+ *     const picked: string = r.result != null ? string(r.result) : ""
+ *     ...
+ * }
  * ```
  */
 export function back(result: any?): void {
