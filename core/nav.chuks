@@ -5,7 +5,7 @@
 // never imports an icon package. You pass icons in — a prebuilt node for the bar
 // actions, or a render function for the tabs (whose color depends on the active
 // state). Bring @chuks/lucide, or any other icon set, from the app side.
-import { Node, Row, Column, Text, KeyedComp } from "./ui.chuks";
+import { Node, Row, Column, Text, KeyedComp, safeBottom } from "./ui.chuks";
 import { tk } from "./theme.chuks";
 
 // A round, tappable icon button around a NON-NULL icon node. `hasPress` says
@@ -85,18 +85,129 @@ export function TabBar(names: []string, labels: []string, iconFor: any, active: 
     ])
 }
 
-// TabView: a bottom-tab scaffold — the active screen above a shared TabBar. It is
-// a plain, stateless render function (everything returns Node); the app owns the
-// active-tab index (a module-level var) and passes it in, and `onSelect(i)` sets
-// it. `screens` is parallel to `icons`/`labels`; each is a () -> Node screen
-// function that fills the area above the bar.
-//   TabView(["house","bell"], ["Home","Alerts"], iconFor, [Home, Alerts], active, onSelect)
-export function TabView(icons: []string, labels: []string, iconFor: any, screens: []any, active: int, onSelect: any): Node {
-    const build: any = screens[active]
-    return Column({ tw: "bg-bg" }, [
-            // Place the active screen lazily, keyed by tab, so it runs with its own
-            // identity (its useState is per-tab and doesn't leak to the next tab).
-            KeyedComp("tab:" + string(active), build),
-            TabBar(icons, labels, iconFor, active, onSelect),
+// ── Composable tabs ─────────────────────────────────────────────────────────
+// TabView is a bottom-tab scaffold you COMPOSE: declare each tab with `Tab({...})`
+// and pass the list. The scaffold owns the shared bar and the per-tab keyed remount
+// (so a tab's state never leaks to the next, and a reused node can't carry a stale
+// event binding into the next tab). Every bit of chrome is a prop or slot — a top
+// `header` bar, a floating `accessory`, a per-tab `badge`, a raised `fab` center tab,
+// or a fully custom `bar` — so you never have to hand-roll the shell (and lose the
+// keyed remount) just to customize it.
+//
+//   TabView({ active: idx, onSelect: onSelect, iconFor: iconFor, header: appBar }, [
+//       Tab({ name: "home",  icon: "house", label: "Home", screen: Home }),
+//       Tab({ name: "track", icon: "plus",  fab: true,      screen: Track }),
+//       Tab({ name: "you",   icon: "user",  label: "You", badge: "3", screen: Profile }),
+//   ])
+
+// One tab: its bar appearance plus the screen it shows. Only `name` + `screen` are required.
+export dataType TabSpec {
+    name: string,                 // stable id for this tab
+    icon: string?,                // icon name passed to iconFor; omit for a label-only tab
+    iconSelected: string?,        // icon name when active (default: same as `icon`)
+    label: string?,               // omit -> use `name`; "" -> icon-only (no text)
+    badge: string?,               // "" = a dot, "3" / "9+" = a count bubble
+    fab: bool?,                   // render as a raised center action (a FAB tab)
+    hidden: bool?,                // keep out of the bar (still selectable from code)
+    disabled: bool?,              // show but don't allow taps
+    // Full control (the Expo / React Navigation model): draw the tab's inner content
+    // yourself from the focused state, and style it however you like (bigger when active,
+    // any color / layout / icon). When set, `icon` / `label` / `badge` / `fab` are ignored
+    // for this tab; the framework still owns the pressable slot, the tap, and the layout.
+    render: function?(focused: bool): Node,
+    screen: function(): Node,     // the screen this tab renders
+}
+// Declare one tab. A named builder over a TabSpec literal (like Expo's <Trigger>), so
+// the fields autocomplete and typos are caught at the call site.
+export function Tab(spec: TabSpec): TabSpec { return spec }
+
+// TabView props. `active` indexes `tabs`; `onSelect(i)` fires on tap; `iconFor` is the
+// icon-agnostic renderer (name, color, size) -> Node. Everything else is optional chrome.
+export dataType TabViewProps {
+    active: int,
+    onSelect: function(i: int): void,
+    iconFor: function(name: string, color: string, size: int): Node,
+    // Default-path colors (used only for tabs WITHOUT a `render` fn, like Expo's
+    // tabBarActiveTintColor). For anything beyond color, use a tab's `render`.
+    activeColor: string?,         // active icon/label color   (default tk("primary"))
+    inactiveColor: string?,       // inactive icon/label color (default tk("subtle"))
+    bg: string?,                  // bar background (default tk("surface"))
+    fabColor: string?,            // FAB glyph color on the tint circle (default tk("primaryText"))
+    header: Node?,                // a fixed slot ABOVE the content (a top app bar)
+    accessory: Node?,             // a floating slot just above the bar (a mini-player / banner)
+    bar: function?(tabs: []TabSpec, active: int, onSelect: any): Node,   // replace the whole bar
+}
+export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
+    const build: any = tabs[p.active].screen
+    var kids: []Node = []
+    if (p.header != null) { kids.push(p.header) }                                    // top bar (optional)
+    // Keyed by tab so the active screen REMOUNTS on switch: its useState is per-tab
+    // and a reused native node can't carry a stale event binding into the next tab.
+    kids.push(Column({ grow: 1 }, [ KeyedComp("tab:" + string(p.active), build) ]))
+    if (p.accessory != null) { kids.push(p.accessory) }                             // floating accessory
+    if (p.bar != null) { const bf: any = p.bar; kids.push(bf(tabs, p.active, p.onSelect)) }   // custom bar
+    else { kids.push(defaultTabBar(tabs, p)) }                                       // default bar
+    return Column({ grow: 1, tw: "bg-bg" }, kids)
+}
+
+// A small notification bubble drawn over a tab icon (top-right). "" renders a dot.
+function tabBadge(text: string): Node {
+    if (text == "") { return Row({ abs: true, top: 0, right: 0, w: 8, h: 8, radius: 4, bg: tk("danger") }, []) }
+    return Row({ abs: true, top: -6, right: -12, h: 16, radius: 8, bg: tk("danger"), justify: "center", align: "center", px: 5 }, [
+            Text({ size: 10, weight: "bold", color: tk("primaryText") }, text),
+    ])
+}
+// The default bottom bar, built from the tab specs: icon (+ a selected variant), an
+// optional label, an optional badge, a raised `fab` center tab, and dimmed `disabled`
+// tabs. Hidden tabs are skipped. Pass `bar` to TabView to replace this entirely.
+function defaultTabBar(tabs: []TabSpec, p: TabViewProps): Node {
+    const activeC: string = p.activeColor ?? tk("primary")
+    const inactiveC: string = p.inactiveColor ?? tk("subtle")
+    const bg: string = p.bg ?? tk("surface")
+    const iconFor: any = p.iconFor
+    var items: []Node = []
+    for (var i: int = 0; i < tabs.length; i = i + 1) {
+        const spec: TabSpec = tabs[i]
+        // A guard-`continue` here would jump over the `var`s below (miscompiles under
+        // AOT), so build the whole item inside the not-hidden branch instead.
+        if (!(spec.hidden ?? false)) {
+            const sel: bool = i == p.active
+            const disabled: bool = spec.disabled ?? false
+            const onP: any = disabled ? null : tabPress(p.onSelect, i)
+            const rf: any = spec.render
+            if (rf != null) {
+                // Full control (Expo model): the app draws the tab's inner content from
+                // the focused state; the framework only owns the pressable slot + tap.
+                const inner: Node = rf(sel)
+                items.push(Column({ tw: "grow items-center justify-center", opacity: disabled ? 40 : 100, onPress: onP }, [ inner ]))
+            } else {
+                const col: string = sel ? activeC : inactiveC
+                const iconName: string = sel ? (spec.iconSelected ?? (spec.icon ?? "")) : (spec.icon ?? "")
+                const build: any = iconFor
+                if (spec.fab ?? false) {
+                    // A raised circular center action (the FAB tab).
+                    const glyph: Node = build(iconName, p.fabColor ?? tk("primaryText"), 26)
+                    items.push(Column({ tw: "grow items-center justify-center", onPress: onP }, [
+                            Row({ tw: "w-14 h-14 rounded-full items-center justify-center", bg: activeC, shadow: 3 }, [ glyph ]),
+                    ]))
+                } else {
+                    var glyph: Node = build(iconName, col, 24)
+                    if (spec.badge != null) { glyph = Row({}, [ glyph, tabBadge(spec.badge ?? "") ]) }
+                    // Label: omitted -> use name; "" -> icon-only.
+                    var showLabel: bool = true
+                    var labelText: string = spec.name
+                    if (spec.label != null) { const l: string = spec.label ?? ""; if (l == "") { showLabel = false } else { labelText = l } }
+                    var col2: []Node = [ glyph ]
+                    if (showLabel) { col2.push(Text({ size: 12, weight: sel ? "semibold" : "regular", color: col }, labelText)) }
+                    items.push(Column({ tw: "grow items-center justify-center gap-xs p-sm", opacity: disabled ? 40 : 100, onPress: onP }, col2))
+                }
+            }
+        }
+    }
+    return Column({ bg: bg }, [
+            Row({ tw: "h-1 bg-borderSoft" }, []),   // top hairline
+            // Bake the bottom safe-area inset into the bar so its background reaches the
+            // screen edge and the tabs clear the home indicator on every device.
+            Row({ px: 6, pt: 6, pb: 6 + safeBottom() }, items),
     ])
 }
