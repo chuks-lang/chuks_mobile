@@ -404,6 +404,53 @@ final class CameraController: NSObject, AVCapturePhotoCaptureDelegate {
 // The normal per-app UIKit host. The Chuks Preview build (-D CHUKS_PREVIEW) supplies its
 // own @main in ChuksPreview.swift, gating CardsVC behind a connect/scan screen.
 #if !CHUKS_PREVIEW
+// Cold start: process launch -> the first frame the user could see. Measured the same
+// way as the RN and Flutter benchmark apps (process start time from the kernel, first
+// display-link callback after launch), so the three numbers are comparable. Benchmark
+// builds only.
+final class ColdStartProbe {
+    static let shared = ColdStartProbe()
+    private var link: CADisplayLink?
+    func begin() {
+        let l = CADisplayLink(target: self, selector: #selector(tick))
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+    private var firstFrameMs: Double = -1
+    // Process start, from the kernel.
+    private func sinceLaunchMs() -> Double {
+        var kp = kinfo_proc(); var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        sysctl(&mib, 4, &kp, &size, nil, 0)
+        let st = kp.kp_proc.p_un.__p_starttime
+        let start = Double(st.tv_sec) + Double(st.tv_usec) / 1_000_000.0
+        var tv = timeval(); gettimeofday(&tv, nil)
+        return ((Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000.0) - start) * 1000.0
+    }
+    // A list that has actually rendered: a scroll view whose content is taller than
+    // itself. "First frame" alone is not comparable across frameworks, because a
+    // framework that renders asynchronously shows an EMPTY first frame and would look
+    // faster while the user is still staring at nothing.
+    private func contentReady(_ v: UIView?) -> Bool {
+        guard let v = v else { return false }
+        if let sv = v as? UIScrollView, sv.contentSize.height > sv.bounds.height, sv.bounds.height > 0 { return true }
+        for sub in v.subviews where contentReady(sub) { return true }
+        return false
+    }
+    @objc private func tick() {
+        if firstFrameMs < 0 { firstFrameMs = sinceLaunchMs() }
+        guard contentReady(UIApplication.shared.windows.first) else { return }   // keep waiting
+        link?.invalidate(); link = nil
+        let msg = String(format: "BENCHMARK CHUKS COLDSTART: first frame %.0f ms | CONTENT %.0f ms | mem %.0f MB",
+                         firstFrameMs, sinceLaunchMs(), physFootprintMB())
+        print(msg); NSLog(msg)
+        if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            try? (msg + "\n").write(to: dir.appendingPathComponent("coldstart.txt"),
+                                    atomically: true, encoding: .utf8)
+        }
+    }
+}
+
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
@@ -414,6 +461,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         w.rootViewController = vc
         w.makeKeyAndVisible()
         window = w
+        if BENCHMARK_MODE { ColdStartProbe.shared.begin() }
         return true
     }
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
@@ -669,7 +717,17 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     private var pending = false   // waiting on the authorization decision to begin
     init(once: Bool, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
         self.once = once; self.onFix = onFix; self.onErr = onErr
-        super.init(); mgr.delegate = self; mgr.desiredAccuracy = kCLLocationAccuracyBest
+        super.init(); mgr.delegate = self
+        // Continuous route tracking (a walk, a run, a ride) needs more than the default
+        // setup: the navigation-grade accuracy class, an activity type so Core Location
+        // tunes its filtering for a person on foot, and auto-pause OFF (iOS otherwise
+        // stops updates when it decides you have stopped, silently losing the middle of
+        // a walk). `once` callers get a single fix, so they keep the cheaper class.
+        mgr.desiredAccuracy = once ? kCLLocationAccuracyBest : kCLLocationAccuracyBestForNavigation
+        if !once {
+            mgr.activityType = .fitness
+            mgr.pausesLocationUpdatesAutomatically = false
+        }
     }
     func start() {
         switch mgr.authorizationStatus {
@@ -689,10 +747,23 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
         }
     }
     func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {
-        guard let l = locs.last else { return }
-        let c = l.coordinate
-        onFix("\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course)")
-        if once { m.stopUpdatingLocation() }
+        // Deliver EVERY fix in the batch. Core Location coalesces updates, so keeping
+        // only `locs.last` threw away route points (and the distance between them).
+        // Two kinds of fix are dropped rather than forwarded:
+        //   - horizontalAccuracy < 0 marks an invalid fix, and its coordinate is meaningless;
+        //   - a fix older than 5s is a CACHED one. The first callback after start is
+        //     usually cached, so forwarding it draws a phantom leg from wherever the
+        //     phone last had a fix, which can be streets (or cities) away.
+        let now = Date()
+        var delivered = false
+        for l in locs {
+            if l.horizontalAccuracy < 0 { continue }
+            if now.timeIntervalSince(l.timestamp) > 5 { continue }
+            let c = l.coordinate
+            onFix("\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course)")
+            delivered = true
+        }
+        if once && delivered { m.stopUpdatingLocation() }
     }
     func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
         if (e as? CLError)?.code == .locationUnknown { return }  // transient: no fix yet, keep waiting
@@ -829,6 +900,34 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var videoObs: [ObjectIdentifier: NSObjectProtocol] = [:]  // player -> loop observer (persists across reuse)
     var videoNoLoop = Set<ObjectIdentifier>()         // players whose Video set loop=false (checked in the end observer)
     let videoPoolCap = 16                             // bound idle players kept warm
+    // Adaptive viewport throttle. A viewport push is a SYNCHRONOUS engine round trip.
+    // Native code answers in microseconds, so pushing every scroll frame is free; the
+    // on-device dev runtime interprets, costing milliseconds, and pushing every frame
+    // there leaves the engine's window trailing the real offset far enough that every
+    // mounted row sits off-screen and the list renders BLANK until the backlog drains
+    // (seconds, on a fast fling). So: measure the round trip and, when it is slow,
+    // push at most once per ~3x its cost, with a final push once scrolling settles.
+    var vpCost: CFTimeInterval = 0                    // smoothed cost of one push
+    var vpLastPush: CFTimeInterval = 0
+    var vpSettleScheduled = false
+    var vsyncLink: CADisplayLink?
+    var vpDirty = false
+    var vsyncParity = false
+    // Where a scroll frame's time actually goes, so an over-budget frame can be
+    // attributed instead of guessed: engine+apply on frames that produced mutations,
+    // Yoga layout + frame copy on those same frames, and the engine call alone on
+    // frames that produced nothing (the common case between window shifts).
+    var stageMaxEngine: CFTimeInterval = 0
+    var stageMaxLayout: CFTimeInterval = 0
+    var stageMaxIdle: CFTimeInterval = 0
+    var stageFrames = 0
+    var stageMaxCall: CFTimeInterval = 0     // the engine round trip alone
+    var stageMaxApply: CFTimeInterval = 0    // applying the mutation stream to views
+    var stageMaxBytes = 0                    // largest mutation stream in a frame
+    var stageMaxTickWork: CFTimeInterval = 0 // worst synchronous work inside one tick
+    var stageWorstInterval: CFTimeInterval = 0
+    var stageWorkOnWorst: CFTimeInterval = 0 // our work on the frame that took longest
+    var stageMaxCommit: CFTimeInterval = 0   // commit + render after our work returned
     var inViewportSync = false                        // reentrancy guard: relayout() sets contentSize, which can
                                                       // clamp the offset and re-fire scrollViewDidScroll synchronously.
                                                       // Without this the two call each other until the stack overflows.
@@ -844,7 +943,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var perfMaxFrame: Double = 0, perfSumTime: Double = 0
     var perfLog: [String] = []                        // every velocity's result line, for on-screen + file readout
     // Velocity sweep: ramp the fling speed to find the breaking point.
-    let perfVels: [CGFloat] = [120, 180, 240, 300, 360, 480]
+    // BENCH_LONG=1 repeats the sweep so a memory trend has room to show whether it
+    // plateaus (heap sizing) or climbs without bound (a leak).
+    let perfVels: [CGFloat] = ProcessInfo.processInfo.environment["BENCH_LONG"] == "1"
+        ? Array(repeating: [120, 180, 240, 300, 360, 480], count: 4).flatMap { $0 }
+        : [120, 180, 240, 300, 360, 480]
     var perfVelIdx = 0
     var perfDir: CGFloat = 1
     let perfPhaseFrames = 240   // ~4s per velocity phase
@@ -1064,7 +1167,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         gChuksWakeVC = self
         chuks_set_wake(unsafeBitCast(chuksWakeThunk as (@convention(c) () -> Void), to: UnsafeMutableRawPointer.self))
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.step() }
+        if !(BENCHMARK_MODE && ProcessInfo.processInfo.environment["NO_HEARTBEAT"] == "1") {
+            timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.step() }
+        }
         // Auto-start the perf harness after a warmup (benchmark builds only — otherwise
         // it would auto-scroll the on-screen Scroll, e.g. the Components gallery).
         if BENCHMARK_MODE {
@@ -1120,19 +1225,94 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let top = Int32(max(0, listHoriz ? sc.contentOffset.x : sc.contentOffset.y))
         let vh = Int32(sc.bounds.height); let vw = Int32(sc.bounds.width)
         if vh <= 0 || vw <= 0 { return false }
+        let _tc0 = BENCHMARK_MODE ? CACurrentMediaTime() : 0
         guard let s = eViewport(top, vh, vw) else { connected = false; return false }
-        if !s.isEmpty { apply(s); return true }
+        let _tc1 = BENCHMARK_MODE ? CACurrentMediaTime() : 0
+        if BENCHMARK_MODE, _tc1 - _tc0 > stageMaxCall { stageMaxCall = _tc1 - _tc0 }
+        if !s.isEmpty {
+            apply(s)
+            if BENCHMARK_MODE {
+                let a = CACurrentMediaTime() - _tc1
+                if a > stageMaxApply { stageMaxApply = a }
+                if s.utf8.count > stageMaxBytes { stageMaxBytes = s.utf8.count }
+            }
+            return true
+        }
         return false
+    }
+
+    // The scroll took the touch: cancel any press in flight so the row un-dims and its
+    // onPress does NOT fire, exactly like a touchable whose touch the scroll steals.
+    // (RCTSurfaceTouchHandler does this with setEnabled:NO/YES; same trick here.)
+    func scrollViewWillBeginDragging(_ sv: UIScrollView) {
+        for (g, entry) in pressGestures where g.state == .began || g.state == .changed {
+            if let v = g.view { UIView.animate(withDuration: 0.09) { v.alpha = 1.0 } }
+            pressLongTimers[ObjectIdentifier(g)]?.invalidate()
+            pressLongTimers[ObjectIdentifier(g)] = nil
+            if let pout = pressOutActions[entry.2] { fire(pout) }
+            g.isEnabled = false
+            g.isEnabled = true
+        }
+    }
+
+    // Per-frame viewport work runs on our OWN display link, not inside the scroll
+    // callback. scrollViewDidScroll fires from within UIScrollView's layout pass, which
+    // is already late in the frame, and it can fire more than once per frame; doing the
+    // engine + layout there left too little of the 16.7ms budget for the commit, so a
+    // frame occasionally missed vsync and landed a whole interval late. Marking the
+    // viewport dirty and servicing it once per vsync does the same work at a predictable
+    // point in the frame.
+    func startVsyncPump() {
+        if vsyncLink != nil { return }
+        let dl = CADisplayLink(target: self, selector: #selector(vsyncTick))
+        dl.add(to: .main, forMode: .common)
+        vsyncLink = dl
+    }
+    @objc func vsyncTick() {
+        // TEMPORARY EXPERIMENT: halve the per-frame main-thread load to test whether the
+        // dropped frames are a throughput problem. If jank collapses, moving the engine
+        // off the main thread is the fix; if it does not, threading would buy nothing.
+        if BENCHMARK_MODE && ProcessInfo.processInfo.environment["HALF_RATE"] == "1" {
+            vsyncParity = !vsyncParity
+            if vsyncParity { return }
+        }
+        guard vpDirty else { return }
+        vpDirty = false
+        serviceViewport()
+    }
+    // The actual work, shared by the pump and by any caller that needs it synchronously.
+    func serviceViewport() {
+        if inViewportSync { return }
+        inViewportSync = true
+        defer { inViewportSync = false }
+        let t0 = CACurrentMediaTime()
+        if BENCHMARK_MODE {
+            let produced = pushViewport()
+            let tApplied = CACurrentMediaTime()
+            if produced { relayout() }
+            let tLaid = CACurrentMediaTime()
+            if produced {
+                let a = tApplied - t0, l = tLaid - tApplied
+                if a > stageMaxEngine { stageMaxEngine = a }
+                if l > stageMaxLayout { stageMaxLayout = l }
+                stageFrames += 1
+            } else if tApplied - t0 > stageMaxIdle {
+                stageMaxIdle = tApplied - t0
+            }
+        } else {
+            if pushViewport() { relayout() }
+        }
+        let spent = CACurrentMediaTime() - t0
+        vpCost = vpCost == 0 ? spent : (vpCost * 0.7 + spent * 0.3)
+        vpLastPush = CACurrentMediaTime()
     }
 
     func scrollViewDidScroll(_ sv: UIScrollView) {
         // relayout() below can nudge contentSize/offset and re-enter this delegate synchronously.
         // Skip the re-entrant call: the outer relayout already positioned for the current offset,
         // and the next real scroll frame picks up any newer offset. Prevents unbounded recursion.
-        if inViewportSync { return }
-        inViewportSync = true
-        defer { inViewportSync = false }
-        if pushViewport() { relayout() }
+        vpDirty = true            // serviced on the next vsync by vsyncTick()
+        startVsyncPump()
         if !perfActive { headerText("scroll \(Int(sv.contentOffset.y))pt") }
         // Scroll onScroll: report the offset along the scrolling axis (points) when it changes.
         if let tag = scrollOnScroll[sv] {
@@ -1141,6 +1321,27 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if scrollLastPos[sv] != pts {
                 scrollLastPos[sv] = pts
                 if let s = eInput(tag, String(pts)) { apply(s); relayout() } else { connected = false }
+            }
+        }
+    }
+
+    // A throttled-away scroll frame must not be the last word: once the offset stops
+    // changing, push it for real so the window matches where the list actually is.
+    func scheduleViewportSettle(_ sv: UIScrollView) {
+        if vpSettleScheduled { return }
+        vpSettleScheduled = true
+        let at = sv.contentOffset
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak sv] in
+            guard let self = self, let sv = sv else { return }
+            self.vpSettleScheduled = false
+            if sv.contentOffset == at {          // settled: this is the offset to render
+                if self.inViewportSync { return }
+                self.inViewportSync = true
+                defer { self.inViewportSync = false }
+                if self.pushViewport() { self.relayout() }
+                self.vpLastPush = CACurrentMediaTime()
+            } else {
+                self.scheduleViewportSettle(sv)  // still moving: check again
             }
         }
     }
@@ -1169,9 +1370,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     func resetPhase() {
         perfFrames = 0; perfJanky = 0; perfMaxFrame = 0; perfSumTime = 0; perfMaxPlayers = 0
+        stageMaxEngine = 0; stageMaxLayout = 0; stageMaxIdle = 0; stageFrames = 0
+        stageMaxCall = 0; stageMaxApply = 0; stageMaxBytes = 0
+        stageMaxTickWork = 0; stageWorstInterval = 0; stageWorkOnWorst = 0; stageMaxCommit = 0
     }
     @objc func perfTick() {
         let now = CACurrentMediaTime(), dt = now - perfLastTs; perfLastTs = now
+        let _tickStart = now
         // Unmeasured warmup: prime video players + reach steady state before sampling.
         if perfWarmup > 0 {
             perfWarmup -= 1
@@ -1199,22 +1404,60 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if y >= maxY { y = maxY; perfDir = -1 }
         if y <= 0 { y = 0; perfDir = 1 }
         sc.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+        let ourWork = CACurrentMediaTime() - _tickStart
+        if ourWork > stageMaxTickWork { stageMaxTickWork = ourWork }
+        if dt > stageWorstInterval { stageWorstInterval = dt; stageWorkOnWorst = ourWork }
+        // Everything AFTER we return: Core Animation's commit, UIKit layout/display, and
+        // the render pass. The completion block fires when this frame's transaction is
+        // done, so the delta is the part of the frame no reconciler change can touch.
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self = self else { return }
+            let after = CACurrentMediaTime() - _tickStart - ourWork
+            if after > self.stageMaxCommit { self.stageMaxCommit = after }
+        }
         if perfFrames >= perfPhaseFrames { logPhase(vel) }
     }
     func logPhase(_ vel: CGFloat) {
         let n = max(1, perfFrames - 1)
         let avg = Double(n) / max(0.0001, perfSumTime)
-        let msg = String(format: "BENCHMARK CHUKS vel=%d: avg %.0f fps | worst frame %.1f ms | janky(<50fps) %d/%d | %d video players peak | mem %.0f MB",
-                         Int(vel), avg, perfMaxFrame * 1000, perfJanky, n, perfMaxPlayers, physFootprintMB())
+        // Census of the per-node host tables alongside memory: cells are recycled, so
+        // these must stay FLAT. If memory climbs while they stay flat, the growth is on
+        // the engine side of the process, not in the host's bookkeeping.
+        let msg = String(format: "BENCHMARK CHUKS vel=%d: avg %.0f fps | worst frame %.1f ms | janky(<50fps) %d/%d | %d video players peak | mem %.0f MB | views %d ynodes %d taps %d press %d",
+                         Int(vel), avg, perfMaxFrame * 1000, perfJanky, n, perfMaxPlayers, physFootprintMB(),
+                         views.count, ynodes.count, taps.count, pressGestures.count)
+            + String(format: " | stages: engine %.1f ms, apply %.1f ms, layout %.1f ms, idle %.1f ms, bytes %d, mutating %d",
+                     stageMaxCall * 1000, stageMaxApply * 1000, stageMaxLayout * 1000, stageMaxIdle * 1000,
+                     stageMaxBytes, stageFrames)
+            + String(format: " | worst frame %.1f ms of which OUR work %.1f ms; worst work %.1f ms; worst commit+render %.1f ms",
+                     stageWorstInterval * 1000, stageWorkOnWorst * 1000, stageMaxTickWork * 1000, stageMaxCommit * 1000)
         print(msg); NSLog(msg); perfLog.append(msg)
+        postBench(msg)   // same collector the RN/Flutter builds report to
         header.numberOfLines = 0; header.text = perfLog.joined(separator: "\n")   // keep all lines on screen
         perfVelIdx += 1
         if perfVelIdx >= perfVels.count { stopPerf(); return }
         resetPhase()
     }
+    // Report one benchmark line to the collector on the Mac. A release build on a
+    // physical device has no reachable console, and every runtime under comparison
+    // needs the SAME reporting path or the comparison measures the reporting.
+    func postBench(_ line: String) {
+        guard let url = URL(string: "http://192.168.1.195:4100/") else { return }
+        var r = URLRequest(url: url); r.httpMethod = "POST"; r.httpBody = line.data(using: .utf8)
+        URLSession.shared.dataTask(with: r).resume()
+    }
+
     func stopPerf() {
         perfActive = false; displayLink?.invalidate(); displayLink = nil
         print("BENCHMARK CHUKS: sweep done")
+        // Settled reading: idle (no scrolling, no rendering) then measure again. A heap
+        // that grew only to hold churn gives most of it back here; a leak does not.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) { [weak self] in
+            guard let self = self else { return }
+            let m = String(format: "BENCHMARK CHUKS settled(+15s idle): mem %.0f MB | views %d ynodes %d",
+                           physFootprintMB(), self.views.count, self.ynodes.count)
+            print(m); NSLog(m)
+        }
         // Persist to the app's Documents so the results can be pulled off a real device
         // (headless syslog capture is unreliable on a locked/untrusted phone).
         let out = (perfLog + ["sweep done"]).joined(separator: "\n") + "\n"
@@ -3323,6 +3566,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let ao = pressOpacity[id] {                          // Pressable: press-feedback gesture, not a plain tap
             let g = UILongPressGestureRecognizer(target: self, action: #selector(handlePress(_:)))
             g.minimumPressDuration = 0
+            // A press must never block an enclosing scroll. RN's touch handler sets
+            // cancelsTouchesInView = NO, refuses to prevent any other recognizer, and
+            // cancels its own touches when an ancestor recognizer takes over; that is
+            // what lets you drag a list by starting on a row. We do the same: the press
+            // stays instant (minimumPressDuration 0, so the dim is immediate), it never
+            // delays or prevents the pan, and scrollViewWillBeginDragging cancels it.
+            g.cancelsTouchesInView = false
+            g.delegate = self
             v.addGestureRecognizer(g)
             pressGestures[g] = (action, ao, id)
             return
@@ -3742,7 +3993,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // indicator); the app pads its content by safeTop()/safeBottom() (reported via
         // setInsets), so an inset is applied ONCE, not twice. Matches the Android host.
         // Without this the tree is inset AND the app pads -> a gap top and bottom.
-        let topY: CGFloat = BENCHMARK_MODE ? header.frame.maxY + 6 : 0
+        let topY: CGFloat = 0
         let W = Float(view.bounds.width)
         let H = Float(view.bounds.height - topY - kbHeight)   // shrink for the keyboard
         if W <= 0 || H <= 0 { return }

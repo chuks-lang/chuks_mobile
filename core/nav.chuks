@@ -207,7 +207,11 @@ function defaultTabBar(tabs: []TabSpec, p: TabViewProps): Node {
     return Column({ bg: bg }, [
             Row({ tw: "h-1 bg-borderSoft" }, []),   // top hairline
             // Bake the bottom safe-area inset into the bar so its background reaches the
-            // screen edge and the tabs clear the home indicator on every device.
-            Row({ px: 6, pt: 6, pb: 6 + safeBottom() }, items),
+            // screen edge and the tabs clear the home indicator on every device. The
+            // inset IS the clearance: adding a constant on top of it (we used to add 6)
+            // makes the bar visibly taller than the platform's own tab bar on any device
+            // with a home indicator. Devices without one get the 6 instead, so the labels
+            // are not flush against the screen edge.
+            Row({ px: 6, pt: 6, pb: safeBottom() > 0 ? safeBottom() : 6 }, items),
     ])
 }
