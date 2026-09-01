@@ -133,9 +133,9 @@ for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/
 done
 # Media assets keep their path relative to assets/ (organize in subfolders, reference
 # as src:"sub/dir/name.ext"); the host resolves them against the .app bundle path.
-find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" \) 2>/dev/null | while IFS= read -r f; do
+find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" \) 2>/dev/null | { while IFS= read -r f; do
     rel="${f#"$PROJDIR/assets/"}"; mkdir -p "$APP/$(dirname "$rel")"; cp "$f" "$APP/$rel"
-done
+done; } || true   # a project with no assets/ dir is fine: find exits non-zero, not fatal
 cat > "$APP/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -208,6 +208,11 @@ if [ "$IOS_TARGET" = "device" ]; then
         esac
     done
     [ -n "$PROFILE" ] || { echo "no wildcard development provisioning profile for team $TEAM (build once in Xcode to create one)"; exit 1; }
+    # HEALTHKIT=1 adds the HealthKit entitlement. It is opt-in because a WILDCARD
+    # profile never carries HealthKit: the App ID must be explicit and have the
+    # capability enabled, and signing FAILS if the entitlement is not in the profile.
+    HEALTHKIT_ENT=""
+    [ "${HEALTHKIT:-0}" = "1" ] && HEALTHKIT_ENT="  <key>com.apple.developer.healthkit</key><true/>"
     cp "$PROFILE" "$APP/embedded.mobileprovision"
     cat > "$OUT/ent.plist" <<ENT
 <?xml version="1.0" encoding="UTF-8"?>
@@ -216,6 +221,7 @@ if [ "$IOS_TARGET" = "device" ]; then
   <key>application-identifier</key><string>$TEAM.$BID</string>
   <key>com.apple.developer.team-identifier</key><string>$TEAM</string>
   <key>get-task-allow</key><true/>
+$HEALTHKIT_ENT
 </dict></plist>
 ENT
     codesign --force --sign "$IDENTITY" --entitlements "$OUT/ent.plist" --generate-entitlement-der --timestamp=none "$APP"

@@ -63,13 +63,16 @@ if [ "${DEV:-0}" = "1" ]; then
     echo "   CMR dev: app will fetch the bundle from $DEVHOST (first run: chuks dev)"
 fi
 
+# BENCHMARK=1 compiles in the scroll perf harness (the same one build.sh offers), so
+# the dev runtime can be measured against the AOT build on the same feed.
+BENCH_FLAG=""; [ "${BENCHMARK:-0}" = "1" ] && BENCH_FLAG="-D BENCHMARK"
 echo "3. Building the UIKit host (CMR mode)"
 printf '#include "libcmr.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$PKGDIR/cmr" -I "$YOGA_INC" \
     "$CMRLIB" "$YOGA/libyoga.a" -lc++ \
     -Xclang-linker -Wno-incompatible-sysroot \
-    -framework UIKit -framework Foundation -parse-as-library -Onone -D CMR \
+    -framework UIKit -framework Foundation -parse-as-library -Onone -D CMR $BENCH_FLAG \
     -o "$OUT/$APPNAME"
 cp "$OUT/$APPNAME" "$APP/$APPNAME"   # the .app's executable (CFBundleExecutable)
 
@@ -81,9 +84,9 @@ for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/
 done
 # Media assets keep their path relative to assets/ (organize in subfolders, reference
 # as src:"sub/dir/name.png"); the host resolves them against the .app bundle path.
-find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" \) 2>/dev/null | while IFS= read -r f; do
+find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.png" -o -name "*.jpg" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" \) 2>/dev/null | { while IFS= read -r f; do
     rel="${f#"$PROJDIR/assets/"}"; mkdir -p "$APP/$(dirname "$rel")"; cp "$f" "$APP/$rel"
-done
+done; } || true   # a project with no assets/ dir is fine: find exits non-zero, not fatal
 cat > "$APP/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

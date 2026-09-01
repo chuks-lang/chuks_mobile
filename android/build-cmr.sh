@@ -101,9 +101,9 @@ cp "$BIN/../sysroot/usr/lib/$CXXLIB/libc++_shared.so" "$OUT/lib/$ABI/"
 # relative to assets/, so you can organize them in subfolders and reference them as
 # src:"sub/dir/name.png" (basenames no longer collide across folders).
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
-find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev/null | while IFS= read -r f; do
+find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev/null | { while IFS= read -r f; do
     rel="${f#"$PROJDIR/assets/"}"; mkdir -p "$OUT/assets/$(dirname "$rel")"; cp "$f" "$OUT/assets/$rel"
-done
+done; } || true   # a project with no assets/ dir is fine: find exits non-zero, not fatal
 ( cd "$OUT" && zip -qj base.apk classes.dex \
     && zip -q base.apk "lib/$ABI/libapp.so" "lib/$ABI/libc++_shared.so" \
     && zip -q base.apk assets/cmr.bundle \
