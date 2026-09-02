@@ -9,8 +9,11 @@
 // `function?(...)`) that defaults to null when omitted. Every component accepts an
 // optional `extra` tw-class string that is appended last, so it wins:
 //   Button({ variant: "primary", label: "Save", extra: "grow rounded-full" })
-import { Node, Row, Column, Text, TextInput, Toggle } from "./ui.chuks";
+import { Node, Row, Column, Text, TextInput, Toggle, List, viewportWidth, requestRender } from "./ui.chuks";
+import { time } from "std/time";
 import { tk } from "./theme.chuks";
+import { useEffect } from "./state.chuks";
+import { Animated, AnimHandle, useAnimated, animLoop, animStep } from "./animated.chuks";
 
 // Button: a tappable action. variant = "primary" | "secondary" | "ghost" | "danger"
 // (default "ghost"). onPress fires on tap.
@@ -152,4 +155,283 @@ export function Switch(p: SwitchProps): Node {
     // A real native switch (UISwitch / Android Switch), tinted with
     // the theme primary. Controlled: the parent owns `on`, onToggle fires on flip.
     return Toggle({ on: p.on, bg: tk("primary"), onPress: p.onToggle })
+}
+
+// ---------------------------------------------------------------------------
+// Selection, search and disclosure. Added to close the gap against the wider
+// component sets other frameworks ship (see docs/ui-primitives-plan.md). Every
+// one of these is a COMPOSITION over the primitives: no host code, so an app that
+// never calls them does not carry them (the linker drops what nothing references).
+// ---------------------------------------------------------------------------
+
+// SegmentedControl: one choice out of a few, laid out as a row of segments.
+//
+// Composed rather than backed by the native control (UISegmentedControl /
+// Material tabs) on purpose: the native ones theme poorly and differ enough in
+// metrics that the same app looks off on one platform. Selection is yours to keep,
+// like every other controlled component here.
+//
+//   SegmentedControl({ options: ["Day", "Week", "Month"], selected: int(tab.get()),
+//                      onSelect: function(i: int): void { tab.set(i) } })
+export dataType SegmentedControlProps {
+    options: []string,
+    selected: int,
+    onSelect: function?(i: int): void,
+    extra: string?,
+}
+export function SegmentedControl(p: SegmentedControlProps): Node {
+    var segs: []Node = []
+    for (var i: int = 0; i < p.options.length; i = i + 1) {
+        segs.push(segment(p.options[i], i == p.selected, i, p.onSelect))
+    }
+    return Row({ tw: "bg-surface2 rounded-lg p-xs gap-xs " + (p.extra ?? "") }, segs)
+}
+// One segment. Its own function so the tap closure binds THIS index: a closure built
+// inline in the loop would capture the loop binding's final value.
+function segment(label: string, on: bool, idx: int, cb: function?(i: int): void): Node {
+    const skin: string = on ? "bg-surface shadow-sm" : ""
+    const txt: string = on ? "text-text font-bold" : "text-muted"
+    return Row({ tw: "grow basis-0 items-center justify-center py-sm rounded-md " + skin,
+                 onPress: cb != null ? function(): void { const f: any = cb; f(idx) } : null },
+        [ Text({ tw: "text-sm " + txt }, label) ])
+}
+
+// SearchBar: a field with a leading icon slot and a clear button that appears once
+// there is text. Icon-agnostic like the rest of the framework: pass the glyph you
+// want as a node rather than a name, so no icon set is baked in.
+//
+//   SearchBar({ value: string(q.get()), icon: lucide("search", 16, tk("muted")),
+//               onChange: function(v: string): void { q.set(v) } })
+export dataType SearchBarProps {
+    value: string,
+    onChange: function?(v: string): void,
+    placeholder: string?,
+    icon: Node?,
+    onClear: function?(): void,
+    extra: string?,
+}
+export function SearchBar(p: SearchBarProps): Node {
+    var kids: []Node = []
+    if (p.icon != null) { kids.push(p.icon) }
+    kids.push(TextInput({ tw: "grow basis-0 h-11 text-base text-text bg-surface2",
+                          placeholder: p.placeholder ?? "Search",
+                          value: p.value,
+                          onChange: p.onChange }))
+    if (p.value != "") {
+        kids.push(Row({ tw: "w-6 h-6 items-center justify-center rounded-full bg-surface2",
+                        onPress: p.onClear },
+            [ Text({ tw: "text-xs text-muted" }, "✕") ]))
+    }
+    return Row({ tw: "items-center gap-sm px-md bg-surface2 border border-border rounded-lg " + (p.extra ?? "") }, kids)
+}
+
+// Stepper: a small numeric control, minus and plus around a value. Clamped to
+// min/max, so the caller never has to re-check what it hands back.
+//
+//   Stepper({ value: int(qty.get()), min: 1, max: 9,
+//             onChange: function(v: int): void { qty.set(v) } })
+export dataType StepperProps {
+    value: int,
+    min: int?,
+    max: int?,
+    step: int?,
+    onChange: function?(v: int): void,
+    extra: string?,
+}
+export function Stepper(p: StepperProps): Node {
+    const lo: int = p.min ?? 0
+    const hi: int = p.max ?? 999999
+    const by: int = p.step ?? 1
+    const v: int = p.value
+    return Row({ tw: "items-center gap-sm bg-surface2 rounded-lg p-xs " + (p.extra ?? "") }, [
+        stepBtn("−", v - by >= lo, v - by, p.onChange),
+        Text({ tw: "text-base font-bold text-text w-10 text-center" }, string(v)),
+        stepBtn("+", v + by <= hi, v + by, p.onChange),
+    ])
+}
+function stepBtn(glyph: string, enabled: bool, next: int, cb: function?(v: int): void): Node {
+    return Row({ tw: "w-8 h-8 items-center justify-center rounded-md bg-surface",
+                 opacity: enabled ? 100 : 40,
+                 onPress: (enabled && cb != null) ? function(): void { const f: any = cb; f(next) } : null },
+        [ Text({ tw: "text-base font-bold text-text" }, glyph) ])
+}
+
+// EmptyState: what a screen shows when it has nothing to show. An icon slot, a
+// headline, a line of explanation, and an optional action. Every app was writing
+// this by hand.
+//
+//   EmptyState({ icon: lucide("users", 30, tk("muted")), title: "No clubs yet",
+//                body: "Create one for your neighbourhood and invite a friend." })
+export dataType EmptyStateProps {
+    title: string,
+    body: string?,
+    icon: Node?,
+    action: Node?,
+    extra: string?,
+}
+export function EmptyState(p: EmptyStateProps): Node {
+    var kids: []Node = []
+    if (p.icon != null) {
+        kids.push(Column({ tw: "w-16 h-16 items-center justify-center rounded-2xl bg-surface2" }, [ p.icon ]))
+    }
+    kids.push(Text({ tw: "text-lg font-bold text-text text-center" }, p.title))
+    if (p.body != null) { kids.push(Text({ tw: "text-sm text-muted text-center" }, p.body)) }
+    if (p.action != null) { kids.push(p.action) }
+    return Column({ tw: "items-center justify-center gap-md p-xl " + (p.extra ?? "") }, kids)
+}
+
+// Accordion: a titled row that expands to reveal its children. The open state stays
+// with the caller, so a set of them can be driven together (one open at a time) or
+// independently.
+//
+//   Accordion({ title: "Shipping", open: bool(o.get()),
+//               onToggle: function(): void { o.set(!bool(o.get())) },
+//               children: [ Text({ tw: "text-sm text-muted" }, "Ships in 2 days") ] })
+export dataType AccordionProps {
+    title: string,
+    open: bool,
+    onToggle: function?(): void,
+    children: []Node,
+    extra: string?,
+}
+export function Accordion(p: AccordionProps): Node {
+    var kids: []Node = [
+        Row({ tw: "items-center justify-between py-md", onPress: p.onToggle }, [
+            Text({ tw: "text-base font-bold text-text" }, p.title),
+            Text({ tw: "text-sm text-muted" }, p.open ? "▾" : "▸"),
+        ]),
+    ]
+    if (p.open) { kids.push(Column({ tw: "pb-md gap-sm" }, p.children)) }
+    return Column({ tw: "border-b border-border " + (p.extra ?? "") }, kids)
+}
+
+// Skeleton: the grey shape a card or row shows while its data loads. It pulses on
+// the native driver (an opacity tween), so a screen full of them costs one animation
+// rather than a re-render per frame.
+//
+// Call it inside a `Comp` (it holds animation state), and stop the pulse when the
+// real content arrives by simply not rendering it any more.
+//
+//   Skeleton({ h: 60, radius: 12 })
+export dataType SkeletonProps {
+    h: int,
+    w: int?,                        // omit to fill the available width
+    radius: int?,
+    extra: string?,
+}
+export function Skeleton(p: SkeletonProps): Node {
+    const a: Animated = useAnimated(35)
+    useEffect(function(): any {
+        const h: AnimHandle = animLoop([
+            animStep(650, function(): void { a.timing(85, 650, "ease") }),
+            animStep(650, function(): void { a.timing(35, 650, "ease") }),
+        ])
+        return function(): void { h.stop() }        // stop the pulse when it unmounts
+    }, [])
+    const fill: string = p.w == null ? "grow " : ""
+    return Row({ h: p.h, w: p.w ?? -1, radius: p.radius ?? 10, opacity: a.value(),
+                 tw: "bg-surface2 " + fill + (p.extra ?? "") }, [])
+}
+
+// Carousel: a paged horizontal strip with page dots. One child per page; each fills
+// the carousel's width. `page` is yours to hold, so the dots and any external control
+// (a "next" button, a timer) stay in agreement.
+//
+//   Carousel({ page: int(pg.get()), onPage: function(i: int): void { pg.set(i) },
+//              h: 180, children: [ slideA, slideB, slideC ] })
+export dataType CarouselProps {
+    children: []Node,
+    page: int,
+    onPage: function?(i: int): void,
+    h: int,
+    itemWidth: int?,                // page width; defaults to the viewport width
+    dots: bool?,                    // default true
+    extra: string?,
+}
+// Height of the page-dot strip, so the carousel can size itself exactly.
+const DOTS_H: int = 20
+
+export function Carousel(p: CarouselProps): Node {
+    const showDots: bool = p.dots ?? true
+    // Page width: the caller's, else the viewport. viewportWidth() is 0 until the host
+    // has reported a viewport (the first frame), so fall back to a sane page rather
+    // than laying out zero-width pages on that first pass.
+    const vw: int = viewportWidth()
+    const pw: int = p.itemWidth ?? (vw > 0 ? vw : 320)
+    const kidsRef: []Node = p.children
+    var kids: []Node = [
+        List({ count: kidsRef.length,
+               horizontal: true,
+               paging: true,
+               itemWidth: pw,
+               h: p.h,
+               key:  function(i: int): string { return "page" + string(i) },
+               item: function(i: int, left: int): Node {
+                   return Column({ abs: true, top: 0, left: left, w: pw, h: p.h }, [ kidsRef[i] ])
+               },
+               onVisible: p.onPage }),
+    ]
+    if (showDots) {
+        var dots: []Node = []
+        for (var d: int = 0; d < kidsRef.length; d = d + 1) {
+            dots.push(Row({ tw: (d == p.page ? "bg-primary" : "bg-border") + " w-2 h-2 rounded-full" }, []))
+        }
+        kids.push(Row({ h: DOTS_H, tw: "items-center justify-center gap-xs" }, dots))
+    }
+    // The wrapper is sized explicitly. A List fills its parent (its rows are absolutely
+    // positioned, so it has no height of its own), and this wrapper would otherwise be
+    // auto-height — nothing to fill, so the pages collapsed to zero and the carousel
+    // showed only its dots.
+    return Column({ h: p.h + (showDots ? DOTS_H : 0), tw: (p.extra ?? "") }, kids)
+}
+
+// ---------------------------------------------------------------------------
+// Toast: a short message that appears over the app and goes away on its own.
+//
+// Two pieces, because a toast outlives the screen that raised it: `toast(msg)` can
+// be called from anywhere (an event closure, a failed request), and `ToastHost()` is
+// mounted ONCE by the app shell, near the bottom of the tree so it draws over the
+// rest. Messages queue rather than overlap, so two failures in quick succession are
+// both read.
+//
+// The dismiss timer runs on a coroutine (spawn + sleep), not on the render loop, so
+// an app with a toast on screen is not an app rendering every frame.
+//
+//   toast("Walk saved")                       // from anywhere
+//   TabView({ ..., accessory: ToastHost() })  // once, in the shell
+// ---------------------------------------------------------------------------
+var TOASTS: []string = []
+var TOAST_MS: int = 2600
+
+/** Show a short message. Safe to call from any closure; messages queue. */
+export function toast(message: string): void {
+    TOASTS.push(message)
+    requestRender()
+    spawn _expireToast()
+}
+/** How long each message stays up, in milliseconds (default 2600). */
+export function setToastDuration(ms: int): void { TOAST_MS = ms }
+
+// One coroutine per message: sleep this message's turn, then drop the oldest and
+// ask for a render. Draining by index would race with a toast raised mid-sleep.
+async function _expireToast(): Task<void> {
+    time.sleep(TOAST_MS)
+    if (TOASTS.length > 0) {
+        var rest: []string = []
+        for (var i: int = 1; i < TOASTS.length; i = i + 1) { rest.push(TOASTS[i]) }
+        TOASTS = rest
+        requestRender()
+    }
+}
+
+/** The surface toasts appear on. Mount once in the app shell; renders nothing when
+ *  there is no message. */
+export function ToastHost(): Node {
+    if (TOASTS.length == 0) { return Column({ tw: "h-0" }, []) }
+    var kids: []Node = []
+    for (var i: int = 0; i < TOASTS.length && i < 3; i = i + 1) {
+        kids.push(Row({ tw: "items-center px-lg py-md rounded-xl bg-elevated border border-border shadow-sm" },
+            [ Text({ tw: "text-sm text-text" }, TOASTS[i]) ]))
+    }
+    return Column({ tw: "items-center gap-xs px-lg pb-md" }, kids)
 }
