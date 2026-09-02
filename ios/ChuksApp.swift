@@ -508,6 +508,21 @@ func weightOf(_ s: String) -> UIFont.Weight {
 }
 
 // hex "5B8CFF" -> UIColor
+/// A view whose backing layer is the gradient itself, so it resizes with the view and
+/// needs no manual frame bookkeeping. It goes in as a SUBVIEW (like the glass material)
+/// rather than as a bare sublayer: a sublayer added to a container draws above the
+/// container's subviews on this host, which hid every child behind the gradient.
+/// Tag on every decorative backing view (an ImageBackground's image, the glass material,
+/// a gradient). They are inserted at the BACK of a container, before its children, so the
+/// child-insert index has to skip them; counting them by tag means a new decoration works
+/// without touching the insert path again.
+let CHUKS_DECOR_TAG = 0x43484B44
+
+final class ChuksGradientView: UIView {
+    override class var layerClass: AnyClass { CAGradientLayer.self }
+    var grad: CAGradientLayer { layer as! CAGradientLayer }
+}
+
 func hexColor(_ h: String) -> UIColor {
     var v: UInt64 = 0
     Scanner(string: h).scanHexInt64(&v)
@@ -881,6 +896,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
+    var scrollContentIds: [String: String] = [:]      // scroll node id -> its content node id
+    var horizScrollIds = Set<String>()                // which of those scroll sideways
     var scrollId = ""
     var listHoriz = false            // the tracked list scrolls horizontally (report x, not y)
     var stickBottomOn = false        // Scroll stickBottom: keep pinned to newest (chat)
@@ -983,6 +1000,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     static var imageCache: [String: UIImage] = [:]                       // URL -> decoded image (shared)
     var bgImageViews: [String: UIImageView] = [:]                        // ImageBackground id -> its backing image view
     var glassViews: [String: UIVisualEffectView] = [:]                   // id -> Liquid Glass backing view
+    var gradLayers: [String: ChuksGradientView] = [:]                    // id -> linear-gradient background view
+    var blurViews: [String: UIVisualEffectView] = [:]                    // id -> backdrop-blur material view
+    var blurSpec: [String: (intensity: Int, tint: String)] = [:]         // last applied blur, to rebuild on either part changing
+    var gradSpec: [String: (colors: String, angle: Int, stops: String)] = [:]   // last applied gradient, to rebuild on any part changing
     var refreshActions: [UIRefreshControl: String] = [:]                 // pull-to-refresh control -> onRefresh action
     var alertIds: Set<String> = []                                       // Alert node ids (native alerts)
     var alertData: [String: [String]] = [:]                              // id -> [title, message, confirm, cancel]
@@ -1160,6 +1181,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         eSetup()
         ePlatform()                                                 // report platform + device info
         eColorScheme(traitCollection.userInterfaceStyle == .dark)   // open in the OS appearance
+        // Report the safe-area insets BEFORE the first mount. They are normally pushed
+        // from viewDidLayoutSubviews, which runs AFTER this, so the first tree was built
+        // with zero insets and drew under the status bar until the next tick corrected
+        // it. This view is not in a window yet, so take them from the scene's window —
+        // the same reason the hot-reload path re-sends them to a fresh VM.
+        if let w = UIApplication.shared.connectedScenes
+                     .compactMap({ ($0 as? UIWindowScene)?.windows.first }).first {
+            let ins = w.safeAreaInsets
+            if ins.top > 0 || ins.bottom > 0 { lastInsets = ins; eInsets(ins) }
+        }
         // Require a non-empty mount before marking connected: a momentarily unreachable
         // dev server returns nil, but a race can also return an empty body — either way
         // leaving connected=false lets step() keep retrying instead of stranding the app
@@ -2087,7 +2118,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if lid.isEmpty { listScroll = nil; scrollId = ""; contentId = "" }
                 else if let sc = views[lid] as? UIScrollView {
                     listScroll = sc; scrollId = lid; contentId = lid + ".0"
-                    listHoriz = (sc.contentSize.width > sc.bounds.width && sc.contentSize.height <= sc.bounds.height)
+                    // From the recorded axis, not inferred from contentSize: at LV time the
+                    // layout pass may not have sized this scroll yet, so the inference could
+                    // read a horizontal list as vertical and report the wrong viewport.
+                    listHoriz = horizScrollIds.contains(lid)
                 }
             case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             case "X" where f.count >= 3:
@@ -2897,6 +2931,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let box = UIView(); box.clipsToBounds = true
             let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
             iv.frame = box.bounds; iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            iv.tag = CHUKS_DECOR_TAG
             box.addSubview(iv)                              // background, behind children (inserted later)
             bgImageViews[id] = iv; v = box
         case "Video":
@@ -3038,6 +3073,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             YGNodeStyleSetOverflow(n, YGOverflow.scroll)
             // NB: creation does NOT make this the live list any more -- the engine says
             // which one is live with LV|, since several screens can be mounted at once.
+            if kind == "HScroll" { horizScrollIds.insert(id) } else { horizScrollIds.remove(id) }
             if listScroll == nil { listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll") }
             v = sc
         case "Modal":
@@ -3092,6 +3128,67 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         YGNodeStyleSetFlexWrap(n, YGWrap.noWrap)
     }
 
+    // Put a blur material behind the view's children. Intensity selects the material
+    // thickness rather than a radius: UIKit's blur is a system material, and picking the
+    // nearest one keeps it looking native and stays cheap, where an animator-driven
+    // fractional blur costs a render pass per frame.
+    func applyBlur(_ id: String, _ v: UIView, _ spec: (intensity: Int, tint: String)) {
+        let style: UIBlurEffect.Style
+        switch spec.tint {
+        case "light": style = spec.intensity < 34 ? .systemUltraThinMaterialLight
+                            : (spec.intensity < 67 ? .systemThinMaterialLight : .systemMaterialLight)
+        case "dark":  style = spec.intensity < 34 ? .systemUltraThinMaterialDark
+                            : (spec.intensity < 67 ? .systemThinMaterialDark : .systemMaterialDark)
+        default:      style = spec.intensity < 34 ? .systemUltraThinMaterial
+                            : (spec.intensity < 67 ? .systemThinMaterial : .systemMaterial)
+        }
+        if let bv = blurViews[id] { bv.effect = UIBlurEffect(style: style); return }
+        let bv = UIVisualEffectView(effect: UIBlurEffect(style: style))
+        bv.isUserInteractionEnabled = false
+        bv.tag = CHUKS_DECOR_TAG                 // counted by the child-insert offset
+        bv.frame = v.bounds
+        bv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        bv.clipsToBounds = true
+        bv.layer.cornerRadius = v.layer.cornerRadius
+        v.insertSubview(bv, at: 0)
+        blurViews[id] = bv
+    }
+
+    // Paint a linear gradient as the view's background. It goes in at sublayer index 0, so
+    // it sits above the view's own background color and below every child, which is what a
+    // background should do. A CALayer does not autoresize, so the frame pass re-sizes it
+    // and copies the (already clamped) corner radius; without that a gradient view would
+    // keep its first frame and square corners.
+    func applyGradient(_ id: String, _ v: UIView, _ spec: (colors: String, angle: Int, stops: String)) {
+        let hexes = spec.colors.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        guard hexes.count >= 2 else {            // one color is a fill, not a gradient
+            if let gv = gradLayers[id] { gv.removeFromSuperview(); gradLayers[id] = nil }
+            return
+        }
+        let gv: ChuksGradientView
+        if let existing = gradLayers[id] { gv = existing } else {
+            gv = ChuksGradientView()
+            gv.isUserInteractionEnabled = false          // never swallow a tap meant for a child
+            gv.tag = CHUKS_DECOR_TAG
+            gv.frame = v.bounds
+            gv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            gv.clipsToBounds = true
+            v.insertSubview(gv, at: 0)                   // behind every child, like the glass view
+            gradLayers[id] = gv
+        }
+        let gl = gv.grad
+        gl.colors = hexes.map { hexColor($0).cgColor }
+        let locs = spec.stops.split(separator: ",").compactMap { Double($0) }
+        gl.locations = (locs.count == hexes.count) ? locs.map { NSNumber(value: $0 / 100) } : nil
+        // 0 degrees runs top to bottom and the angle increases clockwise, so 90 runs left
+        // to right. Both endpoints sit on a unit vector through the centre.
+        let rad = Double(spec.angle) * .pi / 180
+        let dx = sin(rad) / 2, dy = cos(rad) / 2
+        gl.startPoint = CGPoint(x: 0.5 - dx, y: 0.5 - dy)
+        gl.endPoint   = CGPoint(x: 0.5 + dx, y: 0.5 + dy)
+        gv.layer.cornerRadius = v.layer.cornerRadius
+    }
+
     // The paint/layer sibling of resetLayoutStyle: clear the decorative UIView/CALayer
     // properties that style() sets conditionally, so a reused node doesn't keep its
     // previous role's background, border, corner radius, shadow, dashed/side borders or
@@ -3131,6 +3228,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             v.layer.sublayers?.filter { ($0.name ?? "").hasPrefix("chuksDashBorder") || ($0.name ?? "").hasPrefix("chuksSideBorder") }.forEach { $0.removeFromSuperlayer() }
         }
         if let gv = glassViews[id] { gv.removeFromSuperview(); glassViews[id] = nil }
+        if let gv = gradLayers[id] { gv.removeFromSuperview(); gradLayers[id] = nil; gradSpec[id] = nil }
+        if let bv = blurViews[id] { bv.removeFromSuperview(); blurViews[id] = nil; blurSpec[id] = nil }
         // ── Reused-node completeness ──────────────────────────────────────────────
         // Style.str() omits default-valued props, and the reconciler reuses a native
         // view for whatever new role sits at a tree position, so every prop that style()
@@ -3445,12 +3544,31 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         if #available(iOS 26.0, *) { eff = UIGlassEffect() } else { eff = UIBlurEffect(style: .systemUltraThinMaterial) }
                         let gv = UIVisualEffectView(effect: eff)
                         gv.isUserInteractionEnabled = false
+                        gv.tag = CHUKS_DECOR_TAG
                         gv.frame = v.bounds; gv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
                         gv.clipsToBounds = true; gv.layer.cornerRadius = v.layer.cornerRadius
                         v.insertSubview(gv, at: 0); v.backgroundColor = .clear
                         glassViews[id] = gv
                     }
                 } else { glassViews[id]?.removeFromSuperview(); glassViews[id] = nil }
+            // Linear gradient background. The three parts arrive as separate style keys, so
+            // each one re-applies the whole spec rather than trying to patch a live layer.
+            // Backdrop blur: a real UIVisualEffectView, so the system samples what is
+            // behind the view in the window. Both parts arrive as separate keys, so each
+            // re-applies the whole spec.
+            case "bkblur", "bktint":
+                var bs = blurSpec[id] ?? (intensity: 60, tint: "system")
+                if k == "bkblur" { bs.intensity = Int(val) ?? 60 }
+                if k == "bktint" { bs.tint = val }
+                blurSpec[id] = bs
+                applyBlur(id, v, bs)
+            case "grad", "gradang", "gradstop":
+                var spec = gradSpec[id] ?? (colors: "", angle: 0, stops: "")
+                if k == "grad" { spec.colors = val }
+                if k == "gradang" { spec.angle = Int(val) ?? 0 }
+                if k == "gradstop" { spec.stops = val }
+                gradSpec[id] = spec
+                applyGradient(id, v, spec)
             case "pos": if val == "abs" { YGNodeStyleSetPositionType(n, YGPositionType.absolute) }
             case "top":   YGNodeStyleSetPosition(n, YGEdge.top, f)
             case "bottom": YGNodeStyleSetPosition(n, YGEdge.bottom, f)
@@ -3599,9 +3717,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             view.addSubview(child)                           // ROOT, not inline; its Yoga node stays a
             return                                           // separate root (laid out in relayout)
         }
-        if parent == scrollId { contentId = id }             // the scroll's content node
+        if parent == scrollId { contentId = id }             // the live list's content node
+        // Every scroll's FIRST child is its content node. Recorded per id because a screen
+        // can hold several scrolls at once (a vertical Scroll containing a Carousel, whose
+        // horizontal list is itself a scroll), and only one of them can be the "live list".
+        if views[parent] is UIScrollView, scrollContentIds[parent] == nil { scrollContentIds[parent] = id }
         guard let pv = views[parent], let pn = ynodes[parent] else { return }
-        let base = bgImageViews[parent] != nil ? 1 : 0       // keep an ImageBackground's bg image at the back
+        // Skip every decoration already sitting at the back (bg image, glass, gradient), or
+        // the child lands underneath it. Counting the tagged prefix rather than testing one
+        // dictionary keeps this correct as decorations are added.
+        let base = pv.subviews.prefix { $0.tag == CHUKS_DECOR_TAG }.count
         let i = min(index + base, pv.subviews.count)
         pv.insertSubview(child, at: i)
         // A node id can be reused across a kind change (e.g. a Text becomes a container via
@@ -3639,6 +3764,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
             if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil; sliderDoneAction[sl] = nil }
             if let sc = views[k] as? UIScrollView { scrollOnScroll[sc] = nil; scrollLastPos[sc] = nil }
+            scrollContentIds.removeValue(forKey: k); horizScrollIds.remove(k)   // per-scroll content sizing
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
@@ -4189,6 +4315,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             else if let rr = cornerRadii[id] { views[id]?.layer.cornerRadius = min(rr, min(fr.width, fr.height) / 2) }   // clamp numeric radius: never a diamond
             if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
             if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
+            if let gv = gradLayers[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the clamped rounding
+            if let bv = blurViews[id] { bv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }
         }
         needsFrame.removeAll()   // consumed for this pass
         if layoutTiming {
@@ -4211,6 +4339,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // the scroll's content size comes from its content node's laid-out size. A horizontal
         // list's content node has an explicit WIDTH but no height (its rows are abs), so pin the
         // content height to the scroll's own height — it scrolls sideways only, rows never clip.
+        // Size EVERY scroll from its own content node. This used to run only for the single
+        // "live list", which is a different job: live means whose window follows the user's
+        // scrolling, and only a List/SectionList claims it. So a plain Scroll that contained a
+        // List (a Carousel, say) lost the slot to it and was left with no content size at all,
+        // which reads as a screen that simply will not scroll.
+        for (sid, cid) in scrollContentIds {
+            guard let sv = views[sid] as? UIScrollView, let cnode = ynodes[cid] else { continue }
+            let w = CGFloat(YGNodeLayoutGetWidth(cnode)), h = CGFloat(YGNodeLayoutGetHeight(cnode))
+            sv.contentSize = CGSize(width: w, height: horizScrollIds.contains(sid) ? sv.bounds.height : h)
+        }
         if let sc = listScroll, let cn = ynodes[contentId] {
             let cw = CGFloat(YGNodeLayoutGetWidth(cn)), chh = CGFloat(YGNodeLayoutGetHeight(cn))
             sc.contentSize = CGSize(width: cw, height: listHoriz ? sc.bounds.height : chh)

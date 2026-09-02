@@ -62,6 +62,17 @@ export class Style {
     var bc: string      // border color hex
     var shadow: int     // elevation: 1 small, 2 medium, 3 large
     var glass: int      // Liquid Glass material: 1 = on (iOS 26 glassEffect; blur fallback elsewhere)
+    // Linear gradient background. `grad` is 2+ hex colors joined by commas, `gradAng` is
+    // the angle in degrees (0 = top to bottom, 90 = left to right) and `gradStop` is an
+    // optional matching list of percent positions. A gradient REPLACES `bg` on the same
+    // view and composes with radius/border, because on both hosts one background object
+    // owns the fill, the corners and the stroke together.
+    // Backdrop blur. `blur` above is the IMAGE blur radius, so these carry their own names.
+    var bkBlur: int     // 0-100 blur strength; -1 = none
+    var bkTint: string  // "light" | "dark" | "system"; "" = system
+    var grad: string    // "RRGGBB,RRGGBB[,...]"; "" = no gradient
+    var gradAng: int    // degrees; -1 = unset (defaults to 0, top to bottom)
+    var gradStop: string // "0,100" percent positions matching grad; "" = spread evenly
     var opacity: int    // 0-100 (-1 = fully opaque)
     var wrap: string    // "wrap" | "nowrap" (flex-wrap)
     var font: string    // custom font family (e.g. an icon font); "" = system
@@ -135,6 +146,8 @@ export class Style {
         this.bg = ""; this.fg = ""; this.fs = -1; this.fw = ""; this.ta = ""; this.img = ""; this.radius = -1
         this.pos = ""; this.top = -1; this.left = -1; this.right = -1
         this.bw = -1; this.bwT = -1; this.bwR = -1; this.bwB = -1; this.bwL = -1; this.bc = ""; this.shadow = -1; this.glass = -1; this.opacity = -1; this.wrap = ""; this.font = ""; this.vid = ""
+        this.grad = ""; this.gradAng = -1; this.gradStop = ""
+        this.bkBlur = -1; this.bkTint = ""
         this.swOn = -1; this.swThumb = ""; this.press = -1; this.sec = -1
         this.sbHide = -1; this.sbStyle = ""; this.sbColor = ""; this.sbNavColor = ""
         this.mvis = -1; this.mpos = ""
@@ -215,6 +228,11 @@ export class Style {
         if (this.bc != "") { s = s + "bc=" + this.bc + ";" }
         if (this.shadow >= 0) { s = s + "shadow=" + string(this.shadow) + ";" }
         if (this.glass >= 0) { s = s + "glass=" + string(this.glass) + ";" }
+        if (this.bkBlur >= 0) { s = s + "bkblur=" + string(this.bkBlur) + ";" }
+        if (this.bkTint != "") { s = s + "bktint=" + this.bkTint + ";" }
+        if (this.grad != "") { s = s + "grad=" + this.grad + ";" }
+        if (this.gradAng >= 0) { s = s + "gradang=" + string(this.gradAng) + ";" }
+        if (this.gradStop != "") { s = s + "gradstop=" + this.gradStop + ";" }
         if (this.opacity >= 0) { s = s + "opacity=" + string(this.opacity) + ";" }
         if (this.wrap != "") { s = s + "wrap=" + this.wrap + ";" }
         if (this.font != "") { s = s + "font=" + this.font + ";" }
@@ -499,6 +517,11 @@ function applyLayout(s: Style, p: map[string]Prop): void {
     s.bc = pStr(p, "borderColor", s.bc)         // border color hex
     s.shadow = pInt(p, "shadow", s.shadow)      // elevation 1..3
     if (p.get("glass") != null) { s.glass = pBool(p, "glass", false) ? 1 : -1 }   // Liquid Glass material
+    s.bkBlur = pInt(p, "blurIntensity", s.bkBlur)   // 0..100 backdrop blur
+    s.bkTint = pStr(p, "blurTint", s.bkTint)        // light | dark | system
+    s.grad = pStr(p, "gradient", s.grad)            // "RRGGBB,RRGGBB" linear gradient fill
+    s.gradAng = pInt(p, "gradientAngle", s.gradAng) // degrees, 0 = top to bottom
+    s.gradStop = pStr(p, "gradientStops", s.gradStop)
     s.opacity = pInt(p, "opacity", s.opacity)   // 0..100
     s.wrap = pStr(p, "wrap", s.wrap)            // "wrap" | "nowrap"
     s.font = pStr(p, "font", s.font)            // custom font family (icon fonts)
@@ -540,6 +563,8 @@ dataType LayoutProps {
     align: string?; justify: string?; bg: string?; color: string?; size: int?;
     weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
     dir: string?; border: int?; borderColor: string?; shadow: int?; glass: bool?;
+    gradient: string?; gradientAngle: int?; gradientStops: string?;
+    blurIntensity: int?; blurTint: string?;
     opacity: int?; wrap: string?; font: string?; tx: int?; ty: int?; rotate: int?;
     scale: int?; anim: int?; easing: string?; tw: string?;
     // Per-side padding + margins (px/py are the axes; pt/pr/pb/pl are the sides).
@@ -610,6 +635,11 @@ function applyLayoutV(s: Style, p: any): void {
     s.bc = pvS(p, "borderColor", s.bc)
     s.shadow = pvI(p, "shadow", s.shadow)
     if (p["glass"] != null) { s.glass = pvB(p, "glass", false) ? 1 : -1 }
+    s.bkBlur = pvI(p, "blurIntensity", s.bkBlur)
+    s.bkTint = pvS(p, "blurTint", s.bkTint)
+    s.grad = pvS(p, "gradient", s.grad)
+    s.gradAng = pvI(p, "gradientAngle", s.gradAng)
+    s.gradStop = pvS(p, "gradientStops", s.gradStop)
     s.opacity = pvI(p, "opacity", s.opacity)
     s.wrap = pvS(p, "wrap", s.wrap)
     s.font = pvS(p, "font", s.font)
@@ -987,6 +1017,81 @@ export function SafeAreaView(first: SafeAreaViewProps | []Node, kids: []Node = [
     const s: Style = new Style(); s.dir = "col"; s.grow = 1; applyLayoutV(s, p)
     return mkView(s, out)
 }
+dataType LinearGradientProps {
+    ViewProps;
+    colors: []string,   // two or more hex colors, painted first to last along the angle
+    angle: int?,        // degrees: 0 (default) top to bottom, 90 left to right, 180 bottom to top
+    stops: ([]int)?,    // optional percent position per color; omit to spread them evenly
+                        // (parenthesised: a bare []int? is a REQUIRED array of optional ints)
+}
+/**
+ * A view whose background is a linear gradient, with children drawn over it. Use it for
+ * a header, a hero, a card or any surface that should not be one flat color.
+ *
+ * The gradient IS the view's background, so it composes with `radius`, `border` and the
+ * rest of the layout props: on both hosts a single background object owns the fill, the
+ * corners and the stroke together, and painting a gradient behind a separately-rounded
+ * child would show square corners underneath. For the same reason a gradient replaces
+ * `bg` on the same view rather than layering over it.
+ *
+ * Any view can take the same effect through the `gradient` / `gradientAngle` /
+ * `gradientStops` style props (comma-joined strings); this builder is the typed front
+ * door, so the colors stay a `[]string` at the call site.
+ *
+ * ```chuks
+ * LinearGradient({ colors: [tk("primary"), "8B5CF6"], angle: 135, radius: 16, pad: 20 }, [
+ *     Text({ size: 20, weight: "bold", color: "FFFFFF" }, "Good evening"),
+ * ])
+ * ```
+ */
+export function LinearGradient(p: LinearGradientProps, kids: []Node = []): Node {
+    const s: Style = new Style(); s.dir = "col"
+    applyLayoutV(s, p)
+    s.grad = p.colors.join(",")
+    if (p.angle != null) { s.gradAng = int(p.angle) }
+    const st: ([]int)? = p.stops
+    if (st != null) {
+        var parts: []string = []
+        for (var i: int = 0; i < st.length; i = i + 1) { parts.push(string(st[i])) }
+        s.gradStop = parts.join(",")
+    }
+    return mkView(s, kids)
+}
+
+dataType BlurProps {
+    ViewProps;
+    intensity: int?,   // 0 to 100; default 60
+    tint: string?,     // "light" | "dark" | "system" (default): which material to use
+}
+/**
+ * A translucent surface with its children drawn over it. Use it for a bar, a sheet or a
+ * card that should read as glass rather than as a solid panel.
+ *
+ * WHAT IT SAMPLES DIFFERS BY HOST, and the difference is not something the framework can
+ * paper over. On iOS this is a real backdrop blur: the system blurs whatever is behind
+ * the view in the window, so scrolling content under it smears live. Android has no
+ * equivalent for an in-window view (its blur effect blurs a view's OWN content, which
+ * would blur your children too), so there it is a translucent tinted scrim: the same
+ * shape and the same weight in the layout, without the live sampling. Design for the
+ * scrim and treat the iOS blur as the upgrade, or the screen will look thin on Android.
+ *
+ * `intensity` picks the material thickness on iOS and the scrim's opacity on Android.
+ * `tint` chooses a light or dark material; the default follows the OS appearance.
+ *
+ * ```chuks
+ * Blur({ intensity: 70, tint: "system", radius: 20, pad: 16 }, [
+ *     Text({ size: 15, weight: "bold", color: tk("text") }, "Now playing"),
+ * ])
+ * ```
+ */
+export function Blur(p: BlurProps, kids: []Node = []): Node {
+    const s: Style = new Style(); s.dir = "col"
+    applyLayoutV(s, p)
+    s.bkBlur = p.intensity ?? 60
+    s.bkTint = p.tint ?? "system"
+    return mkView(s, kids)
+}
+
 // A fixed-height empty row (a safe-area spacer).
 function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
 

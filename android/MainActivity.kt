@@ -133,6 +133,8 @@ class MainActivity : Activity() {
 
     private lateinit var root: FrameLayout
     private var listScroll: FrameLayout? = null   // a ScrollView (vertical) or HorizontalScrollView (carousel)
+    private val horizScrollIds = HashSet<String>()   // which scroll ids scroll sideways, by id rather than
+                                                     // by inference: LV can hand the live slot to any of them
     private var listHoriz = false                 // the tracked list scrolls horizontally (report x, not y)
     private var scrollId = ""
     private var stickBottomOn = false   // Scroll stickBottom: keep pinned to newest (chat)
@@ -579,7 +581,15 @@ class MainActivity : Activity() {
                 "LV" -> {
                     val lid = if (f.size >= 2) f[1] else ""
                     if (lid.isEmpty()) { listScroll = null; scrollId = ""; contentId = "" }
-                    else (views[lid] as? FrameLayout)?.let { sc -> listScroll = sc; scrollId = lid; contentId = "$lid.0" }
+                    // listHoriz MUST move with the live scroll. It used to be set only at
+                    // creation, so once LV handed the slot to a horizontal list (a Carousel
+                    // inside a vertical Scroll) the host kept reporting the vertical axis: it
+                    // sent that list's own HEIGHT as the app viewport, and the engine windowed
+                    // every list against a 96dp-tall screen.
+                    else (views[lid] as? FrameLayout)?.let { sc ->
+                        listScroll = sc; scrollId = lid; contentId = "$lid.0"
+                        listHoriz = horizScrollIds.contains(lid)
+                    }
                 }
                 "FA" -> if (f.size >= 2) setFrameDriver(f[1] == "1")   // per-frame physics on/off
                 "X" -> if (f.size >= 3) {
@@ -1923,12 +1933,14 @@ class MainActivity : Activity() {
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
+                horizScrollIds.remove(id)
                 if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = false } }
             "HScroll" -> SnapHScrollView(this).also { sc ->   // horizontal list (carousel); snaps when paging=1
                 N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full width
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
+                horizScrollIds.add(id)
                 if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = true } }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
                 it.setBackgroundColor(Color.argb(128, 0, 0, 0))
@@ -1948,6 +1960,11 @@ class MainActivity : Activity() {
     // pending visual state per view (bg color + radius) -> a GradientDrawable
     private val bgColor = HashMap<String, Int>()
     private val bgRadius = HashMap<String, Float>()
+    private val blurAmt = HashMap<String, Int>()           // id -> 0..100 backdrop-blur strength
+    private val blurTint = HashMap<String, String>()       // id -> light | dark | system
+    private val gradColors = HashMap<String, IntArray>()   // id -> linear-gradient colors
+    private val gradAngle = HashMap<String, Int>()         // id -> angle in degrees (0 = top to bottom)
+    private val gradStops = HashMap<String, FloatArray>()  // id -> 0..1 positions matching the colors
     private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a translucent frosted panel
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
     private val longPressActions = HashMap<String, String>()   // id -> onLongPress action
@@ -2016,6 +2033,8 @@ class MainActivity : Activity() {
         v.clipToOutline = false                            // overflow / TextureView+ImageView radius outline
         v.isEnabled = true                                 // dis / edit
         disabledIds.remove(id)                             // dis (alpha handled post-loop)
+        blurAmt.remove(id); blurTint.remove(id)            // backdrop blur (drawn as a scrim)
+        gradColors.remove(id); gradAngle.remove(id); gradStops.remove(id)   // linear gradient
         glassIds.remove(id)                                // glass frosted panel
         pressOpacity.remove(id); longDelayMs.remove(id)    // Pressable active-alpha / long-press
         if (!modalIds.contains(id)) v.visibility = View.VISIBLE   // hidden/mvis (modal drives its own)
@@ -2114,6 +2133,17 @@ class MainActivity : Activity() {
                 "anim" -> animMs = f.toInt()
                 "ez" -> animEz = vl
                 "shadow" -> v.elevation = dpf(if (f >= 3f) 12f else if (f == 2f) 6f else 3f)
+                "bkblur" -> blurAmt[id] = vl.toIntOrNull() ?: 60
+                "bktint" -> blurTint[id] = vl
+                "grad" -> {
+                    val cs = vl.split(",").filter { it.isNotEmpty() }.map { Color.parseColor("#$it") }
+                    if (cs.size >= 2) gradColors[id] = cs.toIntArray() else gradColors.remove(id)
+                }
+                "gradang" -> gradAngle[id] = vl.toIntOrNull() ?: 0
+                "gradstop" -> {
+                    val ps = vl.split(",").mapNotNull { it.toFloatOrNull() }
+                    if (ps.isNotEmpty()) gradStops[id] = ps.map { it / 100f }.toFloatArray() else gradStops.remove(id)
+                }
                 "glass" -> if (vl == "1") glassIds.add(id) else glassIds.remove(id)
                 "wrap" -> N.ySetF(n, 13, if (vl == "wrap") 1f else 0f)
                 "fs" -> fsPx = dpf(f)
@@ -2352,14 +2382,30 @@ class MainActivity : Activity() {
         // bg + radius + border -> GradientDrawable (a large radius clamps to a pill)
         val hasPerCorner = rcTL >= 0f || rcTR >= 0f || rcBR >= 0f || rcBL >= 0f
         val side = bwSideM[id]
-        if (side != null && v !is TextureView) {   // per-side border: a custom drawable draws the set edges
+        val gcs = gradColors[id]
+        if (gcs != null && v !is TextureView) {
+            // A gradient owns the whole background: fill, corners and stroke together, the
+            // same way the solid path below does, so radius and border keep working on it.
+            val radii = if (hasPerCorner) {
+                val tl = if (rcTL >= 0f) rcTL else 0f; val tr = if (rcTR >= 0f) rcTR else 0f
+                val br = if (rcBR >= 0f) rcBR else 0f; val bl = if (rcBL >= 0f) rcBL else 0f
+                floatArrayOf(tl, tl, tr, tr, br, br, bl, bl)
+            } else null
+            v.background = LinearGradientDrawable(gcs, gradStops[id], gradAngle[id] ?: 0,
+                radii, bgRadius[id] ?: 0f, borderW[id] ?: 0f,
+                borderC[id] ?: Color.parseColor("#334155"))
+        } else if (side != null && v !is TextureView) {   // per-side border: a custom drawable draws the set edges
             val bc = borderC[id] ?: Color.parseColor("#334155")
             v.background = SideBorderDrawable(bgColor[id] ?: Color.TRANSPARENT, bgRadius[id] ?: 0f,
                 if (side[0] >= 0f) side[0] else 0f, if (side[1] >= 0f) side[1] else 0f,
                 if (side[2] >= 0f) side[2] else 0f, if (side[3] >= 0f) side[3] else 0f, bc)
-        } else if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id) || hasPerCorner) {
+        } else if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id) || blurAmt.containsKey(id) || hasPerCorner) {
             val gd = GradientDrawable()
-            gd.setColor(if (glassIds.contains(id)) Color.argb(56, 255, 255, 255) else (bgColor[id] ?: Color.TRANSPARENT))   // frosted translucent
+            gd.setColor(when {
+                blurAmt.containsKey(id) -> blurScrim(id)                       // Blur -> tinted scrim
+                glassIds.contains(id) -> Color.argb(56, 255, 255, 255)         // frosted translucent
+                else -> bgColor[id] ?: Color.TRANSPARENT
+            })
             if (hasPerCorner) {   // rounded-t-*, rounded-bl-*, … : per-corner radii (tl, tr, br, bl x2)
                 val tl = if (rcTL >= 0f) rcTL else 0f; val tr = if (rcTR >= 0f) rcTR else 0f
                 val br = if (rcBR >= 0f) rcBR else 0f; val bl = if (rcBL >= 0f) rcBL else 0f
@@ -3066,6 +3112,67 @@ class MainActivity : Activity() {
 
     // Draws a (rounded) background fill plus per-side border edges. Android has no native
     // per-side border, so we paint the edges ourselves. Radius applies to the fill only.
+    // A rounded-rect fill painted with a LinearGradient shader, plus the same stroke a
+    // GradientDrawable would draw. GradientDrawable only accepts orientation in 45-degree
+    // steps, so using it would have made an angle mean something different on each host;
+    // a shader takes the angle as given and keeps the two in step.
+    /// Android has no backdrop blur for an in-window view: its blur effect blurs a view's
+    /// OWN content, which would blur the children drawn on top. So a Blur is a translucent
+    /// tinted scrim here: the same shape and the same weight in the layout, without the live
+    /// sampling iOS gets. Documented on the component, because designing for the blur and
+    /// getting the scrim is how a screen ends up looking thin on Android.
+    private fun blurScrim(id: String): Int {
+        val amt = (blurAmt[id] ?: 60).coerceIn(0, 100)
+        val alpha = (30 + amt * 1.5f).toInt().coerceIn(0, 200)
+        val night = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        val light = when (blurTint[id] ?: "system") {
+            "light" -> true
+            "dark" -> false
+            else -> !night                         // system: match the OS appearance, as the iOS material does
+        }
+        return if (light) Color.argb(alpha, 255, 255, 255) else Color.argb(alpha, 20, 20, 22)
+    }
+
+    inner class LinearGradientDrawable(
+        private val colors: IntArray, private val stops: FloatArray?, private val angleDeg: Int,
+        private val radii: FloatArray?, private val radius: Float,
+        private val strokeW: Float, private val strokeC: Int
+    ) : android.graphics.drawable.Drawable() {
+        private val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        private val path = android.graphics.Path()
+        private fun rrect(): android.graphics.Path {
+            val b = bounds; path.reset()
+            val r = android.graphics.RectF(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+            if (radii != null) path.addRoundRect(r, radii, android.graphics.Path.Direction.CW)
+            else path.addRoundRect(r, radius, radius, android.graphics.Path.Direction.CW)
+            return path
+        }
+        override fun draw(canvas: android.graphics.Canvas) {
+            val b = bounds
+            if (b.width() <= 0 || b.height() <= 0) return
+            // 0 degrees runs top to bottom and the angle grows clockwise, matching iOS. Both
+            // endpoints sit on a unit vector through the centre, scaled to the bounds.
+            val rad = Math.toRadians(angleDeg.toDouble())
+            val cx = b.exactCenterX(); val cy = b.exactCenterY()
+            val dx = (Math.sin(rad) * b.width() / 2.0).toFloat()
+            val dy = (Math.cos(rad) * b.height() / 2.0).toFloat()
+            p.shader = android.graphics.LinearGradient(cx - dx, cy - dy, cx + dx, cy + dy,
+                colors, stops, android.graphics.Shader.TileMode.CLAMP)
+            p.style = android.graphics.Paint.Style.FILL
+            canvas.drawPath(rrect(), p)
+            if (strokeW > 0f) {
+                p.shader = null; p.style = android.graphics.Paint.Style.STROKE
+                p.strokeWidth = strokeW; p.color = strokeC
+                canvas.drawPath(rrect(), p)   // inset by half the stroke, as GradientDrawable does
+            }
+        }
+        override fun setAlpha(a: Int) { p.alpha = a }
+        override fun setColorFilter(cf: android.graphics.ColorFilter?) { p.colorFilter = cf }
+        @Deprecated("deprecated in API 29, still required by the base class")
+        override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
+    }
+
     inner class SideBorderDrawable(
         private val bg: Int, private val radius: Float,
         private val t: Float, private val r: Float, private val b: Float, private val l: Float,

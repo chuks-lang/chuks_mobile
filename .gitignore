@@ -27,6 +27,9 @@
 # Internal design docs / roadmaps — kept local, out of the repo.
 docs/
 .chuks/typecheck/
+# Local host bridge for THIS repo's demo app; it imports app/, which is ignored too.
+# Consumers get the real one from template/.chuks/entry.chuks.
+.chuks/entry.chuks
 
 # Example / demo entries — local scratch for docshots + manual testing, not part
 # of the shippable package (the starter template lives under template/).

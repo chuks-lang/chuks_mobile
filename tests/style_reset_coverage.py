@@ -77,6 +77,12 @@ MANIFEST = {
     "r": (RESET, "corner radius"), "rtl": (RESET, "radius TL"), "rtr": (RESET, "radius TR"),
     "rbr": (RESET, "radius BR"), "rbl": (RESET, "radius BL"), "shadow": (RESET, "shadow/elevation"),
     "glass": (RESET, "frosted panel"), "overflow": (RESET, "clip"), "z": (RESET, "z-order"),
+    # Gradient + backdrop blur: both are decoration views held per id, and both host reset
+    # paths drop the view and its cached spec (iOS resetPaintStyle, Android's style reset),
+    # so a reused node cannot keep the previous role's fill or material.
+    "grad": (RESET, "gradient colors"), "gradang": (RESET, "gradient angle"),
+    "gradstop": (RESET, "gradient stops"),
+    "bkblur": (RESET, "backdrop blur strength"), "bktint": (RESET, "backdrop blur tint"),
     "opacity": (RESET, "alpha (post-loop else-branch)"),
     "tx": (RESET, "translate-x (post-loop else-branch)"), "ty": (RESET, "translate-y (post-loop else-branch)"),
     "rot": (RESET, "rotation (post-loop else-branch)"), "sc": (RESET, "scale (post-loop else-branch)"),
