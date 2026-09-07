@@ -239,8 +239,34 @@ final class NfcReader: NSObject, NFCNDEFReaderSessionDelegate {
     func write(_ text: String, _ token: String) { begin(token, write: text) }
     var available: Bool { NFCNDEFReaderSession.readingAvailable }
 
+    /// Why `readingAvailable` is false, which is not the question it looks like.
+    ///
+    /// iOS reports NFC as unavailable when the app is not signed with
+    /// com.apple.developer.nfc.readersession.formats, exactly as it does on a device
+    /// with no NFC reader at all. So an entitled build on an iPhone 12 Pro and an
+    /// unentitled one give the same answer, and "NFC not available" sends the reader
+    /// looking at the hardware when the problem is the signature.
+    ///
+    /// The build writes what it was actually signed for into Info.plist, so this can
+    /// say which of the two it is instead of guessing.
+    static func unavailableReason() -> String {
+        #if targetEnvironment(simulator)
+        return "NFC is unavailable: no simulator has an NFC reader. Test this on a device."
+        #else
+        let granted = Bundle.main.object(forInfoDictionaryKey: "ChuksGrantedEntitlements") as? [String] ?? []
+        if granted.contains("com.apple.developer.nfc.readersession.formats") {
+            return "NFC is unavailable on this device."
+        }
+        return "NFC is unavailable because this build is not signed for it. iOS reports "
+            + "no NFC reader unless the app carries com.apple.developer.nfc.readersession.formats, "
+            + "even on a device that has one. Declare \"nfc\" under permissions in app.json and "
+            + "sign with a profile from an explicit App ID that has NFC Tag Reading enabled; a "
+            + "wildcard development profile cannot carry that entitlement."
+        #endif
+    }
+
     private func begin(_ token: String, write: String?) {
-        guard NFCNDEFReaderSession.readingAvailable else { onFail?(token, "NFC not available"); return }
+        guard NFCNDEFReaderSession.readingAvailable else { onFail?(token, NfcReader.unavailableReason()); return }
         self.token = token; self.writeText = write; self.didComplete = false
         session = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
         session?.alertMessage = write == nil ? "Hold your iPhone near a tag." : "Hold your iPhone near a tag to write."
@@ -282,6 +308,15 @@ final class NfcReader: NSObject, NFCNDEFReaderSessionDelegate {
     func readerSession(_ s: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
         if didComplete { return }
         didComplete = true
+        // A missing entitlement is the one failure whose system message does not say
+        // what to do about it: CoreNFC reports a security violation, which reads like
+        // a tag problem rather than a signing one. NFC needs
+        // com.apple.developer.nfc.readersession.formats, and that entitlement needs an
+        // explicit App ID, so a build on the usual wildcard profile lands here.
+        if let e = error as? NFCReaderError, e.code == .readerErrorSecurityViolation {
+            onFail?(token, "NFC is not entitled for this build. Declare \"nfc\" under permissions in app.json and sign with a profile from an explicit App ID that has NFC Tag Reading enabled; a wildcard development profile cannot carry the entitlement.")
+            return
+        }
         onFail?(token, error.localizedDescription)
     }
 }
@@ -2220,6 +2255,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     // Aggregate one metric over [now-secs, now]: sum for steps/distance/energy, average
     // bpm for heart rate. Answers with the number as a string.
+    /// HealthKit names the missing entitlement but not what to do about it. Appending
+    /// the fix keeps it level with the NFC message, which has to say more only because
+    /// CoreNFC says less: it reports the reader as absent rather than naming the
+    /// entitlement at all.
+    static func healthErrorText(_ e: Error) -> String {
+        let msg = e.localizedDescription
+        guard msg.lowercased().contains("com.apple.developer.healthkit") else { return msg }
+        return msg + " Declare \"health\" under permissions in app.json and sign with a profile "
+            + "from an explicit App ID that has HealthKit enabled; a wildcard development profile "
+            + "cannot carry that entitlement."
+    }
+
     func hkRead(_ token: String, _ metric: String, _ secs: Double) {
         guard HKHealthStore.isHealthDataAvailable(), let qt = Self.hkQuantityType(metric) else { fail(token, "unsupported health metric: \(metric)"); return }
         let from = Date(timeIntervalSinceNow: -secs)
@@ -2227,7 +2274,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let isAvg = (metric == "heartRate")
         let q = HKStatisticsQuery(quantityType: qt, quantitySamplePredicate: pred, options: isAvg ? .discreteAverage : .cumulativeSum) { [weak self] _, stats, err in
             DispatchQueue.main.async {
-                if let e = err { self?.fail(token, e.localizedDescription); return }
+                if let e = err { self?.fail(token, Self.healthErrorText(e)); return }
                 let unit: HKUnit
                 switch metric {
                 case "distanceMeters": unit = HKUnit.meter()
@@ -2408,7 +2455,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if types.isEmpty { fail(token, "no valid health metrics: \(args)"); break }
             healthStore.requestAuthorization(toShare: nil, read: types) { [weak self] ok, err in
                 DispatchQueue.main.async {
-                    if let e = err { self?.fail(token, e.localizedDescription) }
+                    if let e = err { self?.fail(token, Self.healthErrorText(e)) }
                     else { self?.resolve(token, ok ? "granted" : "denied") }
                 }
             }

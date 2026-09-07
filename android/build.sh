@@ -47,12 +47,17 @@ if [ "$PREVIEW" = "1" ]; then
 fi
 PKG="$APPID"; OUT="$PROJDIR/.chuks/android-out"
 export CHUKS_NO_WARNINGS=1
-rm -rf "$OUT" ~/.chuks/cache/builds/*; mkdir -p "$OUT"
+# shellcheck source=../buildcache.sh
+source "$SDKROOT/buildcache.sh"
+rm -rf "$OUT"; chuks_clear_build_cache; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the .so is compiled inside the cache dir, so its -o must be absolute
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
+BDSTAMP="$OUT/.build-started"; : > "$BDSTAMP"   # only cache dirs newer than this are ours
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )   # --c-archive emits the chuks_* C-ABI bridge
-BD="$( { set +o pipefail; ls -dt "$HOME"/.chuks/cache/builds/*/ 2>/dev/null | head -1; } )"   # generated sources live here, under ~/.chuks/cache
+BD="$(chuks_latest_build_dir "$BDSTAMP")"        # generated sources, under ~/.chuks/cache
+[ -n "$BD" ] && [ -f "$BD/go.mod" ] || {
+    echo "  the Chuks build produced no Go sources in $CHUKS_BUILD_CACHE"; exit 1; }
 # Stage the JNI bridge + cgo link flags + Yoga (from the PACKAGE) next to the generated Go.
 cp "$PKGDIR/jni.cpp" "$PKGDIR/cgo_android.go" "$BD/"
 mkdir -p "$BD/yoga"; cp "$PKGDIR/yoga/libyoga.a" "$BD/yoga/"; cp -r "$SDKROOT/core/yoga/include" "$BD/yoga/"

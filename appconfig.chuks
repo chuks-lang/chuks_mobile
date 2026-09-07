@@ -4,7 +4,7 @@
 //
 //   chuks run appconfig.chuks <projdir> <field> [arg]
 //     <field> = version | build | name | displayName | ios-bundle | ios-plist
-//               | android-perms | android-schemes            (print the value)
+//               | ios-entitlements | android-perms | android-schemes   (print the value)
 //             | patch-manifest <manifest-path>               (fill the manifest in place)
 //
 // app.json (in the project root) is the app's identity + native config, like RN/Expo's
@@ -35,6 +35,45 @@ function iosKeysFor(kind: string): []string {
     var empty: []string = []          // notifications / bodySensors need no iOS plist string
     return empty
 }
+// permission kind -> the iOS ENTITLEMENT it needs, as `key<TAB>value-xml` lines.
+//
+// An entitlement is not a usage string. A usage string is text in Info.plist and any
+// build can carry one; an entitlement is signed into the app and must ALSO be present
+// in the provisioning profile, which means an EXPLICIT App ID with the capability
+// enabled. The wildcard development profile the build normally uses can never carry
+// one, so these two kinds are the only capabilities that cannot be developed against
+// with the default signing setup.
+//
+// Emitted as lines rather than plist XML because the build script has to filter them
+// against what the chosen profile actually carries before assembling the plist: an
+// entitlement the profile lacks makes codesign fail outright, which would stop an app
+// that merely DECLARES nfc from reaching a device at all.
+//
+// Everything else on the bus needs no entitlement: local notifications are
+// UNUserNotificationCenter (remote push would need aps-environment, which is not
+// implemented), the keychain uses the default access group application-identifier
+// already grants, and bluetooth, contacts, calendar, camera, location and motion are
+// usage strings only.
+function iosEntitlementFor(kind: string): string {
+    if (kind == "health") { return "com.apple.developer.healthkit\t<true/>\n" }
+    if (kind == "nfc") {
+        return "com.apple.developer.nfc.readersession.formats\t<array><string>NDEF</string></array>\n"
+    }
+    return ""
+}
+
+// The entitlements the app's declared permissions imply, one per line.
+function iosEntitlementsStr(perms: any): string {
+    var out: string = ""
+    var i: int = 0
+    while (i < KINDS.length) {
+        const kind: string = KINDS[i]
+        if (perms[kind] != null) { out = out + iosEntitlementFor(kind) }
+        i = i + 1
+    }
+    return out
+}
+
 // permission kind -> Android manifest uses-permission name(s)
 function androidPermsFor(kind: string): []string {
     if (kind == "camera") { return ["CAMERA"] }
@@ -180,6 +219,7 @@ function main(): void {
     else if (field == "displayName") { println(strOr(cfg["displayName"], strOr(cfg["name"], ""))) }
     else if (field == "ios-bundle") { println(ios == null ? "" : strOr(ios["bundleId"], "")) }
     else if (field == "ios-plist") { print(iosPlistStr(perms, ios)) }
+    else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
     else if (field == "patch-manifest") { patchManifest(a[5], cfg, perms, android) }

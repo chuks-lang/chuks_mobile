@@ -47,8 +47,10 @@ fi
 OUT="$PROJDIR/.chuks/ios-out"; APP="$OUT/$APPNAME.app"
 rm -rf "$OUT"; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the c-archive is compiled inside the cache dir, so its -o must be absolute
+# shellcheck source=../buildcache.sh
+source "$SDKROOT/buildcache.sh"
 # Cold build wipes the AOT cache for reproducibility; FAST=1 (the dev loop) keeps it.
-[ "${FAST:-0}" = "1" ] || rm -rf ~/.chuks/cache/builds/*
+[ "${FAST:-0}" = "1" ] || chuks_clear_build_cache
 SWIFT_OPT="-O"; [ "${FAST:-0}" = "1" ] && SWIFT_OPT="-Onone"
 DEV_FLAG=""; [ "${DEV:-0}" = "1" ] && DEV_FLAG="-D DEV"
 BENCH_FLAG=""; [ "${BENCHMARK:-0}" = "1" ] && BENCH_FLAG="-D BENCHMARK"
@@ -77,8 +79,12 @@ YOGA="$PKGDIR/yoga"; [ "$IOS_TARGET" = "device" ] && YOGA="$PKGDIR/yoga-device"
 YOGA_INC="$SDKROOT/core/yoga/include"     # shared Yoga headers (in the package)
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
+BDSTAMP="$OUT/.build-started"; : > "$BDSTAMP"   # only cache dirs newer than this are ours
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )
-BD="$( { set +o pipefail; ls -dt "$HOME"/.chuks/cache/builds/*/ 2>/dev/null | head -1; } )"   # generated sources live under ~/.chuks/cache (pipefail-safe: ls SIGPIPEs when many build dirs exist)
+BD="$(chuks_latest_build_dir "$BDSTAMP")"        # generated sources, under ~/.chuks/cache
+[ -n "$BD" ] && [ -f "$BD/go.mod" ] || {
+    echo "  the Chuks build produced no Go sources in $CHUKS_BUILD_CACHE"
+    echo "  (rerun without >/dev/null on the chuks build above to see why)"; exit 1; }
 
 echo "2. Building the iOS engine ($PLATLABEL)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
@@ -162,6 +168,10 @@ $IOS_PLIST_EXTRA
   <key>UILaunchScreen</key><dict/>
   $ICONNAME_PLIST
   <key>UIAppFonts</key><array>$FONT_PLIST</array>
+  <!-- Which entitlement-bearing capabilities this build is actually signed for. The
+       device branch below fills it in from the provisioning profile; a simulator build
+       is signed for none, and the host says so rather than guessing. -->
+  <key>ChuksGrantedEntitlements</key><array/>
 </dict></plist>
 PLIST
 
@@ -208,11 +218,48 @@ if [ "$IOS_TARGET" = "device" ]; then
         esac
     done
     [ -n "$PROFILE" ] || { echo "no wildcard development provisioning profile for team $TEAM (build once in Xcode to create one)"; exit 1; }
-    # HEALTHKIT=1 adds the HealthKit entitlement. It is opt-in because a WILDCARD
-    # profile never carries HealthKit: the App ID must be explicit and have the
-    # capability enabled, and signing FAILS if the entitlement is not in the profile.
-    HEALTHKIT_ENT=""
-    [ "${HEALTHKIT:-0}" = "1" ] && HEALTHKIT_ENT="  <key>com.apple.developer.healthkit</key><true/>"
+    # Entitlements the app's declared permissions imply: HealthKit for "health",
+    # the NFC reader formats for "nfc". Only those two kinds need one; everything
+    # else on the bus is a usage string.
+    #
+    # Each is filtered against what THIS profile actually carries, because codesign
+    # fails outright on an entitlement the profile lacks. A wildcard profile carries
+    # neither, so an app that declares nfc still builds and installs, and is told once
+    # that the capability will not work until it has an explicit App ID. Emitting them
+    # unconditionally would stop such an app reaching a device at all; emitting them
+    # never is how NFC came to be shipped, documented, and dead on every device.
+    PROF_ENT="$(security cms -D -i "$PROFILE" 2>/dev/null | plutil -extract Entitlements xml1 -o - - 2>/dev/null)"
+    WANT_ENT="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" ios-entitlements 2>/dev/null)"
+    # HEALTHKIT=1 predates app.json and still works, for a project without one.
+    case "$WANT_ENT" in
+        *healthkit*) ;;
+        *) [ "${HEALTHKIT:-0}" = "1" ] && WANT_ENT="$(printf '%s\ncom.apple.developer.healthkit\t<true/>' "$WANT_ENT")" ;;
+    esac
+    EXTRA_ENT=""; DROPPED_ENT=""
+    while IFS="$(printf '\t')" read -r ent_key ent_val; do
+        [ -n "$ent_key" ] || continue
+        case "$PROF_ENT" in
+            *"<key>$ent_key</key>"*) EXTRA_ENT="$EXTRA_ENT  <key>$ent_key</key>$ent_val
+" ;;
+            *) DROPPED_ENT="$DROPPED_ENT $ent_key" ;;
+        esac
+    done <<WANTENT
+$WANT_ENT
+WANTENT
+    if [ -n "$DROPPED_ENT" ]; then
+        echo "   note: this provisioning profile carries none of:$DROPPED_ENT"
+        echo "         The app builds and installs, but those capabilities will not work"
+        echo "         on device. A wildcard profile can never carry an entitlement: to"
+        echo "         use them, register an explicit App ID for $BID at developer.apple.com"
+        echo "         with the capability enabled, then build once in Xcode."
+    fi
+    # Tell the running app which of these it actually got. Without this the host has
+    # to guess: iOS reports NFC as simply unavailable when the entitlement is missing,
+    # which is indistinguishable at runtime from a device that has no NFC reader.
+    plutil -replace ChuksGrantedEntitlements -json '[]' "$APP/Info.plist" >/dev/null 2>&1
+    printf '%s' "$EXTRA_ENT" | sed -n 's/^  <key>\(.*\)<\/key>.*/\1/p' | while read -r granted; do
+        [ -n "$granted" ] && plutil -insert ChuksGrantedEntitlements -string "$granted" -append "$APP/Info.plist" >/dev/null 2>&1
+    done
     cp "$PROFILE" "$APP/embedded.mobileprovision"
     cat > "$OUT/ent.plist" <<ENT
 <?xml version="1.0" encoding="UTF-8"?>
@@ -221,10 +268,11 @@ if [ "$IOS_TARGET" = "device" ]; then
   <key>application-identifier</key><string>$TEAM.$BID</string>
   <key>com.apple.developer.team-identifier</key><string>$TEAM</string>
   <key>get-task-allow</key><true/>
-$HEALTHKIT_ENT
-</dict></plist>
+$EXTRA_ENT</dict></plist>
 ENT
-    codesign --force --sign "$IDENTITY" --entitlements "$OUT/ent.plist" --generate-entitlement-der --timestamp=none "$APP"
+    if ! codesign --force --sign "$IDENTITY" --entitlements "$OUT/ent.plist" --generate-entitlement-der --timestamp=none "$APP" 2>"$OUT/codesign.log"; then
+        echo "  Signing failed:"; sed 's/^/    /' "$OUT/codesign.log"; exit 1
+    fi
     echo "6. Installing + launching on your device"
     # First connected+available device; exclude "unavailable" (substring match trap) and
     # let IOS_DEVICE_ID override when more than one is attached.
