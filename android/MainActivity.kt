@@ -121,7 +121,7 @@ object N {
     }
 }
 
-class MainActivity : Activity() {
+class MainActivity : Activity(), ChuksModuleHost {
     private val views = HashMap<String, View>()
     private val ynodes = HashMap<String, Long>()
     // Incremental apply: relayout() reassigns a view's LayoutParams (which triggers a child
@@ -895,13 +895,33 @@ class MainActivity : Activity() {
     private fun hostInput(a: String, v: String) { applyStream(engInput(a, v)); relayout() }
 
     // Deliver a native capability result back to the engine and apply the re-render.
-    private fun resolve(token: String, payload: String) {
+    // Public because a package's module answers through the same channel the framework's
+    // own capabilities do (ChuksModuleHost).
+    override fun resolve(token: String, payload: String) {
         applyStream(engResolve(token, payload)); relayout()
     }
     // Report a capability failure back to the engine (fires the request's onErr).
-    private fun fail(token: String, message: String) {
+    override fun fail(token: String, message: String) {
         applyStream(engFail(token, message)); relayout()
     }
+    // ChuksModuleHost: a module gets the Activity the framework's own capabilities use.
+    override val activity: Activity get() = this
+
+    // ChuksModuleHost: a module's stream is torn down through the same map the
+    // framework's own streams use, so `__cancel__` releases both alike.
+    override fun onCancel(token: String, teardown: () -> Unit) { streamTeardown[token] = teardown }
+
+    // ChuksModuleHost: a runtime permission request rides the host's existing pending-token
+    // plumbing, because only the Activity receives onRequestPermissionsResult.
+    override fun requestPermission(token: String, permissions: Array<String>) {
+        val code = ++permSeq
+        pendingPerms[code] = token
+        requestPermissions(permissions, code)
+    }
+
+    // Capabilities installed packages provide, consulted for any command the framework's
+    // own `when` does not claim. Lazy: an app with no native package never builds it.
+    private val packageModules by lazy { ChuksModuleRegistry(this) }
 
     // Live native subscriptions (stream token -> repeating Runnable), for teardown.
     private val streamHandler = Handler(Looper.getMainLooper())
@@ -1012,25 +1032,6 @@ class MainActivity : Activity() {
             }
             "pedometer.watch" -> startPedometer(token)
             "pedometer.query" -> fail(token, "historical steps need Health Connect on Android; use Pedometer.watch for a live count")
-            "health.available" -> {
-                val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
-                resolve(token, if (sm.getDefaultSensor(android.hardware.Sensor.TYPE_HEART_RATE) != null) "true" else "false")
-            }
-            "health.authorize" -> {
-                // No Health Connect in the base runtime: the only readable source is the
-                // body heart-rate sensor, gated by the BODY_SENSORS runtime permission.
-                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) == PackageManager.PERMISSION_GRANTED) resolve(token, "granted")
-                else {
-                    val code = ++permSeq
-                    pendingPerms[code] = token       // resolved "granted"/"denied" in onRequestPermissionsResult
-                    requestPermissions(arrayOf(Manifest.permission.BODY_SENSORS), code)
-                }
-            }
-            "health.read" -> fail(token, "reading health totals needs Health Connect on Android; use Pedometer for steps/distance")
-            "health.heartRate" -> {
-                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) { fail(token, "body-sensors permission denied"); return }
-                startLightSensor(token, android.hardware.Sensor.TYPE_HEART_RATE) { v -> v[0].toInt().toString() }
-            }
             "deviceinfo.screen" -> {
                 val dm = resources.displayMetrics
                 val wdp = (dm.widthPixels / dm.density).toInt()
@@ -1368,6 +1369,9 @@ class MainActivity : Activity() {
                 "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
                 else        -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
+            // Not a framework capability. An installed package may claim this namespace;
+            // if none does, the command is unknown, exactly as before.
+            else -> packageModules.handle(token, cap, args)
         }
     }
 

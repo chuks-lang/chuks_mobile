@@ -60,7 +60,6 @@ import Security
 import Network
 import CoreBluetooth
 import CoreNFC
-import HealthKit
 
 // ===== Feed-grade image cache (shared by both iOS hosts) =====
 // Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
@@ -904,7 +903,7 @@ func chuksWakeThunk() {
     }
 }
 
-final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate {
+final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost {
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
@@ -915,6 +914,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // of the whole tree. `needsFrame` is a belt-and-suspenders set of just-created views that
     // must get their frame at least once even if Yoga's flag says unchanged.
     var needsFrame = Set<String>()
+    /// Capabilities that installed packages provide, consulted for any command the
+    /// framework's own switch does not claim. Built lazily, so an app with no native
+    /// package never constructs it.
+    lazy var packageModules = ChuksModuleRegistry(host: self)
     /// Nodes already reported as non-finite, so the warning fires once, not every tick.
     var warnedNonFinite = Set<String>()
     // Layout timing (env CHUKS_LAYOUT_TIMING=1): logs Yoga compute vs frame-apply µs per
@@ -2178,6 +2181,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Like every other apply path, re-run Yoga layout after applying: a stream tick
     // that changes a label's width (a growing counter, live data) must re-measure
     // its node, or the frame lags the text and truncates it for a frame (the jank).
+    /// ChuksModuleHost: a module presents from this controller, which IS the app's
+    /// root view controller, the same one the framework's own capabilities present from.
+    var presenter: UIViewController { self }
+
+    /// ChuksModuleHost: a module's stream is torn down through the same map the
+    /// framework's own streams use, so `__cancel__` releases both alike.
+    func onCancel(_ token: String, _ teardown: @escaping () -> Void) { streamTeardown[token] = teardown }
+
     func resolve(_ token: String, _ payload: String) { if let s = eResolve(token, payload) { apply(s); relayout() } }
     // Report a capability failure back to the engine (fires the request's onErr).
     func fail(_ token: String, _ message: String) { if let s = eFail(token, message) { apply(s); relayout() } }
@@ -2206,7 +2217,6 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     let pedometer = CMPedometer()       // step counter / distance / pace (Pedometer)
     let altimeter = CMAltimeter()       // barometer: pressure + relative altitude
     var proximityTokens = Set<String>() // motion.proximity subscribers (UIDevice proximity)
-    lazy var healthStore = HKHealthStore()   // HealthKit (Health) — lazy: only if used
 
     // Execute a native capability requested via an `X|` command (F3). This host IS a
     // UIViewController, so capabilities that present UI (e.g. presentShare) present
@@ -2237,72 +2247,6 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let up = d.floorsAscended?.intValue ?? 0
         let down = d.floorsDescended?.intValue ?? 0
         return "\(steps),\(dist),\(pace),\(cadence),\(up),\(down)"
-    }
-    // A comma list of metric names -> HealthKit read types (drops unknown names).
-    static func hkTypes(_ csv: String) -> Set<HKObjectType> {
-        var out = Set<HKObjectType>()
-        for m in csv.components(separatedBy: ",") {
-            if let t = hkQuantityType(m.trimmingCharacters(in: .whitespaces)) { out.insert(t) }
-        }
-        return out
-    }
-    static func hkQuantityType(_ metric: String) -> HKQuantityType? {
-        switch metric {
-        case "steps": return HKQuantityType.quantityType(forIdentifier: .stepCount)
-        case "distanceMeters": return HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning)
-        case "activeEnergyKcal": return HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)
-        case "heartRate": return HKQuantityType.quantityType(forIdentifier: .heartRate)
-        default: return nil
-        }
-    }
-    // Aggregate one metric over [now-secs, now]: sum for steps/distance/energy, average
-    // bpm for heart rate. Answers with the number as a string.
-    /// HealthKit names the missing entitlement but not what to do about it. Appending
-    /// the fix keeps it level with the NFC message, which has to say more only because
-    /// CoreNFC says less: it reports the reader as absent rather than naming the
-    /// entitlement at all.
-    static func healthErrorText(_ e: Error) -> String {
-        let msg = e.localizedDescription
-        guard msg.lowercased().contains("com.apple.developer.healthkit") else { return msg }
-        return msg + " Declare \"health\" under permissions in app.json and sign with a profile "
-            + "from an explicit App ID that has HealthKit enabled; a wildcard development profile "
-            + "cannot carry that entitlement."
-    }
-
-    func hkRead(_ token: String, _ metric: String, _ secs: Double) {
-        guard HKHealthStore.isHealthDataAvailable(), let qt = Self.hkQuantityType(metric) else { fail(token, "unsupported health metric: \(metric)"); return }
-        let from = Date(timeIntervalSinceNow: -secs)
-        let pred = HKQuery.predicateForSamples(withStart: from, end: Date(), options: .strictStartDate)
-        let isAvg = (metric == "heartRate")
-        let q = HKStatisticsQuery(quantityType: qt, quantitySamplePredicate: pred, options: isAvg ? .discreteAverage : .cumulativeSum) { [weak self] _, stats, err in
-            DispatchQueue.main.async {
-                if let e = err { self?.fail(token, Self.healthErrorText(e)); return }
-                let unit: HKUnit
-                switch metric {
-                case "distanceMeters": unit = HKUnit.meter()
-                case "activeEnergyKcal": unit = HKUnit.kilocalorie()
-                case "heartRate": unit = HKUnit.count().unitDivided(by: .minute())
-                default: unit = HKUnit.count()
-                }
-                let quantity = isAvg ? stats?.averageQuantity() : stats?.sumQuantity()
-                self?.resolve(token, String(quantity?.doubleValue(for: unit) ?? 0))
-            }
-        }
-        healthStore.execute(q)
-    }
-    // Live heart rate: an anchored query that also fires its updateHandler as new
-    // samples land (e.g. from a paired Apple Watch). Emits the latest bpm as an int.
-    func hkHeartRate(_ token: String) {
-        guard HKHealthStore.isHealthDataAvailable(), let hr = HKQuantityType.quantityType(forIdentifier: .heartRate) else { fail(token, "heart rate unavailable"); return }
-        let unit = HKUnit.count().unitDivided(by: .minute())
-        let handler: (HKAnchoredObjectQuery, [HKSample]?, [HKDeletedObject]?, HKQueryAnchor?, Error?) -> Void = { [weak self] _, samples, _, _, _ in
-            guard let s = samples as? [HKQuantitySample], let last = s.last else { return }
-            DispatchQueue.main.async { self?.resolve(token, String(Int(last.quantity.doubleValue(for: unit)))) }
-        }
-        let q = HKAnchoredObjectQuery(type: hr, predicate: nil, anchor: nil, limit: HKObjectQueryNoLimit, resultsHandler: handler)
-        q.updateHandler = handler
-        healthStore.execute(q)
-        streamTeardown[token] = { [weak self] in self?.healthStore.stop(q) }
     }
 
     func handleCommand(_ token: String, _ cap: String, _ args: String) {
@@ -2449,25 +2393,6 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     self?.resolve(token, "\(d.numberOfSteps.intValue),\(dist)")
                 }
             }
-        case "health.available":
-            resolve(token, HKHealthStore.isHealthDataAvailable() ? "true" : "false")
-        case "health.authorize":
-            guard HKHealthStore.isHealthDataAvailable() else { fail(token, "health data unavailable"); break }
-            let types = Self.hkTypes(args)
-            if types.isEmpty { fail(token, "no valid health metrics: \(args)"); break }
-            healthStore.requestAuthorization(toShare: nil, read: types) { [weak self] ok, err in
-                DispatchQueue.main.async {
-                    if let e = err { self?.fail(token, Self.healthErrorText(e)) }
-                    else { self?.resolve(token, ok ? "granted" : "denied") }
-                }
-            }
-        case "health.read":
-            let parts = args.components(separatedBy: "|")   // "metric|secondsAgo"
-            let metric = parts.first ?? ""
-            let secs = Double(parts.count > 1 ? parts[1] : "0") ?? 0
-            hkRead(token, metric, secs)
-        case "health.heartRate":
-            hkHeartRate(token)
         case "deviceinfo.screen":
             let b = UIScreen.main.bounds
             resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")
@@ -2718,7 +2643,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 guard let self = self else { return }
                 self.orientationTokens.forEach { self.resolve($0, currentOrientationString()) }
             }
-        default: break
+        default:
+            // Not a framework capability. An installed package may claim this
+            // namespace; if none does, the command is unknown, exactly as before.
+            _ = packageModules.handle(token, cap, args)
         }
     }
 

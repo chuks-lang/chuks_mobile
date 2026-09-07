@@ -6,13 +6,141 @@
 //     <field> = version | build | name | displayName | ios-bundle | ios-plist
 //               | ios-entitlements | android-perms | android-schemes   (print the value)
 //             | patch-manifest <manifest-path>               (fill the manifest in place)
+//             | mobile-sources <ios|android>                 (native sources from packages)
+//             | mobile-modules <ios|android>                 (namespace<TAB>class per module)
 //
 // app.json (in the project root) is the app's identity + native config, like RN/Expo's
 // app.json; chuks.json stays the package/tooling manifest. Every field is optional and
 // falls back to a default, so a project without app.json still builds.
-import { fs } from "std/fs";
+import { fs, DirEntry } from "std/fs";
 import { json } from "std/json";
 import { os } from "std/os";
+
+// ---- Installed packages that carry native code ------------------------------
+//
+// A pure-Chuks package needs nothing here: the transpiler emits its functions and the
+// Go linker drops whatever the app never calls, so it costs an app that does not use
+// it nothing. A package that reaches a platform API has no such luxury. HealthKit
+// exists only in Swift and Android's calendar only in Java, so the package has to ship
+// Swift and Kotlin and the build has to compile them in.
+//
+// A package declares that in its own chuks.json, explicitly, rather than the build
+// inferring it from an ios/ directory being present:
+//
+//   "mobile": {
+//     "namespace": "health",              // the part before the dot in health.read
+//     "module":    "ChuksHealthModule",   // the class, same name on both platforms
+//     "permissions": ["health"],          // merged into the app's plist / manifest
+//     "ios":     { "sources": ["mobile/ios/Health.swift"] },
+//     "android": { "sources": ["mobile/android/Health.kt"] }
+//   }
+//
+// The declaration is the contract: a package with no "mobile" block is pure Chuks and
+// is skipped entirely.
+
+// Every installed package's chuks.json, scoped (@scope/name) or not.
+function packageManifests(projdir: string): []any {
+    var out: []any = []
+    const root: string = projdir + "/chuks_packages"
+    if (!fs.exists(root)) { return out }
+    const tops: []DirEntry = fs.readDir(root)
+    var i: int = 0
+    while (i < tops.length) {
+        const t: DirEntry = tops[i]
+        i = i + 1
+        if (!t.isDir) { continue }
+        const tp: string = root + "/" + t.name
+        // A scope directory (@chuks) holds packages; anything else IS one.
+        var dirs: []string = []
+        if (strStartsWith(t.name, "@")) {
+            const inner: []DirEntry = fs.readDir(tp)
+            var j: int = 0
+            while (j < inner.length) {
+                if (inner[j].isDir) { dirs.push(tp + "/" + inner[j].name) }
+                j = j + 1
+            }
+        } else {
+            dirs.push(tp)
+        }
+        var k: int = 0
+        while (k < dirs.length) {
+            const mf: string = dirs[k] + "/chuks.json"
+            k = k + 1
+            if (!fs.exists(mf)) { continue }
+            var cfg: any = json.parse(fs.readFile(mf))
+            if (cfg["mobile"] == null) { continue }       // pure Chuks: nothing to compile
+            cfg["__dir"] = dirs[k - 1]
+            out.push(cfg)
+        }
+    }
+    return out
+}
+
+function strStartsWith(s: string, pre: string): bool {
+    return s.length >= pre.length && s.substring(0, pre.length) == pre
+}
+
+// Absolute paths of the native sources every installed package contributes, for the
+// platform's compiler invocation.
+function mobileSourcesStr(projdir: string, platform: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        const plat: any = m[platform]
+        i = i + 1
+        if (plat == null || plat["sources"] == null) { continue }
+        const srcs: []any = plat["sources"]
+        var j: int = 0
+        while (j < srcs.length) {
+            out = out + string(pkgs[i - 1]["__dir"]) + "/" + string(srcs[j]) + "\n"
+            j = j + 1
+        }
+    }
+    return out
+}
+
+// `namespace<TAB>ClassName` per module, for the generated registration file. Only
+// packages that ship sources for THIS platform are listed: a package with an Android
+// half and no iOS half must not be registered into an iOS build.
+function mobileModulesStr(projdir: string, platform: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        i = i + 1
+        if (m[platform] == null) { continue }
+        const ns: string = strOr(m["namespace"], "")
+        const cls: string = strOr(m["module"], "")
+        if (ns == "" || cls == "") { continue }
+        out = out + ns + "\t" + cls + "\n"
+    }
+    return out
+}
+
+// The permission kinds installed packages declare, folded into the app's own map so
+// one emitter produces the plist strings and manifest entries for both. A package
+// declares WHICH permission it needs; the app still writes the user-facing reason,
+// since only the app knows what it uses the capability for.
+function withPackagePerms(projdir: string, perms: any): any {
+    const pkgs: []any = packageManifests(projdir)
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        i = i + 1
+        if (m["permissions"] == null) { continue }
+        const kinds: []any = m["permissions"]
+        var j: int = 0
+        while (j < kinds.length) {
+            const k: string = string(kinds[j])
+            j = j + 1
+            if (perms[k] == null) { perms[k] = "Used by this app." }
+        }
+    }
+    return perms
+}
 
 // A FIXED kind order (not the parsed map's order, which isn't stable) so the generated
 // plist / manifest is deterministic across builds.
@@ -212,6 +340,9 @@ function main(): void {
     var android: any = cfg["android"]
     var perms: any = cfg["permissions"]
     if (perms == null) { perms = {} }
+    // An installed package's declared permissions count as the app's: the package knows
+    // which permission its capability needs, the app supplies the reason shown to the user.
+    perms = withPackagePerms(projdir, perms)
 
     if (field == "version") { println(strOr(cfg["version"], "1.0")) }
     else if (field == "build") { println(strOr(cfg["buildNumber"], "1")) }
@@ -222,6 +353,8 @@ function main(): void {
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
+    else if (field == "mobile-sources") { print(mobileSourcesStr(projdir, a[5])) }
+    else if (field == "mobile-modules") { print(mobileModulesStr(projdir, a[5])) }
     else if (field == "patch-manifest") { patchManifest(a[5], cfg, perms, android) }
 }
 

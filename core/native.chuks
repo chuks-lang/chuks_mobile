@@ -295,29 +295,17 @@ export class Pedometer {
     public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", string(secondsAgo), onResult, onError) }
 }
 
-// ---- Health: the health database + heart rate --------------------------------
-// iOS: HealthKit — aggregated across every source (iPhone, Apple Watch, other apps).
-// Android: no Health Connect in the base runtime (it needs a Gradle/AAR dependency),
-// so only the live heart-rate SENSOR is wired (TYPE_HEART_RATE, present on watches /
-// a few phones); read() of steps/distance/energy fails with a message pointing to
-// Pedometer / Health Connect. Call authorize() once before reading. A device build
-// needs the HealthKit capability in its provisioning profile; the metric strings for
-// read() are "steps" | "distanceMeters" | "activeEnergyKcal" | "heartRate".
-export class Health {
-    // "true"/"false": is health data available at all (HealthKit present / a body sensor).
-    public static available(onResult: (string)=> void): void { emitNativeCommand("health.available", "", onResult) }
-    // Request read access. `metrics` is a comma list ("heartRate,steps,distanceMeters,
-    // activeEnergyKcal"); iOS shows the HealthKit sheet, Android maps to its runtime
-    // permissions. onResult "granted"; onError with the reason if it fails.
-    public static authorize(metrics: string, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("health.authorize", metrics, onResult, onError) }
-    // Aggregate a metric over the last `secondsAgo` seconds -> a number as a string
-    // (steps/energy = sum, heartRate = average bpm, distance = meters). iOS: HealthKit;
-    // Android: onError unless the runtime gains Health Connect.
-    public static read(metric: string, secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("health.read", metric + "|" + string(secondsAgo), onResult, onError) }
-    // Live heart rate in bpm. iOS: HealthKit anchored query (updates as new samples
-    // land, e.g. from a paired Watch). Android: the TYPE_HEART_RATE sensor directly.
-    public static heartRate(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("health.heartRate", "", onData, onError) }
-}
+// ---- Health -----------------------------------------------------------------
+// Health moved OUT of the framework and into @chuks/health. It is the one capability
+// that needs an iOS ENTITLEMENT (com.apple.developer.healthkit), and an entitlement can
+// only come from an explicit App ID, which the wildcard development profile the
+// framework builds against can never carry. Kept here it was permanently unsigned.
+//
+//   chuks install @chuks/health
+//   import { Health } from "pkg/@chuks/health";
+//
+// Pedometer, just above, stays here: step counts need no entitlement, so an app that
+// only wants steps needs no package and no App ID registration.
 
 // ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------
 // A minimal repeating stream used to exercise + prove the teardown path: start it
