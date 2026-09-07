@@ -915,6 +915,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // of the whole tree. `needsFrame` is a belt-and-suspenders set of just-created views that
     // must get their frame at least once even if Yoga's flag says unchanged.
     var needsFrame = Set<String>()
+    /// Nodes already reported as non-finite, so the warning fires once, not every tick.
+    var warnedNonFinite = Set<String>()
     // Layout timing (env CHUKS_LAYOUT_TIMING=1): logs Yoga compute vs frame-apply µs per
     // relayout, to decide whether moving YGNodeCalculateLayout off the UI thread is warranted.
     let layoutTiming = ProcessInfo.processInfo.environment["CHUKS_LAYOUT_TIMING"] != nil
@@ -4313,6 +4315,34 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     // ---- run Yoga on the app tree and copy computed rects onto the UIViews ---
+    /// Yoga's "undefined" IS NaN, and Yoga hands it back for any node a layout pass did
+    /// not resolve. CoreAnimation raises CALayerInvalidGeometry on a NaN or infinite
+    /// geometry value, and an uncaught Objective-C exception in Swift aborts the process,
+    /// so one unresolved node anywhere in the tree kills the app on the next vsync tick.
+    ///
+    /// React Native carries the same guard for the same reason ("CALayer will crash if we
+    /// pass NaN or Inf values"), and skips the update rather than substituting a value:
+    /// a view's previous frame is a better guess than zero, and for a view created this
+    /// pass the previous frame is already zero.
+    ///
+    /// Returns nil when the node is not safe to place, having logged which node it was
+    /// (once per node, so a persistently bad node cannot flood the log at 60Hz).
+    private func yogaFrame(_ n: YGNodeRef, _ id: String) -> CGRect? {
+        let l = YGNodeLayoutGetLeft(n), t = YGNodeLayoutGetTop(n)
+        let w = YGNodeLayoutGetWidth(n), h = YGNodeLayoutGetHeight(n)
+        guard l.isFinite, t.isFinite, w.isFinite, h.isFinite else {
+            if warnedNonFinite.insert(id).inserted {
+                NSLog("chuks-layout: node %@ has a non-finite frame (%f,%f %fx%f) and was not placed", id, l, t, w, h)
+            }
+            return nil
+        }
+        return CGRect(x: CGFloat(l), y: CGFloat(t), width: CGFloat(w), height: CGFloat(h))
+    }
+
+    /// A Yoga measurement for something that needs a number rather than a skip, such as a
+    /// scroll's content size. Undefined collapses to zero, which is inert.
+    private func yogaSize(_ v: Float) -> CGFloat { v.isFinite ? CGFloat(v) : 0 }
+
     func relayout() {
         guard let app = ynodes["app"] else { return }
         let insets = view.safeAreaInsets
@@ -4348,8 +4378,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if !YGNodeGetHasNewLayout(n) && !needsFrame.contains(id) { continue }
             YGNodeSetHasNewLayout(n, false)
             _applied += 1
-            let fr = CGRect(x: CGFloat(YGNodeLayoutGetLeft(n)), y: CGFloat(YGNodeLayoutGetTop(n)),
-                            width: CGFloat(YGNodeLayoutGetWidth(n)), height: CGFloat(YGNodeLayoutGetHeight(n)))
+            guard let fr = yogaFrame(n, id) else { continue }
             if let vv = views[id] {
                 // Setting .frame on a view with a non-identity transform corrupts it
                 // (frame is transform-affected); position such views via bounds + center.
@@ -4393,11 +4422,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // which reads as a screen that simply will not scroll.
         for (sid, cid) in scrollContentIds {
             guard let sv = views[sid] as? UIScrollView, let cnode = ynodes[cid] else { continue }
-            let w = CGFloat(YGNodeLayoutGetWidth(cnode)), h = CGFloat(YGNodeLayoutGetHeight(cnode))
+            let w = yogaSize(YGNodeLayoutGetWidth(cnode)), h = yogaSize(YGNodeLayoutGetHeight(cnode))
             sv.contentSize = CGSize(width: w, height: horizScrollIds.contains(sid) ? sv.bounds.height : h)
         }
         if let sc = listScroll, let cn = ynodes[contentId] {
-            let cw = CGFloat(YGNodeLayoutGetWidth(cn)), chh = CGFloat(YGNodeLayoutGetHeight(cn))
+            let cw = yogaSize(YGNodeLayoutGetWidth(cn)), chh = yogaSize(YGNodeLayoutGetHeight(cn))
             sc.contentSize = CGSize(width: cw, height: listHoriz ? sc.bounds.height : chh)
             // stickBottom (chat): if the user was at the bottom before this layout, stay pinned
             // to the new bottom (a new message, or the keyboard opening and shrinking the view).
