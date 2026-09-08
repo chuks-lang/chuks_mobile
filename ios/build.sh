@@ -140,13 +140,25 @@ if [ "${DEV:-0}" = "1" ] && [ "$PREVIEW" != "1" ]; then
 fi
 # Per-app plist keys: permission usage strings + URL schemes. A real build gets them from
 # app.json (via appconfig.chuks); Chuks Preview overrides with its scanner copy + chuks:// scheme.
+# The launch assets an app declares in app.json. Preview keeps using the packaged logo,
+# since it IS the framework's own app rather than someone's project.
+APP_ICON=""; SPLASH_IMG=""; SPLASH_BG=""; SPLASH_BG_DARK=""
+if [ "$PREVIEW" != "1" ]; then
+    APP_ICON="$(AJ icon)"
+    SPLASH_IMG="$(AJ splash-image)"
+    SPLASH_BG="$(AJ splash-bg)"
+    SPLASH_BG_DARK="$(AJ splash-bg-dark)"
+fi
+ICON_SRC="$APP_ICON"
+[ "$PREVIEW" = "1" ] && ICON_SRC="$PKGDIR/preview-icon.png"
+
 ICONNAME_PLIST=""
+[ -n "$ICON_SRC" ] && [ -f "$ICON_SRC" ] && ICONNAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
 if [ "$PREVIEW" = "1" ]; then
     IOS_PLIST_EXTRA='  <key>NSCameraUsageDescription</key><string>Scan a Chuks dev-server QR code to run your app.</string>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Scan for nearby Bluetooth devices in previewed apps.</string>
   <key>NFCReaderUsageDescription</key><string>Read NFC tags in previewed apps.</string>
   <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>com.chuks.preview</string><key>CFBundleURLSchemes</key><array><string>chuks</string></array></dict></array>'
-    [ -f "$PKGDIR/preview-icon.png" ] && ICONNAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
 else
     IOS_PLIST_EXTRA="$(AJ ios-plist)"
 fi
@@ -193,17 +205,56 @@ $IOS_PLIST_EXTRA
 </dict></plist>
 PLIST
 
-# Chuks Preview home-screen icon: compile the packaged 1024 logo into an asset catalog
-# (Assets.car) with actool. Info.plist already points at it via CFBundleIconName=AppIcon.
-if [ "$PREVIEW" = "1" ] && [ -f "$PKGDIR/preview-icon.png" ]; then
-    [ -f "$PKGDIR/preview-logo.png" ] && cp "$PKGDIR/preview-logo.png" "$APP/ChuksLogo.png"   # transparent logo for the connect screen
-    ICONSET="$OUT/Assets.xcassets/AppIcon.appiconset"
-    mkdir -p "$ICONSET"
-    cp "$PKGDIR/preview-icon.png" "$ICONSET/icon.png"
+# The home-screen icon and the launch screen, compiled into one asset catalog.
+#
+# iOS wants a single 1024 source and generates every idiom from it, so an app declares
+# one file and gets the whole set. The launch screen is a plist dict rather than a
+# storyboard (iOS 14+), which is why the image and the colour both have to live in the
+# catalog: UILaunchScreen refers to them BY NAME, and a name that is not in the catalog
+# silently produces a blank launch instead of an error.
+[ "$PREVIEW" = "1" ] && [ -f "$PKGDIR/preview-logo.png" ] && cp "$PKGDIR/preview-logo.png" "$APP/ChuksLogo.png"   # transparent logo for the connect screen
+if [ -n "$ICON_SRC" ] && [ -f "$ICON_SRC" ] || [ -n "$SPLASH_IMG" ] || [ -n "$SPLASH_BG" ]; then
+    mkdir -p "$OUT/Assets.xcassets"
     printf '{"info":{"author":"xcode","version":1}}' > "$OUT/Assets.xcassets/Contents.json"
-    printf '{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$ICONSET/Contents.json"
+    if [ -n "$ICON_SRC" ] && [ -f "$ICON_SRC" ]; then
+        ICONSET="$OUT/Assets.xcassets/AppIcon.appiconset"
+        mkdir -p "$ICONSET"
+        # actool wants a square source; sips normalises whatever the app supplied so a
+        # non-1024 or non-square icon is a warning in the log rather than a broken build.
+        sips -z 1024 1024 "$ICON_SRC" --out "$ICONSET/icon.png" >/dev/null 2>&1 || cp "$ICON_SRC" "$ICONSET/icon.png"
+        printf '{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}' > "$ICONSET/Contents.json"
+    fi
+    if [ -n "$SPLASH_IMG" ] && [ -f "$SPLASH_IMG" ]; then
+        SPLASHSET="$OUT/Assets.xcassets/SplashImage.imageset"
+        mkdir -p "$SPLASHSET"
+        cp "$SPLASH_IMG" "$SPLASHSET/splash.png"
+        printf '{"images":[{"filename":"splash.png","idiom":"universal","scale":"1x"},{"idiom":"universal","scale":"2x"},{"idiom":"universal","scale":"3x"}],"info":{"author":"xcode","version":1}}' > "$SPLASHSET/Contents.json"
+    fi
+    if [ -n "$SPLASH_BG" ]; then
+        COLORSET="$OUT/Assets.xcassets/SplashBackground.colorset"
+        mkdir -p "$COLORSET"
+        # A colorset carries both appearances, so the launch screen follows dark mode
+        # without the app running: the OS picks before a single line of ours executes.
+        python3 - "$COLORSET/Contents.json" "$SPLASH_BG" "${SPLASH_BG_DARK:-$SPLASH_BG}" <<'PYCOLOR'
+import json, sys
+out, light, dark = sys.argv[1], sys.argv[2], sys.argv[3]
+def rgb(h):
+    h = h.lstrip("#")
+    if len(h) == 3: h = "".join(c * 2 for c in h)
+    return {"red": f"0x{h[0:2]}", "green": f"0x{h[2:4]}", "blue": f"0x{h[4:6]}", "alpha": "1.000"}
+def entry(hexv, appearances=None):
+    e = {"idiom": "universal", "color": {"color-space": "srgb", "components": rgb(hexv)}}
+    if appearances: e["appearances"] = appearances
+    return e
+doc = {"colors": [entry(light),
+                  entry(dark, [{"appearance": "luminosity", "value": "dark"}])],
+       "info": {"author": "xcode", "version": 1}}
+json.dump(doc, open(out, "w"), indent=2)
+PYCOLOR
+    fi
     ACT_PLAT=iphonesimulator; [ "$IOS_TARGET" = "device" ] && ACT_PLAT=iphoneos
-    actool "$OUT/Assets.xcassets" --compile "$APP" --app-icon AppIcon \
+    ACT_ICON=""; [ -n "$ICON_SRC" ] && [ -f "$ICON_SRC" ] && ACT_ICON="--app-icon AppIcon"
+    actool "$OUT/Assets.xcassets" --compile "$APP" $ACT_ICON \
         --output-partial-info-plist "$OUT/icon.plist" \
         --platform "$ACT_PLAT" --minimum-deployment-target 15.0 --target-device iphone >/dev/null 2>&1
     # actool emits the runtime icon PNGs + Assets.car into the bundle AND a partial plist
@@ -212,8 +263,22 @@ if [ "$PREVIEW" = "1" ] && [ -f "$PKGDIR/preview-icon.png" ]; then
     if [ -f "$OUT/icon.plist" ] && ls "$APP"/AppIcon*.png >/dev/null 2>&1; then
         /usr/libexec/PlistBuddy -c "Merge $OUT/icon.plist" "$APP/Info.plist" >/dev/null 2>&1
         echo "   home-screen icon compiled (Assets.car + CFBundleIcons)"
-    else
-        echo "   (icon compile skipped)"
+    fi
+    # The launch screen: a colour, an optional centred image, both named from the catalog.
+    if [ -n "$SPLASH_BG" ] || [ -n "$SPLASH_IMG" ]; then
+        LS_ENTRIES=""
+        [ -n "$SPLASH_BG" ] && LS_ENTRIES="$LS_ENTRIES  <key>UIColorName</key><string>SplashBackground</string>"
+        [ -n "$SPLASH_IMG" ] && [ -f "$SPLASH_IMG" ] && LS_ENTRIES="$LS_ENTRIES  <key>UIImageName</key><string>SplashImage</string><key>UIImageRespectsSafeAreaInsets</key><true/>"
+        /usr/libexec/PlistBuddy -c "Delete :UILaunchScreen" "$APP/Info.plist" >/dev/null 2>&1
+        cat > "$OUT/launch.plist" <<LSP
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>UILaunchScreen</key><dict>$LS_ENTRIES</dict>
+</dict></plist>
+LSP
+        /usr/libexec/PlistBuddy -c "Merge $OUT/launch.plist" "$APP/Info.plist" >/dev/null 2>&1
+        echo "   launch screen configured"
     fi
 fi
 

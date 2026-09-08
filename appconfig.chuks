@@ -8,6 +8,7 @@
 //             | patch-manifest <manifest-path>               (fill the manifest in place)
 //             | mobile-sources <ios|android>                 (native sources from packages)
 //             | mobile-modules <ios|android>                 (namespace<TAB>class per module)
+//             | icon | splash-image | splash-bg | splash-bg-dark   (launch assets)
 //
 // app.json (in the project root) is the app's identity + native config, like RN/Expo's
 // app.json; chuks.json stays the package/tooling manifest. Every field is optional and
@@ -326,6 +327,24 @@ function trimEnd(s: string): string {
     return s
 }
 
+// ---- Launch assets ----------------------------------------------------------
+//
+// One source image per job, resized by the build for every density and idiom the
+// platforms want. Declared in app.json because they are identity, not code:
+//
+//   "icon": "assets/icon.png",
+//   "splash": { "image": "assets/splash.png", "backgroundColor": "#0F1412" }
+//
+// Paths are relative to the project root. An absent field means the platform default,
+// which is what every app got before this existed.
+function assetPath(projdir: string, rel: string): string {
+    if (rel == "") { return "" }
+    var full: string = projdir + "/" + rel
+    if (strStartsWith(rel, "/")) { full = rel }
+    if (!fs.exists(full)) { return "" }        // a path that is not there is not an asset
+    return full
+}
+
 function main(): void {
     const a: []string = os.args()
     if (a.length < 5) { return }            // chuks run <script> <projdir> <field> [arg]
@@ -353,6 +372,20 @@ function main(): void {
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
+    else if (field == "icon") { println(assetPath(projdir, strOr(cfg["icon"], ""))) }
+    else if (field == "splash-image") {
+        const sp: any = cfg["splash"]
+        println(sp == null ? "" : assetPath(projdir, strOr(sp["image"], "")))
+    }
+    else if (field == "splash-bg") {
+        const sp2: any = cfg["splash"]
+        println(sp2 == null ? "" : strOr(sp2["backgroundColor"], ""))
+    }
+    else if (field == "splash-bg-dark") {
+        const sp3: any = cfg["splash"]
+        // Falls back to the light colour, so declaring one colour is enough.
+        println(sp3 == null ? "" : strOr(sp3["darkBackgroundColor"], strOr(sp3["backgroundColor"], "")))
+    }
     else if (field == "mobile-sources") { print(mobileSourcesStr(projdir, a[5])) }
     else if (field == "mobile-modules") { print(mobileModulesStr(projdir, a[5])) }
     else if (field == "patch-manifest") { patchManifest(a[5], cfg, perms, android) }

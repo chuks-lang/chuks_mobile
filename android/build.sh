@@ -127,6 +127,57 @@ else
     sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
     # app.json -> fill the manifest's permission block, deep-link schemes, and version
     chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" patch-manifest "$OUT/AndroidManifest.xml" 2>/dev/null
+
+    # Launch assets the app declared. Android has no "one source, every size" step of its
+    # own, so the icon is resized into each density bucket here; the splash is a theme
+    # whose windowBackground the system paints before the process is even alive, which is
+    # the only way to control the very first frame.
+    APP_ICON="$(AJ icon)"; SPLASH_IMG="$(AJ splash-image)"; SPLASH_BG="$(AJ splash-bg)"
+    HAVE_RES=0
+    if [ -n "$APP_ICON" ] && [ -f "$APP_ICON" ]; then
+        for d in "mdpi 48" "hdpi 72" "xhdpi 96" "xxhdpi 144" "xxxhdpi 192"; do
+            set -- $d; mkdir -p "$OUT/res/mipmap-$1"
+            sips -z "$2" "$2" "$APP_ICON" --out "$OUT/res/mipmap-$1/ic_launcher.png" >/dev/null 2>&1
+        done
+        HAVE_RES=1
+        sed -i '' 's#android:icon="[^"]*"##' "$OUT/AndroidManifest.xml"
+        sed -i '' "s#<application #<application android:icon=\"@mipmap/ic_launcher\" #" "$OUT/AndroidManifest.xml"
+    fi
+    if [ -n "$SPLASH_BG" ]; then
+        mkdir -p "$OUT/res/values" "$OUT/res/drawable"
+        # A layer-list rather than a bare colour so an optional logo sits centred on it,
+        # which is what every splash actually is.
+        SPLASH_LAYER=""
+        if [ -n "$SPLASH_IMG" ] && [ -f "$SPLASH_IMG" ]; then
+            mkdir -p "$OUT/res/drawable-xxhdpi"
+            cp "$SPLASH_IMG" "$OUT/res/drawable-xxhdpi/splash_logo.png"
+            SPLASH_LAYER='  <item><bitmap android:gravity="center" android:src="@drawable/splash_logo" /></item>'
+        fi
+        cat > "$OUT/res/drawable/chuks_splash.xml" <<SPD
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+  <item android:drawable="@color/chuks_splash_bg" />
+$SPLASH_LAYER
+</layer-list>
+SPD
+        cat > "$OUT/res/values/chuks_splash.xml" <<SPV
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <color name="chuks_splash_bg">$SPLASH_BG</color>
+  <style name="ChuksSplash" parent="@android:style/Theme.Material.NoActionBar">
+    <item name="android:windowBackground">@drawable/chuks_splash</item>
+  </style>
+</resources>
+SPV
+        HAVE_RES=1
+        # The launch theme replaces the stock one. The activity swaps to the normal
+        # background once it draws, so the splash is only ever the first frame.
+        sed -i '' 's#android:theme="@android:style/Theme.Material.NoActionBar"#android:theme="@style/ChuksSplash"#' "$OUT/AndroidManifest.xml"
+    fi
+    if [ "$HAVE_RES" = "1" ]; then
+        "$BT/aapt2" compile --dir "$OUT/res" -o "$OUT/res.zip" >/dev/null 2>&1 && RESZIP="$OUT/res.zip"
+        echo "   launch assets compiled"
+    fi
 fi
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
     $RESZIP --rename-manifest-package "$APPID" \
