@@ -578,6 +578,8 @@ class MainActivity : Activity(), ChuksModuleHost {
                 // LV|<id>: the engine names the LIVE list (the one on the top screen).
                 // With several screens mounted, "most recently created scroll" is wrong:
                 // a covered screen's list would take the viewport reports and scroll.
+                // Which container holds the two screens predictive back drags.
+                "SK" -> { stackHostId = if (f.size >= 2) f[1] else "" }
                 "LV" -> {
                     val lid = if (f.size >= 2) f[1] else ""
                     if (lid.isEmpty()) { listScroll = null; scrollId = ""; contentId = "" }
@@ -3475,12 +3477,16 @@ class MainActivity : Activity(), ChuksModuleHost {
     private var backTop: View? = null
     private var backBelow: View? = null
     private val backParallax = 0.28f
+    // Which container holds the pair. "" = the app stack's root; a tab that owns its
+    // history announces its own, so the screens that move are the ones on screen rather
+    // than the shell behind them. Set from the engine's SK| line, like the live list.
+    private var stackHostId: String = ""
 
     private fun backLayers(): Boolean {
-        val appRoot = views["app"] as? ViewGroup ?: return false
-        if (appRoot.childCount < 2) return false
-        backTop = appRoot.getChildAt(appRoot.childCount - 1)
-        backBelow = appRoot.getChildAt(appRoot.childCount - 2)
+        val host = (if (stackHostId.isEmpty()) views["app"] else (views[stackHostId] ?: views["app"])) as? ViewGroup ?: return false
+        if (host.childCount < 2) return false
+        backTop = host.getChildAt(host.childCount - 1)
+        backBelow = host.getChildAt(host.childCount - 2)
         return true
     }
     private fun backProgress(p: Float) {

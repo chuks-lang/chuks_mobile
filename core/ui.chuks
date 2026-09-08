@@ -437,7 +437,32 @@ export function setSafeInsets(t: int, r: int, b: int, l: int): void {
     _safeTop = t; _safeRight = r; _safeBottom = b; _safeLeft = l
 }
 // The last-reported top safe-area inset (notch / status bar), in points.
-export function safeTop(): int { return _safeTop }
+// How much of the top inset an ancestor has already consumed. A screen inside a tab
+// that draws a header is BELOW the notch already, so its own safeTop() must be 0 or the
+// inset lands twice and the screen starts with a band of empty space.
+//
+// This mirrors what the platforms do: UIKit and Android both reduce a view's safe-area
+// insets by what its ancestors absorbed, so "how far in do I start" is a question about
+// where you are, not about the window. Only a nested navigator sets this, so an app that
+// does not use one sees exactly the old value.
+var _consumedTop: int = 0
+// Framework-internal: nested navigators bracket a screen's render with this.
+export function setConsumedTop(v: int): void { _consumedTop = v }
+export function consumedTop(): int { return _consumedTop }
+
+/**
+ * The top safe-area inset to start below: the notch or status bar, in points, minus
+ * whatever the chrome above you already cleared.
+ *
+ * At the top of the window this is the window's inset. Inside a tab whose TabView draws
+ * a header, it is 0, because the header has already moved you below the system chrome.
+ * That means one screen can be pushed full-screen or inside a tab and lay out correctly
+ * either way, without knowing which happened.
+ */
+export function safeTop(): int {
+    const v: int = _safeTop - _consumedTop
+    return v > 0 ? v : 0
+}
 // The last-reported right safe-area inset (rounded corner / landscape), in points.
 export function safeRight(): int { return _safeRight }
 // The last-reported bottom safe-area inset (home indicator / gesture bar), in points.
@@ -2010,6 +2035,11 @@ export class Reconciler {
     // The virtualized List mounted by the last render, so a scroll can re-window it
     // WITHOUT re-rendering the app. Cleared by every renderRoot and set again by
     // reconcileList, so it is null whenever the current screen has no List.
+    // The container whose last two children are the interactive back pair. "app" is the
+    // app stack's root; a tab that owns its history is a deeper one. Tracked the way the
+    // live list is: noted during the walk, announced when it changes.
+    var lastStackId: string
+    var stackHostId: string
     var lastList: Node?
     // The node-id prefix of the screen ON TOP. Several screens are mounted at once (the
     // navigator keeps the one a back gesture would reveal), and only the top screen's
@@ -2046,6 +2076,7 @@ export class Reconciler {
         this.lines = []; this.handlers = {}
         this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
         this.lastList = null; this.lastListId = ""; this.lastListParent = ""; this.lastListIndex = 0
+        this.lastStackId = ""; this.stackHostId = ""
         this.topScope = ""; this.liveListId = ""
         this.lists = {}
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
@@ -2098,6 +2129,10 @@ export class Reconciler {
         // claim the viewport) kept the PREVIOUS screen's list named as live -- so the host
         // went on sizing a list that was covered, or destroyed.
         this.lastList = null; this.lastListId = ""
+        // Cleared each pass: a nested stack that emptied (or a tab switched away from)
+        // must stop claiming the gesture, or the host would drag a container that no
+        // longer holds two screens.
+        this.lastStackId = ""
         this.reconcile(this.rootPrev, next, "app", "root", 0)
         this.rootPrev = next
         // Tell the host WHICH scroll is the live one, so its viewport reports and ours
@@ -2106,6 +2141,13 @@ export class Reconciler {
         if (this.lastListId != this.liveListId) {
             this.liveListId = this.lastListId
             this.emit("LV|" + this.liveListId)
+        }
+        // Tell the host which container holds the screens a back gesture drags. Empty
+        // means the app stack's root, which is what the host assumed before nested
+        // stacks existed, so an app without one behaves exactly as it did.
+        if (this.lastStackId != this.stackHostId) {
+            this.stackHostId = this.lastStackId
+            this.emit("SK|" + this.stackHostId)
         }
     }
     // The navigator names the screen on top (its container's node id); "" means no
@@ -2272,6 +2314,7 @@ export class Reconciler {
     // Mount a fresh node and its whole subtree: emit Create/Style/Text/Insert +
     // event binding, recursing into children. Used for first mount and remounts.
     public mountNode(n: Node, id: string, parent: string, index: int): void {
+        if (n.kind == "StackHost") { this.lastStackId = id }
         if (n.kind == "Comp") {
             // set the component's identity, run it, then mount what it produced AT
             // the Comp's own id (a component is transparent in the native tree).
@@ -2311,6 +2354,9 @@ export class Reconciler {
     // Diff `prev` against `next` at tree position `id` and emit the minimal mutation
     // stream (mount when prev is null, else patch style/text/children in place).
     public reconcile(prev: Node?, next: Node, id: string, parent: string, index: int): void {
+        // A nested navigator marks its container with this kind. The LAST one seen in the
+        // walk wins, which is the innermost, which is the one the user is looking at.
+        if (next.kind == "StackHost") { this.lastStackId = id }
         if (prev == null) { this.mountNode(next, id, parent, index); return }
         const p: Node = prev
         if (p == next) { return }              // memoized + unchanged: whole subtree bails
@@ -3181,6 +3227,7 @@ export class App {
     // A plain App has no route stack; NavStack overrides this to pop one.
     public popRoute(): bool { return false }
 
+
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
         runAsyncQueue()
@@ -3390,6 +3437,41 @@ function screenThunk(f: any, e: Route): function(): Node {
     return function(): Node { return f(e) }
 }
 
+// A NESTED navigator: a tab that owns its own history (TabView with `stack: true`).
+//
+// Only one can be active at a time, because only one tab is visible, so this is a
+// single slot rather than a stack of navigators. The visible tab registers itself on
+// every render; a tab without its own history clears it. navigate() and back() then
+// reach the stack the user can actually see, which is the point: a screen calls the
+// same navigate() wherever it lives, and the framework decides where that lands.
+//
+// This lives here rather than in nav.chuks because navigate() and NavStack are here,
+// and nav.chuks already imports this module. The seam is two closures rather than an
+// interface, so ui.chuks needs to know nothing about tabs.
+var NESTED_PUSH: (function(name: string, params: (map[string]any)?, body: any?): bool)? = null
+var NESTED_POP: (function(result: any?): bool)? = null
+var NESTED_REPLACE: (function(name: string, params: (map[string]any)?, body: any?): bool)? = null
+var NESTED_TOP: (function(): Route?)? = null
+
+/**
+ * Framework-internal: a nested navigator claims the navigation functions while it is
+ * visible. Pass nulls to release the claim. TabView calls this; apps do not.
+ *
+ * `top` matters as much as the other three. Without it currentRoute() answers with the
+ * APP stack's top, which is the shell, not the screen the user is looking at, so a
+ * component that reads its params through currentRoute() gets the wrong route and a
+ * deep link cannot tell it is already on the screen it was asked to open.
+ */
+export function setNestedNavigator(push: (function(name: string, params: (map[string]any)?, body: any?): bool)?,
+                                   pop: (function(result: any?): bool)?,
+                                   replace: (function(name: string, params: (map[string]any)?, body: any?): bool)?,
+                                   top: (function(): Route?)?): void {
+    NESTED_PUSH = push
+    NESTED_POP = pop
+    NESTED_REPLACE = replace
+    NESTED_TOP = top
+}
+
 /**
  * The app's navigator: a stack of routes, where the top one is on screen.
  *
@@ -3472,12 +3554,23 @@ export class NavStack extends App {
     // screen is dismissable the way the platform expects without the app wiring
     // anything. Returns false at the root, which lets the host do its default.
     public override popRoute(): bool {
+        // A nested navigator (a tab with its own history) unwinds FIRST, so the system
+        // back button walks back the way the user came: through the tab's screens, then
+        // out of whatever was pushed over the shell.
+        const nested: any = NESTED_POP
+        if (nested != null && nested(null)) { return true }
         if (this.stack.length <= 1) { return false }
         this.popStack(null)
         return true
     }
     // The current screen function (top of the stack).
     cur(): any { return this.routes[this.top().name] }
+    /**
+     * The screen registered under `name`, or null. A nested navigator renders routes
+     * from this same table, so an app declares its screens in exactly one place
+     * whether they open over the shell or inside a tab.
+     */
+    public screenFor(name: string): any { return this.routes[name] }
     // Render the current screen LAZILY: wrap it in a Comp so the screen function
     // runs inside the reconciler's top-down walk, with identity "app". This is what
     // lets screens and their components use useState() with no key.
@@ -3640,6 +3733,26 @@ function runBackHandlers(): bool {
  * ```
  */
 export function navigate(name: string, params: (map[string]any)?, body: any?): void {
+    // A tab that owns its history takes the push, so the bar stays visible and the
+    // screen joins that tab's stack rather than covering the whole shell.
+    const nested: any = NESTED_PUSH
+    if (nested != null && nested(name, params, body)) { return }
+    const nv: NavStack? = NAV
+    if (nv != null) { nv.push(name, params, body) }
+}
+
+/**
+ * Push over the WHOLE app, including a tab bar, ignoring any tab's own history.
+ *
+ * Use it for a screen that should own the display until it is done: a checkout flow,
+ * a full-screen player, an onboarding step. Inside a tab with no history of its own
+ * this is identical to navigate().
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { navigateRoot("checkout", { id: cartId }, null) } }, "Check out")
+ * ```
+ */
+export function navigateRoot(name: string, params: (map[string]any)?, body: any?): void {
     const nv: NavStack? = NAV
     if (nv != null) { nv.push(name, params, body) }
 }
@@ -3656,6 +3769,11 @@ export function navigate(name: string, params: (map[string]any)?, body: any?): v
  * ```
  */
 export function navReplace(name: string, params: (map[string]any)?, body: any?): void {
+    // Inside a tab that owns its history this replaces the TAB's top, not the whole
+    // app: replacing the app stack there would tear the shell out from under the user,
+    // bar and all.
+    const nested: any = NESTED_REPLACE
+    if (nested != null && nested(name, params, body)) { return }
     const nv: NavStack? = NAV
     if (nv != null) { nv.replace(name, params, body) }
 }
@@ -3677,6 +3795,8 @@ export function navReplace(name: string, params: (map[string]any)?, body: any?):
  * ```
  */
 export function back(result: any?): void {
+    const nested: any = NESTED_POP
+    if (nested != null && nested(result)) { return }
     const nv: NavStack? = NAV
     if (nv != null) { nv.popStack(result) }
 }
@@ -3691,7 +3811,18 @@ export function back(result: any?): void {
  * const id: string = currentRoute() != null ? currentRoute().str("id", "") : ""
  * ```
  */
+/**
+ * Framework-internal: the active NavStack, for a nested navigator that needs to look
+ * a route name up in the same table the app registered. Apps use navigate() instead.
+ */
+export function activeNav(): NavStack? { return NAV }
+
 export function currentRoute(): Route? {
+    const nested: any = NESTED_TOP
+    if (nested != null) {
+        const t: Route? = nested()
+        if (t != null) { return t }        // null means the tab is at its root screen
+    }
     const nv: NavStack? = NAV
     if (nv == null) { return null }
     return nv.top()

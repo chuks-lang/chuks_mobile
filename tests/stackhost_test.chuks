@@ -1,0 +1,88 @@
+// Which container a back gesture drags.
+//
+// The hosts animate an interactive pop by transforming the last two children of ONE
+// container. That container used to be hard-coded as the app root, which was right
+// while the app stack was the only stack. A tab that owns its history puts its screens
+// somewhere else entirely, and a gesture aimed at the app root would then drag the shell
+// sitting behind the user instead of the screens in front of them, or find nothing to
+// drag and fall back to popping with no animation.
+//
+// So the engine announces the container as `SK|<id>`, empty meaning the app root. This
+// asserts the announcement, because the alternative is discovering it by feel on a
+// device, and a gesture is the hardest thing in this framework to test that way.
+//
+// Run:  chuks run tests/stackhost_test.chuks   (exits non-zero on failure)
+import { Node, Column, Text, Reconciler, Style } from "../core/ui.chuks";
+import { os } from "std/os";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function has(s: string, sub: string): bool {
+    if (sub.length > s.length) { return false }
+    for (var i: int = 0; i + sub.length <= s.length; i = i + 1) {
+        if (s.slice(i, i + sub.length) == sub) { return true }
+    }
+    return false
+}
+
+// A container of the kind a nested navigator emits, with two screens in it.
+function stackHost(a: string, b: string): Node {
+    const st: Style = new Style(); st.grow = 1; st.basis = 0
+    return new Node("StackHost", st, "", [
+        Column({ dir: "col" }, [ Text({ size: 14 }, a) ]),
+        Column({ dir: "col" }, [ Text({ size: 14 }, b) ]),
+    ])
+}
+// A plain shell with no nested navigator anywhere.
+function plain(label: string): Node {
+    return Column({ dir: "col", grow: 1 }, [ Text({ size: 14 }, label) ])
+}
+// A shell whose second child is a nested stack, which is where a TabView's content sits.
+function shellWithStack(label: string): Node {
+    return Column({ dir: "col", grow: 1 }, [
+        Column({ dir: "col" }, [ Text({ size: 14 }, label) ]),   // the header, outside the stack
+        stackHost("screen A", "screen B"),
+    ])
+}
+
+function main(): void {
+    println("no nested navigator")
+    const r1: Reconciler = new Reconciler()
+    r1.begin(); r1.renderRoot(plain("home"))
+    const s1: string = r1.drain()
+    check(!has(s1, "SK|"), "nothing is announced, so the host keeps using the app root")
+
+    println("a nested stack appears")
+    const r2: Reconciler = new Reconciler()
+    r2.begin(); r2.renderRoot(plain("home"))
+    r2.begin(); r2.renderRoot(shellWithStack("home"))
+    const s2: string = r2.drain()
+    check(has(s2, "SK|app.1"), "the container is announced by id (SK|app.1)")
+
+    println("it goes away again")
+    // A tab switched away from, or a stack popped to its root, must RELEASE the claim.
+    // Leaving a stale id behind is the interesting bug: the host would go on dragging a
+    // container that no longer holds two screens.
+    const r3: Reconciler = new Reconciler()
+    r3.begin(); r3.renderRoot(shellWithStack("home"))
+    r3.begin(); r3.renderRoot(plain("home"))
+    const s3: string = r3.drain()
+    check(has(s3, "SK|") && !has(s3, "SK|app"), "the claim is released with an EMPTY id, not a stale one")
+
+    println("it is not re-announced while unchanged")
+    const r4: Reconciler = new Reconciler()
+    r4.begin(); r4.renderRoot(shellWithStack("home"))
+    r4.begin(); r4.renderRoot(shellWithStack("home"))
+    const s4: string = r4.drain()
+    check(!has(s4, "SK|"), "an unchanged stack emits nothing, like the live-list announcement")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { os.exit(1) }
+}
+
+main()

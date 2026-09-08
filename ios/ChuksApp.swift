@@ -1972,12 +1972,17 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // behaviour so an app that handles back itself still gets the gesture.
     var swipeTop: UIView?
     var swipeBelow: UIView?
+    // The container the gesture drags in. "" = the app stack's root ("app"); a tab that
+    // owns its history announces its own container, so the pair that moves is the pair
+    // the user can see rather than the shell sitting behind it.
+    var stackHostId: String = ""
     let swipeParallax: CGFloat = 0.28      // how far the revealed screen sits left, as a fraction of width
     @objc func handleBackSwipe(_ g: UIScreenEdgePanGestureRecognizer) {
         let w = max(1, view.bounds.width)
         switch g.state {
         case .began:
-            let kids = views["app"]?.subviews ?? []
+            let host = stackHostId.isEmpty ? views["app"] : (views[stackHostId] ?? views["app"])
+            let kids = host?.subviews ?? []
             guard kids.count >= 2 else { swipeTop = nil; swipeBelow = nil; return }
             swipeTop = kids[kids.count - 1]
             swipeBelow = kids[kids.count - 2]
@@ -2153,6 +2158,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // scroll view" is the wrong guess: the covered screen's list would receive the
             // viewport reports and scroll itself. An empty id means the top screen has no
             // list, and the viewport is the plain root.
+            case "SK":
+                // Which container holds the two screens a back gesture drags. Empty means
+                // the app stack's root, which is what this assumed before a tab could own
+                // its own history.
+                stackHostId = f.count >= 2 ? f[1] : ""
             case "LV":
                 let lid = f.count >= 2 ? f[1] : ""
                 if lid.isEmpty { listScroll = nil; scrollId = ""; contentId = "" }

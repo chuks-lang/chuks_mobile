@@ -143,7 +143,15 @@ var _parked: []string = []
  * the list every pass, so an app with no navigator retains nothing and a route that
  * is actually popped is swept the moment it stops being declared.
  */
-export function hookPark(prefixes: []string): void { _parked = prefixes }
+// Park hook identities under these key prefixes: their state and effects survive
+// untouched instead of being swept as unmounted. ACCUMULATES within a render pass
+// (hookBegin clears it), because a pass can now have two navigators in it: the app
+// stack parks its deep entries, and a tab that owns its history parks its own. An
+// assignment here would silently drop whichever called first, and the symptom would
+// be a screen losing its state only when it was nested.
+export function hookPark(prefixes: []string): void {
+    for (var i: int = 0; i < prefixes.length; i = i + 1) { _parked.push(prefixes[i]) }
+}
 function isParked(key: string): bool {
     for (var i: int = 0; i < _parked.length; i = i + 1) {
         const p: string = _parked[i]
