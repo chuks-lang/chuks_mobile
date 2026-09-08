@@ -382,6 +382,12 @@ function main(): void {
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
+    else if (field == "state-restore-window") {
+        // How recently the app must have been backgrounded for its state to be restored.
+        // Absent means the default; 0 turns restoration off.
+        const sr: any = cfg["stateRestoration"]
+        println(sr == null ? "1800" : string(sr))
+    }
     else if (field == "background-tasks") {
         // BGTaskScheduler refuses any identifier not in the plist, and JobScheduler needs
         // to know which jobs to persist, so tasks are declared rather than invented at

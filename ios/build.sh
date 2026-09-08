@@ -155,6 +155,7 @@ ICON_SRC="$APP_ICON"
 # Background tasks: iOS refuses to register an identifier that is not declared here, and
 # refuses to run one at all without the matching UIBackgroundModes. Both come from the
 # app.json list, so an app declares its tasks once.
+RESTORE_WINDOW="$(AJ state-restore-window)"; [ -n "$RESTORE_WINDOW" ] || RESTORE_WINDOW=1800
 BGTASK_PLIST=""
 BG_IDS="$(AJ background-tasks)"
 if [ -n "$BG_IDS" ]; then
@@ -208,6 +209,7 @@ $IOS_PLIST_EXTRA
     <string>UIInterfaceOrientationLandscapeRight</string>
   </array>
   <key>UILaunchScreen</key><dict/>
+  <key>ChuksStateRestoreWindow</key><integer>$RESTORE_WINDOW</integer>
 $BGTASK_PLIST
   $ICONNAME_PLIST
   <key>UIAppFonts</key><array>$FONT_PLIST</array>

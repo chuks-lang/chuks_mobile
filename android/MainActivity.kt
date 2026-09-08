@@ -86,6 +86,8 @@ object N {
     external fun setInsets(top: Int, right: Int, bottom: Int, left: Int)
     external fun setPlatform(os: String, version: String, model: String, isTablet: Int)
     external fun drain(): String
+    external fun saveState(): String                            // route stack + useState cells
+    external fun loadState(data: String)
     external fun cmrBoot(bundle: ByteArray, tmpdir: String): Int   // CMR: load a chukspack bundle (libcmr only)
     external fun cmrApplyDelta(delta: ByteArray): Int              // CMR: merge only the changed modules + re-init
     external fun cmrLastError(): String                            // CMR: why the last boot/delta failed (dev error overlay)
@@ -352,6 +354,9 @@ class MainActivity : Activity(), ChuksModuleHost {
             N.setPlatform("android", android.os.Build.VERSION.RELEASE, android.os.Build.MODEL, isTablet)   // platform + device info
             N.setColorScheme(if (osDark()) 1 else 0)   // open in the OS appearance
         }
+        // BEFORE the first mount: loadState replaces the route stack and the useState
+        // cells, so it has to land while there is still nothing on screen.
+        restoreStateIfAppropriate()
         hostMount()
 
         // first layout after the window is measured
@@ -893,6 +898,54 @@ class MainActivity : Activity(), ChuksModuleHost {
     // screen. In the JNI (AOT) path the engine is in-process and this never fails.
     private var everMounted = false
     private fun hostMount() { applyStream(engMount()); relayout(); if (views.isNotEmpty()) everMounted = true }
+
+    // ---- State restoration --------------------------------------------------
+    //
+    // The engine already serializes the route stack, every tab's own history, and every
+    // useState cell, because hot reload needs exactly that. Restoring therefore returns
+    // the user to the screen they left with what they had typed and where they had
+    // scrolled, not merely to the right screen.
+    private val stateFile get() = java.io.File(filesDir, "chuks-state.json")
+    // Written at launch, removed on a clean pause. Finding it at launch means the last
+    // run ended without pausing, which usually means it crashed, and dropping someone
+    // straight back onto a screen that crashes can trap them in a loop.
+    private val runMarker get() = java.io.File(filesDir, "chuks-running")
+    // How recently the app must have been backgrounded for its state to count, in
+    // seconds. 0 disables restoration. Baked in from app.json at build time.
+    private val restoreWindow: Int get() = ChuksBuild.STATE_RESTORE_WINDOW
+
+    private fun persistState() {
+        if (devMode || restoreWindow <= 0) return
+        val st = try { N.saveState() } catch (e: Throwable) { "" }
+        if (st.isEmpty()) return
+        val doc = org.json.JSONObject()
+        doc.put("at", System.currentTimeMillis() / 1000)
+        doc.put("state", st)
+        try { stateFile.writeText(doc.toString()); runMarker.delete() } catch (e: Throwable) {}
+    }
+
+    /// Decide whether to restore, and do it. Called once, BEFORE the first mount, because
+    /// loadState replaces the route stack and the cells: restoring afterwards would build
+    /// the wrong screen and then throw it away.
+    private fun restoreStateIfAppropriate() {
+        val crashed = runMarker.exists()
+        try { runMarker.writeText("1") } catch (e: Exception) {}     // arm for this run
+
+        if (devMode || restoreWindow <= 0) return
+        if (!lastUrl.isNullOrEmpty()) return              // a deep link is a deliberate destination
+        if (crashed) {
+            stateFile.delete()
+            android.util.Log.w("chuks-state", "not restoring, the previous run did not exit cleanly")
+            return
+        }
+        if (!stateFile.exists()) return
+        try {
+            val doc = org.json.JSONObject(stateFile.readText())
+            val age = System.currentTimeMillis() / 1000 - doc.getLong("at")
+            if (age > restoreWindow) { stateFile.delete(); return }   // stale: start fresh
+            N.loadState(doc.getString("state"))
+        } catch (e: Throwable) { stateFile.delete() }
+    }
     private fun hostEvent(a: String) { applyStream(engEvent(a)); relayout() }
     private fun hostInput(a: String, v: String) { applyStream(engInput(a, v)); relayout() }
 
@@ -1681,6 +1734,9 @@ class MainActivity : Activity(), ChuksModuleHost {
     override fun onPause() {
         super.onPause(); appForeground = false
         appStateTokens.toList().forEach { resolve(it, "background") }
+        // The last reliable moment: Android makes no promise to run anything when it
+        // later kills a backgrounded process.
+        persistState()
     }
     private fun notify(title: String, body: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager

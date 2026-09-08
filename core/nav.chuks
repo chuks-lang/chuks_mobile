@@ -6,7 +6,9 @@
 // actions, or a render function for the tabs (whose color depends on the active
 // state). Bring @chuks/lucide, or any other icon set, from the app side.
 import { Node, Row, Column, Text, KeyedComp, safeBottom, Route, Style, NavStack,
-         setNestedNavigator, activeNav, safeTop, setConsumedTop, consumedTop } from "./ui.chuks";
+         setNestedNavigator, activeNav, safeTop, setConsumedTop, consumedTop,
+         setNestedStateHandlers } from "./ui.chuks";
+import { json } from "std/json";
 import { hookPark } from "./state.chuks";
 import { tk } from "./theme.chuks";
 
@@ -157,6 +159,46 @@ function tabStack(name: string): []Route {
  * ```
  */
 export function resetTabStack(name: string): void { var empty: []Route = []; TAB_STACKS[name] = empty }
+
+// Per-tab history for saveState/loadState. Registered once at module load so it is in
+// place before the first save, and shaped like the app stack's own entries: a name and
+// its params, with `body` deliberately dropped because it is in-memory only and a
+// restored screen has to be able to rebuild itself from params alone.
+setNestedStateHandlers(
+    function(): string {
+        var doc: map[string]any = {}
+        const names: []string = TAB_STACKS.keys()
+        for (var i: int = 0; i < names.length; i = i + 1) {
+            const st: []Route = tabStack(names[i])
+            var arr: []any = []
+            for (var j: int = 0; j < st.length; j = j + 1) {
+                var e: map[string]any = {}
+                e["n"] = st[j].name
+                e["p"] = st[j].params
+                arr.push(e)
+            }
+            if (arr.length > 0) { doc[names[i]] = arr }
+        }
+        return json.stringify(doc)
+    },
+    function(data: string): void {
+        if (data == "") { return }
+        const doc: any = json.parse(data)
+        const names: []string = doc.keys()
+        for (var i: int = 0; i < names.length; i = i + 1) {
+            const arr: []any = doc[names[i]]
+            var out: []Route = []
+            for (var j: int = 0; j < arr.length; j = j + 1) {
+                const e: any = arr[j]
+                if (e == null || e["n"] == null) { continue }
+                var pm: map[string]any = {}
+                const raw: any = e["p"]
+                if (raw != null) { pm = raw }
+                out.push(new Route(string(e["n"]), pm, null))
+            }
+            TAB_STACKS[names[i]] = out
+        }
+    })
 
 // TabView props. `active` indexes `tabs`; `onSelect(i)` fires on tap; `iconFor` is the
 // icon-agnostic renderer (name, color, size) -> Node. Everything else is optional chrome.

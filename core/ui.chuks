@@ -3081,6 +3081,20 @@ function flushHostReady(): void {
     for (var i: int = 0; i < fns.length; i = i + 1) { fns[i]() }
 }
 
+// A nested navigator's own history, for saveState/loadState. Same seam as the rest:
+// nav.chuks imports this module, so this one cannot import it back.
+//
+// Without this, restoring an app whose tabs own their history puts the user on the right
+// TAB and loses the screen they were actually looking at, which reads as restoration
+// being broken rather than partial.
+var NESTED_SAVE: (function(): string)? = null
+var NESTED_LOAD: (function(data: string): void)? = null
+/** Framework-internal: TabView registers how to save and restore its per-tab stacks. */
+export function setNestedStateHandlers(save: function(): string, load: function(data: string): void): void {
+    NESTED_SAVE = save
+    NESTED_LOAD = load
+}
+
 var ON_TASK_EXPIRE: (function(): void)? = null
 /** Framework-internal: core/native.chuks registers its handler here. */
 export function setTaskExpireHandler(f: function(): void): void { ON_TASK_EXPIRE = f }
@@ -3678,7 +3692,14 @@ export class NavStack extends App {
             e["p"] = this.stack[i].params
             arr.push(e)
         }
-        return json.stringify(arr) + "\n" + serializeCells()
+        // An OBJECT rather than the bare array it used to be, so a nested navigator's
+        // history rides along. restoreStack still reads the old array (and the older
+        // tab-joined names) so a snapshot written by a previous build still restores.
+        var doc: map[string]any = {}
+        doc["stack"] = arr
+        const ns: any = NESTED_SAVE
+        if (ns != null) { doc["nested"] = ns() }
+        return json.stringify(doc) + "\n" + serializeCells()
     }
     override loadState(data: string): void {
         if (data == "") { return }
@@ -3693,6 +3714,16 @@ export class NavStack extends App {
     // plain tab-joined list of names, so read that too rather than dropping the user
     // back on route 0 the first time they reload across the upgrade.
     restoreStack(snap: string): void {
+        // The current format: an object holding the app stack and any nested history.
+        if (snap.slice(0, 1) == "{") {
+            const doc: any = json.parse(snap)
+            const nested: any = doc["nested"]
+            const nl: any = NESTED_LOAD
+            if (nested != null && nl != null) { nl(string(nested)) }
+            const inner: any = doc["stack"]
+            if (inner != null) { this.restoreRoutes(inner) }
+            return
+        }
         if (snap.slice(0, 1) != "[") {
             var names: []string = snap.split("\t")
             var plain: []Route = []
@@ -3700,7 +3731,11 @@ export class NavStack extends App {
             if (plain.length > 0) { this.stack = plain }
             return
         }
-        const arr: []any = json.parse(snap)
+        this.restoreRoutes(json.parse(snap))
+    }
+
+    // Rebuild the app stack from an array of {n, p} entries.
+    restoreRoutes(arr: []any): void {
         var out: []Route = []
         for (var j: int = 0; j < arr.length; j = j + 1) {
             const e: any = arr[j]

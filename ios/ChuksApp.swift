@@ -513,6 +513,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         chuksOrientationMask   // Orientation.lockTo() drives this
     }
+    // Save on the way out rather than on termination: iOS makes no promise to run
+    // anything when it kills a suspended app, so this is the last reliable moment.
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        (window?.rootViewController as? CardsVC)?.persistState()
+    }
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
         (window?.rootViewController as? CardsVC)?.receiveURL(url.absoluteString)   // subsequent deep link
         return true
@@ -1135,6 +1140,68 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Returns true when the app consumed it.
     // Tell the engine a running task is out of time, so Background.expired() flips and
     // a handler can checkpoint instead of losing the batch.
+    // ---- State restoration --------------------------------------------------
+    //
+    // The engine already serializes the route stack AND every useState cell, because
+    // hot reload needs exactly that. So restoring puts the user back on the screen they
+    // left WITH what they had typed and where they had scrolled, not merely on the right
+    // screen. All that was missing was somewhere to keep it between launches.
+    var stateFile: URL { appDir().appendingPathComponent("chuks-state.json") }
+    // Written at launch and removed on a clean suspend. Finding it at launch means the
+    // last run ended without suspending, which usually means it crashed, and restoring
+    // straight back onto a screen that crashes can trap someone in a loop. React
+    // Navigation's docs warn about exactly this.
+    var runMarkerFile: URL { appDir().appendingPathComponent("chuks-running") }
+
+    func eSaveState() -> String? {
+        if DEV_MODE { return nil }
+        return String(cString: chuks_saveState())
+    }
+    func eLoadState(_ data: String) {
+        if DEV_MODE { return }
+        _ = data.withCString { chuks_loadState(UnsafeMutablePointer(mutating: $0)) }
+    }
+
+    /// Persist on the way out. Called when the app leaves the screen, not on termination:
+    /// iOS does not promise to run anything when it kills a suspended app.
+    func persistState() {
+        guard restoreWindow > 0, let s = eSaveState(), !s.isEmpty else { return }
+        let doc = ["at": Int(Date().timeIntervalSince1970), "state": s] as [String: Any]
+        if let data = try? JSONSerialization.data(withJSONObject: doc) {
+            try? data.write(to: stateFile)
+        }
+        try? FileManager.default.removeItem(at: runMarkerFile)   // we suspended cleanly
+    }
+
+    /// Decide whether to restore, and do it. Called once, before the first mount.
+    ///
+    /// Four things have to be true, and each of them is a real failure if ignored:
+    /// restoration is enabled; the app was not opened by a deep link (a link is a
+    /// deliberate destination and must beat where the user happened to be); the last run
+    /// suspended cleanly; and the state is recent enough that going back there is
+    /// helpful rather than confusing.
+    func restoreStateIfAppropriate() {
+        let crashed = FileManager.default.fileExists(atPath: runMarkerFile.path)
+        try? "1".write(to: runMarkerFile, atomically: true, encoding: .utf8)   // arm for this run
+
+        guard restoreWindow > 0 else { return }
+        guard lastURL == nil else { return }          // a deep link wins
+        if crashed {
+            try? FileManager.default.removeItem(at: stateFile)
+            NSLog("chuks-state: not restoring, the previous run did not suspend cleanly")
+            return
+        }
+        guard let data = try? Data(contentsOf: stateFile),
+              let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let at = doc["at"] as? Int, let saved = doc["state"] as? String else { return }
+        let age = Int(Date().timeIntervalSince1970) - at
+        if age > restoreWindow {
+            try? FileManager.default.removeItem(at: stateFile)
+            return                                     // stale: start fresh
+        }
+        eLoadState(saved)
+    }
+
     func eDispatchTaskExpired() -> String? {
         if DEV_MODE { return nil }
         _ = "__bgexpire__".withCString { chuks_dispatch(UnsafeMutablePointer(mutating: $0)) }
@@ -1254,6 +1321,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // dev server returns nil, but a race can also return an empty body — either way
         // leaving connected=false lets step() keep retrying instead of stranding the app
         // on a blank screen with no recovery (AOT is in-process, so it never hits this).
+        // BEFORE the first mount: loadState replaces the route stack and the useState
+        // cells, so it has to happen while there is still nothing on screen. Restoring
+        // afterwards would mean building the wrong screen and then throwing it away.
+        restoreStateIfAppropriate()
         #if CMR
         // A boot that failed to compile / crashed has no VM to mount: show the dev
         // overlay with the reason and skip eMount (mounting a dead VM strands the app).
@@ -1995,6 +2066,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // owns its history announces its own container, so the pair that moves is the pair
     // the user can see rather than the shell sitting behind it.
     var stackHostId: String = ""
+    // How recently the app must have been backgrounded for its state to be restored, in
+    // seconds. 0 disables restoration. Read from app.json at build time.
+    var restoreWindow: Int {
+        (Bundle.main.object(forInfoDictionaryKey: "ChuksStateRestoreWindow") as? Int) ?? 1800
+    }
 
     // ---- Background tasks ---------------------------------------------------
     //
