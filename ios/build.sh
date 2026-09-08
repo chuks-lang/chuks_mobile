@@ -152,6 +152,18 @@ fi
 ICON_SRC="$APP_ICON"
 [ "$PREVIEW" = "1" ] && ICON_SRC="$PKGDIR/preview-icon.png"
 
+# Background tasks: iOS refuses to register an identifier that is not declared here, and
+# refuses to run one at all without the matching UIBackgroundModes. Both come from the
+# app.json list, so an app declares its tasks once.
+BGTASK_PLIST=""
+BG_IDS="$(AJ background-tasks)"
+if [ -n "$BG_IDS" ]; then
+    BG_ARRAY=""
+    for t in $BG_IDS; do BG_ARRAY="$BG_ARRAY<string>$t</string>"; done
+    BGTASK_PLIST="  <key>BGTaskSchedulerPermittedIdentifiers</key><array>$BG_ARRAY</array>
+  <key>UIBackgroundModes</key><array><string>fetch</string><string>processing</string></array>"
+fi
+
 ICONNAME_PLIST=""
 [ -n "$ICON_SRC" ] && [ -f "$ICON_SRC" ] && ICONNAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
 if [ "$PREVIEW" = "1" ]; then
@@ -196,6 +208,7 @@ $IOS_PLIST_EXTRA
     <string>UIInterfaceOrientationLandscapeRight</string>
   </array>
   <key>UILaunchScreen</key><dict/>
+$BGTASK_PLIST
   $ICONNAME_PLIST
   <key>UIAppFonts</key><array>$FONT_PLIST</array>
   <!-- Which entitlement-bearing capabilities this build is actually signed for. The

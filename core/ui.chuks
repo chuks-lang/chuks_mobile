@@ -3054,6 +3054,37 @@ export function asyncPending(): int { return ASYNC.pending() }
 // follows, so their state changes are reflected this frame.
 // Returns true when it actually ran something, so callers can tell a tick that DID
 // work from one that found an empty queue.
+// The host says a running background task is out of time. Routed through a hook rather
+// than a direct call because native.chuks imports THIS module, so this one cannot import
+// it back. Same seam as the nested navigator above.
+// Work that needs the host and may be asked for before the host exists.
+//
+// An app's createRoot() runs while the App is still being CONSTRUCTED, so anything it
+// does that talks to the host (defining a background task, subscribing to a stream) would
+// otherwise emit into nothing and fail silently, which is the worst way for it to fail:
+// the code looks right and simply never runs. Queue those until the host is there.
+var ON_HOST_READY: []function(): void = []
+/**
+ * Run `f` now if the host exists, or as soon as it does.
+ *
+ * Use it for anything that emits a native command from app-construction code, rather
+ * than requiring apps to order their setup around a lifecycle they cannot see.
+ */
+export function onHostReady(f: function(): void): void {
+    if (HOST != null) { f(); return }
+    ON_HOST_READY.push(f)
+}
+function flushHostReady(): void {
+    var fns: []function(): void = ON_HOST_READY
+    var empty: []function(): void = []
+    ON_HOST_READY = empty
+    for (var i: int = 0; i < fns.length; i = i + 1) { fns[i]() }
+}
+
+var ON_TASK_EXPIRE: (function(): void)? = null
+/** Framework-internal: core/native.chuks registers its handler here. */
+export function setTaskExpireHandler(f: function(): void): void { ON_TASK_EXPIRE = f }
+
 function runAsyncQueue(): bool {
     var fns: []function(): void = ASYNC.take()
     if (fns.length == 0) { return false }
@@ -3150,7 +3181,17 @@ export class App {
     // Render the tree and emit the initial mutation stream. Returns mutation count.
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
     // reconnected by identity, and freed when a component leaves the tree.
-    public mount(): int { runAsyncQueue(); this.recon.begin(); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count() }
+    public mount(): int {
+        runAsyncQueue()
+        this.recon.begin()
+        // AFTER begin(), which clears the line buffer. Work queued while the app was
+        // being constructed emits here so it rides the first batch to the host; flushing
+        // any earlier would put the commands in a buffer that begin() then throws away,
+        // and they would vanish without a trace.
+        flushHostReady()
+        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        return this.recon.count()
+    }
     // Full re-mount: re-emit the entire current tree (state preserved). The dev server
     // calls this on every /mount so any host that connects or relaunches gets a complete
     // tree, not an empty diff against a tree it never received. Not called in production.
@@ -3230,6 +3271,13 @@ export class App {
 
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
+        // The host's way of saying "the OS is taking the time back". Not a node id, so it
+        // must be caught before the reconciler looks one up.
+        if (tag == "__bgexpire__") {
+            const h: any = ON_TASK_EXPIRE
+            if (h != null) { h() }
+            return 0
+        }
         runAsyncQueue()
         this.recon.begin(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }

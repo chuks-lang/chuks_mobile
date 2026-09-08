@@ -60,6 +60,7 @@ import Security
 import Network
 import CoreBluetooth
 import CoreNFC
+import BackgroundTasks
 
 // ===== Feed-grade image cache (shared by both iOS hosts) =====
 // Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
@@ -495,6 +496,17 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         w.rootViewController = vc
         w.makeKeyAndVisible()
         window = w
+        // Background task handlers MUST be registered before this method returns, and
+        // only for identifiers the plist permits. makeKeyAndVisible above has already
+        // loaded the view and mounted the engine, so by the time a handler fires the
+        // app's module scope has run and its Background.define calls have handed us
+        // their tokens. That is what makes a COLD background wake work: there is no
+        // separate context to boot and no entry point to look up by name.
+        for id in CardsVC.permittedTaskIds {
+            BGTaskScheduler.shared.register(forTaskWithIdentifier: id, using: nil) { task in
+                vc.runBackgroundTask(id, task)
+            }
+        }
         if BENCHMARK_MODE { ColdStartProbe.shared.begin() }
         return true
     }
@@ -1121,6 +1133,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     // System back (the left-edge swipe here; Android's button/gesture on that host).
     // Returns true when the app consumed it.
+    // Tell the engine a running task is out of time, so Background.expired() flips and
+    // a handler can checkpoint instead of losing the batch.
+    func eDispatchTaskExpired() -> String? {
+        if DEV_MODE { return nil }
+        _ = "__bgexpire__".withCString { chuks_dispatch(UnsafeMutablePointer(mutating: $0)) }
+        return drainStr()
+    }
     func eBack() -> Bool {
         if DEV_MODE { return (devHTTP("/back", "") ?? "").isEmpty == false }
         let handled = chuks_back() > 0
@@ -1976,6 +1995,101 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // owns its history announces its own container, so the pair that moves is the pair
     // the user can see rather than the shell sitting behind it.
     var stackHostId: String = ""
+
+    // ---- Background tasks ---------------------------------------------------
+    //
+    // The engine hands us a token per defined task (bg.define). When the OS wakes us we
+    // fire that token, then PUMP the engine until the handler reports back, because a
+    // handler that awaits produces its result on a later turn and the display link that
+    // normally drives those turns is stopped while we are in the background.
+    var bgTokens: [String: String] = [:]        // task name -> engine token
+    var bgRunning: [String: BGTask] = [:]       // name -> the OS task awaiting completion
+    var bgPumpTimer: Timer?
+    // Identifiers the build put in BGTaskSchedulerPermittedIdentifiers. BGTaskScheduler
+    // rejects anything not listed there, so this is the authoritative set.
+    static var permittedTaskIds: [String] {
+        (Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String]) ?? []
+    }
+
+    /// The OS woke us for `name`. Fire the Chuks handler and keep the engine turning
+    /// until it answers, or until the OS takes the time back.
+    func runBackgroundTask(_ name: String, _ task: BGTask) {
+        bgRunning[name] = task
+        // The OS can pull the plug at any point. Tell the engine so a handler can
+        // checkpoint (Background.expired()) rather than losing a half-done batch.
+        task.expirationHandler = { [weak self] in
+            guard let self = self else { return }
+            _ = self.eDispatchTaskExpired()
+            self.finishBackgroundTask(name, success: false)
+        }
+        guard let token = bgTokens[name] else {
+            // Mounted but the app never defined this task: nothing to run, and saying so
+            // is better than leaving the OS waiting for a completion that never comes.
+            task.setTaskCompleted(success: false)
+            bgRunning[name] = nil
+            return
+        }
+        _ = eResolve(token, name)
+        startBackgroundPump()
+    }
+
+    /// Turn the engine on a timer while a task runs. Cheap, and only alive for the
+    /// seconds the OS has granted us.
+    func startBackgroundPump() {
+        if bgPumpTimer != nil { return }
+        bgPumpTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.bgRunning.isEmpty { self.stopBackgroundPump(); return }
+            if let s = self.eTick(), !s.isEmpty { self.apply(s) }
+        }
+    }
+    func stopBackgroundPump() { bgPumpTimer?.invalidate(); bgPumpTimer = nil }
+
+    /// The engine reported a result (bg.result), or the OS expired us.
+    func finishBackgroundTask(_ name: String, success: Bool) {
+        guard let task = bgRunning[name] else { return }
+        bgRunning[name] = nil
+        task.setTaskCompleted(success: success)
+        if bgRunning.isEmpty { stopBackgroundPump() }
+    }
+
+    /// Schedule one request. `kind` is "refresh" or "processing"; iOS honours constraints
+    /// only on the latter, which is why the two shapes stay distinct all the way down.
+    func scheduleBackgroundTask(_ name: String, _ delay: Int, _ kind: String, _ constraints: [String: String]) {
+        guard Self.permittedTaskIds.contains(name) else {
+            NSLog("chuks-bg: \"%@\" is not in BGTaskSchedulerPermittedIdentifiers; add it to backgroundTasks in app.json", name)
+            return
+        }
+        let begin = Date(timeIntervalSinceNow: TimeInterval(max(0, delay)))
+        let request: BGTaskRequest
+        if kind == "processing" {
+            let r = BGProcessingTaskRequest(identifier: name)
+            // The only two constraints iOS can enforce. Everything else the app asked for
+            // is reported at build time rather than silently dropped here.
+            r.requiresNetworkConnectivity = (constraints["network"] ?? "none") != "none"
+            r.requiresExternalPower = constraints["charging"] == "1"
+            request = r
+        } else {
+            request = BGAppRefreshTaskRequest(identifier: name)
+        }
+        request.earliestBeginDate = begin
+        do { try BGTaskScheduler.shared.submit(request) }
+        catch {
+            // Code 1 is "unavailable", and it has two causes that need different answers.
+            // The raw error says neither, and a developer seeing it on a simulator would
+            // reasonably conclude their code is broken.
+            let ns = error as NSError
+            if ns.domain == "BGTaskSchedulerErrorDomain" && ns.code == 1 {
+                #if targetEnvironment(simulator)
+                NSLog("chuks-bg: \"%@\" was not scheduled: BGTaskScheduler does not run on the simulator. Test background tasks on a device.", name)
+                #else
+                NSLog("chuks-bg: \"%@\" was not scheduled: background activity is switched off for this app (Settings > General > Background App Refresh). Background.status reports this as \"restricted\".", name)
+                #endif
+            } else {
+                NSLog("chuks-bg: could not schedule %@: %@", name, String(describing: error))
+            }
+        }
+    }
     let swipeParallax: CGFloat = 0.28      // how far the revealed screen sits left, as a fraction of width
     @objc func handleBackSwipe(_ g: UIScreenEdgePanGestureRecognizer) {
         let w = max(1, view.bounds.width)
@@ -2469,6 +2583,45 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             catch { fail(token, "save failed: \(error.localizedDescription)") }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
+        case "bg.define":
+            // args is the task name. Keep the token so a wake can fire this handler, and
+            // release it if the app ever cancels the subscription.
+            bgTokens[args] = token
+            streamTeardown[token] = { [weak self] in self?.bgTokens[args] = nil }
+        case "bg.result":
+            // "<name>|<1|0>": the handler finished, so the OS can be told.
+            let parts = args.components(separatedBy: "|")
+            if parts.count >= 2 { finishBackgroundTask(parts[0], success: parts[1] == "1") }
+        case "bg.periodic", "bg.once", "bg.processing":
+            // "<name>|<seconds>|<k=v;...>"
+            let parts = args.components(separatedBy: "|")
+            guard parts.count >= 2 else { break }
+            var cons: [String: String] = [:]
+            if parts.count >= 3 {
+                for pair in parts[2].components(separatedBy: ";") where !pair.isEmpty {
+                    let kv = pair.components(separatedBy: "=")
+                    if kv.count == 2 { cons[kv[0]] = kv[1] }
+                }
+            }
+            let secs = Int(parts[1]) ?? 0
+            // iOS has no periodic scheduler: a refresh task is submitted again after each
+            // run, which is what BGTaskScheduler expects you to do anyway. `periodic`
+            // therefore means the same thing here, it is just re-armed rather than
+            // repeating on its own.
+            scheduleBackgroundTask(parts[0], secs, cap == "bg.processing" ? "processing" : "refresh", cons)
+        case "bg.cancel":
+            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: args)
+        case "bg.cancelAll":
+            BGTaskScheduler.shared.cancelAllTaskRequests()
+        case "bg.status":
+            // Whether the user or the system has switched background activity off matters
+            // more than whether a request is pending: when it is off, nothing will run.
+            let refreshOff = UIApplication.shared.backgroundRefreshStatus != .available
+            if refreshOff { resolve(token, "restricted"); break }
+            BGTaskScheduler.shared.getPendingTaskRequests { [weak self] reqs in
+                let pending = reqs.contains { $0.identifier == args }
+                DispatchQueue.main.async { self?.resolve(token, pending ? "scheduled" : "notScheduled") }
+            }
         case "linking.onurl":
             urlTokens.insert(token)
             streamTeardown[token] = { [weak self] in self?.urlTokens.remove(token) }

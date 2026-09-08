@@ -6,7 +6,7 @@
 //
 // Fire-and-forget capabilities pass no callback (the token is "0"); async reads
 // pass a `(string) -> void` that receives the host's result payload.
-import { emitNativeCommand, emitNativeCommandE, emitNativeStream, NativeSub } from "./ui.chuks";
+import { emitNativeCommand, emitNativeCommandE, emitNativeStream, NativeSub, setTaskExpireHandler, onHostReady } from "./ui.chuks";
 import { Base64 } from "std/base64";
 
 // ---- Clipboard --------------------------------------------------------------
@@ -306,6 +306,168 @@ export class Pedometer {
 //
 // Pedometer, just above, stays here: step counts need no entitlement, so an app that
 // only wants steps needs no package and no App ID registration.
+
+// ---- Background tasks -------------------------------------------------------
+//
+// Work the OS runs while your app is not on screen: syncing, uploading, cleaning up.
+//
+// THE ONE RULE. Define your tasks at MODULE scope, never inside a screen or an effect:
+//
+//     // app/tasks.chuks, at the top level of the file
+//     Background.define("sync", async function(): Task<bool> {
+//         await uploadPending()
+//         return true
+//     })
+//
+// When the OS wakes your app for a task it may be a COLD start with no UI at all. A
+// handler registered inside a screen is registered by code that never runs, so the task
+// silently does nothing, and it does nothing only in the case you cannot easily test.
+// Every framework that does this hits the same wall: Expo requires defineTask at module
+// scope, Flutter needs a top-level entry point marked so it is not tree-shaken. Ours is
+// the same rule for the same reason, minus the ceremony, because a Chuks app is one
+// native binary and a task shares memory with the rest of it.
+//
+// WHAT THE OS PROMISES, WHICH IS LESS THAN IT SOUNDS. An interval is a floor, not a
+// schedule. iOS learns your usage and budgets accordingly, often running refresh tasks
+// overnight and ignoring short intervals entirely; a user who force-quits the app gets
+// nothing until they open it again. Android batches jobs and defers them in Doze. Write
+// tasks that catch up from whatever state they find, not tasks that assume they ran an
+// hour ago.
+
+// What must be true before the OS runs a task.
+//
+// Android honours all of these through JobScheduler. iOS honours `network` and
+// `charging` on a processing task and NOTHING on a refresh task, because BGTaskScheduler
+// offers only requiresNetworkConnectivity and requiresExternalPower. The build reports
+// which constraints the iOS half cannot enforce rather than dropping them quietly, so a
+// wifi-only sync that will run on cellular is something you find out at build time and
+// not from a user's data bill.
+export dataType TaskConstraints {
+    network: string?,        // "none" (default), "any", or "unmetered" (wifi-like)
+    charging: bool?,         // both platforms
+    batteryNotLow: bool?,    // Android only
+    deviceIdle: bool?,       // Android only
+    storageNotLow: bool?,    // Android only
+}
+
+// name -> handler, for the host to invoke by name once it has mounted.
+var TASKS: map[string]async function(): Task<bool> = {}
+// Set while a handler runs, cleared when it returns. Read by Background.expired().
+var TASK_EXPIRING: bool = false
+
+export class Background {
+    /**
+     * Register a handler. Call this at MODULE scope, not inside a screen.
+     *
+     * Return true when the work finished, false when it failed and should be retried on
+     * the platform's backoff schedule. Returning is how completion is signalled: an
+     * explicit "finish" call is easy to forget, and forgetting it on iOS gets the app
+     * killed and its future background budget cut.
+     *
+     * ```chuks
+     * Background.define("sync", async function(): Task<bool> {
+     *     const pending: []Item = unsynced()
+     *     if (pending.length == 0) { return true }
+     *     await uploadAll(pending)      // spawn and await both work here
+     *     return true
+     * })
+     * ```
+     */
+    public static define(name: string, run: async function(): Task<bool>): void {
+        TASKS[name] = run
+        // Hand the host a token it can fire. On a cold background wake the host mounts
+        // first, which runs this line, which is how the token exists at all.
+        //
+        // Deferred through onHostReady because define() is meant to be called from app
+        // construction, which happens BEFORE the App exists. Emitting straight into a
+        // null host would drop the registration without a word, and the task would
+        // simply never run.
+        onHostReady(function(): void {
+            emitNativeStream("bg.define", name, function(_: string): void { Background.invoke(name) }, null)
+        })
+    }
+
+    // Framework-internal: run a defined task and report the result back to the host,
+    // which is what lets the OS mark the work finished and stop pumping.
+    static invoke(name: string): void {
+        const f: (async function(): Task<bool>)? = TASKS[name]
+        if (f == null) { emitNativeCommand("bg.result", name + "|0", null); return }
+        // Spawned, so an awaiting handler does not block the host's call. The result
+        // comes back through bg.result whenever it finishes, which is what tells the OS
+        // the work is done and the host it can stop pumping.
+        spawn Background.runAndReport(name, f)
+    }
+    static async runAndReport(name: string, f: async function(): Task<bool>): Task<void> {
+        TASK_EXPIRING = false
+        var ok: bool = false
+        // A handler that throws is a failed task, not a crashed app: the OS is told it
+        // failed so it retries on the platform's backoff rather than never running again.
+        try { ok = await f() } catch (e) { ok = false }
+        emitNativeCommand("bg.result", name + "|" + (ok ? "1" : "0"), null)
+        return
+    }
+
+    /** True when the OS has warned that this task is out of time. Checkpoint and return. */
+    public static expired(): bool { return TASK_EXPIRING }
+    // Framework-internal: the host says time is up.
+    public static markExpired(): void { TASK_EXPIRING = true }
+
+    /**
+     * Repeat this task, no sooner than `minIntervalSeconds` apart. Both platforms floor
+     * this at 15 minutes and neither treats it as a promise.
+     */
+    public static periodic(name: string, minIntervalSeconds: int, c: TaskConstraints?): void {
+        const payload: string = name + "|" + string(minIntervalSeconds) + "|" + encodeConstraints(c)
+        onHostReady(function(): void { emitNativeCommand("bg.periodic", payload, null) })
+    }
+
+    /** Run once, no sooner than `delaySeconds` from now. */
+    public static once(name: string, delaySeconds: int, c: TaskConstraints?): void {
+        const payload: string = name + "|" + string(delaySeconds) + "|" + encodeConstraints(c)
+        onHostReady(function(): void { emitNativeCommand("bg.once", payload, null) })
+    }
+
+    /**
+     * Long work that wants power and a network: a large upload, a database compaction.
+     * iOS runs this as a processing task, which is the only iOS shape that honours any
+     * constraints at all; Android schedules a job with the same requirements.
+     */
+    public static processing(name: string, delaySeconds: int, c: TaskConstraints?): void {
+        const payload: string = name + "|" + string(delaySeconds) + "|" + encodeConstraints(c)
+        onHostReady(function(): void { emitNativeCommand("bg.processing", payload, null) })
+    }
+
+    /** Stop scheduling this task. Already-running work is allowed to finish. */
+    public static cancel(name: string): void { emitNativeCommand("bg.cancel", name, null) }
+    /** Stop scheduling every task this app registered. */
+    public static cancelAll(): void { emitNativeCommand("bg.cancelAll", "", null) }
+
+    /**
+     * What the OS says about this task: "scheduled", "notScheduled", or "restricted"
+     * when the user or the system has disabled background activity for the app. The
+     * last one is worth surfacing, since nothing you schedule will ever run.
+     */
+    public static status(name: string, onResult: (string)=> void): void {
+        onHostReady(function(): void { emitNativeCommand("bg.status", name, onResult) })
+    }
+}
+
+// Wire the host's expiry signal to the flag Background.expired() reads. Done once at
+// module load, so it is in place before any task can run.
+setTaskExpireHandler(function(): void { Background.markExpired() })
+
+// Constraints as `k=v` pairs, so the hosts parse one format and an absent field stays
+// absent rather than becoming a default the caller never asked for.
+function encodeConstraints(c: TaskConstraints?): string {
+    if (c == null) { return "" }
+    var out: string = ""
+    if (c.network != null) { out = out + "network=" + string(c.network) + ";" }
+    if (c.charging != null) { out = out + "charging=" + (c.charging ? "1" : "0") + ";" }
+    if (c.batteryNotLow != null) { out = out + "batteryNotLow=" + (c.batteryNotLow ? "1" : "0") + ";" }
+    if (c.deviceIdle != null) { out = out + "deviceIdle=" + (c.deviceIdle ? "1" : "0") + ";" }
+    if (c.storageNotLow != null) { out = out + "storageNotLow=" + (c.storageNotLow ? "1" : "0") + ";" }
+    return out
+}
 
 // ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------
 // A minimal repeating stream used to exercise + prove the teardown path: start it
