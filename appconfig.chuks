@@ -146,6 +146,10 @@ function withPackagePerms(projdir: string, perms: any): any {
 
 // A FIXED kind order (not the parsed map's order, which isn't stable) so the generated
 // plist / manifest is deterministic across builds.
+// Set from app.json before the manifest is written: an app that declares backgroundTasks
+// needs one extra Android permission that nothing else implies.
+var HAS_BG_TASKS: bool = false
+
 const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "bluetooth", "nfc", "activity", "bodySensors", "health"]
 
 // permission kind -> iOS Info.plist usage-description key(s)
@@ -281,6 +285,9 @@ function iosPlistStr(perms: any, ios: any): string {
 // The Android <uses-permission> block (base entries + whatever the permissions map implies).
 function androidPermsStr(perms: any): string {
     var names: []string = ["INTERNET", "ACCESS_NETWORK_STATE", "VIBRATE", "FLASHLIGHT"]
+    // An app with background tasks needs this to persist jobs across a reboot, and
+    // JobScheduler throws rather than declining when it is missing.
+    if (HAS_BG_TASKS) { names.push("RECEIVE_BOOT_COMPLETED") }
     var i: int = 0
     while (i < KINDS.length) {
         if (perms[KINDS[i]] != null) {
@@ -363,6 +370,8 @@ function main(): void {
     // An installed package's declared permissions count as the app's: the package knows
     // which permission its capability needs, the app supplies the reason shown to the user.
     perms = withPackagePerms(projdir, perms)
+    const btl: any = cfg["backgroundTasks"]
+    if (btl != null) { const arr: []any = btl; HAS_BG_TASKS = arr.length > 0 }
 
     if (field == "version") { println(strOr(cfg["version"], "1.0")) }
     else if (field == "build") { println(strOr(cfg["buildNumber"], "1")) }

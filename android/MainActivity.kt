@@ -1366,6 +1366,36 @@ class MainActivity : Activity(), ChuksModuleHost {
                 streamTeardown[token] = { orientationTokens.remove(token) }
                 resolve(token, currentOrientation())
             }
+            // ---- Background tasks ----
+            "bg.define" -> {
+                // Remember the token process-wide: a job may be handled by the service
+                // with this Activity alive, in which case it uses what we learned here
+                // rather than mounting again.
+                ChuksBg.tokens[args] = token
+                streamTeardown[token] = { ChuksBg.tokens.remove(args) }
+            }
+            "bg.result" -> {
+                val p = args.split("|")
+                if (p.size >= 2) ChuksBg.finish(p[0], p[1] == "1")
+            }
+            "bg.periodic", "bg.once", "bg.processing" -> {
+                val p = args.split("|")
+                if (p.size >= 2) {
+                    val cons = HashMap<String, String>()
+                    if (p.size >= 3) for (pair in p[2].split(";")) {
+                        if (pair.isEmpty()) continue
+                        val kv = pair.split("=")
+                        if (kv.size == 2) cons[kv[0]] = kv[1]
+                    }
+                    // A processing task is long work that wants power, so it is a one-off
+                    // job with those constraints rather than a repeating one.
+                    scheduleChuksJob(this, p[0], p[1].toIntOrNull() ?: 0, cap == "bg.periodic", cons)
+                }
+            }
+            "bg.cancel" -> cancelChuksJob(this, args)
+            "bg.cancelAll" -> cancelAllChuksJobs(this)
+            "bg.status" -> resolve(token, chuksJobStatus(this, args))
+
             "orientation.lock" -> requestedOrientation = when (args) {
                 "portrait"  -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
