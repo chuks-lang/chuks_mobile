@@ -1075,6 +1075,32 @@ class MainActivity : Activity(), ChuksModuleHost {
                     streamTeardown[token] = { try { lm.removeUpdates(listener) } catch (e: Exception) {} }
                 } catch (e: SecurityException) { fail(token, "location permission denied") }
             }
+            "location.watchBackground" -> {
+                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+                // A foreground service started while the app is on screen keeps the
+                // "while in use" grant with the screen off, so this needs no separate
+                // ACCESS_BACKGROUND_LOCATION prompt.
+                val tab = args.split("\t")
+                val title = if (tab.isNotEmpty() && tab[0].isNotEmpty()) tab[0] else "Location"
+                val body = if (tab.size > 1) tab[1] else ""
+                ChuksLocation.token = token
+                ChuksLocation.deliver = { t, fix -> resolve(t, fix) }
+                val svc = Intent(this, ChuksLocationService::class.java)
+                svc.putExtra("title", title)
+                svc.putExtra("body", body)
+                try {
+                    startForegroundService(svc)
+                } catch (e: Throwable) {
+                    ChuksLocation.deliver = null
+                    fail(token, "background location unavailable: " + (e.message ?: e.toString()))
+                    return
+                }
+                streamTeardown[token] = {
+                    ChuksLocation.deliver = null
+                    ChuksLocation.token = ""
+                    try { stopService(Intent(this, ChuksLocationService::class.java)) } catch (e: Throwable) {}
+                }
+            }
             "motion.accel" -> startSensor(token, android.hardware.Sensor.TYPE_ACCELEROMETER)
             "motion.gyro" -> startSensor(token, android.hardware.Sensor.TYPE_GYROSCOPE)
             "motion.mag" -> startSensor(token, android.hardware.Sensor.TYPE_MAGNETIC_FIELD)

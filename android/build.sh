@@ -99,7 +99,7 @@ object ChuksBuild {
 }
 KTB
 
-KT_SRC="$OUT/ChuksBuild.kt $PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt $PKGDIR/ChuksModule.kt $PKGDIR/ChuksJobService.kt $OUT/ChuksPackageModules.kt $PKG_KT"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
+KT_SRC="$OUT/ChuksBuild.kt $PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt $PKGDIR/ChuksModule.kt $PKGDIR/ChuksJobService.kt $PKGDIR/ChuksLocationService.kt $OUT/ChuksPackageModules.kt $PKG_KT"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
 if [ "$PREVIEW" = "1" ]; then
     KT_SRC="$KT_SRC $PKGDIR/ConnectActivity.kt $PKGDIR/ScannerActivity.kt"   # + in-app QR scanner
     [ -f "$ZXING" ] && KT_CP="$AJAR:$ZXING"

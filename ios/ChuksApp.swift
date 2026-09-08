@@ -781,9 +781,28 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     private let onFix: (String) -> Void
     private let onErr: (String) -> Void
     private var pending = false   // waiting on the authorization decision to begin
-    init(once: Bool, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
+    init(once: Bool, background: Bool = false, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
         self.once = once; self.onFix = onFix; self.onErr = onErr
         super.init(); mgr.delegate = self
+        if background {
+            // Keep delivering with the screen off. Two things are required and one is a
+            // deliberate choice:
+            //
+            // allowsBackgroundLocationUpdates needs "location" in UIBackgroundModes, and
+            // iOS CRASHES the app at this line if it is missing rather than returning an
+            // error, so the build writes it from app.json.
+            //
+            // showsBackgroundLocationIndicator puts the blue bar in the status bar. It is
+            // on deliberately: tracking someone with nothing on screen to say so is what
+            // both platforms are built to prevent, and the bar is also the user's way back
+            // into the app.
+            //
+            // WHEN IN USE is enough for this, and is what we ask for. "Always" exists for
+            // geofencing while the app is not running, costs a second and more alarming
+            // prompt, and invites App Store review questions we would have no answer to.
+            mgr.allowsBackgroundLocationUpdates = true
+            mgr.showsBackgroundLocationIndicator = true
+        }
         // Continuous route tracking (a walk, a run, a ride) needs more than the default
         // setup: the navigation-grade accuracy class, an activity type so Core Location
         // tunes its filtering for a person on foot, and auto-pause OFF (iOS otherwise
@@ -2494,8 +2513,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 onFix: { [weak self] s in self?.resolve(token, s); self?.locFixes[token] = nil },
                 onErr: { [weak self] m in self?.fail(token, m); self?.locFixes[token] = nil })
             locFixes[token] = fix; fix.start()
-        case "location.watch":
-            let fix = LocFix(once: false,
+        case "location.watch", "location.watchBackground":
+            let bg = (cap == "location.watchBackground")
+            // The notification text in args is Android's business: iOS shows its own blue
+            // indicator and gives an app no say in it.
+            if bg && !(Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []).contains("location") {
+                // Setting allowsBackgroundLocationUpdates without the mode CRASHES, so
+                // refuse with a message that says what to add rather than taking the app
+                // down at a line the developer never wrote.
+                fail(token, "background location needs \"location\" in UIBackgroundModes: add \"backgroundLocation\": true to app.json")
+                break
+            }
+            let fix = LocFix(once: false, background: bg,
                 onFix: { [weak self] s in self?.resolve(token, s) },
                 onErr: { [weak self] m in self?.fail(token, m) })
             locFixes[token] = fix

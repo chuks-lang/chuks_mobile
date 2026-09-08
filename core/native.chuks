@@ -88,12 +88,48 @@ export class Orientation {
 // value means that field is unavailable on this fix). Needs the "location" permission
 // — request it via Permission.request("location", ...) first; onError fires if the
 // permission is denied or no location provider is available.
+// What the user is told while tracking continues in the background. Android REQUIRES a
+// visible notification for the whole session and there is no way to hide it: that is the
+// deal the platform offers, show the user what you are doing and you may keep tracking.
+// iOS shows its own blue status-bar indicator instead, which you do not control.
+export dataType TrackingNotice {
+    title: string,      // Android notification title, e.g. "Recording your walk"
+    body: string,       // Android notification text, e.g. "Tap to return"
+}
+
 export class Location {
     public static once(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("location.once", "", onResult, onError)
     }
+    /**
+     * Location updates while your app is on screen. Stops when the app is backgrounded.
+     */
     public static watch(onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
         return emitNativeStream("location.watch", "", onUpdate, onError)
+    }
+    /**
+     * Location updates that keep arriving with the screen off and the phone pocketed.
+     *
+     * This is what recording a walk, a run or a delivery route needs, and it is visible
+     * to the user by design on both platforms: Android shows the notification you supply
+     * for the whole session, iOS shows its blue status-bar indicator. Neither can be
+     * hidden, and an app that tracks someone silently is one the platforms are actively
+     * trying to prevent.
+     *
+     * Cancel the returned NativeSub when the activity ends. Forgetting to is not a small
+     * leak: it keeps the GPS alive and the notification on screen until the app is killed.
+     *
+     * ```chuks
+     * const sub: NativeSub = Location.watchBackground(
+     *     { title: "Recording your walk", body: "Tap to return to the app" },
+     *     function(fix: string): void { addPoint(fix) },
+     *     function(e: string): void { println(e) })
+     * // later, when the walk ends
+     * sub.cancel()
+     * ```
+     */
+    public static watchBackground(notice: TrackingNotice, onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
+        return emitNativeStream("location.watchBackground", notice.title + "\t" + notice.body, onUpdate, onError)
     }
 }
 

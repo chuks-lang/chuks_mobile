@@ -161,9 +161,15 @@ BG_IDS="$(AJ background-tasks)"
 if [ -n "$BG_IDS" ]; then
     BG_ARRAY=""
     for t in $BG_IDS; do BG_ARRAY="$BG_ARRAY<string>$t</string>"; done
-    BGTASK_PLIST="  <key>BGTaskSchedulerPermittedIdentifiers</key><array>$BG_ARRAY</array>
-  <key>UIBackgroundModes</key><array><string>fetch</string><string>processing</string></array>"
+    BGTASK_PLIST="  <key>BGTaskSchedulerPermittedIdentifiers</key><array>$BG_ARRAY</array>"
 fi
+# UIBackgroundModes is one array, so the modes an app needs are collected before it is
+# written: tasks want fetch/processing, background location wants location.
+BG_MODES=""
+[ -n "$BG_IDS" ] && BG_MODES="$BG_MODES<string>fetch</string><string>processing</string>"
+[ "$(AJ background-location)" = "1" ] && BG_MODES="$BG_MODES<string>location</string>"
+[ -n "$BG_MODES" ] && BGTASK_PLIST="$BGTASK_PLIST
+  <key>UIBackgroundModes</key><array>$BG_MODES</array>"
 
 ICONNAME_PLIST=""
 [ -n "$ICON_SRC" ] && [ -f "$ICON_SRC" ] && ICONNAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'

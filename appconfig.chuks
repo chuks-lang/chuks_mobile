@@ -149,6 +149,9 @@ function withPackagePerms(projdir: string, perms: any): any {
 // Set from app.json before the manifest is written: an app that declares backgroundTasks
 // needs one extra Android permission that nothing else implies.
 var HAS_BG_TASKS: bool = false
+// Same idea for background location: it runs in a foreground service, and a foreground
+// service needs permissions no ordinary location read does.
+var HAS_BG_LOCATION: bool = false
 
 const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "bluetooth", "nfc", "activity", "bodySensors", "health"]
 
@@ -288,6 +291,14 @@ function androidPermsStr(perms: any): string {
     // An app with background tasks needs this to persist jobs across a reboot, and
     // JobScheduler throws rather than declining when it is missing.
     if (HAS_BG_TASKS) { names.push("RECEIVE_BOOT_COMPLETED") }
+    // Background location is a foreground service on Android, and since API 34 the
+    // service must hold the permission matching its declared type. POST_NOTIFICATIONS
+    // is what makes the mandatory tracking notification visible on Android 13+.
+    if (HAS_BG_LOCATION) {
+        names.push("FOREGROUND_SERVICE")
+        names.push("FOREGROUND_SERVICE_LOCATION")
+        names.push("POST_NOTIFICATIONS")
+    }
     var i: int = 0
     while (i < KINDS.length) {
         if (perms[KINDS[i]] != null) {
@@ -372,6 +383,7 @@ function main(): void {
     perms = withPackagePerms(projdir, perms)
     const btl: any = cfg["backgroundTasks"]
     if (btl != null) { const arr: []any = btl; HAS_BG_TASKS = arr.length > 0 }
+    HAS_BG_LOCATION = cfg["backgroundLocation"] == true
 
     if (field == "version") { println(strOr(cfg["version"], "1.0")) }
     else if (field == "build") { println(strOr(cfg["buildNumber"], "1")) }
@@ -382,6 +394,12 @@ function main(): void {
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
+    else if (field == "background-location") {
+        // iOS needs "location" in UIBackgroundModes, and CRASHES rather than erroring if
+        // an app sets allowsBackgroundLocationUpdates without it. Android needs the
+        // foreground-service permissions. Declared, so neither is a surprise.
+        println(cfg["backgroundLocation"] == true ? "1" : "0")
+    }
     else if (field == "state-restore-window") {
         // How recently the app must have been backgrounded for its state to be restored.
         // Absent means the default; 0 turns restoration off.
