@@ -1923,7 +1923,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
         if let line = overlay as? MKPolyline {
             let r = MKPolylineRenderer(polyline: line)
-            r.strokeColor = UIColor(red: 0.18, green: 0.83, blue: 0.55, alpha: 1)   // walkSocials green
+            r.strokeColor = UIColor(red: 0.18, green: 0.83, blue: 0.55, alpha: 1)   // route stroke: green
             r.lineWidth = 4
             r.lineCap = .round
             return r

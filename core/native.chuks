@@ -228,7 +228,7 @@ export class DeviceInfo {
     // vendor's apps are removed (iOS). Needs no permission. (RN's expo-application
     // getIosIdForVendorAsync / getAndroidId.) Occasionally "" on iOS just after boot.
     public static deviceId(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.id", "", onResult) }
-    // The app's bundle id (iOS) / application id (Android), e.g. "com.chuks.walksocials".
+    // The app's bundle id (iOS) / application id (Android), e.g. "com.acme.myapp".
     public static appId(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appid", "", onResult) }
     // The app's human-readable display name.
     public static appName(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appname", "", onResult) }
