@@ -11,7 +11,6 @@
 //
 // Run:  chuks run tests/deeplink_test.chuks   (exits non-zero on failure)
 import { resolveLink, linkSegments, linkQuery, LinkTarget } from "../core/deeplink.chuks";
-import { os } from "std/os";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -79,7 +78,7 @@ function main(): void {
 
     println("")
     println(string(PASS) + " passed, " + string(FAIL) + " failed")
-    if (FAIL > 0) { os.exit(1) }
+    if (FAIL > 0) { throw "deeplink_test failed" }
 }
 
 main()

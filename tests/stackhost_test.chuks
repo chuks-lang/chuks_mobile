@@ -13,7 +13,6 @@
 //
 // Run:  chuks run tests/stackhost_test.chuks   (exits non-zero on failure)
 import { Node, Column, Text, Reconciler, Style } from "../core/ui.chuks";
-import { os } from "std/os";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -82,7 +81,7 @@ function main(): void {
 
     println("")
     println(string(PASS) + " passed, " + string(FAIL) + " failed")
-    if (FAIL > 0) { os.exit(1) }
+    if (FAIL > 0) { throw "stackhost_test failed" }
 }
 
 main()
