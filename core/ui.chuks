@@ -3400,10 +3400,15 @@ const AWAIT_POLL_SLOW_MS: int = 25    // after that, back off so a long wait cos
 /**
  * Await a one-shot capability and return its payload, or throw.
  *
+ * Await it OFF the host thread: an event handler runs inside the host's call into the
+ * engine, so blocking there blocks the very thread that would deliver the answer. Put
+ * the await in an `async` function and call that function from your handler WITHOUT
+ * awaiting it.
+ *
  * `timeoutMs` bounds the wait. Pick it from what the capability waits ON: a device
  * reading answers in milliseconds, while a picker or a permission prompt waits on a
- * person and needs minutes. A timeout throws rather than hanging, and says both things
- * it could mean, because one of them is the mistake above.
+ * person and needs minutes. A timeout throws rather than hanging, and names both things
+ * it can mean, since one of them is the await-on-the-host-thread mistake above.
  */
 export async function awaitCommand(cap: string, args: string, failable: bool, timeoutMs: int): Task<string> {
     const h: App? = HOST

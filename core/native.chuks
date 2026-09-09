@@ -27,7 +27,7 @@ export class Clipboard {
     public static set(text: string): void { emitNativeCommand("clipboard.set", text, null) }
     public static get(onResult: (string)=> void): void { emitNativeCommand("clipboard.get", "", onResult) }
 
-    /** The clipboard's text, awaited. See awaitCommand for the one rule about where. */
+    /** The clipboard's text, awaited. Await it inside an async function, not in a handler. */
     public static async getAsync(): Task<string> { return await awaitCommand("clipboard.get", "", false, CAP_QUICK_MS) }
 }
 
