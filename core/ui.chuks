@@ -14,6 +14,8 @@ import { host } from "std/host";
 import { Prop } from "./prop.chuks";
 import { tw } from "./tw.chuks";
 import { json } from "std/json";   // route params ride the hot-reload snapshot
+import { Channel } from "std/channel";   // awaited capabilities park on one of these
+import { time } from "std/time";
 
 // ---- Style: a compact subset of the flexbox + visual model -----------------
 export class Style {
@@ -2087,7 +2089,13 @@ export class Reconciler {
         this.scrollToPos = {}
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
-    public begin(): void { this.lines = [] }
+    // Start a frame. It deliberately does NOT clear the mutation buffer: the buffer is
+    // emptied by drain(), the reader, not by the next writer. Clearing here used to lose
+    // any command emitted between two frames (from a queued closure, or an awaited
+    // capability), and lose it SILENTLY: the engine had emitted it, the host never saw
+    // it, and the only symptom was a callback that never fired. The host drains after
+    // every entry point, so nothing accumulates.
+    public begin(): void { }
     // Drop the committed-tree baseline so the next renderRoot re-emits the WHOLE tree as
     // creates (not a diff). The dev server uses this so a freshly connected or relaunched
     // host, which has no views yet, receives the full tree. Component state is untouched
@@ -2101,7 +2109,11 @@ export class Reconciler {
     // Number of mutations buffered this frame.
     public count(): int { return this.lines.length }
     // Join the buffered mutations into the newline-delimited stream the host applies.
-    public drain(): string { return this.lines.join("\n") }
+    public drain(): string {
+        const out: string = this.lines.join("\n")
+        this.lines = []
+        return out
+    }
     // Record the visible scroll window used by reconcileList to pick the mount range.
     public setViewport(top: int, h: int, w: int): void {
         this.vpTop = top; this.vpH = h; if (w > 0) { this.vpW = w }
@@ -3196,8 +3208,8 @@ export class App {
     // hookBegin/hookSweep bracket every render so component state cells are seeded,
     // reconnected by identity, and freed when a component leaves the tree.
     public mount(): int {
-        runAsyncQueue()
         this.recon.begin()
+        runAsyncQueue()
         // AFTER begin(), which clears the line buffer. Work queued while the app was
         // being constructed emits here so it rides the first batch to the host; flushing
         // any earlier would put the commands in a buffer that begin() then throws away,
@@ -3247,8 +3259,12 @@ export class App {
     // continuation, an animation is stepping (or just stopped), or the app's own onTick
     // changed something. Otherwise it costs a queue check and returns.
     public tick(): int {
-        const ran: bool = runAsyncQueue()
+        // begin() FIRST, then the queue. begin() clears the mutation buffer, so a
+        // capability command emitted by a queued closure would be thrown away before
+        // the host ever drained it: exactly the trap mount() documents below, in the
+        // general case. Anything the queue emits has to land inside this frame.
         this.recon.begin()
+        const ran: bool = runAsyncQueue()
         var active: int = 0                            // advance decay/spring values (updates their cur)
         if (_frameStepper != null) { const f: any = _frameStepper; active = int(f()) }
         const flipped: bool = (active > 0) != (this.prevFrameActive > 0)
@@ -3270,8 +3286,8 @@ export class App {
     // Returns 1 when the app handled it and the host should stay put, 0 when the host
     // should do its platform default. Re-renders only when something actually changed.
     public dispatchBack(): int {
-        runAsyncQueue()
         this.recon.begin()
+        runAsyncQueue()
         var handled: bool = runBackHandlers()
         if (!handled) { handled = this.popRoute() }
         if (!handled) { return 0 }
@@ -3292,32 +3308,27 @@ export class App {
             if (h != null) { h() }
             return 0
         }
-        runAsyncQueue()
-        this.recon.begin(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // A native input change arrived for node `tag`: fire its onChange(value), then re-render.
     public dispatchInput(tag: string, value: string): int {
-        runAsyncQueue()
-        this.recon.begin(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // A native async result arrived for `token` (F3): fire the registered callback
     // with `payload`, then re-render. Mirrors dispatch, but keyed by an async token
     // rather than a UI node id.
     public resolve(token: string, payload: string): int {
-        runAsyncQueue()
-        this.recon.begin(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // The host reports that `token` is dead (user dismissed the picker, native op
     // ended with no result). Drop it and re-render. Mirrors resolve, without a fire.
     public cancelToken(token: string): int {
-        runAsyncQueue()
-        this.recon.begin(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // The host reports a FAILURE for `token` (permission denied, hardware missing,
     // native error). Fire the request's error callback and re-render.
     public failToken(token: string, message: string): int {
-        runAsyncQueue()
-        this.recon.begin(); this.recon.failToken(token, message); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.failToken(token, message); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
     }
     // Return the pending mutation stream as text and hand it to the host.
     public drain(): string { return this.recon.drain() }
@@ -3356,6 +3367,83 @@ export function emitNativeCommandE(cap: string, args: string, cb: any, onErr: an
     const h: App? = HOST
     if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, onErr, false)) }
     return new NativeSub("0")
+}
+
+// ---- Awaiting a capability -------------------------------------------------
+//
+// A capability answers on a callback because the host resolves it on a later runloop
+// turn. `awaitCommand` parks a lightweight thread on that answer instead, so a
+// sequence of device calls reads as a sequence rather than a staircase of closures.
+//
+// THE ONE RULE, and the reason this took a second attempt to get right: await it off
+// the host thread. An event handler runs INSIDE the host's call into the engine, so
+// blocking there blocks the very thread that would have delivered the answer, and the
+// app freezes. An `async function` body runs on its own lightweight thread, so awaiting
+// inside one is safe; call that function from a handler WITHOUT awaiting it.
+//
+//     async function load(): Task<void> {
+//         const id: string = await DeviceInfo.deviceIdAsync()   // safe: own thread
+//         dispatchAsync(function(): void { idCell.set(id) })    // back to the render thread
+//     }
+//     Pressable({ onPress: function(): void { load() } }, [...])   // no await here
+//
+// This is not a limitation we invented. A synchronous FFI call blocks Flutter's UI
+// isolate and a synchronous native call blocks React Native's JS thread; the difference
+// is that a Chuks await parks one lightweight thread and leaves the frame rendering.
+//
+// The buffered channel matters: the callback fires ON the host thread, and a send that
+// blocked there would freeze the app for real. trySend into a buffer of one never
+// blocks, and there is exactly one message either way.
+const AWAIT_POLL_MS: int = 2          // first-moments poll; most capabilities answer in <15ms
+const AWAIT_POLL_SLOW_MS: int = 25    // after that, back off so a long wait costs nothing
+
+/**
+ * Await a one-shot capability and return its payload, or throw.
+ *
+ * `timeoutMs` bounds the wait. Pick it from what the capability waits ON: a device
+ * reading answers in milliseconds, while a picker or a permission prompt waits on a
+ * person and needs minutes. A timeout throws rather than hanging, and says both things
+ * it could mean, because one of them is the mistake above.
+ */
+export async function awaitCommand(cap: string, args: string, failable: bool, timeoutMs: int): Task<string> {
+    const h: App? = HOST
+    if (h == null) { throw "capability '" + cap + "' was called before the app mounted" }
+    // One channel carries both outcomes, tagged, so there is only one thing to poll.
+    // The tag is a single character because the payload can be anything at all.
+    const ch: Channel<string> = new Channel<string>(1)
+    // ...and a second carries the token back, because the command is registered on the
+    // RENDER thread, not this one. Nothing but the render thread may touch the
+    // reconciler: its line buffer is a plain array, and a command pushed onto it from
+    // here would race the frame that is writing mutations into it. dispatchAsync is the
+    // one thread-safe door, and it also wakes the host so the command goes out on the
+    // next frame rather than waiting for the idle heartbeat.
+    const toks: Channel<string> = new Channel<string>(1)
+    dispatchAsync(function(): void {
+        const onOk: function(v: string): void = function(v: string): void { ch.trySend("v" + v) }
+        const onErr: function(m: string): void = function(m: string): void { ch.trySend("e" + m) }
+        toks.trySend(h.recon.command(cap, args, onOk, failable ? onErr : null, false))
+    })
+
+    var waited: int = 0
+    while (waited < timeoutMs) {
+        const got: any = ch.tryReceive()
+        if (bool(got.ok)) {
+            ch.close()
+            const msg: string = string(got.value)
+            if (msg.length > 0 && msg[0] == "e") { throw msg.substring(1, msg.length) }
+            return msg.substring(1, msg.length)
+        }
+        const step: int = waited < 40 ? AWAIT_POLL_MS : AWAIT_POLL_SLOW_MS
+        time.sleep(step)
+        waited = waited + step
+    }
+    // Nothing came back. Tell the host to drop the native op so it does not leak, and
+    // name both causes: a capability that never answered, or the await-on-the-host-thread
+    // mistake, which looks exactly like this from in here.
+    ch.close()
+    const t: any = toks.tryReceive()
+    if (bool(t.ok)) { const tok: string = string(t.value); dispatchAsync(function(): void { h.recon.cancelStream(tok) }) }
+    throw "capability '" + cap + "' did not answer within " + string(timeoutMs) + "ms. Either the native side never resolved it, or it was awaited on the host thread: await inside an async function, and call that function from your handler without awaiting it."
 }
 
 /**

@@ -6,14 +6,29 @@
 //
 // Fire-and-forget capabilities pass no callback (the token is "0"); async reads
 // pass a `(string) -> void` that receives the host's result payload.
-import { emitNativeCommand, emitNativeCommandE, emitNativeStream, NativeSub, setTaskExpireHandler, onHostReady } from "./ui.chuks";
+import { emitNativeCommand, awaitCommand, emitNativeCommandE, emitNativeStream, NativeSub, setTaskExpireHandler, onHostReady } from "./ui.chuks";
 import { Base64 } from "std/base64";
 
 // ---- Clipboard --------------------------------------------------------------
 // set() copies text; get() reads it (async — the OS pasteboard read is deferred).
+// How long an awaited capability may take before it gives up and throws. Chosen from
+// what the capability is waiting ON, not from how important it is:
+//   quick     a device reading, answered from memory or a sensor
+//   hardware  radio, GPS or storage that legitimately takes its time
+//   prompt    a person: an OS permission sheet, a picker, tapping a tag to the phone
+// The short one matters for more than tidiness: awaiting a capability on the host
+// thread deadlocks the app, and a 10-second explanatory throw is a far better way to
+// discover that than a freeze.
+const CAP_QUICK_MS: int = 10000
+const CAP_HARDWARE_MS: int = 60000
+const CAP_PROMPT_MS: int = 300000
+
 export class Clipboard {
     public static set(text: string): void { emitNativeCommand("clipboard.set", text, null) }
     public static get(onResult: (string)=> void): void { emitNativeCommand("clipboard.get", "", onResult) }
+
+    /** The clipboard's text, awaited. See awaitCommand for the one rule about where. */
+    public static async getAsync(): Task<string> { return await awaitCommand("clipboard.get", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Linking ----------------------------------------------------------------
@@ -33,6 +48,12 @@ export class Linking {
     // until the NativeSub is cancelled. Register it in a useEffect and cancel on unmount.
     public static onURL(onURL: (string)=> void): NativeSub {
         return emitNativeStream("linking.onurl", "", onURL, null)
+    }
+
+    /** Whether the OS can open this url, awaited. */
+    public static async canOpenAsync(url: string): Task<bool> {
+        const s: string = await awaitCommand("linking.canOpen", url, false, CAP_QUICK_MS)
+        return s == "1"
     }
 }
 
@@ -131,6 +152,9 @@ export class Location {
     public static watchBackground(notice: TrackingNotice, onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
         return emitNativeStream("location.watchBackground", notice.title + "\t" + notice.body, onUpdate, onError)
     }
+
+    /** One fix, awaited. Throws the host's message if location is off or denied. */
+    public static async onceAsync(): Task<string> { return await awaitCommand("location.once", "", true, CAP_HARDWARE_MS) }
 }
 
 // ---- Media picker + camera --------------------------------------------------
@@ -151,6 +175,14 @@ export class MediaPicker {
     public static saveImage(fileUri: string, onOk: ()=> void, onError: (string)=> void): void {
         emitNativeCommandE("mediapicker.save", fileUri, function(_: string): void { onOk() }, onError)
     }
+
+    /** Pick one photo, awaited. Throws if the user cancels or the permission is denied. */
+    public static async pickImageAsync(): Task<string> { return await awaitCommand("mediapicker.image", "", true, CAP_PROMPT_MS) }
+    /** Save a "file://" image to the gallery, awaited. Throws on failure. */
+    public static async saveImageAsync(fileUri: string): Task<void> {
+        await awaitCommand("mediapicker.save", fileUri, true, CAP_HARDWARE_MS)
+        return
+    }
 }
 export class Camera {
     public static takePhoto(onResult: (string)=> void, onError: (string)=> void): void {
@@ -161,6 +193,11 @@ export class Camera {
     public static capturePreview(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("camera.capturePreview", "", onResult, onError)
     }
+
+    /** Take a photo, awaited. Throws if the user cancels or the permission is denied. */
+    public static async takePhotoAsync(): Task<string> { return await awaitCommand("camera.photo", "", true, CAP_PROMPT_MS) }
+    /** Capture a still from a mounted CameraView, awaited. */
+    public static async capturePreviewAsync(): Task<string> { return await awaitCommand("camera.capturePreview", "", true, CAP_QUICK_MS) }
 }
 
 // ---- Bluetooth LE -----------------------------------------------------------
@@ -197,6 +234,17 @@ export class Bluetooth {
     public static subscribe(deviceId: string, service: string, characteristic: string, onValue: (string)=> void, onError: (string)=> void): NativeSub {
         return emitNativeStream("ble.subscribe", deviceId + "\t" + service + "\t" + characteristic, onValue, onError)
     }
+
+    /** Connect to a scanned peripheral, awaited. Resolves once services are discovered. */
+    public static async connectAsync(deviceId: string): Task<string> { return await awaitCommand("ble.connect", deviceId, true, CAP_HARDWARE_MS) }
+    /** Read a characteristic once, awaited. Answers a hex string. */
+    public static async readAsync(deviceId: string, service: string, characteristic: string): Task<string> {
+        return await awaitCommand("ble.read", deviceId + "\t" + service + "\t" + characteristic, true, CAP_HARDWARE_MS)
+    }
+    /** Write a hex value to a characteristic, awaited. Resolves when the write completes. */
+    public static async writeAsync(deviceId: string, service: string, characteristic: string, valueHex: string): Task<string> {
+        return await awaitCommand("ble.write", deviceId + "\t" + service + "\t" + characteristic + "\t" + valueHex, true, CAP_HARDWARE_MS)
+    }
 }
 
 // ---- NFC --------------------------------------------------------------------
@@ -217,6 +265,16 @@ export class Nfc {
     public static writeText(text: string, onOk: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("nfc.write", text, onOk, onError)
     }
+
+    /** Whether this device has usable NFC hardware, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("nfc.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** Scan one tag, awaited. The user has to tap the tag, so this waits on a person. */
+    public static async readTagAsync(): Task<string> { return await awaitCommand("nfc.read", "", true, CAP_PROMPT_MS) }
+    /** Write a text record to the next tag tapped, awaited. */
+    public static async writeTextAsync(text: string): Task<string> { return await awaitCommand("nfc.write", text, true, CAP_PROMPT_MS) }
 }
 
 // ---- Calendar ---------------------------------------------------------------
@@ -233,6 +291,13 @@ export class Calendar {
     public static createEvent(title: string, startInMin: int, durationMin: int, onOk: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("calendar.create", title + "|" + string(startInMin) + "|" + string(durationMin), onOk, onError)
     }
+
+    /** Upcoming events for the next `days` days, awaited. */
+    public static async upcomingAsync(days: int): Task<string> { return await awaitCommand("calendar.upcoming", string(days), true, CAP_PROMPT_MS) }
+    /** Create an event, awaited. Answers the new event's id. */
+    public static async createEventAsync(title: string, startInMin: int, durationMin: int): Task<string> {
+        return await awaitCommand("calendar.create", title + "|" + string(startInMin) + "|" + string(durationMin), true, CAP_PROMPT_MS)
+    }
 }
 
 // ---- Contacts ---------------------------------------------------------------
@@ -244,6 +309,9 @@ export class Contacts {
     public static list(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("contacts.list", "", onResult, onError)
     }
+
+    /** The address book, awaited. First call may show the OS permission prompt. */
+    public static async listAsync(): Task<string> { return await awaitCommand("contacts.list", "", true, CAP_PROMPT_MS) }
 }
 
 // ---- Device info ------------------------------------------------------------
@@ -271,6 +339,17 @@ export class DeviceInfo {
     // First-install time as epoch milliseconds (a string; parse with int()). Resets on
     // reinstall. On iOS this is the app's document-directory creation time (no OS API).
     public static installTime(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.installtime", "", onResult) }
+
+    // Awaited forms. Every one of these answers in milliseconds, so a short timeout
+    // turns the await-on-the-host-thread mistake into a quick, explanatory error
+    // rather than a long freeze.
+    public static async screenAsync(): Task<string> { return await awaitCommand("deviceinfo.screen", "", false, CAP_QUICK_MS) }
+    public static async appVersionAsync(): Task<string> { return await awaitCommand("deviceinfo.appversion", "", false, CAP_QUICK_MS) }
+    public static async localeAsync(): Task<string> { return await awaitCommand("deviceinfo.locale", "", false, CAP_QUICK_MS) }
+    public static async deviceIdAsync(): Task<string> { return await awaitCommand("deviceinfo.id", "", false, CAP_QUICK_MS) }
+    public static async appIdAsync(): Task<string> { return await awaitCommand("deviceinfo.appid", "", false, CAP_QUICK_MS) }
+    public static async appNameAsync(): Task<string> { return await awaitCommand("deviceinfo.appname", "", false, CAP_QUICK_MS) }
+    public static async installTimeAsync(): Task<string> { return await awaitCommand("deviceinfo.installtime", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Biometrics -------------------------------------------------------------
@@ -287,6 +366,17 @@ export class Biometrics {
     }
     public static authenticate(reason: string, onOk: ()=> void, onError: (string)=> void): void {
         emitNativeCommandE("biometrics.authenticate", reason, function(_: string): void { onOk() }, onError)
+    }
+
+    /** Whether Face ID / Touch ID / fingerprint is usable here, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("biometrics.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** Prompt for biometric authentication, awaited. Returns on success, throws on cancel or failure. */
+    public static async authenticateAsync(reason: string): Task<void> {
+        await awaitCommand("biometrics.authenticate", reason, true, CAP_PROMPT_MS)
+        return
     }
 }
 
@@ -329,6 +419,11 @@ export class Pedometer {
     // iOS only (CMPedometer history); on Android onError fires with a message pointing
     // to watch() (no on-device history without Health Connect).
     public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", string(secondsAgo), onResult, onError) }
+
+    /** "true"/"false": is there a hardware step counter, awaited. */
+    public static async availableAsync(): Task<string> { return await awaitCommand("pedometer.available", "", false, CAP_QUICK_MS) }
+    /** Steps and distance over the last `secondsAgo` seconds, awaited. iOS only; throws on Android. */
+    public static async queryAsync(secondsAgo: int): Task<string> { return await awaitCommand("pedometer.query", string(secondsAgo), true, CAP_QUICK_MS) }
 }
 
 // ---- Health -----------------------------------------------------------------
@@ -527,6 +622,11 @@ export class Permission {
     public static request(kind: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("permission.request", kind, onResult, onError)
     }
+
+    /** A permission's current state, awaited. */
+    public static async statusAsync(kind: string): Task<string> { return await awaitCommand("permission.status", kind, false, CAP_QUICK_MS) }
+    /** Request a permission, awaited. Waits on the OS prompt, so waits on a person. */
+    public static async requestAsync(kind: string): Task<string> { return await awaitCommand("permission.request", kind, true, CAP_PROMPT_MS) }
 }
 
 // ---- File system (Tier B) ---------------------------------------------------
@@ -546,6 +646,11 @@ export class FileSystem {
         emitNativeCommand("fs.list", "", onResult)
     }
     public static delete(name: string): void { emitNativeCommand("fs.delete", name, null) }
+
+    /** A file's contents, awaited. Throws if it does not exist. */
+    public static async readAsync(name: string): Task<string> { return await awaitCommand("fs.read", name, true, CAP_QUICK_MS) }
+    /** The private directory's file names, newline-joined, awaited. */
+    public static async listAsync(): Task<string> { return await awaitCommand("fs.list", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Secure storage (Tier B) ------------------------------------------------
@@ -561,6 +666,9 @@ export class SecureStore {
         emitNativeCommandE("secure.get", key, onResult, onError)
     }
     public static delete(key: string): void { emitNativeCommand("secure.delete", key, null) }
+
+    /** A stored secret, awaited. Throws if the key is not there. */
+    public static async getAsync(key: string): Task<string> { return await awaitCommand("secure.get", key, true, CAP_QUICK_MS) }
 }
 
 // ---- Local notifications (Tier B) -------------------------------------------
@@ -585,6 +693,9 @@ export class Audio {
     public static resume(): void { emitNativeCommand("audio.resume", "", null) }
     public static stop(): void { emitNativeCommand("audio.stop", "", null) }
     public static position(onResult: (string)=> void): void { emitNativeCommand("audio.position", "", onResult) }
+
+    /** "posMs/durMs" for the current track, awaited. */
+    public static async positionAsync(): Task<string> { return await awaitCommand("audio.position", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Microphone recording (Tier C) ------------------------------------------
@@ -604,6 +715,9 @@ export class Recorder {
     public static levels(onLevel: (string)=> void): NativeSub {
         return emitNativeStream("recorder.levels", "", onLevel, null)
     }
+
+    /** Stop recording, awaited. Answers a "file://" path to the m4a. */
+    public static async stopAsync(): Task<string> { return await awaitCommand("recorder.stop", "", true, CAP_QUICK_MS) }
 }
 
 // ---- Text-to-speech (Tier B) ------------------------------------------------
@@ -617,6 +731,12 @@ export class Tts {
     public static stop(): void { emitNativeCommand("tts.stop", "", null) }
     public static isSpeaking(onResult: (bool)=> void): void {
         emitNativeCommand("tts.isSpeaking", "", function(s: string): void { onResult(s == "1") })
+    }
+
+    /** Whether the synthesizer is currently speaking, awaited. */
+    public static async isSpeakingAsync(): Task<bool> {
+        const s: string = await awaitCommand("tts.isSpeaking", "", false, CAP_QUICK_MS)
+        return s == "1"
     }
 }
 

@@ -137,7 +137,7 @@ function main(): void {
     nv.push("club", { "id": c.id }, c)
     check(nv.depth() == 2, "push deepens the stack")
     const rc: Reconciler = new Reconciler()
-    rc.begin(); rc.renderRoot(nv.render())
+    rc.drain(); rc.renderRoot(nv.render())
     check(SEEN_ID == "c-7", "the screen reads its param, got '" + SEEN_ID + "'")
     check(SEEN_BODY, "the screen receives the body")
 
@@ -155,7 +155,7 @@ function main(): void {
     nv.popStack("chosen")
     check(nv.depth() == 1, "pop shrinks the stack")
     check(nv.top().result != null && string(nv.top().result) == "chosen", "the popped screen's result lands on the one below")
-    rc.begin(); rc.renderRoot(nv.render())
+    rc.drain(); rc.renderRoot(nv.render())
     check(SEEN_RESULT == "chosen", "the screen below reads the result, got '" + SEEN_RESULT + "'")
 
     // 5. A pop at the root is refused, so the host can do its platform default.
@@ -167,14 +167,14 @@ function main(): void {
     //    scroll position, everything the user had set up.
     const nv3: NavStack = navStateful()
     const rc3: Reconciler = new Reconciler()
-    rc3.begin(); rc3.renderRoot(nv3.render())        // home mounts, tab defaults to 0
+    rc3.drain(); rc3.renderRoot(nv3.render())        // home mounts, tab defaults to 0
     if (TAB != null) { TAB.set(2) }                  // the user picks the third tab
-    rc3.begin(); rc3.renderRoot(nv3.render())
+    rc3.drain(); rc3.renderRoot(nv3.render())
     check(SEEN_TAB == 2, "the screen's own state applies, got " + string(SEEN_TAB))
     nv3.push("club", { "id": "c-1" }, null)          // push a detail over it
-    rc3.begin(); rc3.renderRoot(nv3.render())
+    rc3.drain(); rc3.renderRoot(nv3.render())
     nv3.popStack(null)                               // and come back
-    rc3.begin(); rc3.renderRoot(nv3.render())
+    rc3.drain(); rc3.renderRoot(nv3.render())
     check(SEEN_TAB == 2, "state under the top survives a push and pop, got " + string(SEEN_TAB))
 
     // 7. TWO SCREENS ARE MOUNTED AT ONCE: the visible one and the one a back gesture
@@ -185,7 +185,7 @@ function main(): void {
     const rc4: Reconciler = new Reconciler()
     nv4.push("club", { "id": "c-1" }, null)
     var e1: []string = []; RENDERED = e1
-    rc4.begin(); rc4.renderRoot(nv4.render())
+    rc4.drain(); rc4.renderRoot(nv4.render())
     check(RENDERED.length == 2, "the top two entries both render, got " + string(RENDERED.length))
     check(RENDERED.length == 2 && RENDERED[0] == "home:" && RENDERED[1] == "club:c-1",
           "each layer renders its OWN route, got " + RENDERED.join(" | "))
@@ -193,10 +193,10 @@ function main(): void {
     // 8. A push does not renumber the screens below it: a route's node id follows its
     //    DEPTH, so the reconciler leaves an unchanged screen alone instead of tearing
     //    it down and rebuilding it (which would drop native scroll position).
-    rc4.begin(); rc4.renderRoot(nv4.render())
+    rc4.drain(); rc4.renderRoot(nv4.render())
     check(rc4.count() == 0, "re-rendering the stack emits 0 mutations, got " + string(rc4.count()))
     nv4.push("club", { "id": "c-2" }, null)
-    rc4.begin(); rc4.renderRoot(nv4.render())
+    rc4.drain(); rc4.renderRoot(nv4.render())
     const churn: string = rc4.drain()
     // The screen a back gesture would reveal keeps its id and its subtree: it is not
     // torn down and rebuilt just because something was pushed over it.
@@ -213,19 +213,19 @@ function main(): void {
     const nv5: NavStack = new NavStack(deepRoutes, "lvl")
     const rc5: Reconciler = new Reconciler()
     rc5.setViewport(0, 600, 400)
-    rc5.begin(); rc5.renderRoot(nv5.render())
+    rc5.drain(); rc5.renderRoot(nv5.render())
     if (DEEP_CELL != null) { DEEP_CELL.set(100) }            // stamp the root level
     for (var d: int = 1; d <= 4; d = d + 1) {
         nv5.push("lvl", { "n": d }, null)
-        rc5.begin(); rc5.renderRoot(nv5.render())
+        rc5.drain(); rc5.renderRoot(nv5.render())
         if (DEEP_CELL != null) { DEEP_CELL.set(100 + d) }    // stamp this level
-        rc5.begin(); rc5.renderRoot(nv5.render())
+        rc5.drain(); rc5.renderRoot(nv5.render())
     }
     check(nv5.depth() == 5, "five levels deep, got " + string(nv5.depth()))
     check(DEEP_SEEN == 4, "the top level is the one on screen, got " + string(DEEP_SEEN))
     // Only the top two render, however deep the stack is.
     var e2: []string = []; DEEP_RENDERED = e2
-    rc5.begin(); rc5.renderRoot(nv5.render())
+    rc5.drain(); rc5.renderRoot(nv5.render())
     check(DEEP_RENDERED.length == 2, "only the top two levels render at depth 5, got " + string(DEEP_RENDERED.length))
     check(rc5.count() == 0, "a settled deep stack emits 0 mutations, got " + string(rc5.count()))
 
@@ -234,10 +234,10 @@ function main(): void {
     var noChurn: bool = true
     for (var b: int = 3; b >= 0; b = b - 1) {
         nv5.popStack(null)
-        rc5.begin(); rc5.renderRoot(nv5.render())
+        rc5.drain(); rc5.renderRoot(nv5.render())
         if (DEEP_SEEN != b) { ok = false }                   // the right level is on screen
         if (int(DEEP_STATE) != 100 + b) { ok = false }       // and it kept the state it had
-        rc5.begin(); rc5.renderRoot(nv5.render())
+        rc5.drain(); rc5.renderRoot(nv5.render())
         if (rc5.count() != 0) { noChurn = false }            // and settles with no churn
     }
     check(ok, "every level revealed by a pop is the right one, with its state")
@@ -253,12 +253,12 @@ function main(): void {
     const rc6: Reconciler = new Reconciler()
     rc6.setViewport(0, 600, 400)
     var f0: map[string]int = {}; FIRST_ROW = f0
-    rc6.begin(); rc6.renderRoot(nv6.render())          // one screen, at the top
+    rc6.drain(); rc6.renderRoot(nv6.render())          // one screen, at the top
     nv6.push("scr", { "who": "B" }, null)              // B over A (A has who="?")
-    rc6.begin(); rc6.renderRoot(nv6.render())
+    rc6.drain(); rc6.renderRoot(nv6.render())
     rc6.setViewport(6000, 600, 400)                    // the user scrolls B a long way down
     var f1: map[string]int = {}; FIRST_ROW = f1
-    rc6.begin(); rc6.renderRoot(nv6.render())
+    rc6.drain(); rc6.renderRoot(nv6.render())
     check(FIRST_ROW.getOr("B", -1) > 80, "the visible list follows the scroll, first row " + string(FIRST_ROW.getOr("B", -1)))
     check(FIRST_ROW.getOr("?", -1) == 0, "the covered list stays where it was, first row " + string(FIRST_ROW.getOr("?", -1)))
 
@@ -268,19 +268,19 @@ function main(): void {
     //     offset without animation. That lands while the screen is still covered, which
     //     is why the position is never seen being restored.
     nv6.push("scr", { "who": "C" }, null)
-    rc6.begin(); rc6.renderRoot(nv6.render())
+    rc6.drain(); rc6.renderRoot(nv6.render())
     nv6.push("scr", { "who": "D" }, null)              // now B is third from the top: released
-    rc6.begin(); rc6.renderRoot(nv6.render())
+    rc6.drain(); rc6.renderRoot(nv6.render())
     // Popping to C re-mounts B UNDERNEATH it -- one gesture before B could be revealed.
     nv6.popStack(null)
     var f2: map[string]int = {}; FIRST_ROW = f2
-    rc6.begin(); rc6.renderRoot(nv6.render())
+    rc6.drain(); rc6.renderRoot(nv6.render())
     const restored: string = rc6.drain()
     check(FIRST_ROW.getOr("B", -1) > 80, "the re-mounted list windows at its old position, first row " + string(FIRST_ROW.getOr("B", -1)))
     check(has(restored, "LS|"), "the host is asked to restore the offset, while the screen is still covered")
     // And by the time it IS revealed, nothing further is needed: no second restore, no jump.
     nv6.popStack(null)
-    rc6.begin(); rc6.renderRoot(nv6.render())
+    rc6.drain(); rc6.renderRoot(nv6.render())
     const revealed: string = rc6.drain()
     check(!has(revealed, "LS|"), "revealing it asks for no further scrolling")
 
@@ -296,15 +296,15 @@ function main(): void {
     const nv7: NavStack = new NavStack(lr2, "plain")
     const rc7: Reconciler = new Reconciler()
     rc7.setViewport(0, 600, 400)
-    rc7.begin(); rc7.renderRoot(nv7.render())
+    rc7.drain(); rc7.renderRoot(nv7.render())
     nv7.push("scr", { "who": "X" }, null)
-    rc7.begin(); rc7.renderRoot(nv7.render())
+    rc7.drain(); rc7.renderRoot(nv7.render())
     const first: string = rc7.drain()
     nv7.popStack(null)
-    rc7.begin(); rc7.renderRoot(nv7.render())
+    rc7.drain(); rc7.renderRoot(nv7.render())
     check(has(rc7.drain(), "LV|"), "popping to a screen with no list clears the live list")
     nv7.push("scr", { "who": "X" }, null)          // the SAME route again: same id, new view
-    rc7.begin(); rc7.renderRoot(nv7.render())
+    rc7.drain(); rc7.renderRoot(nv7.render())
     check(has(rc7.drain(), "LV|"), "re-opening the same route re-announces its live list")
 
     // 13. A SECTION LIST IS A LIST TOO. It has to claim the viewport when it is the
@@ -316,7 +316,7 @@ function main(): void {
     const nv8: NavStack = new NavStack(sr, "sec")
     const rc8: Reconciler = new Reconciler()
     rc8.setViewport(0, 600, 400)
-    rc8.begin(); rc8.renderRoot(nv8.render())
+    rc8.drain(); rc8.renderRoot(nv8.render())
     check(has(rc8.drain(), "LV|"), "a section list claims the live list")
     rc8.setViewport(6000, 600, 400)                  // the user scrolls it a long way down
     var sr0: []int = []; SEC_ROWS = sr0
@@ -344,12 +344,12 @@ function main(): void {
     const nv9: NavStack = new NavStack(sk, "s")
     const rc9: Reconciler = new Reconciler()
     rc9.setViewport(0, 600, 400)
-    rc9.begin(); rc9.renderRoot(nv9.render())
+    rc9.drain(); rc9.renderRoot(nv9.render())
     rc9.setViewport(15000, 600, 400)                  // scrolled deep into 300 rows
-    rc9.begin(); rc9.renderRoot(nv9.render())
+    rc9.drain(); rc9.renderRoot(nv9.render())
     shrink = 3                                        // now the list holds three rows
     var sr9: []int = []; SEC_ROWS = sr9
-    rc9.begin(); rc9.renderRoot(nv9.render())
+    rc9.drain(); rc9.renderRoot(nv9.render())
     check(SEC_ROWS.length > 0, "a shrunken list still mounts its rows, got " + string(SEC_ROWS.length))
     var low9: int = 99999
     for (var z: int = 0; z < SEC_ROWS.length; z = z + 1) { if (SEC_ROWS[z] < low9) { low9 = SEC_ROWS[z] } }
@@ -375,12 +375,12 @@ function main(): void {
     const nvA: NavStack = new NavStack(sq, "s")
     const rcA: Reconciler = new Reconciler()
     rcA.setViewport(0, 600, 400)
-    rcA.begin(); rcA.renderRoot(nvA.render())
+    rcA.drain(); rcA.renderRoot(nvA.render())
     rcA.setViewport(9000, 600, 400)                   // scrolled deep into 200 rows
-    rcA.begin(); rcA.renderRoot(nvA.render())
+    rcA.drain(); rcA.renderRoot(nvA.render())
     secN = 4                                          // the list now holds four rows
     var srA: []int = []; SEC_ROWS = srA
-    rcA.begin(); rcA.renderRoot(nvA.render())
+    rcA.drain(); rcA.renderRoot(nvA.render())
     check(SEC_ROWS.length > 0, "a shrunken SECTION list still mounts rows, got " + string(SEC_ROWS.length))
     var lowA: int = 99999
     for (var y: int = 0; y < SEC_ROWS.length; y = y + 1) { if (SEC_ROWS[y] < lowA) { lowA = SEC_ROWS[y] } }

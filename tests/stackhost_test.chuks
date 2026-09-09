@@ -51,14 +51,14 @@ function shellWithStack(label: string): Node {
 function main(): void {
     println("no nested navigator")
     const r1: Reconciler = new Reconciler()
-    r1.begin(); r1.renderRoot(plain("home"))
+    r1.drain(); r1.renderRoot(plain("home"))
     const s1: string = r1.drain()
     check(!has(s1, "SK|"), "nothing is announced, so the host keeps using the app root")
 
     println("a nested stack appears")
     const r2: Reconciler = new Reconciler()
-    r2.begin(); r2.renderRoot(plain("home"))
-    r2.begin(); r2.renderRoot(shellWithStack("home"))
+    r2.drain(); r2.renderRoot(plain("home"))
+    r2.drain(); r2.renderRoot(shellWithStack("home"))
     const s2: string = r2.drain()
     check(has(s2, "SK|app.1"), "the container is announced by id (SK|app.1)")
 
@@ -67,15 +67,15 @@ function main(): void {
     // Leaving a stale id behind is the interesting bug: the host would go on dragging a
     // container that no longer holds two screens.
     const r3: Reconciler = new Reconciler()
-    r3.begin(); r3.renderRoot(shellWithStack("home"))
-    r3.begin(); r3.renderRoot(plain("home"))
+    r3.drain(); r3.renderRoot(shellWithStack("home"))
+    r3.drain(); r3.renderRoot(plain("home"))
     const s3: string = r3.drain()
     check(has(s3, "SK|") && !has(s3, "SK|app"), "the claim is released with an EMPTY id, not a stale one")
 
     println("it is not re-announced while unchanged")
     const r4: Reconciler = new Reconciler()
-    r4.begin(); r4.renderRoot(shellWithStack("home"))
-    r4.begin(); r4.renderRoot(shellWithStack("home"))
+    r4.drain(); r4.renderRoot(shellWithStack("home"))
+    r4.drain(); r4.renderRoot(shellWithStack("home"))
     const s4: string = r4.drain()
     check(!has(s4, "SK|"), "an unchanged stack emits nothing, like the live-list announcement")
 

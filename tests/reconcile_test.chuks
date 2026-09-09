@@ -77,19 +77,19 @@ function main(): void {
     // 1. Idempotency: after the first render, re-rendering an IDENTICAL tree must
     //    emit zero mutations, and must stay zero across many passes (convergence).
     const r: Reconciler = new Reconciler()
-    r.begin(); r.renderRoot(tree("Distance", "106 m"))
+    r.drain(); r.renderRoot(tree("Distance", "106 m"))
     const created: int = r.count()
     check(created > 0, "first render creates nodes (" + string(created) + " ops)")
 
     var maxRepeat: int = 0
     for (var i: int = 0; i < 5; i = i + 1) {
-        r.begin(); r.renderRoot(tree("Distance", "106 m"))
+        r.drain(); r.renderRoot(tree("Distance", "106 m"))
         if (r.count() > maxRepeat) { maxRepeat = r.count() }
     }
     check(maxRepeat == 0, "re-rendering an identical tree emits 0 mutations x5 (idempotent/convergent), max=" + string(maxRepeat))
 
     // 2. Diff precision: changing exactly one Text emits exactly one mutation.
-    r.begin(); r.renderRoot(tree("Distance", "108 m"))
+    r.drain(); r.renderRoot(tree("Distance", "108 m"))
     check(r.count() == 1, "a single text change emits exactly 1 mutation, got " + string(r.count()))
 
     // 3. Determinism: the same props serialize to the same style string every time.
@@ -103,8 +103,8 @@ function main(): void {
 
     // 4. A fresh Reconciler mounting the same tree is stable on the immediate re-render.
     const r2: Reconciler = new Reconciler()
-    r2.begin(); r2.renderRoot(tree("A", "B"))
-    r2.begin(); r2.renderRoot(tree("A", "B"))
+    r2.drain(); r2.renderRoot(tree("A", "B"))
+    r2.drain(); r2.renderRoot(tree("A", "B"))
     check(r2.count() == 0, "second identical render on a fresh reconciler emits 0, got " + string(r2.count()))
 
     // 5. A MOUNT MUST DESTROY WHATEVER HOLDS ITS ID.
@@ -117,7 +117,7 @@ function main(): void {
     //    with path ids the reconciler has to say it.
     const r3: Reconciler = new Reconciler()
     r3.setViewport(0, 600, 400)
-    r3.begin(); r3.renderRoot(listScreen(30, "A"))
+    r3.drain(); r3.renderRoot(listScreen(30, "A"))
     const s3: string = r3.drain()
     var lines3: []string = s3.split("\n")
     var creates: int = 0
@@ -149,7 +149,7 @@ function main(): void {
     //    row (or filter 300 results to 3) and those stale rows are suddenly inside
     //    the visible area, still showing the PREVIOUS list's content. RN unmounts a
     //    cell that leaves the render stack; so do we.
-    r3.begin(); r3.renderRoot(listScreen(1, "B"))
+    r3.drain(); r3.renderRoot(listScreen(1, "B"))
     const s4: string = r3.drain()
     var lines4: []string = s4.split("\n")
     var mountedCells: int = 0
@@ -162,7 +162,7 @@ function main(): void {
 
     // And the rows that remain must show the NEW data: no cell may still carry a
     // label from the previous screen once the swap settles.
-    r3.begin(); r3.renderRoot(listScreen(1, "B"))
+    r3.drain(); r3.renderRoot(listScreen(1, "B"))
     check(r3.count() == 0, "the shrunken list is stable on re-render, got " + string(r3.count()))
 
     println("reconcile_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
