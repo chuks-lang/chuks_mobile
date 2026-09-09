@@ -116,6 +116,11 @@ PKG_SRC="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-sources ios 2>
         while IFS="$(printf '\t')" read -r ns cls; do [ -n "$cls" ] && echo "    $cls.self,"; done
     echo "] }"
 } > "$OUT/ChuksPackageModules.swift"
+# The capability boundary is generated from core/capabilities.json: the encoder the
+# engine calls and the decoders both hosts use, from one declaration. Regenerated on
+# every build rather than trusted, so the checked-in files cannot drift from it.
+chuks run "$SDKROOT/tools/gencaps.chuks" "$SDKROOT" >/dev/null 2>&1 || true
+
 # A capability is one thing with two implementations, so the build says when the two
 # disagree. Covers the framework's own hosts as well as every installed package. An undeclared gap is loud: it means a capability that is shipped and
 # documented but dead on one platform, whose only other symptom is a callback that
@@ -139,7 +144,7 @@ chuks_capability_check() {
 [ -n "$PKG_SRC" ] && echo "   native packages: $(echo $PKG_SRC | wc -w | tr -d ' ') source file(s)"
 chuks_capability_check
 
-swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" "$PKGDIR/ChuksModule.swift" "$OUT/ChuksPackageModules.swift" $PKG_SRC $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
+swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" "$PKGDIR/ChuksModule.swift" "$PKGDIR/ChuksCaps.gen.swift" "$OUT/ChuksPackageModules.swift" $PKG_SRC $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
     "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
     -Xclang-linker -Wno-incompatible-sysroot \

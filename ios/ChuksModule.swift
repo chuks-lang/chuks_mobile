@@ -13,14 +13,38 @@
 // loop painless, and a wildcard profile can never carry an entitlement. Camera,
 // location and media stay in core deliberately; Health and NFC are the ones that cannot.
 import UIKit
+import Foundation
+
+/// How a generated argument decoder reports an argument it could not use. Split out
+/// from the module host so the generated code depends on the smallest possible thing.
+public protocol ChuksArgFailer: AnyObject {
+    /// Fail the token. Reaches Chuks through the error channel, not as a value.
+    func fail(_ token: String, _ message: String)
+}
+
+public extension ChuksArgFailer {
+    /// The command carried fewer arguments than the capability takes. Almost always a
+    /// call site and a decoder that have drifted apart, which is what generating both
+    /// from one declaration is meant to prevent.
+    func argMissing(_ token: String, _ cap: String, _ want: Int, _ got: Int) {
+        report(token, "\(cap) takes \(want) argument(s), got \(got)")
+    }
+    /// An argument arrived that is not the type the capability declared.
+    func argBad(_ token: String, _ cap: String, _ name: String, _ type: String, _ raw: String) {
+        report(token, "\(cap): \(name) should be \(type == "int" ? "an" : "a") \(type), got \"\(raw)\"")
+    }
+    /// A fire-and-forget command has no token to fail, so it says so in the log rather
+    /// than vanishing.
+    private func report(_ token: String, _ message: String) {
+        if token == "0" { NSLog("chuks: %@", message) } else { fail(token, message) }
+    }
+}
 
 /// What a module is handed: two answer channels and somewhere to present from, which is
 /// all any capability has ever needed from this host.
-public protocol ChuksModuleHost: AnyObject {
+public protocol ChuksModuleHost: ChuksArgFailer {
     /// Answer the token that asked. Fires the Chuks callback with this payload.
     func resolve(_ token: String, _ payload: String)
-    /// Fail the token. Reaches Chuks through the error channel, not as a value.
-    func fail(_ token: String, _ message: String)
     /// The view controller a capability presents from (a picker, a permission sheet).
     var presenter: UIViewController { get }
     /// Register cleanup for a STREAMING capability. Chuks cancels a token when the

@@ -12,11 +12,32 @@ import android.app.Activity
 
 /// What a module is handed: two answer channels and the Activity, which is what an
 /// Android capability needs for permissions, system services and intents.
-interface ChuksModuleHost {
-    /** Answer the token that asked. Fires the Chuks callback with this payload. */
-    fun resolve(token: String, payload: String)
+/// How a generated argument decoder reports an argument it could not use. Split out from
+/// the module host so the generated code depends on the smallest possible thing.
+interface ChuksArgFailer {
     /** Fail the token. Reaches Chuks through the error channel, not as a value. */
     fun fail(token: String, message: String)
+
+    /** The command carried fewer arguments than the capability takes. Almost always a
+     *  call site and a decoder that have drifted apart, which is what generating both
+     *  from one declaration is meant to prevent. */
+    fun argMissing(token: String, cap: String, want: Int, got: Int) {
+        report(token, "$cap takes $want argument(s), got $got")
+    }
+    /** An argument arrived that is not the type the capability declared. */
+    fun argBad(token: String, cap: String, name: String, type: String, raw: String) {
+        report(token, "$cap: $name should be ${if (type == "int") "an" else "a"} $type, got \"$raw\"")
+    }
+    /** A fire-and-forget command has no token to fail, so it says so in the log rather
+     *  than vanishing. */
+    private fun report(token: String, message: String) {
+        if (token == "0") android.util.Log.w("chuks", message) else fail(token, message)
+    }
+}
+
+interface ChuksModuleHost : ChuksArgFailer {
+    /** Answer the token that asked. Fires the Chuks callback with this payload. */
+    fun resolve(token: String, payload: String)
     /** The Activity a capability needs for getSystemService, permissions and intents. */
     val activity: Activity
     /** Register cleanup for a STREAMING capability. Chuks cancels a token when the

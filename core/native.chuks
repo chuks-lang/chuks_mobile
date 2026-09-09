@@ -7,6 +7,13 @@
 // Fire-and-forget capabilities pass no callback (the token is "0"); async reads
 // pass a `(string) -> void` that receives the host's result payload.
 import { emitNativeCommand, awaitCommand, emitNativeCommandE, emitNativeStream, NativeSub, setTaskExpireHandler, onHostReady } from "./ui.chuks";
+// The typed encoders, generated from core/capabilities.json alongside the decoders the
+// two hosts use. A call site names its arguments and passes them as themselves.
+import { argsHapticsVibrate, argsTorchSet, argsBrightnessSet, argsBrightnessKeepAwake,
+         argsCalendarUpcoming, argsCalendarCreate, argsPedometerQuery, argsBgResult,
+         argsBgPeriodic, argsBgOnce, argsBgProcessing, argsFsWrite, argsSecureSet,
+         argsNotifNotify, argsBleRead, argsBleWrite, argsBleSubscribe,
+         argsLocationWatchBackground } from "./caps.gen.chuks";
 
 // ---- Clipboard --------------------------------------------------------------
 // set() copies text; get() reads it (async — the OS pasteboard read is deferred).
@@ -72,20 +79,20 @@ export class Share {
 // that supports it (older/haptics-less devices fall back to a medium impact).
 export class Haptics {
     public static impact(style: string): void { emitNativeCommand("haptics.impact", [style], null) }
-    public static vibrate(ms: int): void { emitNativeCommand("haptics.vibrate", [string(ms)], null) }
+    public static vibrate(ms: int): void { emitNativeCommand("haptics.vibrate", argsHapticsVibrate(ms), null) }
     public static pattern(msSequence: string): void { emitNativeCommand("haptics.pattern", [msSequence], null) }
 }
 
 // ---- Torch / flashlight -----------------------------------------------------
 export class Torch {
-    public static set(on: bool): void { emitNativeCommand("torch.set", [on ? "1" : "0"], null) }
+    public static set(on: bool): void { emitNativeCommand("torch.set", argsTorchSet(on), null) }
 }
 
 // ---- Screen brightness ------------------------------------------------------
 // level is 0.0..1.0. keepAwake() toggles the idle timer (keep the screen on).
 export class Brightness {
-    public static set(level: float): void { emitNativeCommand("brightness.set", [string(level)], null) }
-    public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", [on ? "1" : "0"], null) }
+    public static set(level: float): void { emitNativeCommand("brightness.set", argsBrightnessSet(level), null) }
+    public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", argsBrightnessKeepAwake(on), null) }
 }
 
 // ---- Orientation ------------------------------------------------------------
@@ -149,7 +156,7 @@ export class Location {
      * ```
      */
     public static watchBackground(notice: TrackingNotice, onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
-        return emitNativeStream("location.watchBackground", [notice.title, notice.body], onUpdate, onError)
+        return emitNativeStream("location.watchBackground", argsLocationWatchBackground(notice.title, notice.body), onUpdate, onError)
     }
 
     /** One fix, awaited. Throws the host's message if location is off or denied. */
@@ -223,15 +230,15 @@ export class Bluetooth {
     }
     // Read a characteristic once; onOk gets its value as a hex string.
     public static read(deviceId: string, service: string, characteristic: string, onOk: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("ble.read", [deviceId, service, characteristic], onOk, onError)
+        emitNativeCommandE("ble.read", argsBleRead(deviceId, service, characteristic), onOk, onError)
     }
     // Write a hex-string value to a characteristic; onOk fires when the write completes.
     public static write(deviceId: string, service: string, characteristic: string, valueHex: string, onOk: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("ble.write", [deviceId, service, characteristic, valueHex], onOk, onError)
+        emitNativeCommandE("ble.write", argsBleWrite(deviceId, service, characteristic, valueHex), onOk, onError)
     }
     // Subscribe to notifications/indications; onValue fires with each new value (hex) until cancelled.
     public static subscribe(deviceId: string, service: string, characteristic: string, onValue: (string)=> void, onError: (string)=> void): NativeSub {
-        return emitNativeStream("ble.subscribe", [deviceId, service, characteristic], onValue, onError)
+        return emitNativeStream("ble.subscribe", argsBleSubscribe(deviceId, service, characteristic), onValue, onError)
     }
 
     /** Connect to a scanned peripheral, awaited. Resolves once services are discovered. */
@@ -285,10 +292,10 @@ export class Nfc {
 // calendar goes to onError.
 export class Calendar {
     public static upcoming(days: int, onResult: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("calendar.upcoming", [string(days)], onResult, onError)
+        emitNativeCommandE("calendar.upcoming", argsCalendarUpcoming(days), onResult, onError)
     }
     public static createEvent(title: string, startInMin: int, durationMin: int, onOk: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("calendar.create", [title, string(startInMin), string(durationMin)], onOk, onError)
+        emitNativeCommandE("calendar.create", argsCalendarCreate(title, startInMin, durationMin), onOk, onError)
     }
 
     /** Upcoming events for the next `days` days, awaited. */
@@ -417,7 +424,7 @@ export class Pedometer {
     // One-shot count for the last `secondsAgo` seconds -> "steps,distanceMeters".
     // iOS only (CMPedometer history); on Android onError fires with a message pointing
     // to watch() (no on-device history without Health Connect).
-    public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", [string(secondsAgo)], onResult, onError) }
+    public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", argsPedometerQuery(secondsAgo), onResult, onError) }
 
     /** "true"/"false": is there a hardware step counter, awaited. */
     public static async availableAsync(): Task<string> { return await awaitCommand("pedometer.available", [], false, CAP_QUICK_MS) }
@@ -521,7 +528,7 @@ export class Background {
     // which is what lets the OS mark the work finished and stop pumping.
     static invoke(name: string): void {
         const f: (async function(): Task<bool>)? = TASKS[name]
-        if (f == null) { emitNativeCommand("bg.result", [name, "0"], null); return }
+        if (f == null) { emitNativeCommand("bg.result", argsBgResult(name, false), null); return }
         // Spawned, so an awaiting handler does not block the host's call. The result
         // comes back through bg.result whenever it finishes, which is what tells the OS
         // the work is done and the host it can stop pumping.
@@ -533,7 +540,7 @@ export class Background {
         // A handler that throws is a failed task, not a crashed app: the OS is told it
         // failed so it retries on the platform's backoff rather than never running again.
         try { ok = await f() } catch (e) { ok = false }
-        emitNativeCommand("bg.result", [name, (ok ? "1" : "0")], null)
+        emitNativeCommand("bg.result", argsBgResult(name, ok), null)
         return
     }
 
@@ -547,16 +554,16 @@ export class Background {
      * this at 15 minutes and neither treats it as a promise.
      */
     public static periodic(name: string, minIntervalSeconds: int, c: TaskConstraints?): void {
-        const secs: string = string(minIntervalSeconds)
+        const secs: int = minIntervalSeconds
         const cons: string = encodeConstraints(c)
-        onHostReady(function(): void { emitNativeCommand("bg.periodic", [name, secs, cons], null) })
+        onHostReady(function(): void { emitNativeCommand("bg.periodic", argsBgPeriodic(name, secs, cons), null) })
     }
 
     /** Run once, no sooner than `delaySeconds` from now. */
     public static once(name: string, delaySeconds: int, c: TaskConstraints?): void {
-        const secs: string = string(delaySeconds)
+        const secs: int = delaySeconds
         const cons: string = encodeConstraints(c)
-        onHostReady(function(): void { emitNativeCommand("bg.once", [name, secs, cons], null) })
+        onHostReady(function(): void { emitNativeCommand("bg.once", argsBgOnce(name, secs, cons), null) })
     }
 
     /**
@@ -565,9 +572,9 @@ export class Background {
      * constraints at all; Android schedules a job with the same requirements.
      */
     public static processing(name: string, delaySeconds: int, c: TaskConstraints?): void {
-        const secs: string = string(delaySeconds)
+        const secs: int = delaySeconds
         const cons: string = encodeConstraints(c)
-        onHostReady(function(): void { emitNativeCommand("bg.processing", [name, secs, cons], null) })
+        onHostReady(function(): void { emitNativeCommand("bg.processing", argsBgProcessing(name, secs, cons), null) })
     }
 
     /** Stop scheduling this task. Already-running work is allowed to finish. */
@@ -638,7 +645,7 @@ export class Permission {
 // of a missing file goes to onError.
 export class FileSystem {
     public static write(name: string, content: string): void {
-        emitNativeCommand("fs.write", [name, content], null)
+        emitNativeCommand("fs.write", argsFsWrite(name, content), null)
     }
     public static read(name: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("fs.read", [name], onResult, onError)
@@ -660,7 +667,7 @@ export class FileSystem {
 // goes to onError. Not for large blobs; use FileSystem for those.
 export class SecureStore {
     public static set(key: string, value: string): void {
-        emitNativeCommand("secure.set", [key, value], null)
+        emitNativeCommand("secure.set", argsSecureSet(key, value), null)
     }
     public static get(key: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("secure.get", [key], onResult, onError)
@@ -676,7 +683,7 @@ export class SecureStore {
 // shortly after the call and appears in the notification shade / as a banner.
 export class Notifications {
     public static notify(title: string, body: string): void {
-        emitNativeCommand("notif.notify", [title, body], null)
+        emitNativeCommand("notif.notify", argsNotifNotify(title, body), null)
     }
 }
 

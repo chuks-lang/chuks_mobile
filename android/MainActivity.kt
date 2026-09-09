@@ -1030,29 +1030,6 @@ class MainActivity : Activity(), ChuksModuleHost {
 
     // Execute a native capability requested via an `X|` command (F3). Fire-and-forget
     // commands (token "0") just perform the side effect; async reads call resolve().
-    // A capability's numeric argument, or null.
-    //
-    // The old shape was `args.toLongOrNull() ?: 0`, and that zero is a lie:
-    // calendar.upcoming would quietly look seven days ahead instead of whatever was
-    // asked, and the app would get a confident wrong answer rather than an error. A
-    // default is right for a STYLE PROP, where absent means "use the default"; it is
-    // wrong for an argument the caller definitely sent.
-    //
-    // A fire-and-forget command has no token to fail, so it says so in the log rather
-    // than vanishing.
-    private fun numArg(token: String, cap: String, fields: List<String>, i: Int): Double? {
-        val raw = arg(fields, i)
-        val v = raw.toDoubleOrNull()
-        if (v != null) return v
-        val msg = "$cap: argument $i should be a number, got \"$raw\""
-        if (token == "0") android.util.Log.w("chuks", msg) else fail(token, msg)
-        return null
-    }
-    private fun intArg(token: String, cap: String, fields: List<String>, i: Int): Int? =
-        numArg(token, cap, fields, i)?.toInt()
-    private fun longArg(token: String, cap: String, fields: List<String>, i: Int): Long? =
-        numArg(token, cap, fields, i)?.toLong()
-
     private fun handleCommand(token: String, cap: String, args: String, fields: List<String> = emptyList()) {
         when (cap) {
             "__cancel__" -> {
@@ -1142,8 +1119,9 @@ class MainActivity : Activity(), ChuksModuleHost {
                 // A foreground service started while the app is on screen keeps the
                 // "while in use" grant with the screen off, so this needs no separate
                 // ACCESS_BACKGROUND_LOCATION prompt.
-                val title = arg(fields, 0, "Location").ifEmpty { "Location" }
-                val body = arg(fields, 1)
+                val la = ChuksCaps.locationWatchBackground(fields, token, this) ?: return
+                val title = la.title.ifEmpty { "Location" }
+                val body = la.body
                 ChuksLocation.token = token
                 ChuksLocation.deliver = { t, fix -> resolve(t, fix) }
                 val svc = Intent(this, ChuksLocationService::class.java)
@@ -1233,7 +1211,8 @@ class MainActivity : Activity(), ChuksModuleHost {
             "calendar.upcoming" -> {
                 if (checkSelfPermission(Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
                 try {
-                    val days = longArg(token, cap, fields, 0) ?: return
+                    val a = ChuksCaps.calendarUpcoming(fields, token, this) ?: return
+                    val days = a.days.toLong()
                     val now = System.currentTimeMillis()
                     val sb = StringBuilder()
                     contentResolver.query(CalendarContract.Events.CONTENT_URI, arrayOf(CalendarContract.Events.TITLE, CalendarContract.Events.DTSTART, CalendarContract.Events.DTEND),
@@ -1247,10 +1226,8 @@ class MainActivity : Activity(), ChuksModuleHost {
             "calendar.create" -> {
                 if (checkSelfPermission(Manifest.permission.WRITE_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
                 try {
-                    val parts = fields
-                    if (parts.size < 3) { fail(token, "bad args"); return }
-                    val startMin = longArg(token, cap, fields, 1) ?: return
-                    val durMin = longArg(token, cap, fields, 2) ?: return
+                    val a = ChuksCaps.calendarCreate(fields, token, this) ?: return
+                    val startMin = a.startInMin.toLong(); val durMin = a.durationMin.toLong()
                     var calId = -1L
                     contentResolver.query(CalendarContract.Calendars.CONTENT_URI, arrayOf(CalendarContract.Calendars._ID),
                         "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ?", arrayOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR.toString()), null)?.use { c ->
@@ -1259,7 +1236,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     if (calId < 0) { fail(token, "no writable calendar"); return }
                     val now = System.currentTimeMillis()
                     val values = android.content.ContentValues().apply {
-                        put(CalendarContract.Events.CALENDAR_ID, calId); put(CalendarContract.Events.TITLE, parts[0])
+                        put(CalendarContract.Events.CALENDAR_ID, calId); put(CalendarContract.Events.TITLE, a.title)
                         put(CalendarContract.Events.DTSTART, now + startMin * 60000L); put(CalendarContract.Events.DTEND, now + (startMin + durMin) * 60000L)
                         put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
                     }
@@ -1322,14 +1299,12 @@ class MainActivity : Activity(), ChuksModuleHost {
             "ble.connect" -> ensureBle().connect(args, { p -> resolve(token, p) }, { m -> fail(token, m) })
             "ble.disconnect" -> bleManager?.disconnect(args)
             "ble.read" -> {
-                val a = fields
-                if (a.size == 3) ensureBle().read(a[0], a[1], a[2], { p -> resolve(token, p) }, { m -> fail(token, m) })
-                else fail(token, "ble.read needs id, service, characteristic")
+                val a = ChuksCaps.bleRead(fields, token, this) ?: return
+                ensureBle().read(a.deviceId, a.service, a.characteristic, { p -> resolve(token, p) }, { m -> fail(token, m) })
             }
             "ble.write" -> {
-                val a = fields
-                if (a.size == 4) ensureBle().write(a[0], a[1], a[2], a[3], { p -> resolve(token, p) }, { m -> fail(token, m) })
-                else fail(token, "ble.write needs id, service, characteristic, hex")
+                val a = ChuksCaps.bleWrite(fields, token, this) ?: return
+                ensureBle().write(a.deviceId, a.service, a.characteristic, a.valueHex, { p -> resolve(token, p) }, { m -> fail(token, m) })
             }
             "ble.subscribe" -> {
                 val a = args.split("\t")
@@ -1385,7 +1360,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             "fs.write" -> {
                 // The content arrives as an ordinary field: the wire packs arguments,
                 // so a multi-line body needs no encoding of its own any more.
-                if (fields.size >= 2) java.io.File(filesDir, fields[0]).writeText(fields[1])
+                ChuksCaps.fsWrite(fields, token, this)?.let { java.io.File(filesDir, it.name).writeText(it.content) }
             }
             "fs.read" -> {
                 val f = java.io.File(filesDir, args)
@@ -1394,14 +1369,15 @@ class MainActivity : Activity(), ChuksModuleHost {
             "fs.list" -> resolve(token, (filesDir.listFiles()?.map { it.name } ?: emptyList()).joinToString("\n"))
             "fs.delete" -> java.io.File(filesDir, args).delete()
             "secure.set" -> {
-                if (fields.size >= 2) secureSet(fields[0], fields[1])
+                ChuksCaps.secureSet(fields, token, this)?.let { secureSet(it.key, it.value) }
             }
             "secure.get" -> { val v = secureGet(args); if (v != null) resolve(token, v) else fail(token, "no such key: $args") }
             "secure.delete" -> securePrefs().edit().remove(args).apply()
             "notif.notify" -> {
 
-                val title = arg(fields, 0)
-                val body = arg(fields, 1)
+                val na = ChuksCaps.notifNotify(fields, token, this) ?: return
+                val title = na.title
+                val body = na.body
                 notify(title, body)
             }
             "audio.play" -> {
@@ -1485,11 +1461,11 @@ class MainActivity : Activity(), ChuksModuleHost {
                 startActivity(Intent.createChooser(i, null))
             }
             "haptics.impact" -> fireHaptic(args)
-            "haptics.vibrate" -> longArg(token, cap, fields, 0)?.let { hapticVibrate(it) }
+            "haptics.vibrate" -> ChuksCaps.hapticsVibrate(fields, token, this)?.let { hapticVibrate(it.ms.toLong()) }
             "haptics.pattern" -> hapticPattern(args)
             "torch.set" -> setTorch(args == "1")
-            "brightness.set" -> numArg(token, cap, fields, 0)?.let {
-                val lp = window.attributes; lp.screenBrightness = it.toFloat().coerceIn(0f, 1f); window.attributes = lp
+            "brightness.set" -> ChuksCaps.brightnessSet(fields, token, this)?.let {
+                val lp = window.attributes; lp.screenBrightness = it.level.toFloat().coerceIn(0f, 1f); window.attributes = lp
             }
             "brightness.keepAwake" ->
                 if (args == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -1508,22 +1484,20 @@ class MainActivity : Activity(), ChuksModuleHost {
                 streamTeardown[token] = { ChuksBg.tokens.remove(args) }
             }
             "bg.result" -> {
-                if (fields.size >= 2) ChuksBg.finish(fields[0], fields[1] == "1")
+                ChuksCaps.bgResult(fields, token, this)?.let { ChuksBg.finish(it.name, it.ok) }
             }
             "bg.periodic", "bg.once", "bg.processing" -> {
-                val p = fields
-                if (p.size >= 2) {
-                    val cons = HashMap<String, String>()
-                    if (p.size >= 3) for (pair in p[2].split(";")) {
-                        if (pair.isEmpty()) continue
-                        val kv = pair.split("=")
-                        if (kv.size == 2) cons[kv[0]] = kv[1]
-                    }
-                    // A processing task is long work that wants power, so it is a one-off
-                    // job with those constraints rather than a repeating one.
-                    val secs = intArg(token, cap, fields, 1) ?: return
-                    scheduleChuksJob(this, p[0], secs, cap == "bg.periodic", cons)
+                // Same three arguments whichever of the three schedulers this is.
+                val sched = ChuksCaps.bgPeriodic(fields, token, this) ?: return
+                val cons = HashMap<String, String>()
+                for (pair in sched.constraints.split(";")) {
+                    if (pair.isEmpty()) continue
+                    val kv = pair.split("=")
+                    if (kv.size == 2) cons[kv[0]] = kv[1]
                 }
+                // A processing task is long work that wants power, so it is a one-off
+                // job with those constraints rather than a repeating one.
+                scheduleChuksJob(this, sched.name, sched.seconds, cap == "bg.periodic", cons)
             }
             "bg.cancel" -> cancelChuksJob(this, args)
             "bg.cancelAll" -> cancelAllChuksJobs(this)

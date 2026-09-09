@@ -86,6 +86,11 @@ PKG_KT="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-sources android
     echo "    )"
     echo "}"
 } > "$OUT/ChuksPackageModules.kt"
+# The capability boundary is generated from core/capabilities.json: the encoder the
+# engine calls and the decoders both hosts use, from one declaration. Regenerated on
+# every build rather than trusted, so the checked-in files cannot drift from it.
+chuks run "$SDKROOT/tools/gencaps.chuks" "$SDKROOT" >/dev/null 2>&1 || true
+
 # A capability is one thing with two implementations, so the build says when the two
 # disagree. Covers the framework's own hosts as well as every installed package. An undeclared gap is loud: it means a capability that is shipped and
 # documented but dead on one platform, whose only other symptom is a callback that
@@ -120,7 +125,7 @@ object ChuksBuild {
 }
 KTB
 
-KT_SRC="$OUT/ChuksBuild.kt $PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt $PKGDIR/ChuksModule.kt $PKGDIR/ChuksJobService.kt $PKGDIR/ChuksLocationService.kt $OUT/ChuksPackageModules.kt $PKG_KT"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
+KT_SRC="$OUT/ChuksBuild.kt $PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt $PKGDIR/ChuksModule.kt $PKGDIR/ChuksCaps.gen.kt $PKGDIR/ChuksJobService.kt $PKGDIR/ChuksLocationService.kt $OUT/ChuksPackageModules.kt $PKG_KT"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
 if [ "$PREVIEW" = "1" ]; then
     KT_SRC="$KT_SRC $PKGDIR/ConnectActivity.kt $PKGDIR/ScannerActivity.kt"   # + in-app QR scanner
     [ -f "$ZXING" ] && KT_CP="$AJAR:$ZXING"
