@@ -8,6 +8,7 @@
 //             | patch-manifest <manifest-path>               (fill the manifest in place)
 //             | mobile-sources <ios|android>                 (native sources from packages)
 //             | mobile-modules <ios|android>                 (namespace<TAB>class per module)
+//             | mobile-symmetry                              (iOS/Android capability diff)
 //             | icon | splash-image | splash-bg | splash-bg-dark   (launch assets)
 //             | background-tasks                             (task ids, one per line)
 //
@@ -98,6 +99,168 @@ function mobileSourcesStr(projdir: string, platform: string): string {
         while (j < srcs.length) {
             out = out + string(pkgs[i - 1]["__dir"]) + "/" + string(srcs[j]) + "\n"
             j = j + 1
+        }
+    }
+    return out
+}
+
+// ---- Cross-platform symmetry ------------------------------------------------
+//
+// A capability is ONE thing with two implementations, and nothing until now checked
+// that the two agreed. A package could ship `health.read` in its Swift, forget it in
+// its Kotlin, and the only symptom would be an app whose callback never fires on one
+// platform: shipped, documented and dead, with no build ever saying so.
+//
+// The check is a three-way diff between the capability names in the Swift, the names
+// in the Kotlin, and what the package DECLARES in its chuks.json:
+//
+//   "mobile": {
+//     "namespace": "health",
+//     "capabilities": {                      // optional; omit and only gaps are reported
+//       "available": ["ios", "android"],
+//       "read":      ["ios"]                 // deliberate: Android has no Health Connect
+//     }
+//   }
+//
+// An undeclared gap is loud, because it is almost always a mistake. A declared
+// difference is quiet, because someone decided it. And a capability declared for a
+// platform whose sources never mention it is loud in the other direction: the
+// declaration promised something the code does not do.
+//
+// Note what this does NOT catch, so nobody trusts it further than it goes: a
+// capability present on both sides that FAILS at runtime on one of them. @chuks/health
+// is exactly that case, its Android `read` exists only to return a message pointing at
+// Pedometer. Names are structure; behaviour needs the declaration above to say so.
+
+// Every `"<ns>.<name>"` string literal in `src`. A capability is dispatched by that
+// exact literal on both hosts (`case "health.read":` / `"health.read" ->`), so the
+// literals ARE the implemented surface. Requiring the closing quote right after the
+// name keeps error messages like "health.read is unavailable" out of the results.
+function capNamesIn(src: string, ns: string): []string {
+    var out: []string = []
+    const needle: string = "\"" + ns + "."
+    var rest: string = src
+    while (true) {
+        const at: int = rest.indexOf(needle)
+        if (at < 0) { break }
+        const after: string = rest.slice(at + needle.length, rest.length)
+        const close: int = after.indexOf("\"")
+        rest = after
+        if (close < 0) { break }
+        const name: string = after.slice(0, close)
+        if (name.length > 0 && isPlainName(name) && !contains(out, name)) { out.push(name) }
+    }
+    return out
+}
+
+// Letters, digits and underscore only: anything else is prose, not a capability name.
+function isPlainName(s: string): bool {
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        const ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_"
+        if (!ok) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The capability names a package's sources for `platform` actually implement.
+function implementedCaps(pkg: any, platform: string, ns: string): []string {
+    var out: []string = []
+    const m: any = pkg["mobile"]
+    const plat: any = m[platform]
+    if (plat == null || plat["sources"] == null) { return out }
+    const srcs: []any = plat["sources"]
+    var j: int = 0
+    while (j < srcs.length) {
+        const path: string = string(pkg["__dir"]) + "/" + string(srcs[j])
+        j = j + 1
+        if (!fs.exists(path)) { continue }
+        const found: []string = capNamesIn(fs.readFile(path), ns)
+        var k: int = 0
+        while (k < found.length) {
+            if (!contains(out, found[k])) { out.push(found[k]) }
+            k = k + 1
+        }
+    }
+    return out
+}
+
+// Does the package declare this capability for this platform? An absent
+// "capabilities" block means nothing is declared, so nothing is excused.
+function declaredFor(m: any, name: string, platform: string): bool {
+    const caps: any = m["capabilities"]
+    if (caps == null) { return false }
+    const plats: any = caps[name]
+    if (plats == null) { return false }
+    const arr: []any = plats
+    var i: int = 0
+    while (i < arr.length) {
+        if (string(arr[i]) == platform) { return true }
+        i = i + 1
+    }
+    return false
+}
+function isDeclared(m: any, name: string): bool {
+    const caps: any = m["capabilities"]
+    if (caps == null) { return false }
+    return caps[name] != null
+}
+
+// One line per finding: "<level>\t<package>\t<capability>\t<message>".
+// level is "gap" (loud) or "note" (declared, informational).
+function mobileSymmetryStr(projdir: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const pkg: any = pkgs[i]
+        i = i + 1
+        const m: any = pkg["mobile"]
+        if (m == null) { continue }
+        const ns: string = strOr(m["namespace"], "")
+        if (ns == "") { continue }
+        const name: string = strOr(pkg["name"], "(unnamed package)")
+        const ios: []string = implementedCaps(pkg, "ios", ns)
+        const android: []string = implementedCaps(pkg, "android", ns)
+        // A package that ships only one platform's sources is a different thing from
+        // one whose two halves disagree, and saying "everything is missing on Android"
+        // for an iOS-only package would be noise.
+        if (ios.length == 0 || android.length == 0) { continue }
+
+        var j: int = 0
+        while (j < ios.length) {
+            const c: string = ios[j]
+            j = j + 1
+            if (contains(android, c)) {
+                // Present on both, but the declaration says one platform. Worth a note:
+                // it is how a package records "the code is there to report it politely".
+                if (isDeclared(m, c) && !declaredFor(m, c, "android")) {
+                    out = out + "note\t" + name + "\t" + ns + "." + c + "\tdeclared iOS-only; the Kotlin implements it (expected to report unsupported)\n"
+                }
+                continue
+            }
+            if (declaredFor(m, c, "android")) {
+                out = out + "gap\t" + name + "\t" + ns + "." + c + "\tdeclared for Android, but no Kotlin source mentions it\n"
+            } else if (isDeclared(m, c)) {
+                out = out + "note\t" + name + "\t" + ns + "." + c + "\tiOS only, as declared\n"
+            } else {
+                out = out + "gap\t" + name + "\t" + ns + "." + c + "\timplemented in Swift, missing from the Kotlin\n"
+            }
+        }
+        var k: int = 0
+        while (k < android.length) {
+            const c2: string = android[k]
+            k = k + 1
+            if (contains(ios, c2)) { continue }
+            if (declaredFor(m, c2, "ios")) {
+                out = out + "gap\t" + name + "\t" + ns + "." + c2 + "\tdeclared for iOS, but no Swift source mentions it\n"
+            } else if (isDeclared(m, c2)) {
+                out = out + "note\t" + name + "\t" + ns + "." + c2 + "\tAndroid only, as declared\n"
+            } else {
+                out = out + "gap\t" + name + "\t" + ns + "." + c2 + "\timplemented in Kotlin, missing from the Swift\n"
+            }
         }
     }
     return out
@@ -393,6 +556,7 @@ function main(): void {
     else if (field == "ios-plist") { print(iosPlistStr(perms, ios)) }
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
+    else if (field == "mobile-symmetry") { print(mobileSymmetryStr(projdir)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
     else if (field == "background-location") {
         // iOS needs "location" in UIBackgroundModes, and CRASHES rather than erroring if

@@ -116,7 +116,28 @@ PKG_SRC="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-sources ios 2>
         while IFS="$(printf '\t')" read -r ns cls; do [ -n "$cls" ] && echo "    $cls.self,"; done
     echo "] }"
 } > "$OUT/ChuksPackageModules.swift"
+# A capability is one thing with two implementations, so the build says when the two
+# disagree. An undeclared gap is loud: it means a capability that is shipped and
+# documented but dead on one platform, whose only other symptom is a callback that
+# never fires. A difference the package DECLARED is counted, not listed.
+chuks_capability_check() {
+    local sym gaps notes
+    sym="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-symmetry 2>/dev/null)"
+    [ -n "$sym" ] || return 0
+    gaps="$(printf '%s\n' "$sym" | grep -c '^gap' || true)"
+    notes="$(printf '%s\n' "$sym" | grep -c '^note' || true)"
+    if [ "$gaps" -gt 0 ]; then
+        echo "   capability check: $gaps iOS/Android mismatch(es)"
+        printf '%s\n' "$sym" | awk -F'\t' '$1=="gap" { printf "      %s  %s\n", $3, $4 }'
+        echo "      A capability missing on one side is dead there. Implement it, or declare"
+        echo "      the difference in the package's chuks.json (\"capabilities\")."
+    fi
+    [ "$notes" -gt 0 ] && echo "   capability check: $notes declared platform difference(s)"
+    return 0
+}
+
 [ -n "$PKG_SRC" ] && echo "   native packages: $(echo $PKG_SRC | wc -w | tr -d ' ') source file(s)"
+chuks_capability_check
 
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" "$PKGDIR/ChuksModule.swift" "$OUT/ChuksPackageModules.swift" $PKG_SRC $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
