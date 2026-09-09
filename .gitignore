@@ -13,7 +13,9 @@
 # starter lives under template/).
 /app/
 /assets/
-/benchmarks/
+# Benchmarks: the built harnesses and their outputs are local, the source is not.
+/benchmarks/*
+!/benchmarks/boundary.chuks
 /utils/
 /build/
 /chuks_packages/
