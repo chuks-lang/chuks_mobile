@@ -908,6 +908,36 @@ dataType WebViewProps { ViewProps; url: string? }
  * WebView({ url: "https://chuks.dev", grow: 1, radius: 12 })
  * ```
  */
+/**
+ * A view kind supplied by a package.
+ *
+ * Everything on screen so far is a kind the framework knows: Text, Image, Scroll and
+ * the rest are cases in each host's `make`. A package can add one of its own, for the
+ * things a framework should not carry: a chart, a map from a vendor SDK, a camera with
+ * someone else's pipeline behind it.
+ *
+ * `kind` is namespaced like a capability (`health.ring`), and the package's chuks.json
+ * says which class implements it on each platform. `props` are the package's own, and
+ * they cross as JSON, so they arrive typed and a newline in one cannot end the mutation
+ * line. `layout` is the same prop bag every builtin view takes (w, h, grow, pad, bg,
+ * radius and the rest), applied by the framework rather than by the package.
+ *
+ * A package author's builder is a one-liner over this:
+ *
+ * ```chuks
+ * export function Ring(p: any): Node {
+ *     return nativeView("health.ring", { progress: p.getOr("progress", 0.0) }, p, [])
+ * }
+ * ```
+ *
+ * Taps need no new mechanism: wrap it in a `Pressable` the way you would any other view.
+ */
+export function nativeView(kind: string, props: any, layout: any, kids: []Node): Node {
+    const s: Style = new Style()
+    applyLayoutV(s, layout)
+    return new Node(kind, s, json.stringify(props), kids)
+}
+
 export function WebView(p: WebViewProps): Node {
     const s: Style = new Style()
     if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }

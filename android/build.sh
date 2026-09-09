@@ -84,6 +84,13 @@ PKG_KT="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-sources android
             [ -n "$cls" ] && echo "        \"$ns\" to { h: ChuksModuleHost -> $cls(h) },"
         done
     echo "    )"
+    echo "    // The view kinds those packages supply, if any."
+    echo "    fun views(): Map<String, (ChuksViewHost) -> ChuksNativeView> = mapOf("
+    chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-views android 2>/dev/null |
+        while IFS="$(printf '\t')" read -r kind cls; do
+            [ -n "$cls" ] && echo "        \"$kind\" to { h: ChuksViewHost -> $cls(h) },"
+        done
+    echo "    )"
     echo "}"
 } > "$OUT/ChuksPackageModules.kt"
 # A capability is one thing with two implementations, so the build says when the two

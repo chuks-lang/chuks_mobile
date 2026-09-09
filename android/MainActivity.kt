@@ -123,7 +123,21 @@ object N {
     }
 }
 
-class MainActivity : Activity(), ChuksModuleHost {
+// Every colour on the wire, parsed the one way.
+//
+// Style values carry a bare hex ("2F7A4F") because that is how the theme stores them, and
+// every site used to write Color.parseColor("#$vl") on that assumption. An app that wrote
+// the colour the way a person writes one, "#2F7A4F", produced "##..." and an uncaught
+// NumberFormatException that killed the process, from a style value correct by every
+// other measure. Accept both, and never throw: a misspelled colour should not be fatal.
+fun hexColorStatic(h: String, fallback: Int = android.graphics.Color.TRANSPARENT): Int {
+    val t = h.trim()
+    if (t.isEmpty()) return fallback
+    return try { android.graphics.Color.parseColor(if (t.startsWith("#")) t else "#$t") }
+    catch (e: Throwable) { android.util.Log.w("chuks", "bad colour: \"$h\""); fallback }
+}
+
+class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val views = HashMap<String, View>()
     private val ynodes = HashMap<String, Long>()
     // Incremental apply: relayout() reassigns a view's LayoutParams (which triggers a child
@@ -991,6 +1005,8 @@ class MainActivity : Activity(), ChuksModuleHost {
     private val activeStreams = mutableMapOf<String, Runnable>()
     // Real OS streams (battery/app-state/network): a teardown closure per token,
     // run on __cancel__ so the receiver/callback is unregistered.
+    // Live package-supplied views, by node id.
+    private val packageViews = HashMap<String, ChuksNativeView>()
     private val streamTeardown = mutableMapOf<String, () -> Unit>()
     private val appStateTokens = mutableSetOf<String>()   // tokens watching foreground/background
     private val orientationTokens = mutableSetOf<String>()   // tokens watching device orientation
@@ -1803,6 +1819,8 @@ class MainActivity : Activity(), ChuksModuleHost {
         } catch (_: Exception) {}
     }
 
+    private fun hexColor(h: String, fallback: Int = Color.TRANSPARENT): Int = hexColorStatic(h, fallback)
+
     private fun make(id: String, kind: String) {
         if (views.containsKey(id)) return
         val n = N.yNew()
@@ -2056,7 +2074,17 @@ class MainActivity : Activity(), ChuksModuleHost {
                 it.visibility = View.GONE                // shown when mvis=1
                 modalIds.add(id)
             }
-            else -> FrameLayout(this)
+            // A kind the framework does not know may be one a package claims. Only then
+            // do we look: an unknown kind is otherwise a plain container, exactly as
+            // before, so an app with no view packages pays one map miss.
+            else -> {
+                val factory = ChuksPackageModules.views()[kind]
+                if (factory != null) {
+                    val pv = factory(this)
+                    packageViews[id] = pv
+                    pv.view
+                } else FrameLayout(this)
+            }
         }
         views[id] = v
         ynodes[id] = n
@@ -2219,16 +2247,16 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "right" -> N.ySetF(n, 12, dpf(f))
                 "on" -> (v as? Switch)?.isChecked = (vl == "1")
                 "bg" -> if (v is Switch) {
-                    v.trackTintList = ColorStateList.valueOf(Color.parseColor("#$vl"))   // on-track = primary
+                    v.trackTintList = ColorStateList.valueOf(hexColor(vl))   // on-track = primary
                     v.thumbTintList = ColorStateList.valueOf(switchThumb[id] ?: Color.WHITE)   // white thumb, like iOS (unless thumbColor set)
-                } else bgColor[id] = Color.parseColor("#$vl")
+                } else bgColor[id] = hexColor(vl)
                 "swtc" -> if (v is Switch) {                                              // Switch thumb (knob) color
-                    val c = Color.parseColor("#$vl"); switchThumb[id] = c
+                    val c = hexColor(vl); switchThumb[id] = c
                     v.thumbTintList = ColorStateList.valueOf(c)
                 }
                 "r" -> bgRadius[id] = dpf(f)
                 "bw" -> borderW[id] = dpf(f)
-                "bc" -> borderC[id] = Color.parseColor("#$vl")
+                "bc" -> borderC[id] = hexColor(vl)
                 "bstyle" -> if (vl == "dashed" || vl == "dotted") borderStyleM[id] = vl
                 "bwt" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[0] = dpf(f)
                 "bwr" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[1] = dpf(f)
@@ -2245,7 +2273,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "bkblur" -> blurAmt[id] = vl.toIntOrNull() ?: 60
                 "bktint" -> blurTint[id] = vl
                 "grad" -> {
-                    val cs = vl.split(",").filter { it.isNotEmpty() }.map { Color.parseColor("#$it") }
+                    val cs = vl.split(",").filter { it.isNotEmpty() }.map { hexColor(it) }
                     if (cs.size >= 2) gradColors[id] = cs.toIntArray() else gradColors.remove(id)
                 }
                 "gradang" -> gradAngle[id] = vl.toIntOrNull() ?: 0
@@ -2291,7 +2319,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val st = if (vl == "contain") ImageView.ScaleType.FIT_CENTER else if (vl == "center") ImageView.ScaleType.CENTER else ImageView.ScaleType.CENTER_CROP
                     (v as? ImageView)?.scaleType = st; bgImageViews[id]?.scaleType = st
                 }
-                "fg" -> { val c = Color.parseColor("#$vl")
+                "fg" -> { val c = hexColor(vl)
                     (v as? TextView)?.setTextColor(c); (v as? EditText)?.setTextColor(c)
                     // A field's placeholder must follow its text color. The platform default
                     // hint color comes from the Activity theme, not from the field's own
@@ -2742,6 +2770,9 @@ class MainActivity : Activity(), ChuksModuleHost {
     }
 
     private fun setText(id: String, t: String) {
+        // A package view's "text" is its props, as JSON. Layout and background have
+        // already been applied by the framework; this is the package's own half.
+        packageViews[id]?.let { it.apply(ChuksArgs(t, "view", "0", this)); return }
         if (gestureIds.contains(id)) {                       // a Gesture's "text" is its continuous-recognizer list
             gestureCont[id] = t
             return
@@ -2964,7 +2995,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         var shapes: String = ""
             set(value) { field = value; invalidate() }
         private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-        private fun col(h: String) = Color.parseColor("#$h")
+        private fun col(h: String) = hexColorStatic(h)
         override fun onDraw(c: android.graphics.Canvas) {
             for (shape in shapes.split(";")) {
                 if (shape.isEmpty()) continue
@@ -3485,6 +3516,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         // Unknown id: nothing to tear down. Mounts emit R| before C| (see mountNode in
         // core/ui.chuks), so keep this a map miss rather than the O(views) sweep below.
         if (!views.containsKey(id) && !ynodes.containsKey(id)) return
+        packageViews.remove(id)?.destroy()
         views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
         ynodes[id]?.let { textNodes.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."

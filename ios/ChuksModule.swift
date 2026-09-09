@@ -113,6 +113,40 @@ public protocol ChuksModuleHost: ChuksArgFailer {
     func onCancel(_ token: String, _ teardown: @escaping () -> Void)
 }
 
+/// A view kind a package supplies.
+///
+/// The framework's own kinds (Text, Image, Scroll) are cases in the host's `make`. This
+/// is the same thing from outside: the host creates one when a node of the package's
+/// kind appears, hands it its props whenever they change, and tells it when the node
+/// goes away.
+///
+/// `apply` is called on every prop change AND when a recycled list cell is rebound to a
+/// different row, so it must set every property it cares about rather than only the ones
+/// that look different. A view that skips a property inherits the previous row's value,
+/// which is the oldest bug in this framework.
+public protocol ChuksNativeView: AnyObject {
+    /// The kind this claims, namespaced like a capability: "health.ring".
+    static var kind: String { get }
+    init(host: ChuksViewHost)
+    /// The view the host puts in the tree. Created once, in init.
+    var view: UIView { get }
+    /// The package's own props, already parsed. Layout and background are the
+    /// framework's business and have been applied already.
+    func apply(_ a: ChuksArgs)
+    /// The node left the tree. Stop timers, close sessions, release what you hold.
+    func destroy()
+}
+
+public extension ChuksNativeView {
+    func destroy() {}
+}
+
+/// What a view is handed. Deliberately small: a view draws, it does not answer requests.
+public protocol ChuksViewHost: AnyObject {
+    /// The view controller to present from, for a view that opens something.
+    var presenter: UIViewController { get }
+}
+
 /// One package's native capability. `namespace` is the part before the dot in every
 /// command it answers, so `health` claims `health.read`, `health.authorize` and the rest.
 public protocol ChuksNativeModule: AnyObject {

@@ -576,7 +576,12 @@ final class ChuksGradientView: UIView {
 
 func hexColor(_ h: String) -> UIColor {
     var v: UInt64 = 0
-    Scanner(string: h).scanHexInt64(&v)
+    // Style values carry a bare hex ("2F7A4F"), but an app may write the colour the way a
+    // person writes one. Scanner stops at the '#' and leaves 0, so a hash-prefixed colour
+    // used to come out black rather than wrong-looking; on Android the same value crashed
+    // the process. Both accept both now.
+    let t = h.hasPrefix("#") ? String(h.dropFirst()) : h
+    Scanner(string: t).scanHexInt64(&v)
     return UIColor(red: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
                    blue: CGFloat(v & 0xff) / 255, alpha: 1)
 }
@@ -934,7 +939,7 @@ func chuksWakeThunk() {
     }
 }
 
-final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost {
+final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost, ChuksViewHost {
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
@@ -2425,6 +2430,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var accelTokens = Set<String>()
     var gyroTokens = Set<String>()
     var magTokens = Set<String>()
+    // View kinds packages supply: the types by kind, and the live instances by node id.
+    lazy var packageViewTypes: [String: ChuksNativeView.Type] = {
+        var m: [String: ChuksNativeView.Type] = [:]
+        for t in chuksPackageViews() { m[t.kind] = t }
+        return m
+    }()
+    var packageViews: [String: ChuksNativeView] = [:]
+
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
     var urlTokens = Set<String>()             // linking.onurl subscribers
     var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
@@ -3024,6 +3037,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func setText(_ id: String, _ t: String) {
+        // A package view's "text" is its props, as JSON. Layout and background have
+        // already been applied by the framework; this is the package's own half.
+        if let pv = packageViews[id] {
+            pv.apply(ChuksArgs(t, type(of: pv).kind, "0", self))
+            return
+        }
         if gestureIds.contains(id) {   // a Gesture's "text" is its continuous-recognizer list ("pan,pinch,rotate")
             attachContinuousGestures(id, t)
             return
@@ -3312,7 +3331,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let a = UIView(); a.isUserInteractionEnabled = false   // invisible placeholder; the OS alert shows on avis=1
             alertIds.insert(id); v = a
         default:
-            v = HitSlopView()   // a plain container that can also carry a Pressable hitSlop
+            // A kind the framework does not know may be one a package claims. Only then
+            // do we look: an unknown kind is otherwise a plain container, exactly as
+            // before, so an app with no view packages pays one dictionary miss.
+            if let t = packageViewTypes[kind] {
+                let pv = t.init(host: self)
+                packageViews[id] = pv
+                v = pv.view
+            } else {
+                v = HitSlopView()   // a plain container that can also carry a Pressable hitSlop
+            }
         }
         v.translatesAutoresizingMaskIntoConstraints = true   // we drive .frame directly
         views[id] = v
@@ -3974,6 +4002,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // must not inherit a stale subtree at the same path id), so this is the hot case
         // and must stay a dictionary miss -- never the O(views) prefix sweep below.
         if views[id] == nil && ynodes[id] == nil { return }
+        if let pv = packageViews.removeValue(forKey: id) { pv.destroy() }
         if let v = views[id] {
             for g in v.gestureRecognizers ?? [] {
                 if let t = g as? UITapGestureRecognizer { taps[t] = nil }

@@ -8,6 +8,7 @@
 //             | patch-manifest <manifest-path>               (fill the manifest in place)
 //             | mobile-sources <ios|android>                 (native sources from packages)
 //             | mobile-modules <ios|android>                 (namespace<TAB>class per module)
+//             | mobile-views <ios|android>                   (kind<TAB>class per package view)
 //             | mobile-symmetry [sdkroot]                    (iOS/Android capability diff)
 //             | icon | splash-image | splash-bg | splash-bg-dark   (launch assets)
 //             | background-tasks                             (task ids, one per line)
@@ -208,6 +209,17 @@ function isDeclared(m: any, name: string): bool {
     return caps[name] != null
 }
 
+// A VIEW kind is not a capability. It is dispatched by the host's view registry from the
+// package's chuks.json, not by a name-matched branch in each half, so only one side
+// mentions the string at all: the iOS class declares `static var kind`, the Kotlin class
+// is named in the manifest. Comparing them as capabilities reports a mismatch that is
+// not one, which is exactly what happened the first time a package shipped a view.
+function isViewKind(m: any, name: string): bool {
+    const views: any = m["views"]
+    if (views == null) { return false }
+    return views[name] != null
+}
+
 // ---- The framework's own two halves -----------------------------------------
 //
 // Same check, pointed at the hosts themselves. It finds nothing today (89 names on
@@ -363,6 +375,7 @@ function mobileSymmetryStr(projdir: string): string {
         while (j < ios.length) {
             const c: string = ios[j]
             j = j + 1
+            if (isViewKind(m, c)) { continue }
             if (contains(android, c)) {
                 // Present on both, but the declaration says one platform. Worth a note:
                 // it is how a package records "the code is there to report it politely".
@@ -383,6 +396,7 @@ function mobileSymmetryStr(projdir: string): string {
         while (k < android.length) {
             const c2: string = android[k]
             k = k + 1
+            if (isViewKind(m, c2)) { continue }
             if (contains(ios, c2)) { continue }
             if (declaredFor(m, c2, "ios")) {
                 out = out + "gap\t" + name + "\t" + ns + "." + c2 + "\tdeclared for iOS, but no Swift source mentions it\n"
@@ -411,6 +425,40 @@ function mobileModulesStr(projdir: string, platform: string): string {
         const cls: string = strOr(m["module"], "")
         if (ns == "" || cls == "") { continue }
         out = out + ns + "\t" + cls + "\n"
+    }
+    return out
+}
+
+// `kind<TAB>ClassName` per view a package supplies, for the generated registry. A view
+// is declared the way a module is, in the package's chuks.json:
+//
+//   "mobile": {
+//     "namespace": "health",
+//     "views": { "ring": "ChuksHealthRingView" }
+//   }
+//
+// The kind an app writes is namespace-qualified ("health.ring"), so two packages can
+// both call a view "chart" without colliding. Only packages that ship sources for THIS
+// platform are listed, for the same reason modules are.
+function mobileViewsStr(projdir: string, platform: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        i = i + 1
+        if (m == null || m[platform] == null) { continue }
+        const ns: string = strOr(m["namespace"], "")
+        const views: any = m["views"]
+        if (ns == "" || views == null) { continue }
+        const names: []string = views.keys()
+        var j: int = 0
+        while (j < names.length) {
+            const name: string = names[j]
+            j = j + 1
+            const cls: string = string(views[name])
+            if (cls != "") { out = out + ns + "." + name + "\t" + cls + "\n" }
+        }
     }
     return out
 }
@@ -686,6 +734,7 @@ function main(): void {
     else if (field == "ios-plist") { print(iosPlistStr(perms, ios)) }
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
+    else if (field == "mobile-views") { print(mobileViewsStr(projdir, a[5])) }
     else if (field == "mobile-symmetry") { print(coreSymmetryStr(a.length > 5 ? a[5] : "") + mobileSymmetryStr(projdir)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
     else if (field == "background-location") {

@@ -108,6 +108,29 @@ interface ChuksModuleHost : ChuksArgFailer {
     fun requestPermission(token: String, permissions: Array<String>)
 }
 
+/// A view kind a package supplies. The Android half of the protocol in
+/// ios/ChuksModule.swift, and deliberately the same shape.
+///
+/// `apply` is called on every prop change AND when a recycled list cell is rebound to a
+/// different row, so it must set every property it cares about rather than only the ones
+/// that look different. A view that skips a property inherits the previous row's value,
+/// which is the oldest bug in this framework.
+interface ChuksNativeView {
+    /** The view the host puts in the tree. Created once, with the instance. */
+    val view: android.view.View
+    /** The package's own props, already parsed. Layout and background are the
+     *  framework's business and have been applied already. */
+    fun apply(a: ChuksArgs)
+    /** The node left the tree. Stop timers, close sessions, release what you hold. */
+    fun destroy() {}
+}
+
+/// What a view is handed. Deliberately small: a view draws, it does not answer requests.
+interface ChuksViewHost {
+    /** The Activity, for a view that needs a Context or opens something. */
+    val activity: Activity
+}
+
 /// One package's native capability. The namespace it claims is declared in the package's
 /// chuks.json and baked into the generated registry, not read from here, so the build can
 /// know it without loading the class.

@@ -115,6 +115,11 @@ PKG_SRC="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-sources ios 2>
     chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-modules ios 2>/dev/null |
         while IFS="$(printf '\t')" read -r ns cls; do [ -n "$cls" ] && echo "    $cls.self,"; done
     echo "] }"
+    echo "// The view kinds those packages supply, if any."
+    echo "func chuksPackageViews() -> [ChuksNativeView.Type] { ["
+    chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-views ios 2>/dev/null |
+        while IFS="$(printf '\t')" read -r kind cls; do [ -n "$cls" ] && echo "    $cls.self,"; done
+    echo "] }"
 } > "$OUT/ChuksPackageModules.swift"
 # A capability is one thing with two implementations, so the build says when the two
 # disagree. Covers the framework's own hosts as well as every installed package. An undeclared gap is loud: it means a capability that is shipped and
