@@ -19,23 +19,29 @@
 // Capabilities screen; the report is shown there and written to bench.txt, which is how
 // a device with no console gives it back.
 //
-// WHAT IT FOUND, 9 September 2026, and the shape is the point rather than the digits:
+// WHAT IT FOUND, 9 September 2026. The phone is the column that counts; the other two
+// are there because they agree, which is how you know the harness is measuring the code
+// rather than the machine.
 //
-//                        Android emulator   iOS simulator
-//   capability encode        310ns/call        160ns/call
-//   first render (60 rows)   11ms, 1384 muts   10ms, 1384 muts
-//   tree build               9890us/frame      8870us/frame
-//   diff + drain              180us/frame       176us/frame
+//                        iPhone 12 Pro    iOS simulator   Android emulator
+//   capability encode       280ns/call      160ns/call      310ns/call
+//   first render (60 rows)  17ms            10ms            11ms          (1384 mutations, 28KB)
+//   tree build              13670us/frame   8870us/frame    9890us/frame
+//   diff + drain              250us/frame    176us/frame     180us/frame  (2 mutations, 44B)
 //
-// The stream is not the cost. A frame that changes one row diffs and serializes in
-// under 200 microseconds and puts 44 bytes on the wire, which is around 1% of a 60Hz
-// budget. What costs is BUILDING the tree the screen function returns: 60 rows of nodes
-// is ~9ms, fifty times the diff. So the thing to optimise is not the reconciler or the
-// encoding but how often an app rebuilds a subtree it did not change, which is what
-// Comp and the List windowing already exist to avoid.
+// The stream is not the cost. On the phone, a frame that changes one row diffs and
+// serializes in 250 microseconds and puts 44 BYTES on the wire: one and a half percent
+// of a 60Hz budget.
 //
-// Both figures come from a simulator and an emulator, not a phone, and the numbers move
-// with the hardware. The RATIO is what to trust.
+// What costs is BUILDING the tree the screen function returns. Sixty rows of nodes is
+// 13.7ms on the phone, fifty-five times the diff, and 82% of a frame on its own. So the
+// thing to optimise is how often an app rebuilds a subtree it did not change, which is
+// exactly what Comp and the List windowing exist to avoid, and NOT the reconciler, the
+// stream or the encoding.
+//
+// For scale: Expo published 100,000 no-op calls across their boundary in 9ms. Ours is
+// 100,000 encodes in 28ms, carrying two JSON arguments where a no-op carries none. Same
+// order, doing more work: not a race won or lost.
 import { Reconciler, Node, Column, Row, Text, Style } from "../core/ui.chuks";
 import { time } from "std/time";
 
