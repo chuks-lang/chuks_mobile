@@ -929,13 +929,25 @@ dataType WebViewProps { ViewProps; url: string? }
  * line. `layout` is the same prop bag every builtin view takes (w, h, grow, pad, bg,
  * radius and the rest), applied by the framework rather than by the package.
  *
- * A package author's builder is a one-liner over this:
+ * A package author's builder is a thin wrapper over this, with a declared prop type so
+ * the call site is checked rather than an `any` that swallows a typo:
  *
  * ```chuks
- * export function Ring(p: any): Node {
- *     return nativeView("health.ring", { progress: p.getOr("progress", 0.0) }, p, [])
+ * export dataType RingProps {
+ *     progress: float?; color: string?;
+ *     w: int?; h: int?; grow: int?; pad: int?; bg: string?; radius: int?; tw: string?;
+ * }
+ *
+ * export function Ring(p: RingProps): Node {
+ *     return nativeView("health.ring", {
+ *         progress: p.progress ?? 0.0,
+ *         color:    p.color ?? "#2F7A4F",
+ *     }, p, [])
  * }
  * ```
+ *
+ * The layout half of that type is listed rather than inherited because a dataType cannot
+ * embed a type from another module yet, so `ViewProps` is out of reach from a package.
  *
  * Taps need no new mechanism: wrap it in a `Pressable` the way you would any other view.
  */
