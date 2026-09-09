@@ -1,0 +1,60 @@
+// Real memoizing reconciler over a View tree (not a flat loop).
+class View {
+    var kind: string
+    var text: string
+    var kids: []View
+    constructor(kind: string, text: string, kids: []View) { this.kind = kind; this.text = text; this.kids = kids }
+}
+// Memoized Row component: returns the SAME cached View node when its value is
+// unchanged (React.memo referential bailout); allocates a new node when changed.
+class Row {
+    var id: int
+    var last: int
+    var cached: View
+    constructor(id: int) {
+        this.id = id
+        this.last = 0
+        this.cached = new View("Text", "Row " + string(id) + ": 0", [])
+    }
+    public render(value: int): View {
+        if (value == this.last) { return this.cached }
+        this.last = value
+        this.cached = new View("Text", "Row " + string(this.id) + ": " + string(value), [])
+        return this.cached
+    }
+}
+var N: int = 2000
+var ROWS: []Row = []
+var VALUES: []int = []
+var MUT: int = 0
+
+function renderList(): View {
+    const kids: []View = []
+    for (var i: int = 0; i < N; i = i + 1) { kids.push(ROWS[i].render(VALUES[i])) }
+    return new View("VStack", "", kids)
+}
+// Reconcile prev vs next; bail when a child reference is identical (memoized).
+function reconcile(prev: View, next: View): void {
+    if (prev == next) { return }
+    if (prev.text != next.text) { MUT = MUT + 1 }
+    const n: int = next.kids.length
+    for (var i: int = 0; i < n; i = i + 1) {
+        if (i < prev.kids.length) { reconcile(prev.kids[i], next.kids[i]) }
+        else { MUT = MUT + 1 }
+    }
+}
+function main(): void {
+    const STRIDE: int = 20
+    const FRAMES: int = 10000
+    for (var i: int = 0; i < N; i = i + 1) { ROWS.push(new Row(i)); VALUES.push(0) }
+    var prev: View = renderList()
+    for (var f: int = 0; f < FRAMES; f = f + 1) {
+        var i: int = f % STRIDE
+        while (i < N) { VALUES[i] = VALUES[i] + 1; i = i + STRIDE }
+        const next: View = renderList()
+        reconcile(prev, next)
+        prev = next
+    }
+    println(MUT)
+}
+main()

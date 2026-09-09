@@ -13,9 +13,18 @@
 # starter lives under template/).
 /app/
 /assets/
-# Benchmarks: the built harnesses and their outputs are local, the source is not.
+# Benchmarks: the built harnesses and their outputs are local, the sources are not.
+# The engine comparison against Hermes is the answer to "are we faster than React
+# Native", so it belongs in the repo rather than on one machine.
 /benchmarks/*
 !/benchmarks/boundary.chuks
+!/benchmarks/bench
+/benchmarks/bench/*
+!/benchmarks/bench/recon
+/benchmarks/bench/recon/*
+!/benchmarks/bench/recon/*.chuks
+!/benchmarks/bench/recon/*.js
+!/benchmarks/bench/recon/run.sh
 /utils/
 /build/
 /chuks_packages/
