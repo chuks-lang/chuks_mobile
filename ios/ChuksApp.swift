@@ -919,48 +919,6 @@ let notifDelegate = NotifDelegate()
 // @convention(c): no captures, so it reaches the live controller through a file
 // global and hops to the main thread. Coalesced: a burst of messages schedules at
 // most one pending main-thread pump.
-// The capability wire format, host side. The engine's core/wire.chuks packs a
-// command's arguments; this unpacks them. Escapes: \\ for a backslash, \n and \r for
-// the line endings that would end the mutation line early, and \; as the field
-// separator. A single left-to-right scan, because search-and-replace would corrupt a
-// field ending in a real backslash.
-//
-// Changing this means changing three files. That is the cost of a hand-written
-// boundary, and the reason the boundary should eventually be generated.
-func chuksUnpackArgs(_ packed: String) -> [String] {
-    if packed.isEmpty { return [] }
-    var out: [String] = []
-    var cur = ""
-    var i = packed.startIndex
-    while i < packed.endIndex {
-        let c = packed[i]
-        if c == "\\" {
-            let n = packed.index(after: i)
-            if n < packed.endIndex {
-                let e = packed[n]
-                i = packed.index(after: n)
-                switch e {
-                case "\\": cur.append("\\")
-                case "n":  cur.append("\n")
-                case "r":  cur.append("\r")
-                case ";":  out.append(cur); cur = ""
-                default:   cur.append(e)      // an escape nobody defined: keep the character
-                }
-                continue
-            }
-        }
-        cur.append(c)
-        i = packed.index(after: i)
-    }
-    out.append(cur)
-    return out
-}
-
-// Field `i`, or `fallback` when the command did not carry that many.
-func chuksArg(_ fields: [String], _ i: Int, _ fallback: String = "") -> String {
-    return i >= 0 && i < fields.count ? fields[i] : fallback
-}
-
 private weak var gChuksWakeVC: CardsVC?
 private let gWakeLock = NSLock()
 private var gWakeScheduled = false
@@ -2425,13 +2383,17 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 // apply() finishes (main.async), so a sync capability's resolve() doesn't
                 // re-enter apply() mid-parse. args may contain '|'.
                 let token = f[1], cap = f[2]
-                let packed = f.count >= 4 ? f[3...].joined(separator: "|") : ""
-                // Unpacked once, here, rather than by each capability inventing its own
-                // separator. `args` is the first field, which is all a one-argument
-                // capability ever wanted.
-                let fields = chuksUnpackArgs(packed)
-                let args = chuksArg(fields, 0)
-                DispatchQueue.main.async { [weak self] in self?.handleCommand(token, cap, args, fields) }
+                // The arguments are JSON, so a raw pipe inside them is safe here: they
+                // are everything after the third one, joined back together.
+                let raw = f.count >= 4 ? f[3...].joined(separator: "|") : ""
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    // Parsed once, centrally, rather than by each capability. `args` is
+                    // the single argument as a string, which is all a one-argument
+                    // capability ever wanted; `a` reads the rest by name.
+                    let a = ChuksArgs(raw, cap, token, self)
+                    self.handleCommand(token, cap, a.str, a)
+                }
             default: break
             }
         }
@@ -2510,7 +2472,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return "\(steps),\(dist),\(pace),\(cadence),\(up),\(down)"
     }
 
-    func handleCommand(_ token: String, _ cap: String, _ args: String, _ fields: [String] = []) {
+    func handleCommand(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) {
         switch cap {
         case "__cancel__":
             activeStreams[token]?.invalidate(); activeStreams[token] = nil
@@ -2654,8 +2616,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             streamTeardown[token] = { [weak self] in self?.pedometer.stopUpdates() }
         case "pedometer.query":
             guard CMPedometer.isStepCountingAvailable() else { fail(token, "step counting unavailable"); break }
-            guard let a = ChuksCaps.pedometerQuery(fields, token, self) else { break }
-            let from = Date(timeIntervalSinceNow: -Double(a.secondsAgo))
+            guard let secs = a.num() else { break }
+            let from = Date(timeIntervalSinceNow: -secs)
             pedometer.queryPedometerData(from: from, to: Date()) { [weak self] data, err in
                 DispatchQueue.main.async {
                     if let e = err { self?.fail(token, e.localizedDescription); return }
@@ -2710,8 +2672,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 } catch { DispatchQueue.main.async { self.fail(token, "read failed") } }
             }
         case "calendar.upcoming":
-            guard let a = ChuksCaps.calendarUpcoming(fields, token, self) else { break }
-            let days = Double(a.days)
+            guard let days = a.num() else { break }
             let store = EKEventStore()
             let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
             let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map {
@@ -2719,12 +2680,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
             resolve(token, lines.joined(separator: "\n"))
         case "calendar.create":
-            guard let a = ChuksCaps.calendarCreate(fields, token, self) else { break }
-            let startMin = Double(a.startInMin), durMin = Double(a.durationMin)
+            guard let startMin = a.num("startInMin"), let durMin = a.num("durationMin") else { break }
             let store = EKEventStore()
             guard let cal = store.defaultCalendarForNewEvents else { fail(token, "no writable calendar"); break }
             let ev = EKEvent(eventStore: store)
-            ev.title = a.title; ev.calendar = cal
+            ev.title = a.s("title"); ev.calendar = cal
             ev.startDate = Date(timeIntervalSinceNow: startMin * 60)
             ev.endDate = Date(timeIntervalSinceNow: startMin * 60 + durMin * 60)
             do { try store.save(ev, span: .thisEvent); resolve(token, ev.eventIdentifier ?? "ok") }
@@ -2738,12 +2698,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             streamTeardown[token] = { [weak self] in self?.bgTokens[args] = nil }
         case "bg.result":
             // name, then "1" or "0": the handler finished, so the OS can be told.
-            if let a = ChuksCaps.bgResult(fields, token, self) { finishBackgroundTask(a.name, success: a.ok) }
+            finishBackgroundTask(a.s("name"), success: a.bool("ok"))
         case "bg.periodic", "bg.once", "bg.processing":
             // Same three arguments whichever of the three schedulers this is.
-            guard let sched = ChuksCaps.bgPeriodic(fields, token, self) else { break }
+            guard let secs = a.int("seconds") else { break }
             var cons: [String: String] = [:]
-            for pair in sched.constraints.components(separatedBy: ";") where !pair.isEmpty {
+            for pair in a.s("constraints").components(separatedBy: ";") where !pair.isEmpty {
                 let kv = pair.components(separatedBy: "=")
                 if kv.count == 2 { cons[kv[0]] = kv[1] }
             }
@@ -2751,7 +2711,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // run, which is what BGTaskScheduler expects you to do anyway. `periodic`
             // therefore means the same thing here, it is just re-armed rather than
             // repeating on its own.
-            scheduleBackgroundTask(sched.name, sched.seconds, cap == "bg.processing" ? "processing" : "refresh", cons)
+            scheduleBackgroundTask(a.s("name"), secs, cap == "bg.processing" ? "processing" : "refresh", cons)
         case "bg.cancel":
             BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: args)
         case "bg.cancelAll":
@@ -2805,15 +2765,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "ble.disconnect":
             ble?.disconnect(args)
         case "ble.read":
-            guard let a = ChuksCaps.bleRead(fields, token, self) else { break }
-            ensureBle(); ble!.read(a.deviceId, a.service, a.characteristic, ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
+            ensureBle(); ble!.read(a.s("deviceId"), a.s("service"), a.s("characteristic"), ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
         case "ble.write":
-            guard let a = ChuksCaps.bleWrite(fields, token, self) else { break }
-            ensureBle(); ble!.write(a.deviceId, a.service, a.characteristic, a.valueHex, ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
+            ensureBle(); ble!.write(a.s("deviceId"), a.s("service"), a.s("characteristic"), a.s("valueHex"), ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
         case "ble.subscribe":
-            guard let a = ChuksCaps.bleSubscribe(fields, token, self) else { break }
             ensureBle()
-            ble!.subscribe(a.deviceId, a.service, a.characteristic, token: token, err: { [weak self] m in self?.fail(token, m) })
+            ble!.subscribe(a.s("deviceId"), a.s("service"), a.s("characteristic"), token: token, err: { [weak self] m in self?.fail(token, m) })
             streamTeardown[token] = { [weak self] in self?.ble?.unsubscribe(token) }
         case "nfc.available":
             ensureNfc(); resolve(token, nfc!.available ? "1" : "0")
@@ -2839,9 +2796,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "fs.write":
             // The content arrives as an ordinary field: the wire packs arguments, so a
             // multi-line body needs no encoding of its own any more.
-            if let a = ChuksCaps.fsWrite(fields, token, self) {
-                try? a.content.write(to: appFile(a.name), atomically: true, encoding: .utf8)
-            }
+            try? a.s("content").write(to: appFile(a.s("name")), atomically: true, encoding: .utf8)
         case "fs.read":
             if let s = try? String(contentsOf: appFile(args), encoding: .utf8) { resolve(token, s) }
             else { fail(token, "no such file: \(args)") }
@@ -2850,14 +2805,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             resolve(token, names.joined(separator: "\n"))
         case "fs.delete": try? FileManager.default.removeItem(at: appFile(args))
         case "secure.set":
-            if let a = ChuksCaps.secureSet(fields, token, self) { keychainSet(a.key, a.value) }
+            keychainSet(a.s("key"), a.s("value"))
         case "secure.get":
             if let v = keychainGet(args) { resolve(token, v) } else { fail(token, "no such key: \(args)") }
         case "secure.delete": keychainDelete(args)
         case "notif.notify":
             let content = UNMutableNotificationContent()
-            guard let a = ChuksCaps.notifNotify(fields, token, self) else { break }
-            content.title = a.title; content.body = a.body
+            content.title = a.s("title"); content.body = a.s("body")
             content.sound = .default
             UNUserNotificationCenter.current().add(UNNotificationRequest(
                 identifier: UUID().uuidString, content: content,
@@ -2920,10 +2874,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "share.text": presentShare([args])
         case "share.url": presentShare([URL(string: args) ?? args])
         case "haptics.impact": fireHaptic(args)
-        case "haptics.vibrate": if let a = ChuksCaps.hapticsVibrate(fields, token, self) { hapticBuzz(a.ms) }
+        case "haptics.vibrate": if let ms = a.int() { hapticBuzz(ms) }
         case "haptics.pattern": hapticPattern(args)
         case "torch.set": setTorch(args == "1")
-        case "brightness.set": if let a = ChuksCaps.brightnessSet(fields, token, self) { UIScreen.main.brightness = CGFloat(max(0, min(1, a.level))) }
+        case "brightness.set": if let v = a.num() { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
         case "orientation.watch":
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -2943,7 +2897,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         default:
             // Not a framework capability. An installed package may claim this
             // namespace; if none does, the command is unknown, exactly as before.
-            _ = packageModules.handle(token, cap, args, fields)
+            _ = packageModules.handle(token, cap, args, a)
         }
     }
 

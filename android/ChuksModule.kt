@@ -12,25 +12,81 @@ import android.app.Activity
 
 /// What a module is handed: two answer channels and the Activity, which is what an
 /// Android capability needs for permissions, system services and intents.
-/// How a generated argument decoder reports an argument it could not use. Split out from
-/// the module host so the generated code depends on the smallest possible thing.
+/// A command's arguments, already parsed.
+///
+/// They cross as JSON, so they arrive as themselves: a string is a string, a number is a
+/// number, and several arguments are an object that names them. Reading one by name is
+/// the whole API, and a value that is not what the capability expects is reported by name
+/// rather than defaulted to zero.
+class ChuksArgs(raw: String, private val cap: String, private val token: String,
+                private val host: ChuksArgFailer?) {
+    private var obj: org.json.JSONObject? = null
+    private var scalar: Any? = null
+
+    /** The single argument as a string, which is what a one-argument capability wants. */
+    val str: String
+
+    init {
+        var text = ""
+        if (raw.isNotEmpty()) {
+            try {
+                when (val v = org.json.JSONTokener(raw).nextValue()) {
+                    is org.json.JSONObject -> obj = v
+                    else -> { scalar = v; text = textOf(v) }
+                }
+            } catch (e: Throwable) { /* not JSON: no arguments */ }
+        }
+        str = text
+    }
+
+    private fun textOf(v: Any?): String = when (v) {
+        null -> ""
+        is Boolean -> if (v) "1" else "0"
+        is Double -> if (v == Math.floor(v) && !v.isInfinite()) v.toLong().toString() else v.toString()
+        else -> v.toString()
+    }
+
+    private fun raw(key: String): Any? =
+        if (key.isEmpty()) scalar else obj?.opt(key)?.takeIf { it != org.json.JSONObject.NULL }
+
+    /** A named string argument. */
+    fun s(key: String, fallback: String = ""): String {
+        val v = raw(key) ?: return fallback
+        return textOf(v)
+    }
+    /** A named number, or the single argument when `key` is empty. Null, and a message
+     *  naming the argument, when it is not a number. */
+    fun num(key: String = ""): Double? {
+        val v = raw(key)
+        if (v is Number) return v.toDouble()
+        if (v is String) v.toDoubleOrNull()?.let { return it }
+        host?.argBad(token, cap, if (key.isEmpty()) "argument" else key, "number",
+                     if (v == null) "(missing)" else textOf(v))
+        return null
+    }
+    fun int(key: String = ""): Int? = num(key)?.toInt()
+    /** A named boolean, or the single argument. A missing one is false, since every
+     *  boolean argument here means "turn this on", and absent means do not. */
+    fun bool(key: String = ""): Boolean = when (val v = raw(key)) {
+        is Boolean -> v
+        is Number -> v.toInt() != 0
+        is String -> v == "1" || v == "true"
+        else -> false
+    }
+    /** Whether the command carried this argument at all. */
+    fun has(key: String): Boolean = raw(key) != null
+}
+
+/// How a capability reports an argument it could not use.
 interface ChuksArgFailer {
     /** Fail the token. Reaches Chuks through the error channel, not as a value. */
     fun fail(token: String, message: String)
 
-    /** The command carried fewer arguments than the capability takes. Almost always a
-     *  call site and a decoder that have drifted apart, which is what generating both
-     *  from one declaration is meant to prevent. */
-    fun argMissing(token: String, cap: String, want: Int, got: Int) {
-        report(token, "$cap takes $want argument(s), got $got")
-    }
-    /** An argument arrived that is not the type the capability declared. */
+    /** An argument arrived that is not the type the capability expects. */
     fun argBad(token: String, cap: String, name: String, type: String, raw: String) {
-        report(token, "$cap: $name should be ${if (type == "int") "an" else "a"} $type, got \"$raw\"")
-    }
-    /** A fire-and-forget command has no token to fail, so it says so in the log rather
-     *  than vanishing. */
-    private fun report(token: String, message: String) {
+        val message = "$cap: $name should be a $type, got \"$raw\""
+        // A fire-and-forget command has no token to fail, so it says so in the log
+        // rather than vanishing.
         if (token == "0") android.util.Log.w("chuks", message) else fail(token, message)
     }
 }
@@ -59,11 +115,9 @@ interface ChuksNativeModule {
     /** Return true when the command was handled. False leaves it unanswered, which is
      *  what an unknown name inside a claimed namespace should do.
      *
-     *  `args` is the first argument and `fields` is all of them, already unpacked from
-     *  the wire format. A one-argument capability reads `args` and ignores the rest; a
-     *  capability taking several reads `fields`, and never has to pick a separator or
-     *  worry about what a user might type into one. */
-    fun handle(token: String, cap: String, args: String, fields: List<String>): Boolean
+     *  `args` is the single argument as a string, which is all a one-argument
+     *  capability wants; `a` reads several of them by name, already parsed and typed. */
+    fun handle(token: String, cap: String, args: String, a: ChuksArgs): Boolean
 }
 
 /// Routes a command to whichever installed package claims its namespace.
@@ -76,10 +130,10 @@ class ChuksModuleRegistry(private val host: ChuksModuleHost) {
     private val factories = ChuksPackageModules.factories()
 
     /** True when a package answered; false means no package claims this namespace. */
-    fun handle(token: String, cap: String, args: String, fields: List<String>): Boolean {
+    fun handle(token: String, cap: String, args: String, a: ChuksArgs): Boolean {
         val ns = cap.substringBefore('.', "")
         if (ns.isEmpty()) return false
         val m = live[ns] ?: factories[ns]?.invoke(host)?.also { live[ns] = it } ?: return false
-        return m.handle(token, cap, args, fields)
+        return m.handle(token, cap, args, a)
     }
 }

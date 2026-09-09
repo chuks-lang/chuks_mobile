@@ -15,27 +15,87 @@
 import UIKit
 import Foundation
 
-/// How a generated argument decoder reports an argument it could not use. Split out
-/// from the module host so the generated code depends on the smallest possible thing.
+/// A command's arguments, already parsed.
+///
+/// They cross as JSON, so they arrive as themselves: a string is a string, a number is a
+/// number, and several arguments are an object that names them. Reading one by name is
+/// the whole API, and a value that is not what the capability expects is reported by
+/// name rather than defaulted to zero, which is the difference between a capability that
+/// says what is wrong and one that quietly acts on nothing.
+public final class ChuksArgs {
+    private let obj: [String: Any]
+    private let scalar: Any?
+    private let cap: String
+    private let token: String
+    private weak var host: AnyObject?
+
+    /// The single argument as a string, which is what a one-argument capability wants.
+    public let str: String
+
+    public init(_ raw: String, _ cap: String, _ token: String, _ host: ChuksArgFailer?) {
+        self.cap = cap; self.token = token; self.host = host
+        var o: [String: Any] = [:]
+        var sc: Any? = nil
+        var text = ""
+        if !raw.isEmpty, let d = raw.data(using: .utf8),
+           let v = try? JSONSerialization.jsonObject(with: d, options: [.fragmentsAllowed]) {
+            if let dict = v as? [String: Any] { o = dict } else { sc = v; text = ChuksArgs.text(v) }
+        }
+        self.obj = o; self.scalar = sc; self.str = text
+    }
+
+    private static func text(_ v: Any) -> String {
+        if let s = v as? String { return s }
+        if let b = v as? Bool { return b ? "1" : "0" }
+        if let n = v as? NSNumber { return n.stringValue }
+        return ""
+    }
+
+    /// A named string argument.
+    public func s(_ key: String, _ fallback: String = "") -> String {
+        if let v = obj[key] as? String { return v }
+        if let v = obj[key] { return ChuksArgs.text(v) }
+        return fallback
+    }
+    /// A named number, or the single argument when `key` is empty. Nil, and a message
+    /// naming the argument, when it is not a number.
+    public func num(_ key: String = "") -> Double? {
+        let v: Any? = key.isEmpty ? scalar : obj[key]
+        if let n = v as? NSNumber { return n.doubleValue }
+        if let s = v as? String, let d = Double(s) { return d }
+        (host as? ChuksArgFailer)?.argBad(token, cap, key.isEmpty ? "argument" : key, "number",
+                                          v == nil ? "(missing)" : ChuksArgs.text(v!))
+        return nil
+    }
+    public func int(_ key: String = "") -> Int? {
+        guard let d = num(key) else { return nil }
+        return Int(d)
+    }
+    /// A named boolean, or the single argument. A missing one is false, since every
+    /// boolean argument here means "turn this on", and absent means do not.
+    public func bool(_ key: String = "") -> Bool {
+        let v: Any? = key.isEmpty ? scalar : obj[key]
+        if let b = v as? Bool { return b }
+        if let n = v as? NSNumber { return n.intValue != 0 }
+        if let s = v as? String { return s == "1" || s == "true" }
+        return false
+    }
+    /// Whether the command carried this argument at all.
+    public func has(_ key: String) -> Bool { obj[key] != nil }
+}
+
+/// How a capability reports an argument it could not use.
 public protocol ChuksArgFailer: AnyObject {
     /// Fail the token. Reaches Chuks through the error channel, not as a value.
     func fail(_ token: String, _ message: String)
 }
 
 public extension ChuksArgFailer {
-    /// The command carried fewer arguments than the capability takes. Almost always a
-    /// call site and a decoder that have drifted apart, which is what generating both
-    /// from one declaration is meant to prevent.
-    func argMissing(_ token: String, _ cap: String, _ want: Int, _ got: Int) {
-        report(token, "\(cap) takes \(want) argument(s), got \(got)")
-    }
-    /// An argument arrived that is not the type the capability declared.
+    /// An argument arrived that is not the type the capability expects.
     func argBad(_ token: String, _ cap: String, _ name: String, _ type: String, _ raw: String) {
-        report(token, "\(cap): \(name) should be \(type == "int" ? "an" : "a") \(type), got \"\(raw)\"")
-    }
-    /// A fire-and-forget command has no token to fail, so it says so in the log rather
-    /// than vanishing.
-    private func report(_ token: String, _ message: String) {
+        let message = "\(cap): \(name) should be a \(type), got \"\(raw)\""
+        // A fire-and-forget command has no token to fail, so it says so in the log
+        // rather than vanishing.
         if token == "0" { NSLog("chuks: %@", message) } else { fail(token, message) }
     }
 }
@@ -61,11 +121,9 @@ public protocol ChuksNativeModule: AnyObject {
     /// Return true when the command was handled. False leaves it unanswered, which is
     /// what an unknown name inside a claimed namespace should do.
     ///
-    /// `args` is the first argument and `fields` is all of them, already unpacked from
-    /// the wire format. A one-argument capability reads `args` and ignores the rest; a
-    /// capability taking several reads `fields`, and never has to pick a separator or
-    /// worry about what a user might type into one.
-    func handle(_ token: String, _ cap: String, _ args: String, _ fields: [String]) -> Bool
+    /// `args` is the single argument as a string, which is all a one-argument
+    /// capability wants; `a` reads several of them by name, already parsed and typed.
+    func handle(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) -> Bool
 }
 
 /// Routes a command to whichever installed package claims its namespace.
@@ -85,13 +143,13 @@ final class ChuksModuleRegistry {
 
     /// True when a package answered. False means no package claims this namespace and
     /// the caller should treat the command as unknown, exactly as before.
-    func handle(_ token: String, _ cap: String, _ args: String, _ fields: [String]) -> Bool {
+    func handle(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) -> Bool {
         guard let dot = cap.firstIndex(of: ".") else { return false }
         let ns = String(cap[cap.startIndex..<dot])
         if live[ns] == nil {
             guard let t = types[ns] else { return false }
             live[ns] = t.init(host: host)
         }
-        return live[ns]?.handle(token, cap, args, fields) ?? false
+        return live[ns]?.handle(token, cap, args, a) ?? false
     }
 }
