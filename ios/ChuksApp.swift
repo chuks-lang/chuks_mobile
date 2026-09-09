@@ -903,11 +903,6 @@ func keychainDelete(_ key: String) {
     SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key] as CFDictionary)
 }
 
-// Decode a base64 string to UTF-8 (for capability args carrying arbitrary text).
-func b64str(_ s: String) -> String {
-    Data(base64Encoded: s).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-}
-
 // Show notifications even while the app is foregrounded (iOS otherwise suppresses
 // the banner for the active app).
 final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
@@ -924,6 +919,48 @@ let notifDelegate = NotifDelegate()
 // @convention(c): no captures, so it reaches the live controller through a file
 // global and hops to the main thread. Coalesced: a burst of messages schedules at
 // most one pending main-thread pump.
+// The capability wire format, host side. The engine's core/wire.chuks packs a
+// command's arguments; this unpacks them. Escapes: \\ for a backslash, \n and \r for
+// the line endings that would end the mutation line early, and \; as the field
+// separator. A single left-to-right scan, because search-and-replace would corrupt a
+// field ending in a real backslash.
+//
+// Changing this means changing three files. That is the cost of a hand-written
+// boundary, and the reason the boundary should eventually be generated.
+func chuksUnpackArgs(_ packed: String) -> [String] {
+    if packed.isEmpty { return [] }
+    var out: [String] = []
+    var cur = ""
+    var i = packed.startIndex
+    while i < packed.endIndex {
+        let c = packed[i]
+        if c == "\\" {
+            let n = packed.index(after: i)
+            if n < packed.endIndex {
+                let e = packed[n]
+                i = packed.index(after: n)
+                switch e {
+                case "\\": cur.append("\\")
+                case "n":  cur.append("\n")
+                case "r":  cur.append("\r")
+                case ";":  out.append(cur); cur = ""
+                default:   cur.append(e)      // an escape nobody defined: keep the character
+                }
+                continue
+            }
+        }
+        cur.append(c)
+        i = packed.index(after: i)
+    }
+    out.append(cur)
+    return out
+}
+
+// Field `i`, or `fallback` when the command did not carry that many.
+func chuksArg(_ fields: [String], _ i: Int, _ fallback: String = "") -> String {
+    return i >= 0 && i < fields.count ? fields[i] : fallback
+}
+
 private weak var gChuksWakeVC: CardsVC?
 private let gWakeLock = NSLock()
 private var gWakeScheduled = false
@@ -2388,8 +2425,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 // apply() finishes (main.async), so a sync capability's resolve() doesn't
                 // re-enter apply() mid-parse. args may contain '|'.
                 let token = f[1], cap = f[2]
-                let args = f.count >= 4 ? f[3...].joined(separator: "|") : ""
-                DispatchQueue.main.async { [weak self] in self?.handleCommand(token, cap, args) }
+                let packed = f.count >= 4 ? f[3...].joined(separator: "|") : ""
+                // Unpacked once, here, rather than by each capability inventing its own
+                // separator. `args` is the first field, which is all a one-argument
+                // capability ever wanted.
+                let fields = chuksUnpackArgs(packed)
+                let args = chuksArg(fields, 0)
+                DispatchQueue.main.async { [weak self] in self?.handleCommand(token, cap, args, fields) }
             default: break
             }
         }
@@ -2468,7 +2510,29 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return "\(steps),\(dist),\(pace),\(cadence),\(up),\(down)"
     }
 
-    func handleCommand(_ token: String, _ cap: String, _ args: String) {
+    // A capability's numeric argument, or nothing.
+    //
+    // The old shape was `Double(args) ?? 0`, and that zero is a lie: pedometer.query
+    // would report a window starting now, calendar.upcoming would quietly look seven
+    // days ahead instead of whatever was asked, and the app would get a confident wrong
+    // answer instead of an error. A default is right for a STYLE PROP, where absent
+    // means "use the default"; it is wrong for an argument the caller definitely sent.
+    //
+    // A fire-and-forget command has no token to fail, so it says so in the log rather
+    // than vanishing.
+    func numArg(_ token: String, _ cap: String, _ fields: [String], _ i: Int) -> Double? {
+        let raw = chuksArg(fields, i)
+        if let v = Double(raw) { return v }
+        let msg = "\(cap): argument \(i) should be a number, got \"\(raw)\""
+        if token == "0" { NSLog("chuks: %@", msg) } else { fail(token, msg) }
+        return nil
+    }
+    func intArg(_ token: String, _ cap: String, _ fields: [String], _ i: Int) -> Int? {
+        guard let d = numArg(token, cap, fields, i) else { return nil }
+        return Int(d)
+    }
+
+    func handleCommand(_ token: String, _ cap: String, _ args: String, _ fields: [String] = []) {
         switch cap {
         case "__cancel__":
             activeStreams[token]?.invalidate(); activeStreams[token] = nil
@@ -2612,7 +2676,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             streamTeardown[token] = { [weak self] in self?.pedometer.stopUpdates() }
         case "pedometer.query":
             guard CMPedometer.isStepCountingAvailable() else { fail(token, "step counting unavailable"); break }
-            let secs = Double(args) ?? 0
+            guard let secs = numArg(token, cap, fields, 0) else { break }
             let from = Date(timeIntervalSinceNow: -secs)
             pedometer.queryPedometerData(from: from, to: Date()) { [weak self] data, err in
                 DispatchQueue.main.async {
@@ -2668,7 +2732,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 } catch { DispatchQueue.main.async { self.fail(token, "read failed") } }
             }
         case "calendar.upcoming":
-            let days = Double(args) ?? 7
+            guard let days = numArg(token, cap, fields, 0) else { break }
             let store = EKEventStore()
             let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
             let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map {
@@ -2676,8 +2740,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
             resolve(token, lines.joined(separator: "\n"))
         case "calendar.create":
-            let parts = args.split(separator: "|", maxSplits: 2).map(String.init)
-            guard parts.count == 3, let startMin = Double(parts[1]), let durMin = Double(parts[2]) else { fail(token, "bad args"); break }
+            guard fields.count == 3 else { fail(token, "calendar.create needs title, startInMin, durationMin"); break }
+            guard let startMin = numArg(token, cap, fields, 1), let durMin = numArg(token, cap, fields, 2) else { break }
+            let parts = fields
             let store = EKEventStore()
             guard let cal = store.defaultCalendarForNewEvents else { fail(token, "no writable calendar"); break }
             let ev = EKEvent(eventStore: store)
@@ -2694,12 +2759,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             bgTokens[args] = token
             streamTeardown[token] = { [weak self] in self?.bgTokens[args] = nil }
         case "bg.result":
-            // "<name>|<1|0>": the handler finished, so the OS can be told.
-            let parts = args.components(separatedBy: "|")
-            if parts.count >= 2 { finishBackgroundTask(parts[0], success: parts[1] == "1") }
+            // name, then "1" or "0": the handler finished, so the OS can be told.
+            if fields.count >= 2 { finishBackgroundTask(fields[0], success: fields[1] == "1") }
         case "bg.periodic", "bg.once", "bg.processing":
-            // "<name>|<seconds>|<k=v;...>"
-            let parts = args.components(separatedBy: "|")
+            // name, seconds, then the constraint string "k=v;..."
+            let parts = fields
             guard parts.count >= 2 else { break }
             var cons: [String: String] = [:]
             if parts.count >= 3 {
@@ -2708,7 +2772,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     if kv.count == 2 { cons[kv[0]] = kv[1] }
                 }
             }
-            let secs = Int(parts[1]) ?? 0
+            guard let secs = intArg(token, cap, fields, 1) else { break }
             // iOS has no periodic scheduler: a refresh task is submitted again after each
             // run, which is what BGTaskScheduler expects you to do anyway. `periodic`
             // therefore means the same thing here, it is just re-armed rather than
@@ -2767,15 +2831,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "ble.disconnect":
             ble?.disconnect(args)
         case "ble.read":
-            let a = args.components(separatedBy: "\t")
+            let a = fields
             if a.count == 3 { ensureBle(); ble!.read(a[0], a[1], a[2], ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) }) }
             else { fail(token, "ble.read needs id, service, characteristic") }
         case "ble.write":
-            let a = args.components(separatedBy: "\t")
+            let a = fields
             if a.count == 4 { ensureBle(); ble!.write(a[0], a[1], a[2], a[3], ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) }) }
             else { fail(token, "ble.write needs id, service, characteristic, hex") }
         case "ble.subscribe":
-            let a = args.components(separatedBy: "\t")
+            let a = fields
             if a.count == 3 {
                 ensureBle()
                 ble!.subscribe(a[0], a[1], a[2], token: token, err: { [weak self] m in self?.fail(token, m) })
@@ -2803,11 +2867,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "permission.status": permStatus(args, token)
         case "permission.request": permRequest(args, token)
         case "fs.write":
-            if let bar = args.firstIndex(of: "|") {
-                let name = String(args[..<bar]), b64 = String(args[args.index(after: bar)...])
-                if let d = Data(base64Encoded: b64), let content = String(data: d, encoding: .utf8) {
-                    try? content.write(to: appFile(name), atomically: true, encoding: .utf8)
-                }
+            // The content arrives as an ordinary field: the wire packs arguments, so a
+            // multi-line body needs no encoding of its own any more.
+            if fields.count >= 2 {
+                try? fields[1].write(to: appFile(fields[0]), atomically: true, encoding: .utf8)
             }
         case "fs.read":
             if let s = try? String(contentsOf: appFile(args), encoding: .utf8) { resolve(token, s) }
@@ -2817,18 +2880,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             resolve(token, names.joined(separator: "\n"))
         case "fs.delete": try? FileManager.default.removeItem(at: appFile(args))
         case "secure.set":
-            if let bar = args.firstIndex(of: "|") {
-                let key = String(args[..<bar]), b64 = String(args[args.index(after: bar)...])
-                if let d = Data(base64Encoded: b64), let v = String(data: d, encoding: .utf8) { keychainSet(key, v) }
-            }
+            if fields.count >= 2 { keychainSet(fields[0], fields[1]) }
         case "secure.get":
             if let v = keychainGet(args) { resolve(token, v) } else { fail(token, "no such key: \(args)") }
         case "secure.delete": keychainDelete(args)
         case "notif.notify":
-            // args = "b64title|b64body"
-            let parts = args.split(separator: "|", maxSplits: 1).map(String.init)
             let content = UNMutableNotificationContent()
-            content.title = b64str(parts.first ?? ""); content.body = parts.count > 1 ? b64str(parts[1]) : ""
+            content.title = chuksArg(fields, 0); content.body = chuksArg(fields, 1)
             content.sound = .default
             UNUserNotificationCenter.current().add(UNNotificationRequest(
                 identifier: UUID().uuidString, content: content,
@@ -2878,7 +2936,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)
             if speech.isSpeaking { speech.stopSpeaking(at: .immediate) }
-            speech.speak(AVSpeechUtterance(string: b64str(args)))
+            speech.speak(AVSpeechUtterance(string: args))
         case "tts.stop": speech.stopSpeaking(at: .immediate)
         case "tts.isSpeaking": resolve(token, speech.isSpeaking ? "1" : "0")
         case "clipboard.set": UIPasteboard.general.string = args
@@ -2891,10 +2949,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "share.text": presentShare([args])
         case "share.url": presentShare([URL(string: args) ?? args])
         case "haptics.impact": fireHaptic(args)
-        case "haptics.vibrate": hapticBuzz(Int(args) ?? 0)
+        case "haptics.vibrate": if let ms = intArg(token, cap, fields, 0) { hapticBuzz(ms) }
         case "haptics.pattern": hapticPattern(args)
         case "torch.set": setTorch(args == "1")
-        case "brightness.set": if let v = Double(args) { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
+        case "brightness.set": if let v = numArg(token, cap, fields, 0) { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
         case "orientation.watch":
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -2914,7 +2972,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         default:
             // Not a framework capability. An installed package may claim this
             // namespace; if none does, the command is unknown, exactly as before.
-            _ = packageModules.handle(token, cap, args)
+            _ = packageModules.handle(token, cap, args, fields)
         }
     }
 

@@ -36,7 +36,12 @@ public protocol ChuksNativeModule: AnyObject {
     init(host: ChuksModuleHost)
     /// Return true when the command was handled. False leaves it unanswered, which is
     /// what an unknown name inside a claimed namespace should do.
-    func handle(_ token: String, _ cap: String, _ args: String) -> Bool
+    ///
+    /// `args` is the first argument and `fields` is all of them, already unpacked from
+    /// the wire format. A one-argument capability reads `args` and ignores the rest; a
+    /// capability taking several reads `fields`, and never has to pick a separator or
+    /// worry about what a user might type into one.
+    func handle(_ token: String, _ cap: String, _ args: String, _ fields: [String]) -> Bool
 }
 
 /// Routes a command to whichever installed package claims its namespace.
@@ -56,13 +61,13 @@ final class ChuksModuleRegistry {
 
     /// True when a package answered. False means no package claims this namespace and
     /// the caller should treat the command as unknown, exactly as before.
-    func handle(_ token: String, _ cap: String, _ args: String) -> Bool {
+    func handle(_ token: String, _ cap: String, _ args: String, _ fields: [String]) -> Bool {
         guard let dot = cap.firstIndex(of: ".") else { return false }
         let ns = String(cap[cap.startIndex..<dot])
         if live[ns] == nil {
             guard let t = types[ns] else { return false }
             live[ns] = t.init(host: host)
         }
-        return live[ns]?.handle(token, cap, args) ?? false
+        return live[ns]?.handle(token, cap, args, fields) ?? false
     }
 }

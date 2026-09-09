@@ -1,0 +1,112 @@
+// The capability wire format: how a command's arguments cross to the host.
+//
+// A command travels inside a newline-delimited, pipe-delimited stream:
+//
+//     X|<token>|<namespace>.<name>|<args>
+//
+// which means an argument carrying a newline would end the line early, and one
+// carrying a pipe would be read as a field boundary. For most of this framework's
+// life the answer was convention: pick a separator the value probably does not
+// contain, and base64 the ones that certainly do. That is not a rule anything can
+// enforce, and it failed twice: a text field truncated at its first pipe, and a
+// tracking notice had to reach for a tab because pipe was already spoken for.
+//
+// So arguments are packed instead. Each field escapes the three characters that mean
+// something to the transport, and the fields are joined by an escape sequence:
+//
+//     \   ->  \\        the escape character itself
+//     LF  ->  \n        would end the line
+//     CR  ->  \r        same
+//     join with  \;     the field separator
+//
+// The separator is a two-character sequence rather than some exotic control
+// character, and that is what makes it safe: after escaping, every backslash in a
+// field is part of a pair, so a bare backslash-semicolon can only ever be a
+// boundary. A field that really contains a backslash followed by a semicolon packs
+// to \; and reads back correctly. Nothing else is touched, so a packed argument
+// still reads as itself in a log and text in any language passes through untouched.
+//
+// Decoding is a single left-to-right scan, which is the only way to read escapes
+// correctly. Search-and-replace would corrupt a field ending in a real backslash.
+//
+// Both hosts carry the same two functions. Any change here is a change in three
+// places, which is exactly the duplication a typed declaration is meant to remove
+// later; until then the format is small enough to hold in your head, on purpose.
+
+/** Escape one field so it cannot be mistaken for the transport's own punctuation. */
+function escapeField(s: string): string {
+    var out: string = ""
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        i = i + 1
+        if (c == "\\") { out = out + "\\\\" }
+        else if (c == "\n") { out = out + "\\n" }
+        else if (c == "\r") { out = out + "\\r" }
+        else { out = out + c }
+    }
+    return out
+}
+
+/**
+ * Pack a command's arguments into one transport-safe string.
+ *
+ * No arguments packs to the empty string, which is what a capability that takes none
+ * already sends, so the wire is unchanged for the majority of commands. One empty
+ * argument packs to the empty string too: the two are deliberately the same on the
+ * wire, because a host reads a field it expects with a fallback (`argAt`), and both
+ * cases hand it that fallback. Nothing downstream can tell them apart, so nothing
+ * downstream has to.
+ *
+ * ```chuks
+ * packArgs(["a walk|with pipes", "and\na newline"])
+ * ```
+ */
+export function packArgs(fields: []string): string {
+    if (fields.length == 0) { return "" }
+    var out: string = escapeField(fields[0])
+    var i: int = 1
+    while (i < fields.length) {
+        out = out + "\\;" + escapeField(fields[i])
+        i = i + 1
+    }
+    return out
+}
+
+/** Pack a single argument. The common case, and it reads better than a one-item list. */
+export function packArg(field: string): string { return packArgs([field]) }
+
+/**
+ * Unpack what packArgs produced. An empty string is no arguments at all, not one
+ * empty argument: a capability that takes nothing and one that takes an empty string
+ * are different things, and the host asks for the field it expects either way.
+ */
+export function unpackArgs(packed: string): []string {
+    var out: []string = []
+    if (packed.length == 0) { return out }
+    var cur: string = ""
+    var i: int = 0
+    while (i < packed.length) {
+        const c: string = packed.slice(i, i + 1)
+        if (c == "\\" && i + 1 < packed.length) {
+            const n: string = packed.slice(i + 1, i + 2)
+            i = i + 2
+            if (n == "\\") { cur = cur + "\\" }
+            else if (n == "n") { cur = cur + "\n" }
+            else if (n == "r") { cur = cur + "\r" }
+            else if (n == ";") { out.push(cur); cur = "" }
+            else { cur = cur + n }          // an escape nobody defined: keep the character
+            continue
+        }
+        i = i + 1
+        cur = cur + c
+    }
+    out.push(cur)
+    return out
+}
+
+/** Field `i`, or `fallback` when the command did not carry that many. */
+export function argAt(fields: []string, i: int, fallback: string): string {
+    if (i < 0 || i >= fields.length) { return fallback }
+    return fields[i]
+}

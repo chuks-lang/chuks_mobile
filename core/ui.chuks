@@ -13,6 +13,7 @@ import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS 
 import { host } from "std/host";
 import { Prop } from "./prop.chuks";
 import { tw } from "./tw.chuks";
+import { packArgs } from "./wire.chuks";   // arguments cross to the host packed, never hand-joined
 import { json } from "std/json";   // route params ride the hot-reload snapshot
 import { Channel } from "std/channel";   // awaited capabilities park on one of these
 import { time } from "std/time";
@@ -3352,9 +3353,9 @@ export class NativeSub {
  * host's result. Returns a NativeSub you can cancel(). Capability wrappers in
  * core/native.chuks call this; app code uses those (Clipboard, Share, ...).
  */
-export function emitNativeCommand(cap: string, args: string, cb: any): NativeSub {
+export function emitNativeCommand(cap: string, args: []string, cb: any): NativeSub {
     const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, null, false)) }
+    if (h != null) { return new NativeSub(h.recon.command(cap, packArgs(args), cb, null, false)) }
     return new NativeSub("0")
 }
 
@@ -3363,9 +3364,9 @@ export function emitNativeCommand(cap: string, args: string, cb: any): NativeSub
  * `(string) -> void`) fires with the host's error message if the request fails
  * (permission denied, hardware missing), instead of `cb`.
  */
-export function emitNativeCommandE(cap: string, args: string, cb: any, onErr: any): NativeSub {
+export function emitNativeCommandE(cap: string, args: []string, cb: any, onErr: any): NativeSub {
     const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, onErr, false)) }
+    if (h != null) { return new NativeSub(h.recon.command(cap, packArgs(args), cb, onErr, false)) }
     return new NativeSub("0")
 }
 
@@ -3410,7 +3411,7 @@ const AWAIT_POLL_SLOW_MS: int = 25    // after that, back off so a long wait cos
  * person and needs minutes. A timeout throws rather than hanging, and names both things
  * it can mean, since one of them is the await-on-the-host-thread mistake above.
  */
-export async function awaitCommand(cap: string, args: string, failable: bool, timeoutMs: int): Task<string> {
+export async function awaitCommand(cap: string, args: []string, failable: bool, timeoutMs: int): Task<string> {
     const h: App? = HOST
     if (h == null) { throw "capability '" + cap + "' was called before the app mounted" }
     // One channel carries both outcomes, tagged, so there is only one thing to poll.
@@ -3426,7 +3427,7 @@ export async function awaitCommand(cap: string, args: string, failable: bool, ti
     dispatchAsync(function(): void {
         const onOk: function(v: string): void = function(v: string): void { ch.trySend("v" + v) }
         const onErr: function(m: string): void = function(m: string): void { ch.trySend("e" + m) }
-        toks.trySend(h.recon.command(cap, args, onOk, failable ? onErr : null, false))
+        toks.trySend(h.recon.command(cap, packArgs(args), onOk, failable ? onErr : null, false))
     })
 
     var waited: int = 0
@@ -3457,9 +3458,9 @@ export async function awaitCommand(cap: string, args: string, failable: bool, ti
  * `onErr` (optional) fires if the subscription fails. Start streams in a useEffect
  * and cancel() in its cleanup so they tear down on unmount.
  */
-export function emitNativeStream(cap: string, args: string, cb: any, onErr: any): NativeSub {
+export function emitNativeStream(cap: string, args: []string, cb: any, onErr: any): NativeSub {
     const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, args, cb, onErr, true)) }
+    if (h != null) { return new NativeSub(h.recon.command(cap, packArgs(args), cb, onErr, true)) }
     return new NativeSub("0")
 }
 

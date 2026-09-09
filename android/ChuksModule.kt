@@ -36,8 +36,13 @@ interface ChuksModuleHost {
 /// know it without loading the class.
 interface ChuksNativeModule {
     /** Return true when the command was handled. False leaves it unanswered, which is
-     *  what an unknown name inside a claimed namespace should do. */
-    fun handle(token: String, cap: String, args: String): Boolean
+     *  what an unknown name inside a claimed namespace should do.
+     *
+     *  `args` is the first argument and `fields` is all of them, already unpacked from
+     *  the wire format. A one-argument capability reads `args` and ignores the rest; a
+     *  capability taking several reads `fields`, and never has to pick a separator or
+     *  worry about what a user might type into one. */
+    fun handle(token: String, cap: String, args: String, fields: List<String>): Boolean
 }
 
 /// Routes a command to whichever installed package claims its namespace.
@@ -50,10 +55,10 @@ class ChuksModuleRegistry(private val host: ChuksModuleHost) {
     private val factories = ChuksPackageModules.factories()
 
     /** True when a package answered; false means no package claims this namespace. */
-    fun handle(token: String, cap: String, args: String): Boolean {
+    fun handle(token: String, cap: String, args: String, fields: List<String>): Boolean {
         val ns = cap.substringBefore('.', "")
         if (ns.isEmpty()) return false
         val m = live[ns] ?: factories[ns]?.invoke(host)?.also { live[ns] = it } ?: return false
-        return m.handle(token, cap, args)
+        return m.handle(token, cap, args, fields)
     }
 }

@@ -1,0 +1,86 @@
+// The capability wire format, round-tripped. The whole point of the format is that
+// no value can be mistaken for punctuation, so the interesting cases are the values
+// that used to break things: a pipe, a newline, a backslash, and the separator's own
+// escape sequence written out by hand.
+import { packArgs, packArg, unpackArgs, argAt } from "../core/wire.chuks";
+
+var passed: int = 0
+var failed: int = 0
+
+function check(ok: bool, what: string): void {
+    if (ok) { passed = passed + 1; println("  ok   " + what) }
+    else { failed = failed + 1; println("  FAIL " + what) }
+}
+
+function roundTrip(fields: []string, what: string): void {
+    const back: []string = unpackArgs(packArgs(fields))
+    if (back.length != fields.length) {
+        check(false, what + " (got " + string(back.length) + " fields, wanted " + string(fields.length) + ")")
+        return
+    }
+    var i: int = 0
+    while (i < fields.length) {
+        if (back[i] != fields[i]) {
+            check(false, what + " (field " + string(i) + " came back as \"" + back[i] + "\")")
+            return
+        }
+        i = i + 1
+    }
+    check(true, what)
+}
+
+function main(): void {
+    println("wire_test")
+
+    roundTrip([], "no arguments")
+    roundTrip(["plain"], "one plain argument")
+    roundTrip(["a", "b", "c"], "three plain arguments")
+
+    // The values that broke the old convention.
+    roundTrip(["a|b"], "a pipe, which used to split a field in two")
+    roundTrip(["Recording your walk", "Tap to return|now"], "a pipe in the second field")
+    roundTrip(["line one\nline two"], "a newline, which used to end the line early")
+    roundTrip(["carriage\rreturn"], "a carriage return")
+    roundTrip(["tab\there"], "a tab, which no longer means anything")
+
+    // The escape machinery against itself.
+    roundTrip(["back\\slash"], "a backslash")
+    roundTrip(["ends with a backslash\\"], "a trailing backslash")
+    roundTrip(["\\"], "a lone backslash")
+    roundTrip(["\\\\"], "two backslashes")
+    roundTrip(["\\;"], "a backslash followed by a semicolon, which IS the separator")
+    roundTrip(["a\\;b", "second"], "the separator sequence inside the first of two fields")
+    roundTrip(["\\n"], "the two characters backslash and n, not a newline")
+    roundTrip([";", ";;"], "bare semicolons, which are not special on their own")
+
+    // Real payloads.
+    roundTrip(["Coffee with Ada | Ada's place", "30", "60"], "a calendar event whose title has a pipe")
+    roundTrip(["note.txt", "first\nsecond\nthird"], "a file write with a multi-line body")
+    roundTrip(["{\"a\":1,\"b\":\"x|y\"}"], "a JSON blob")
+    roundTrip(["Bergstraße", "naïve café", "日本語"], "text that is not ASCII")
+
+    // Empty fields keep their position, which is how an optional argument stays optional.
+    roundTrip(["", "second"], "an empty first field")
+    roundTrip(["first", ""], "an empty last field")
+    roundTrip(["", "", ""], "three empty fields")
+
+    // The shape of the API.
+    check(packArgs([]) == "", "no arguments packs to the empty string")
+    check(unpackArgs("").length == 0, "the empty string unpacks to no arguments")
+    check(packArgs([""]) == "", "one empty argument packs like no arguments, and the host cannot tell")
+    check(packArg("x") == packArgs(["x"]), "packArg matches packArgs of one")
+    check(argAt(["a", "b"], 1, "?") == "b", "argAt reads a field")
+    check(argAt(["a"], 4, "fallback") == "fallback", "argAt falls back past the end")
+    check(argAt([], 0, "fallback") == "fallback", "argAt falls back on no arguments")
+
+    // A packed field never contains a raw newline, or the mutation line would end
+    // early no matter how careful the decoder is.
+    const packed: string = packArgs(["a\nb", "c\nd"])
+    check(packed.indexOf("\n") < 0, "a packed argument carries no raw newline")
+
+    println("")
+    println(string(passed) + " passed, " + string(failed) + " failed")
+    if (failed > 0) { throw "wire_test failed" }
+}
+
+main()
