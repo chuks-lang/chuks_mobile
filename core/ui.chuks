@@ -614,11 +614,18 @@ export dataType ViewProps { LayoutProps; EventProps }
 export dataType TextProps { ViewProps; numberOfLines: int?; ellipsizeMode: string?; selectable: bool? }
 
 // By-key field readers over an `any` (a map-backed dataType), mirroring pInt/pStr/pBool.
-function pvI(p: any, k: string, d: int): int { const v: any = p[k]; return v != null ? int(v) : d }
+export function pvI(p: any, k: string, d: int): int { const v: any = p[k]; return v != null ? int(v) : d }
 // Read a string field `k` from an `any` (map-backed dataType), or `d` if absent/null.
-function pvS(p: any, k: string, d: string): string { const v: any = p[k]; return v != null ? string(v) : d }
+//
+// These four are exported for PACKAGE authors, who reach a prop bag as `any` and would
+// otherwise write `p.getOr("color", "#fff")`, which warns on every line: a method call on
+// an `any` is exactly what the AOT-safety check exists to flag. Indexing does not warn,
+// so reading through these is both quieter and typed at the call site.
+export function pvS(p: any, k: string, d: string): string { const v: any = p[k]; return v != null ? string(v) : d }
 // Read a bool field `k` from an `any` (map-backed dataType), or `d` if absent/null.
-function pvB(p: any, k: string, d: bool): bool { const v: any = p[k]; return v != null ? (int(v) != 0) : d }
+export function pvB(p: any, k: string, d: bool): bool { const v: any = p[k]; return v != null ? (int(v) != 0) : d }
+// Read a float field `k` from an `any` (map-backed dataType), or `d` if absent/null.
+export function pvF(p: any, k: string, d: float): float { const v: any = p[k]; return v != null ? float(v) : d }
 
 // The typed-props twin of applyLayout: a Tailwind `tw` string first (so explicit
 // props override it), then every layout field by key. Serves all typed builders.
