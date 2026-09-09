@@ -8,7 +8,7 @@
 //             | patch-manifest <manifest-path>               (fill the manifest in place)
 //             | mobile-sources <ios|android>                 (native sources from packages)
 //             | mobile-modules <ios|android>                 (namespace<TAB>class per module)
-//             | mobile-symmetry                              (iOS/Android capability diff)
+//             | mobile-symmetry [sdkroot]                    (iOS/Android capability diff)
 //             | icon | splash-image | splash-bg | splash-bg-dark   (launch assets)
 //             | background-tasks                             (task ids, one per line)
 //
@@ -206,6 +206,136 @@ function isDeclared(m: any, name: string): bool {
     const caps: any = m["capabilities"]
     if (caps == null) { return false }
     return caps[name] != null
+}
+
+// ---- The framework's own two halves -----------------------------------------
+//
+// Same check, pointed at the hosts themselves. It finds nothing today (89 names on
+// each side, identical), which is exactly when a regression check is cheapest to add:
+// the next capability someone adds to one host and forgets in the other is caught by
+// the build that adds it, rather than by a user whose callback never fires.
+//
+// A deliberate difference goes in the SDK's own chuks.json, so core answers to the
+// same discipline a package does:
+//
+//   "coreCapabilities": { "foo.bar": ["ios"] }
+
+// Every quoted substring on one line.
+function quotedOn(line: string): []string {
+    var out: []string = []
+    var rest: string = line
+    while (true) {
+        const a: int = rest.indexOf("\"")
+        if (a < 0) { break }
+        const after: string = rest.slice(a + 1, rest.length)
+        const b: int = after.indexOf("\"")
+        if (b < 0) { break }
+        out.push(after.slice(0, b))
+        rest = after.slice(b + 1, after.length)
+    }
+    return out
+}
+
+// "ns.name": exactly one dot, plain names either side. That is what excludes a bundle
+// id, a mime type, a file name and every other dotted string in a 4,600-line host.
+function isCapLiteral(s: string): bool {
+    const dot: int = s.indexOf(".")
+    if (dot <= 0 || dot == s.length - 1) { return false }
+    const ns: string = s.slice(0, dot)
+    const name: string = s.slice(dot + 1, s.length)
+    if (name.indexOf(".") >= 0) { return false }
+    return isPlainName(ns) && isPlainName(name)
+}
+
+function trimLeft(s: string): string {
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        if (c != " " && c != "\t") { break }
+        i = i + 1
+    }
+    return s.slice(i, s.length)
+}
+
+// The capability names a HOST dispatches. Only the dispatch sites count: a Swift
+// `case "x.y":` and a Kotlin `"x.y" ->`. Scanning the whole file instead would drag in
+// every dotted string literal the host happens to contain.
+function hostCapNames(path: string, kotlin: bool): []string {
+    var out: []string = []
+    if (!fs.exists(path)) { return out }
+    const lines: []string = fs.readFile(path).split("\n")
+    var i: int = 0
+    while (i < lines.length) {
+        const line: string = trimLeft(lines[i])
+        i = i + 1
+        var isDispatch: bool = false
+        if (kotlin) {
+            isDispatch = line.slice(0, 1) == "\"" && line.indexOf("->") > 0
+        } else {
+            isDispatch = line.slice(0, 6) == "case \""
+        }
+        if (!isDispatch) { continue }
+        const lits: []string = quotedOn(line)
+        var j: int = 0
+        while (j < lits.length) {
+            const lit: string = lits[j]
+            j = j + 1
+            if (isCapLiteral(lit) && !contains(out, lit)) { out.push(lit) }
+        }
+    }
+    return out
+}
+
+// Declared core exceptions, from the SDK's own chuks.json.
+function coreDeclared(sdkroot: string): any {
+    const path: string = sdkroot + "/chuks.json"
+    if (!fs.exists(path)) { return {} }
+    const j: any = json.parse(fs.readFile(path))
+    const c: any = j["coreCapabilities"]
+    return c == null ? {} : c
+}
+function coreDeclaredFor(decl: any, name: string, platform: string): bool {
+    const plats: any = decl[name]
+    if (plats == null) { return false }
+    const arr: []any = plats
+    var i: int = 0
+    while (i < arr.length) {
+        if (string(arr[i]) == platform) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+function coreSymmetryStr(sdkroot: string): string {
+    if (sdkroot == "") { return "" }
+    const ios: []string = hostCapNames(sdkroot + "/ios/ChuksApp.swift", false)
+    const android: []string = hostCapNames(sdkroot + "/android/MainActivity.kt", true)
+    if (ios.length == 0 || android.length == 0) { return "" }   // not a full SDK tree
+    const decl: any = coreDeclared(sdkroot)
+    var out: string = ""
+    var i: int = 0
+    while (i < ios.length) {
+        const c: string = ios[i]
+        i = i + 1
+        if (contains(android, c)) { continue }
+        if (decl[c] != null && !coreDeclaredFor(decl, c, "android")) {
+            out = out + "note\t@chuks/mobile\t" + c + "\tiOS only, as declared\n"
+        } else {
+            out = out + "gap\t@chuks/mobile\t" + c + "\tdispatched by the iOS host, not by the Android host\n"
+        }
+    }
+    var k: int = 0
+    while (k < android.length) {
+        const c2: string = android[k]
+        k = k + 1
+        if (contains(ios, c2)) { continue }
+        if (decl[c2] != null && !coreDeclaredFor(decl, c2, "ios")) {
+            out = out + "note\t@chuks/mobile\t" + c2 + "\tAndroid only, as declared\n"
+        } else {
+            out = out + "gap\t@chuks/mobile\t" + c2 + "\tdispatched by the Android host, not by the iOS host\n"
+        }
+    }
+    return out
 }
 
 // One line per finding: "<level>\t<package>\t<capability>\t<message>".
@@ -556,7 +686,7 @@ function main(): void {
     else if (field == "ios-plist") { print(iosPlistStr(perms, ios)) }
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
-    else if (field == "mobile-symmetry") { print(mobileSymmetryStr(projdir)) }
+    else if (field == "mobile-symmetry") { print(coreSymmetryStr(a.length > 5 ? a[5] : "") + mobileSymmetryStr(projdir)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
     else if (field == "background-location") {
         // iOS needs "location" in UIBackgroundModes, and CRASHES rather than erroring if

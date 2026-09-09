@@ -117,20 +117,20 @@ PKG_SRC="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-sources ios 2>
     echo "] }"
 } > "$OUT/ChuksPackageModules.swift"
 # A capability is one thing with two implementations, so the build says when the two
-# disagree. An undeclared gap is loud: it means a capability that is shipped and
+# disagree. Covers the framework's own hosts as well as every installed package. An undeclared gap is loud: it means a capability that is shipped and
 # documented but dead on one platform, whose only other symptom is a callback that
 # never fires. A difference the package DECLARED is counted, not listed.
 chuks_capability_check() {
     local sym gaps notes
-    sym="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-symmetry 2>/dev/null)"
+    sym="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-symmetry "$SDKROOT" 2>/dev/null)"
     [ -n "$sym" ] || return 0
     gaps="$(printf '%s\n' "$sym" | grep -c '^gap' || true)"
     notes="$(printf '%s\n' "$sym" | grep -c '^note' || true)"
     if [ "$gaps" -gt 0 ]; then
         echo "   capability check: $gaps iOS/Android mismatch(es)"
         printf '%s\n' "$sym" | awk -F'\t' '$1=="gap" { printf "      %s  %s\n", $3, $4 }'
-        echo "      A capability missing on one side is dead there. Implement it, or declare"
-        echo "      the difference in the package's chuks.json (\"capabilities\")."
+        echo "      A capability missing on one side is dead there. Implement it, or declare the"
+        echo "      difference: \"capabilities\" in a package's chuks.json, \"coreCapabilities\" in the SDK's."
     fi
     [ "$notes" -gt 0 ] && echo "   capability check: $notes declared platform difference(s)"
     return 0
