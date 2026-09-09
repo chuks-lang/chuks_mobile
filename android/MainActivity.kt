@@ -137,6 +137,35 @@ fun hexColorStatic(h: String, fallback: Int = android.graphics.Color.TRANSPARENT
     catch (e: Throwable) { android.util.Log.w("chuks", "bad colour: \"$h\""); fallback }
 }
 
+// Text arriving on the P|/V| channels, restored.
+//
+// The engine escapes a backslash and the two line endings before putting text into a
+// newline-delimited stream, because a newline inside a label used to end the op early and
+// leave the rest standing as a line the host would then RUN. See escText in core/ui.chuks.
+// One left-to-right scan, because search-and-replace would corrupt a label ending in a
+// real backslash.
+fun chuksUnescapeText(s: String): String {
+    if (s.indexOf('\\') < 0) return s
+    val out = StringBuilder(s.length)
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        if (c == '\\' && i + 1 < s.length) {
+            when (s[i + 1]) {
+                '\\' -> out.append('\\')
+                'n' -> out.append('\n')
+                'r' -> out.append('\r')
+                else -> out.append(s[i + 1])
+            }
+            i += 2
+            continue
+        }
+        out.append(c)
+        i++
+    }
+    return out.toString()
+}
+
 class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val views = HashMap<String, View>()
     private val ynodes = HashMap<String, Long>()
@@ -572,8 +601,8 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             when (f.getOrNull(0)) {
                 "C" -> if (f.size >= 3) make(f[1], f[2])
                 "S" -> if (f.size >= 3) style(f[1], f[2])
-                "P" -> if (f.size >= 3) setText(f[1], f.drop(2).joinToString("|"))   // rejoin: text may contain '|'
-                "V" -> if (f.size >= 3) setFieldValue(f[1], f.drop(2).joinToString("|"))   // controlled value (may contain '|')
+                "P" -> if (f.size >= 3) setText(f[1], chuksUnescapeText(f.drop(2).joinToString("|")))   // rejoin: text may contain '|'
+                "V" -> if (f.size >= 3) setFieldValue(f[1], chuksUnescapeText(f.drop(2).joinToString("|")))   // controlled value (may contain '|')
                 "T" -> if (f.size >= 3) bindAction(f[1], f[2])
                 "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
                 "TF" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldFocus[it] = f[1] + ":focus" }

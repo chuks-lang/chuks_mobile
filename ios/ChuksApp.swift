@@ -924,6 +924,38 @@ let notifDelegate = NotifDelegate()
 // @convention(c): no captures, so it reaches the live controller through a file
 // global and hops to the main thread. Coalesced: a burst of messages schedules at
 // most one pending main-thread pump.
+// Text arriving on the P|/V| channels, restored.
+//
+// The engine escapes a backslash and the two line endings before putting text into a
+// newline-delimited stream, because a newline inside a label used to end the op early
+// and leave the rest standing as a line the host would then RUN. See escText in
+// core/ui.chuks. One left-to-right scan, because search-and-replace would corrupt a
+// label ending in a real backslash.
+func chuksUnescapeText(_ s: String) -> String {
+    if !s.contains("\\") { return s }
+    var out = ""
+    var i = s.startIndex
+    while i < s.endIndex {
+        let c = s[i]
+        if c == "\\" {
+            let n = s.index(after: i)
+            if n < s.endIndex {
+                switch s[n] {
+                case "\\": out.append("\\")
+                case "n": out.append("\n")
+                case "r": out.append("\r")
+                default: out.append(s[n])
+                }
+                i = s.index(after: n)
+                continue
+            }
+        }
+        out.append(c)
+        i = s.index(after: i)
+    }
+    return out
+}
+
 private weak var gChuksWakeVC: CardsVC?
 private let gWakeLock = NSLock()
 private var gWakeScheduled = false
@@ -2341,8 +2373,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             switch op {
             case "C" where f.count >= 3: make(f[1], f[2])
             case "S" where f.count >= 3: style(f[1], f[2])
-            case "P" where f.count >= 3: setText(f[1], f[2...].joined(separator: "|"))   // rejoin: text may contain '|'
-            case "V" where f.count >= 3: setFieldValue(f[1], f[2...].joined(separator: "|"))   // controlled value (may contain '|')
+            case "P" where f.count >= 3: setText(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // rejoin: text may contain '|'
+            case "V" where f.count >= 3: setFieldValue(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
             case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }

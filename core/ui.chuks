@@ -2076,6 +2076,30 @@ export class Component extends Node {
 
 // ---- Reconciler: diffs trees into the minimal mutation stream --------------
 // The app owns one instance; the mutation buffer lives here, not as module state.
+// Text crossing the P|/V| channels, made safe for a newline-delimited stream.
+//
+// The mutation stream is one op per line, so a newline inside a node's TEXT used to end
+// the op early and leave the remainder standing alone as a line of its own. That is not
+// merely a truncated label: a line the host can parse is a line the host RUNS. Text an
+// app did not write, a chat message, a server field, a contact's name, could carry
+// "\nR|app" and remove the root view. Escaped here, unescaped by both hosts.
+//
+// The pipe needs no escape: the host rejoins everything after the third one, which is
+// why a label may contain "|" and always could.
+function escText(s: string): string {
+    var out: string = ""
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        i = i + 1
+        if (c == "\\") { out = out + "\\\\" }
+        else if (c == "\n") { out = out + "\\n" }
+        else if (c == "\r") { out = out + "\\r" }
+        else { out = out + c }
+    }
+    return out
+}
+
 export class Reconciler {
     var lines: []string
     var handlers: map[string]any    // node id -> onPress/onChange closure (events)
@@ -2403,9 +2427,9 @@ export class Reconciler {
         this.emit("C|" + id + "|" + n.kind)
         const st: string = n.style.str()
         if (st != "") { this.emit("S|" + id + "|" + st) }
-        if (n.text != "") { this.emit("P|" + id + "|" + n.text) }
+        if (n.text != "") { this.emit("P|" + id + "|" + escText(n.text)) }
         if (n.opsChain != "") { this.emit("IF|" + id + "|" + n.opsChain) }   // Image GPU op-chain
-        if (n.hasVal) { this.emit("V|" + id + "|" + n.val) }   // controlled TextInput value
+        if (n.hasVal) { this.emit("V|" + id + "|" + escText(n.val)) }   // controlled TextInput value
         this.bindEvents(n, id)
         this.emit("I|" + id + "|" + parent + "|" + string(index))
         for (var i: int = 0; i < n.kids.length; i = i + 1) {
@@ -2443,9 +2467,9 @@ export class Reconciler {
         }
         if (next.kind == "List") { this.reconcileList(prev, next, id, parent, index); return }
         if (next.kind == "SectionList") { this.reconcileSectionList(prev, next, id, parent, index); return }
-        if (p.text != next.text) { this.emit("P|" + id + "|" + next.text) }
+        if (p.text != next.text) { this.emit("P|" + id + "|" + escText(next.text)) }
         if (p.opsChain != next.opsChain) { this.emit("IF|" + id + "|" + next.opsChain) }   // Image GPU op-chain change
-        if (next.hasVal && (!p.hasVal || p.val != next.val)) { this.emit("V|" + id + "|" + next.val) }
+        if (next.hasVal && (!p.hasVal || p.val != next.val)) { this.emit("V|" + id + "|" + escText(next.val)) }
         const ps: string = p.style.str()
         const ns: string = next.style.str()
         if (ps != ns) { this.emit("S|" + id + "|" + ns) }
