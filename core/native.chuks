@@ -764,5 +764,24 @@ export class Network {
 // fail() always resolves via the ERROR channel, to exercise onErr end-to-end.
 export class Debug {
     public static activeStreams(onResult: (string)=> void): void { emitNativeCommand("debug.activeStreams", "", onResult) }
+    /**
+     * The live view tree, as the host has it: one line per view, indented by depth,
+     * with the frame Yoga resolved.
+     *
+     *     app              View        0,0 390x844
+     *       app.0          UIScrollView 0,44 390x756
+     *         app.0.1      UILabel     16,12 358x0        <- the answer to "why is it invisible"
+     *
+     * This is the inspector, and a `w x 0` or an off-screen origin is usually what you
+     * are looking for. Print it, or write it to a file when there is no console:
+     *
+     * ```chuks
+     * Debug.viewTree(function(t: string): void { println(t) })
+     * ```
+     *
+     * A debugging tool, not an API: the shape of a line may change, and reading it in
+     * app logic would be reading the host's mind.
+     */
+    public static viewTree(onResult: (string)=> void): void { emitNativeCommand("debug.viewTree", "", onResult) }
     public static fail(onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("debug.fail", "", onResult, onError) }
 }

@@ -2517,6 +2517,48 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return "\(steps),\(dist),\(pace),\(cadence),\(up),\(down)"
     }
 
+    // The live view tree, for Debug.viewTree. Node ids are structural paths ("app.0.1"),
+    // so sorting them puts a parent before its children and the dot count is the depth:
+    // the tree draws itself without walking UIKit's hierarchy. The frame is the one Yoga
+    // resolved, which is the number a layout question is actually about.
+    let detachedMark = "\u{0000}detached"
+
+    func viewTreeDump() -> String {
+        // Asked before the first layout pass, every frame would read 0 and the dump
+        // would call the whole tree ZERO-SIZED, which is a lie that looks exactly like
+        // the bug this tool exists to find. Say what is actually true instead.
+        guard let rootView = views["app"], rootView.frame.size.width > 0 else {
+            return "(no frames yet: the first layout pass has not run, so nothing has a resolved size)"
+        }
+        // The app's own tree first. Ids sort as strings, and a recycled list cell is
+        // named ".0.cellN", so a plain sort puts a pool of detached cells above the
+        // screen you are looking at and fills the first screenful with them. They are
+        // real views and worth seeing, so they follow under a heading rather than
+        // being dropped.
+        let rooted = views.keys.filter { $0 == "app" || $0.hasPrefix("app.") }.sorted()
+        let detached = views.keys.filter { !($0 == "app" || $0.hasPrefix("app.")) }.sorted()
+        var out = ""
+        for id in rooted + (detached.isEmpty ? [] : [detachedMark]) + detached {
+            if id == detachedMark {
+                out += "-- not attached to the app root (recycled list cells, torn-down screens) --\n"
+                continue
+            }
+            guard let v = views[id] else { continue }
+            let depth = id.filter { $0 == "." }.count
+            let pad = String(repeating: "  ", count: depth)
+            let f = v.frame
+            let cls = String(describing: type(of: v))
+            var line = "\(pad)\(id)  \(cls)  \(Int(f.origin.x)),\(Int(f.origin.y)) \(Int(f.size.width))x\(Int(f.size.height))"
+            if v.isHidden { line += "  hidden" }
+            if f.size.width == 0 || f.size.height == 0 { line += "  ZERO-SIZED" }
+            if let t = (v as? UILabel)?.text, !t.isEmpty {
+                line += "  \"" + (t.count > 30 ? String(t.prefix(30)) + "…" : t) + "\""
+            }
+            out += line + "\n"
+        }
+        return out.isEmpty ? "(no views)" : out
+    }
+
     func handleCommand(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) {
         switch cap {
         case "__cancel__":
@@ -2835,6 +2877,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 DispatchQueue.main.async { ok ? self?.resolve(token, "success") : self?.fail(token, e?.localizedDescription ?? "authentication failed") }
             }
         case "debug.activeStreams": resolve(token, String(activeStreams.count + streamTeardown.count))
+        case "debug.viewTree": resolve(token, viewTreeDump())
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)
         case "permission.request": permRequest(args, token)

@@ -1044,6 +1044,63 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
     // Execute a native capability requested via an `X|` command (F3). Fire-and-forget
     // commands (token "0") just perform the side effect; async reads call resolve().
+    // The live view tree, for Debug.viewTree. Node ids are structural paths ("app.0.1"),
+    // so sorting them puts a parent before its children and the dot count is the depth.
+    // Frames are reported in dp, matching what the Chuks side asked for.
+    private val DETACHED_MARK = "\u0000detached"
+
+    private fun viewTreeDump(): String {
+        // Asked before the first layout pass, every frame would read 0 and the dump
+        // would call the whole tree ZERO-SIZED, which is a lie that looks exactly like
+        // the bug this tool exists to find. Say what is actually true instead.
+        val rootNode = ynodes["app"]
+        if (rootNode == null || N.yGet(rootNode, 2).toInt() == 0) {
+            return "(no frames yet: the first layout pass has not run, so nothing has a resolved size)"
+        }
+        // The app's own tree first. Ids sort as strings, and a recycled list cell is
+        // named ".0.cellN", so a plain sort puts a pool of detached cells above the
+        // screen you are looking at and fills the first screenful with them. They are
+        // real views and worth seeing, so they follow under a heading rather than
+        // being dropped.
+        val rooted = views.keys.filter { it == "app" || it.startsWith("app.") }.sorted()
+        val detached = views.keys.filter { !(it == "app" || it.startsWith("app.")) }.sorted()
+        val sb = StringBuilder()
+        for (id in rooted + listOf(DETACHED_MARK) + detached) {
+            if (id == DETACHED_MARK) {
+                if (detached.isEmpty()) continue
+                sb.append("-- not attached to the app root (recycled list cells, torn-down screens) --\n")
+                continue
+            }
+            val v = views[id] ?: continue
+            val depth = id.count { it == '.' }
+            val pad = "  ".repeat(depth)
+            // The frame comes from Yoga, not from the View. Android applies a frame by
+            // assigning LayoutParams and asking for a layout pass, and that pass has not
+            // run yet when a capability answers on the main looper: every v.width would
+            // read 0 and the dump would call the whole tree ZERO-SIZED. The Yoga node
+            // holds the resolved frame the moment relayout() computed it, which is the
+            // number this dump claims to show, and it is what iOS reports too (there the
+            // frame is assigned to the view directly, so the two agree).
+            val yn = ynodes[id]
+            val x: Int; val y: Int; val w: Int; val h: Int
+            if (yn != null) {
+                x = (N.yGet(yn, 0) / density).toInt(); y = (N.yGet(yn, 1) / density).toInt()
+                w = (N.yGet(yn, 2) / density).toInt(); h = (N.yGet(yn, 3) / density).toInt()
+            } else {
+                x = (v.x / density).toInt(); y = (v.y / density).toInt()
+                w = (v.width / density).toInt(); h = (v.height / density).toInt()
+            }
+            sb.append("$pad$id  ${v.javaClass.simpleName}  $x,$y ${w}x$h")
+            if (v.visibility != View.VISIBLE) sb.append("  hidden")
+            if (w == 0 || h == 0) sb.append("  ZERO-SIZED")
+            (v as? TextView)?.text?.toString()?.let {
+                if (it.isNotEmpty()) sb.append("  \"" + (if (it.length > 30) it.take(30) + "…" else it) + "\"")
+            }
+            sb.append("\n")
+        }
+        return if (sb.isEmpty()) "(no views)" else sb.toString()
+    }
+
     private fun handleCommand(token: String, cap: String, args: String, a: ChuksArgs) {
         when (cap) {
             "__cancel__" -> {
@@ -1350,6 +1407,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             }
             "biometrics.authenticate" -> authenticateBiometric(token, args)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
+            "debug.viewTree" -> resolve(token, viewTreeDump())
             "debug.fail" -> fail(token, "simulated native failure")
             "permission.status" -> {
                 val p = permString(args)
