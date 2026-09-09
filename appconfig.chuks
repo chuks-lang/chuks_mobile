@@ -188,6 +188,52 @@ function implementedCaps(pkg: any, platform: string, ns: string): []string {
     return out
 }
 
+// Every `"<ns>.<name>"` a package's own CHUKS source emits.
+//
+// This is the other side of the boundary from implementedCaps: what the package ASKS
+// for, rather than what its native halves answer. A name that appears here and nowhere
+// else is a command or a view kind nobody handles, which fails in the quietest way
+// there is. A mistyped view kind renders a plain empty container: no error, no log, no
+// missing callback, just nothing on screen.
+function chuksEmitted(pkg: any, ns: string): []string {
+    var out: []string = []
+    const dir: string = string(pkg["__dir"])
+    var files: []string = []
+    const main: any = pkg["main"]
+    if (main != null) { files.push(dir + "/" + string(main)) }
+    const srcDir: string = dir + "/src"
+    if (fs.exists(srcDir)) {
+        const entries: []DirEntry = fs.readDir(srcDir)
+        var i: int = 0
+        while (i < entries.length) {
+            const e: DirEntry = entries[i]
+            i = i + 1
+            if (e.isDir) { continue }
+            if (!endsWith(e.name, ".chuks")) { continue }
+            const path: string = srcDir + "/" + e.name
+            if (!contains(files, path)) { files.push(path) }
+        }
+    }
+    var j: int = 0
+    while (j < files.length) {
+        const f: string = files[j]
+        j = j + 1
+        if (!fs.exists(f)) { continue }
+        const found: []string = capNamesIn(fs.readFile(f), ns)
+        var k: int = 0
+        while (k < found.length) {
+            if (!contains(out, found[k])) { out.push(found[k]) }
+            k = k + 1
+        }
+    }
+    return out
+}
+
+function endsWith(s: string, suffix: string): bool {
+    if (suffix.length > s.length) { return false }
+    return s.slice(s.length - suffix.length, s.length) == suffix
+}
+
 // Does the package declare this capability for this platform? An absent
 // "capabilities" block means nothing is declared, so nothing is excused.
 function declaredFor(m: any, name: string, platform: string): bool {
@@ -392,6 +438,19 @@ function mobileSymmetryStr(projdir: string): string {
                 out = out + "gap\t" + name + "\t" + ns + "." + c + "\timplemented in Swift, missing from the Kotlin\n"
             }
         }
+        // What the package's own Chuks asks for, against what anything answers. A view
+        // kind is answered by the view registry rather than by a native branch, so it
+        // counts as handled when it is declared.
+        const emitted: []string = chuksEmitted(pkg, ns)
+        var e: int = 0
+        while (e < emitted.length) {
+            const name2: string = emitted[e]
+            e = e + 1
+            if (contains(ios, name2) || contains(android, name2)) { continue }
+            if (isViewKind(m, name2)) { continue }
+            out = out + "gap\t" + name + "\t" + ns + "." + name2 + "\tthe package's Chuks emits this, but no native source handles it and no view declares it\n"
+        }
+
         var k: int = 0
         while (k < android.length) {
             const c2: string = android[k]

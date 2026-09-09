@@ -104,10 +104,12 @@ chuks_capability_check() {
     gaps="$(printf '%s\n' "$sym" | grep -c '^gap' || true)"
     notes="$(printf '%s\n' "$sym" | grep -c '^note' || true)"
     if [ "$gaps" -gt 0 ]; then
-        echo "   capability check: $gaps iOS/Android mismatch(es)"
+        echo "   capability check: $gaps problem(s)"
         printf '%s\n' "$sym" | awk -F'\t' '$1=="gap" { printf "      %s  %s\n", $3, $4 }'
-        echo "      A capability missing on one side is dead there. Implement it, or declare the"
-        echo "      difference: \"capabilities\" in a package's chuks.json, \"coreCapabilities\" in the SDK's."
+        echo "      Nothing answers a name like these, and nothing will say so at runtime: a command"
+        echo "      reaches no capability, a view kind renders an empty container. Implement it, fix"
+        echo "      the spelling, or declare the difference: \"capabilities\" and \"views\" in a package's"
+        echo "      chuks.json, \"coreCapabilities\" in the SDK's."
     fi
     [ "$notes" -gt 0 ] && echo "   capability check: $notes declared platform difference(s)"
     return 0
