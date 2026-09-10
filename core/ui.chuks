@@ -782,7 +782,7 @@ export function Column(first: ViewProps | []Kid, kids: []Kid = []): Node {
     applyLayoutV(s, p); const n: Node = mkView(s, flatKids(kids)); applyEventsV(n, p); return n
 }
 /**
- * A plain box (the base container). No default direction or alignment — just the
+ * A plain box (the base container). No default direction or alignment, just the
  * layout/visual props you set (`w`, `h`, `bg`, `radius`, `grow`, `pad`, `gap`,
  * `align`, `justify`, `border`, ...). Use it for spacers, fills, and simple surfaces;
  * reach for `Column`/`Row` when you want a stacking direction by default.
@@ -916,12 +916,12 @@ dataType ImageProps {
 /**
  * A remote (network) image loaded from a URL. The host fetches + caches the
  * bytes asynchronously and shows them; give it a size (`w`/`h`) and optional
- * `radius`. `resize`: "cover" (fill, crop — default), "contain" (fit), "center".
+ * `radius`. `resize`: "cover" (fill, crop, the default), "contain" (fit), "center".
  * (For a local SF Symbol icon use `Icon`/`name` instead.) The URL rides the text
  * channel, so it may not contain a newline or "|".
  *
  * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color),
- *   `tintColor`, `blurRadius`, `spinner`, and `filter` — a GPU photo-filter preset
+ *   `tintColor`, `blurRadius`, `spinner`, and `filter`, a GPU photo-filter preset
  *   (`mono` | `noir` | `sepia` | `vivid` | `cool` | `warm` | `fade`; `normal` = none),
  *   applied natively via Core Image (iOS) / a ColorMatrix on the hardware layer (Android).
  *
@@ -1338,7 +1338,7 @@ export function Pressable(first: PressableProps | []Kid, kids: []Kid = []): Node
 }
 /**
  * An indeterminate activity spinner (UIActivityIndicatorView
- * / Android ProgressBar). Display-only — it just spins to signal work in progress.
+ * / Android ProgressBar). Display-only: it just spins to signal work in progress.
  *
  * Props: `size` (px diameter, default 24), `color` (hex; omit for the platform tint).
  *
