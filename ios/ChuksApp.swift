@@ -2494,7 +2494,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     func resolve(_ token: String, _ payload: String) { if let s = eResolve(token, payload) { apply(s); relayout() } }
     // Report a capability failure back to the engine (fires the request's onErr).
-    func fail(_ token: String, _ message: String) { if let s = eFail(token, message) { apply(s); relayout() } }
+    // Token "0" means the caller passed no callback, so the engine allocated nothing and
+    // there is no closure anywhere to hand this to. The engine's own unhandled-failure
+    // warning cannot reach these, because there is no token for it to fail: a
+    // fire-and-forget capability has nowhere to report to BY CONSTRUCTION. The host is
+    // the last place that still knows both the capability and the reason, so it says so
+    // here rather than letting the failure evaporate.
+    func fail(_ token: String, _ message: String) {
+        if token == "0" {
+            os_log("%{public}@", log: chuksLog, type: .error,
+                   "chuks warning: \(dispatchingCap.isEmpty ? "a capability" : dispatchingCap) failed and nothing is listening: \"\(message)\". It was called without a callback, so nothing could be told.")
+            return
+        }
+        if let s = eFail(token, message) { apply(s); relayout() }
+    }
+    // The capability currently being dispatched, so a failure can name itself.
+    var dispatchingCap: String = ""
 
     // Live native subscriptions (stream token -> timer/observer), for teardown.
     var activeStreams: [String: Timer] = [:]
@@ -2603,6 +2618,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func handleCommand(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) {
+        dispatchingCap = cap
         switch cap {
         case "__cancel__":
             activeStreams[token]?.invalidate(); activeStreams[token] = nil
@@ -3030,9 +3046,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 self.orientationTokens.forEach { self.resolve($0, currentOrientationString()) }
             }
         default:
-            // Not a framework capability. An installed package may claim this
-            // namespace; if none does, the command is unknown, exactly as before.
-            _ = packageModules.handle(token, cap, args, a)
+            // Not a framework capability. An installed package may claim this namespace.
+            // If none does the command is unknown, and saying nothing was the worst
+            // answer available: a misspelt capability, one a package forgot to declare,
+            // and one that simply does not exist on this platform all behaved like a
+            // call that quietly worked. Route it through fail(), which reaches the app
+            // when somebody is listening and the log when nobody is.
+            if !packageModules.handle(token, cap, args, a) {
+                fail(token, "no capability named \(cap) on iOS. Check the spelling, or whether the package that provides it declares this platform.")
+            }
         }
     }
 

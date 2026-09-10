@@ -1046,9 +1046,23 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         applyStream(engResolve(token, payload)); relayout()
     }
     // Report a capability failure back to the engine (fires the request's onErr).
+    // Token "0" means the caller passed no callback, so the engine allocated nothing and
+    // there is no closure anywhere to hand this to. The engine's own unhandled-failure
+    // warning cannot reach these, because there is no token for it to fail: a
+    // fire-and-forget capability has nowhere to report to BY CONSTRUCTION. The host is
+    // the last place that still knows both the capability and the reason, so it says so
+    // here rather than letting the failure evaporate.
     override fun fail(token: String, message: String) {
+        if (token == "0") {
+            val what = if (dispatchingCap.isEmpty()) "a capability" else dispatchingCap
+            android.util.Log.w("Chuks", "chuks warning: $what failed and nothing is listening: " +
+                "\"$message\". It was called without a callback, so nothing could be told.")
+            return
+        }
         applyStream(engFail(token, message)); relayout()
     }
+    // The capability currently being dispatched, so a failure can name itself.
+    private var dispatchingCap: String = ""
     // ChuksModuleHost: a module gets the Activity the framework's own capabilities use.
     override val activity: Activity get() = this
 
@@ -1141,6 +1155,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     }
 
     private fun handleCommand(token: String, cap: String, args: String, a: ChuksArgs) {
+        dispatchingCap = cap
         when (cap) {
             "__cancel__" -> {
                 // Chuks cancelled this token (unmount / explicit): stop + drop the
@@ -1617,9 +1632,16 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
                 else        -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             }
-            // Not a framework capability. An installed package may claim this namespace;
-            // if none does, the command is unknown, exactly as before.
-            else -> packageModules.handle(token, cap, args, a)
+            // Not a framework capability. An installed package may claim this namespace.
+            // If none does the command is unknown, and saying nothing was the worst
+            // answer available: a misspelt capability, one a package forgot to declare,
+            // and one that simply does not exist on this platform all behaved like a
+            // call that quietly worked. Route it through fail(), which reaches the app
+            // when somebody is listening and the log when nobody is.
+            else -> if (!packageModules.handle(token, cap, args, a)) {
+                fail(token, "no capability named $cap on Android. Check the spelling, or " +
+                    "whether the package that provides it declares this platform.")
+            }
         }
     }
 

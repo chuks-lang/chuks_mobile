@@ -784,9 +784,38 @@ export function Text(first: TextProps | string, body: string = ""): Node {
     s.nlines = p.numberOfLines ?? -1                         // cap lines (truncates the overflow)
     s.ellip = p.ellipsizeMode ?? ""                          // "tail"|"head"|"middle"|"clip"
     if (p.selectable ?? false) { s.selectable = 1 }          // user can select/copy the text
+    warnUnwrappableText(p, body)
     const n: Node = mkText(s, body)
     applyEventsV(n, p)                                        // onPress makes the text tappable (a link)
     return n
+}
+
+// How long a line has to be before it is worth mentioning. Deliberately generous: a
+// sentence this long needs more than one line on any phone, and the point is to catch
+// the paragraph that runs off the edge, not to have an opinion about labels.
+const WRAP_SUSPECT_CHARS: int = 70
+
+/**
+ * A long Text with no width will not wrap.
+ *
+ * Yoga measures a text node against the width it is GIVEN, and `grow: 1` sizes the box
+ * without ever telling the label what to measure against, so the label keeps reporting a
+ * single very long line and the sentence runs off the edge of the screen. An explicit
+ * `w:` is what makes it break. This is the one layout rule in the framework that reads
+ * as a bug rather than a rule, and it has cost a device round trip more than once.
+ *
+ * Skipped when `numberOfLines` is 1, which says the text is meant to stay on one line and
+ * be ellipsized, and when a width is already given.
+ */
+function warnUnwrappableText(p: TextProps, body: string): void {
+    if (body.length < WRAP_SUSPECT_CHARS) { return }
+    if (p.w != null) { return }
+    if ((p.numberOfLines ?? -1) == 1) { return }
+    const head: string = body.slice(0, 32)
+    devWarn("textwrap:" + head,
+            "a Text of " + string(body.length) + " characters has no w:, so it will not wrap and " +
+            "will run off the screen: \"" + head + "...\". Give it an explicit width; grow: 1 sizes " +
+            "the box but leaves the label measuring itself on one line.")
 }
 dataType VideoProps {
     ViewProps; MediaEventProps;
