@@ -10,6 +10,7 @@
 
 import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
+import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
 import { Prop } from "./prop.chuks";
 import { tw } from "./tw.chuks";
@@ -3327,6 +3328,7 @@ export class App {
         // any earlier would put the commands in a buffer that begin() then throws away,
         // and they would vanish without a trace.
         flushHostReady()
+        this.flushAppearance()
         hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
         return this.recon.count()
     }
@@ -3334,6 +3336,12 @@ export class App {
     // calls this on every /mount so any host that connects or relaunches gets a complete
     // tree, not an empty diff against a tree it never received. Not called in production.
     public remount(): int { this.recon.forgetCommitted(); return this.mount() }
+    // Hand the host the app's appearance on the frame it changed. Inside begin(), so the
+    // command rides this batch rather than a buffer that begin() has already cleared.
+    flushAppearance(): void {
+        const a: string = takeAppearance()
+        if (a != "") { this.recon.command("appearance.set", json.stringify(a), null, null, false) }
+    }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
     public setViewport(top: int, h: int, w: int): int {
         runAsyncQueue()
@@ -3376,6 +3384,7 @@ export class App {
         // the host ever drained it: exactly the trap mount() documents below, in the
         // general case. Anything the queue emits has to land inside this frame.
         this.recon.begin()
+        this.flushAppearance()
         const ran: bool = runAsyncQueue()
         var active: int = 0                            // advance decay/spring values (updates their cur)
         if (_frameStepper != null) { const f: any = _frameStepper; active = int(f()) }

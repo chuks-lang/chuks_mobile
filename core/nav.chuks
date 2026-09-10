@@ -211,6 +211,14 @@ export dataType TabViewProps {
     activeColor: string?,         // active icon/label color   (default tk("primary"))
     inactiveColor: string?,       // inactive icon/label color (default tk("subtle"))
     bg: string?,                  // bar background (default tk("surface"))
+    // Liquid Glass for the bar: the real iOS 26 material, a frosted panel elsewhere.
+    //
+    // `bg` becomes the FALLBACK rather than the background. An opaque colour behind the
+    // material is exactly what the material would sample, so it is not painted while the
+    // glass is live; it is painted when the glass cannot be, which is what Reduce
+    // Transparency asks for. Set both, or a walker with that setting on gets a bar with
+    // no surface at all.
+    glass: bool?,
     fabColor: string?,            // FAB glyph color on the tint circle (default tk("primaryText"))
     header: Node?,                // a fixed slot ABOVE the content (a top app bar)
     accessory: Node?,             // a floating slot just above the bar (a mini-player / banner)
@@ -343,9 +351,54 @@ export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
     const consumed: int = p.header != null ? safeTop() : 0
     kids.push(tabContent(spec, p.active, consumed))
     if (p.accessory != null) { kids.push(p.accessory) }                             // floating accessory
-    if (p.bar != null) { const bf: any = p.bar; kids.push(bf(tabs, p.active, p.onSelect)) }   // custom bar
-    else { kids.push(defaultTabBar(tabs, p)) }                                       // default bar
+    var barNode: Node = defaultTabBar(tabs, p)
+    if (p.bar != null) { const bf: any = p.bar; barNode = bf(tabs, p.active, p.onSelect) }   // custom bar
+    if (p.glass ?? false) {
+        // A glass bar has to FLOAT, or the material has nothing to work with. In flow it
+        // sits on the app background, and a material over one flat colour is just a
+        // tinted panel: that is the whole reason glass can look disappointing. Out of
+        // flow, the content scrolls under it and the material has something to refract.
+        //
+        // The content keeps the full height, so screens must clear the bar themselves.
+        // tabBarHeight() is what they pad by.
+        kids.push(Column({ abs: true, bottom: 0, left: 0, right: 0, z: 20 }, [ barNode ]))
+    } else {
+        kids.push(barNode)
+    }
     return Column({ grow: 1, tw: "bg-bg" }, kids)
+}
+
+/**
+ * How tall the default tab bar is, in points, including the bottom safe-area inset.
+ *
+ * Exported because a glass bar FLOATS over the content, so every screen has to keep its
+ * last row clear of it, and the only alternative to a real number is each app guessing
+ * one and getting it wrong on the next device.
+ *
+ * The tallest item sets the height: a raised `fab` is 56, and a plain icon-and-label
+ * column comes to about 54. The bar adds 6 above and the home-indicator inset below,
+ * or 6 on a device without one.
+ */
+export function tabBarHeight(): int { return 56 + 10 + floatingBarGap() }
+
+/**
+ * How far a floating bar sits above the bottom edge.
+ *
+ * NOT the whole safe-area inset, which is the mistake that leaves an iPhone with a
+ * conspicuous band of empty background under the bar. That inset exists so CONTENT clears
+ * the home indicator, and an edge-to-edge bar spent it as internal padding, so its
+ * background still reached the screen edge and none of it was visible. A floating capsule
+ * spends it as margin instead, and 34pt of margin is a hole. The capsule only has to clear
+ * the indicator itself, which sits a few points up from the edge.
+ *
+ * A device with no home indicator gets a plain breathing gap, and the result never falls
+ * below 8 so the bar cannot end up flush against the edge on some future inset.
+ */
+function floatingBarGap(): int {
+    const inset: int = safeBottom()
+    if (inset <= 0) { return 10 }
+    const g: int = inset - 14
+    return g < 8 ? 8 : g
 }
 
 // A small notification bubble drawn over a tab icon (top-right). "" renders a dot.
@@ -401,6 +454,18 @@ function defaultTabBar(tabs: []TabSpec, p: TabViewProps): Node {
                 }
             }
         }
+    }
+    // Glass carries its own rim, so the hairline that separates a solid bar from the
+    // content above it would read as a second, harder edge on top of it.
+    const isGlass: bool = p.glass ?? false
+    if (isGlass) {
+        // A floating capsule, inset from the edges, the way iOS 26 draws a tab bar.
+        // The inset is not decoration: an edge-to-edge slab has no visible boundary, so
+        // the material reads as a tinted panel no matter how good it is. Seeing the page
+        // continue AROUND and UNDER the bar is what makes glass look like glass.
+        return Row({ px: 12, pb: floatingBarGap() }, [
+                Row({ grow: 1, glass: true, bg: bg, radius: 30, px: 4, py: 5 }, items),
+        ])
     }
     return Column({ bg: bg }, [
             Row({ tw: "h-1 bg-borderSoft" }, []),   // top hairline

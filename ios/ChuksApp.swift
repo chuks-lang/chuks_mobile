@@ -1151,6 +1151,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     static var imageCache: [String: UIImage] = [:]                       // URL -> decoded image (shared)
     var bgImageViews: [String: UIImageView] = [:]                        // ImageBackground id -> its backing image view
     var glassViews: [String: UIVisualEffectView] = [:]                   // id -> Liquid Glass backing view
+    var glassPending: Set<String> = []                                   // glass never built yet (no frame at style time)
+    var glassBuiltFor: [String: UIUserInterfaceStyle] = [:]              // the appearance each material was built against
+    var glassFallbackColor: [String: UIColor] = [:]                      // the `bg` a glass surface falls back to
+    var themeFadeView: UIView?                                           // frozen frame of the old theme, faded out
     var gradLayers: [String: ChuksGradientView] = [:]                    // id -> linear-gradient background view
     var blurViews: [String: UIVisualEffectView] = [:]                    // id -> backdrop-blur material view
     var blurSpec: [String: (intensity: Int, tint: String)] = [:]         // last applied blur, to rebuild on either part changing
@@ -2478,6 +2482,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
         }
         syncChrome()
+        finishThemeFade()
+    }
+
+    /// Dissolve the frozen old-theme frame, once the new one is fully in place.
+    ///
+    /// Deferred to the next runloop turn so the fade starts against a laid-out tree
+    /// rather than a half-applied one; starting it inside the same batch shows the old
+    /// frame dissolving into an unfinished layout, which looks worse than the hard cut
+    /// it replaces.
+    private func finishThemeFade() {
+        guard let snap = themeFadeView else { return }
+        themeFadeView = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.relayout()
+            UIView.animate(withDuration: 0.28, delay: 0, options: [.curveEaseInOut], animations: {
+                snap.alpha = 0
+            }, completion: { _ in snap.removeFromSuperview() })
+        }
     }
 
     // Deliver a native capability result back to the engine and apply the re-render.
@@ -3015,6 +3037,36 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // natively because the engine's own println reaches neither the device console
         // nor idevicesyslog.
         case "dev.warn": os_log("%{public}@", log: chuksLog, type: .error, "chuks warning: " + args)
+        // Which appearance the APP is in, which is not the same question as which
+        // appearance the phone is in. Every adaptive thing UIKit draws resolves against
+        // the system trait unless told otherwise, so an app switched to its own light
+        // theme on a phone left in dark mode got the DARK glass material: a dark slab in
+        // a light app. Overriding on the window covers glass, blur and anything else
+        // adaptive in one place rather than per view.
+        case "appearance.set":
+            // Freeze the CURRENT frame on top before anything changes, and dissolve it
+            // once the whole batch has landed. A theme switch is not one property
+            // animating, it is every colour in the tree replaced at once, plus every
+            // glass surface torn down and rebuilt to pick up the new trait: nothing in
+            // that is individually animatable, and done bare it reads as a hard cut with
+            // a flash where the materials pop back. One crossfade over the lot is both
+            // smoother and cheaper than trying to tween the parts.
+            if themeFadeView == nil, let snap = view.snapshotView(afterScreenUpdates: false) {
+                snap.frame = view.bounds
+                snap.isUserInteractionEnabled = false
+                snap.tag = CHUKS_DECOR_TAG
+                view.addSubview(snap)
+                themeFadeView = snap
+            }
+            let style: UIUserInterfaceStyle = args == "light" ? .light : (args == "dark" ? .dark : .unspecified)
+            view.window?.overrideUserInterfaceStyle = style
+            view.overrideUserInterfaceStyle = style
+            // A live material keeps the trait it was built with, so every glass surface
+            // needs rebuilding. Nothing is cleared here: activateGlass compares each
+            // surface against the CURRENT trait on every layout pass and rebuilds what no
+            // longer matches, which is why this only has to ask for a layout. Next runloop
+            // turn, so the trait set just above has actually propagated.
+            DispatchQueue.main.async { [weak self] in self?.relayout() }
         case "clipboard.set": UIPasteboard.general.string = args
         case "clipboard.get": resolve(token, UIPasteboard.general.string ?? "")
         case "linking.open":
@@ -3809,7 +3861,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                             if let yn = ynodes[id] { YGNodeStyleSetWidth(yn, Float(sz.width)); YGNodeStyleSetHeight(yn, Float(sz.height)) }
                           }
             case "avis":  if val == "1" { presentAlert(id) } else { dismissAlert(id) }
-            case "bg":  if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) } else { v.backgroundColor = hexColor(val) }
+            case "bg":
+                if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) }
+                else if glassViews[id] != nil || glassPending.contains(id) {
+                    // A glass surface's `bg` is what it falls back to, not what sits
+                    // behind it: an opaque colour behind the material is exactly what the
+                    // material would sample, and the surface would read as a flat panel.
+                    glassFallbackColor[id] = hexColor(val)
+                    if UIAccessibility.isReduceTransparencyEnabled { v.backgroundColor = hexColor(val) }
+                } else { v.backgroundColor = hexColor(val) }
             case "swtc": (v as? UISwitch)?.thumbTintColor = hexColor(val)   // Switch thumb (knob) color
             case "fg":  label?.textColor = hexColor(val); btn?.setTitleColor(hexColor(val), for: .normal)
                         field?.textColor = hexColor(val); imgView?.tintColor = hexColor(val)
@@ -3940,17 +4000,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "glass":   // Liquid Glass: a UIGlassEffect view behind the content (blur fallback)
                 if val == "1" {
                     if glassViews[id] == nil {
-                        let eff: UIVisualEffect
-                        if #available(iOS 26.0, *) { eff = UIGlassEffect() } else { eff = UIBlurEffect(style: .systemUltraThinMaterial) }
-                        let gv = UIVisualEffectView(effect: eff)
+                        // Created EMPTY. UIGlassEffect does not render if it is applied
+                        // before the view has been laid out, and at style time the frame
+                        // is usually still zero: that is why this looked like a flat grey
+                        // slab rather than glass. activateGlass() attaches the effect from
+                        // the layout pass, once there is a real frame to refract into.
+                        let gv = UIVisualEffectView(effect: nil)
                         gv.isUserInteractionEnabled = false
                         gv.tag = CHUKS_DECOR_TAG
                         gv.frame = v.bounds; gv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
                         gv.clipsToBounds = true; gv.layer.cornerRadius = v.layer.cornerRadius
-                        v.insertSubview(gv, at: 0); v.backgroundColor = .clear
+                        v.insertSubview(gv, at: 0)
+                        if let had = v.backgroundColor, had != .clear { glassFallbackColor[id] = had }
+                        v.backgroundColor = .clear
                         glassViews[id] = gv
+                        glassPending.insert(id)
                     }
-                } else { glassViews[id]?.removeFromSuperview(); glassViews[id] = nil }
+                } else {
+                    glassViews[id]?.removeFromSuperview(); glassViews[id] = nil
+                    glassPending.remove(id); glassFallbackColor[id] = nil
+                }
             // Linear gradient background. The three parts arrive as separate style keys, so
             // each one re-applies the whole spec rather than trying to patch a live layer.
             // Backdrop blur: a real UIVisualEffectView, so the system samples what is
@@ -4691,6 +4760,58 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return CGRect(x: CGFloat(l), y: CGFloat(t), width: CGFloat(w), height: CGFloat(h))
     }
 
+    /// Attach the Liquid Glass material, once the view has a real frame, and REATTACH it
+    /// whenever the appearance it was built against is no longer the current one.
+    ///
+    /// Driven by comparing the trait rather than by a flag set when the theme changes.
+    /// The flag version raced: the rebuild and the layout pass are both async, so a
+    /// rebuild that landed AFTER the activations left surfaces cleared with nothing
+    /// re-applied, and the bar simply vanished. Comparing state cannot race, and any pass
+    /// that misses is corrected by the next one.
+    ///
+    /// Everything here is a workaround for the same fact: UIGlassEffect is laid out, not
+    /// merely drawn, so it renders nothing useful until the view it belongs to has a size.
+    /// Applying it at style time gives an opaque panel that looks like a mistake, which is
+    /// exactly what it looked like.
+    ///
+    /// The three moves, in order, all of them load-bearing:
+    ///   1. clear to a plain UIVisualEffect first, so UIKit tears the old effect down;
+    ///      re-assigning over a live effect does not take.
+    ///   2. shape it with cornerConfiguration rather than layer.cornerRadius, so the
+    ///      material's edge refracts along the corner instead of being clipped square.
+    ///   3. assign `effect` again at the end. Configuring the effect object after it is
+    ///      attached does nothing until it is re-set.
+    ///
+    /// Below iOS 26 there is no glass, so this falls back to the thinnest blur material,
+    /// which is the nearest honest thing the platform has.
+    private func activateGlass(_ id: String, _ gv: UIVisualEffectView, _ fr: CGRect) {
+        guard fr.width > 0, fr.height > 0 else { return }
+        let want = view.traitCollection.userInterfaceStyle
+        // Already correct for this appearance: nothing to do, and this runs every layout
+        // pass so the early exit matters.
+        if !glassPending.contains(id), glassBuiltFor[id] == want, gv.effect != nil { return }
+        glassPending.remove(id)
+        glassBuiltFor[id] = want
+
+        if UIAccessibility.isReduceTransparencyEnabled {
+            gv.removeFromSuperview(); glassViews[id] = nil; glassBuiltFor[id] = nil
+            if let host = views[id] { host.backgroundColor = glassFallbackColor[id] }
+            return
+        }
+        gv.effect = UIVisualEffect()
+        if #available(iOS 26.0, *), NSClassFromString("UIGlassEffect") != nil {
+            let eff = UIGlassEffect(style: .regular)
+            eff.isInteractive = false          // a backdrop; the children own the touches
+            let r = UICornerRadius(floatLiteral: gv.layer.cornerRadius)
+            gv.cornerConfiguration = .corners(topLeftRadius: r, topRightRadius: r,
+                                              bottomLeftRadius: r, bottomRightRadius: r)
+            gv.layer.cornerCurve = .continuous
+            gv.effect = eff
+        } else {
+            gv.effect = UIBlurEffect(style: .systemUltraThinMaterial)
+        }
+    }
+
     /// A Yoga measurement for something that needs a number rather than a skip, such as a
     /// scroll's content size. Undefined collapses to zero, which is inert.
     private func yogaSize(_ v: Float) -> CGFloat { v.isFinite ? CGFloat(v) : 0 }
@@ -4742,7 +4863,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
             else if let rr = cornerRadii[id] { views[id]?.layer.cornerRadius = min(rr, min(fr.width, fr.height) / 2) }   // clamp numeric radius: never a diamond
             if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
-            if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
+            if let gv = glassViews[id] {
+                gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0   // match the view's rounding
+                activateGlass(id, gv, fr)
+            }
             if let gv = gradLayers[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the clamped rounding
             if let bv = blurViews[id] { bv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }
         }

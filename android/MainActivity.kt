@@ -1570,6 +1570,11 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             // The framework noticed something the app probably did not mean. Logged
             // natively because the engine's own println reaches nothing on Android.
             "dev.warn" -> android.util.Log.w("Chuks", args)
+            // Which appearance the APP is in. Android's glass is a static scrim rather
+            // than a system material, so nothing here resolves against a trait and this
+            // is recorded rather than applied; it exists so the capability answers on
+            // both platforms instead of failing on one.
+            "appearance.set" -> appAppearance = args
             "clipboard.set" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
             "clipboard.get" -> {
                 val t = clipboard().primaryClip?.let { if (it.itemCount > 0) it.getItemAt(0).coerceToText(this).toString() else "" } ?: ""
@@ -2253,6 +2258,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val gradColors = HashMap<String, IntArray>()   // id -> linear-gradient colors
     private val gradAngle = HashMap<String, Int>()         // id -> angle in degrees (0 = top to bottom)
     private val gradStops = HashMap<String, FloatArray>()  // id -> 0..1 positions matching the colors
+    private var appAppearance: String = "auto"   // the app's own light/dark choice
     private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a translucent frosted panel
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
     private val longPressActions = HashMap<String, String>()   // id -> onLongPress action
