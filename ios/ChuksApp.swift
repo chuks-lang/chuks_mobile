@@ -19,6 +19,7 @@ import PhotosUI
 import UserNotifications
 import CoreLocation
 import CoreMotion
+import os
 import ImageIO
 
 // Per WWDC "Image and Graphics Best Practices": decode a
@@ -486,10 +487,52 @@ final class ColdStartProbe {
     }
 }
 
+// ---- println reaches the log ----------------------------------------------
+//
+// The engine's println goes to file descriptor 1. On a device that descriptor leads
+// nowhere a developer can see: not the unified log, not idevicesyslog, not Console. An
+// app can print all day and see nothing, which is worse than having no print statement
+// at all, because it reads as code that never ran.
+//
+// So take the descriptor over. A pipe replaces stdout and stderr and each line is
+// re-emitted through NSLog, which does reach the unified log. This works at the
+// descriptor rather than at any one engine, so it catches the AOT binary, the CMR VM,
+// and anything a native package prints.
+private let chuksLog = OSLog(subsystem: "org.chuks.mobile", category: "Chuks")
+private var chuksStdioPipe: Pipe?
+private var chuksStdioTail = ""
+func chuksPipeStdioToLog() {
+    if chuksStdioPipe != nil { return }
+    let p = Pipe()
+    chuksStdioPipe = p
+    setvbuf(stdout, nil, _IOLBF, 0)          // line buffered, so a print appears when written
+    setvbuf(stderr, nil, _IONBF, 0)
+    let w = p.fileHandleForWriting.fileDescriptor
+    dup2(w, STDOUT_FILENO)
+    dup2(w, STDERR_FILENO)                    // so a runtime panic is not lost either
+    // Whole lines only: a read can split mid-line, and half a message logged twice is
+    // harder to read than the one it came from.
+    p.fileHandleForReading.readabilityHandler = { h in
+        let d = h.availableData
+        if d.isEmpty { return }
+        guard let chunk = String(data: d, encoding: .utf8) else { return }
+        chuksStdioTail += chunk
+        while let nl = chuksStdioTail.firstIndex(of: "\n") {
+            let line = String(chuksStdioTail[chuksStdioTail.startIndex..<nl])
+            chuksStdioTail = String(chuksStdioTail[chuksStdioTail.index(after: nl)...])
+            // os_log, NOT NSLog. NSLog can write to stderr, and stderr is one of the
+            // two descriptors redirected into this very pipe: the first print would
+            // have fed itself back in and looped for ever.
+            if !line.isEmpty { os_log("%{public}@", log: chuksLog, type: .info, line) }
+        }
+    }
+}
+
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     func application(_ a: UIApplication, didFinishLaunchingWithOptions o: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        chuksPipeStdioToLog()
         let w = UIWindow(frame: UIScreen.main.bounds)
         let vc = CardsVC()
         if let url = o?[.url] as? URL { vc.lastURL = url.absoluteString }   // deep link that launched the app
@@ -2952,6 +2995,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             speech.speak(AVSpeechUtterance(string: args))
         case "tts.stop": speech.stopSpeaking(at: .immediate)
         case "tts.isSpeaking": resolve(token, speech.isSpeaking ? "1" : "0")
+        // The framework noticed something the app probably did not mean. Logged
+        // natively because the engine's own println reaches neither the device console
+        // nor idevicesyslog.
+        case "dev.warn": os_log("%{public}@", log: chuksLog, type: .error, "chuks warning: " + args)
         case "clipboard.set": UIPasteboard.general.string = args
         case "clipboard.get": resolve(token, UIPasteboard.general.string ?? "")
         case "linking.open":

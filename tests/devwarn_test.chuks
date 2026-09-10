@@ -1,0 +1,61 @@
+// The dev warning channel: what the framework says when something fails quietly.
+//
+// The bug class this exists for: a capability refuses, the caller passed no error
+// handler, and the message goes nowhere. On screen that is a zero, and a zero is
+// indistinguishable from a device that works and a person who has not moved. Every
+// expensive bug of that session was this shape, and the framework knew every time.
+//
+// The second thing under test is the de-duplication, which is not a nicety. The failure
+// that prompted the channel was a two-second poll refusing forever: printed every time,
+// it would bury the warnings worth reading. Once, with a count, is the honest form.
+//
+// Run:  chuks run tests/devwarn_test.chuks   (exits non-zero on failure)
+import { devWarn, devWarnings, devWarnCount, clearDevWarnings } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+function main(): void {
+    println("devwarn_test")
+    clearDevWarnings()
+
+    check(devWarnings().length == 0, "nothing to report before anything goes wrong")
+
+    devWarn("pedometer.query|unsupported", "pedometer.query failed and nothing is listening")
+    check(devWarnings().length == 1, "a warning is kept, not just printed")
+    check(devWarnCount("pedometer.query|unsupported") == 1, "and counted once")
+
+    // The polling case. Same situation, three hundred times.
+    for (var i: int = 0; i < 300; i = i + 1) {
+        devWarn("pedometer.query|unsupported", "pedometer.query failed and nothing is listening")
+    }
+    check(devWarnings().length == 1, "a repeat is the same warning, not a new one")
+    check(devWarnCount("pedometer.query|unsupported") == 301, "but every occurrence is counted")
+
+    // A different situation is a different warning, even from the same capability.
+    devWarn("pedometer.query|denied", "pedometer.query failed: permission denied")
+    check(devWarnings().length == 2, "a different failure is a second warning")
+    check(devWarnCount("pedometer.query|unsupported") == 301, "and does not disturb the first count")
+
+    // Order is the order things first happened, so the log reads as a history.
+    const w: []string = devWarnings()
+    check(w[0].contains("nothing is listening"), "the first warning is the first one raised")
+    check(w[1].contains("permission denied"), "the second is the second")
+
+    // An unknown key has fired zero times rather than erroring.
+    check(devWarnCount("never.happened") == 0, "an unraised warning has a count of zero")
+
+    clearDevWarnings()
+    check(devWarnings().length == 0, "clearing empties the log")
+    check(devWarnCount("pedometer.query|unsupported") == 0, "and forgets the counts with it")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("devwarn_test failed") }
+}
+main()

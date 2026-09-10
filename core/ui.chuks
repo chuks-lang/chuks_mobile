@@ -2138,6 +2138,8 @@ export class Reconciler {
     var pendingErr: map[string]any  // async bridge: token -> OPTIONAL error closure (host reports a failure)
     var streamTokens: map[string]bool // async bridge: token -> true if a STREAM (fires repeatedly; not dropped on fire)
     var tokenSeq: int               // async bridge: monotonic token counter
+    var pendingCap: map[string]string // async bridge: token -> capability id, so an
+                                      // unhandled failure can name what actually failed
     var listVisible: map[string]int // List id -> last centered row index reported to its onVisible
     var pendingVisible: []any       // onVisible closures queued this frame, fired after render (see flushVisible)
     var listEndFired: map[string]int // List id -> count at which onEndReached last fired (fire once per count)
@@ -2307,6 +2309,7 @@ export class Reconciler {
             this.tokenSeq = this.tokenSeq + 1
             tok = "k" + string(this.tokenSeq)
             this.pending[tok] = cb
+            this.pendingCap[tok] = cap
             if (onErr != null) { this.pendingErr[tok] = onErr }
             if (stream) { this.streamTokens[tok] = true }
         }
@@ -2334,6 +2337,7 @@ export class Reconciler {
         if (this.pending.has(token)) { this.pending.delete(token) }
         if (this.pendingErr.has(token)) { this.pendingErr.delete(token) }
         if (this.streamTokens.has(token)) { this.streamTokens.delete(token) }
+        if (this.pendingCap.has(token)) { this.pendingCap.delete(token) }
     }
     // The host reports a result for `token`. Fire the registered callback. A one-shot
     // token is dropped BEFORE firing (so it can't fire twice); a stream token stays
@@ -2353,8 +2357,14 @@ export class Reconciler {
     public failToken(token: string, message: string): void {
         if (this.pending.has(token)) {
             const onErr: any = this.pendingErr.getOr(token, null)
+            const cap: string = this.pendingCap.getOr(token, "")
             this.forgetToken(token)
             if (onErr != null) { onErr(message) }
+            // Nowhere for the error to go. Say so, rather than dropping it: a capability
+            // that refuses and a capability that is merely slow look identical from the
+            // app's side, and the only symptom of the difference is a callback that never
+            // fires. Every silent-failure bug worth the name starts here.
+            else { warnUnhandled(cap, message) }
         }
     }
     // Chuks-initiated cancel (a NativeSub.cancel(), typically from a useEffect
@@ -3416,6 +3426,60 @@ export class NativeSub {
     constructor(token: string) { this.token = token }
     // Drop the callback and tell the host to tear down the native op/subscription.
     public cancel(): void { const h: App? = HOST; if (h != null) { h.recon.cancelStream(this.token) } }
+}
+
+// ---- The dev warning channel -----------------------------------------------
+//
+// Things that go wrong quietly are the expensive bugs. Not the crashes: a crash names
+// itself and gets fixed in minutes. The expensive ones are a capability that refuses and
+// a screen that shows a zero, which look exactly like a capability that works and a
+// walker who has not moved.
+//
+// So the framework says something whenever it detects that shape. It goes to the device
+// log, which `adb logcat` and the Xcode console both show, and it is also kept in a list
+// so a screen or the inspector can render it.
+//
+// DE-DUPLICATED, because the failure that prompted this was a two-second poll refusing
+// forever: a warning repeated three hundred times is noise, and noise is where real
+// warnings go to die. The count is kept instead, so "and 148 more" is still the truth.
+var WARNED: map[string]int = {}
+var WARN_LOG: []string = []
+
+/**
+ * Report something the framework noticed and the app probably did not mean.
+ *
+ * `key` identifies the SITUATION, not the occurrence: two of the same key are one
+ * warning with a count. Safe to call from anywhere, including a host callback.
+ */
+export function devWarn(key: string, message: string): void {
+    const seen: int = WARNED.getOr(key, 0)
+    WARNED[key] = seen + 1
+    if (seen > 0) { return }              // already said once; the count carries the rest
+    WARN_LOG.push(message)
+    // Over the capability bus rather than println, because a println from the engine
+    // reaches neither logcat nor the device console: an app can print into the void all
+    // day and never know. The host logs this natively, where the platform's own tools
+    // can see it. Fire and forget, so a warning can never itself fail and warn again.
+    emitNativeCommand("dev.warn", message, null)
+}
+
+/** Every distinct warning raised so far, in the order they first happened. */
+export function devWarnings(): []string { return WARN_LOG }
+
+/** How many times a given warning key has fired, including the ones not printed. */
+export function devWarnCount(key: string): int { return WARNED.getOr(key, 0) }
+
+/** Forget every warning. For a test, or a screen that offers to clear them. */
+export function clearDevWarnings(): void { WARNED = {}; WARN_LOG = [] }
+
+// A capability failed and the caller passed no error handler, so the message had nowhere
+// to go. Named separately from devWarn because the advice is specific: this is always
+// fixable at the call site by using the twin that takes an onError.
+function warnUnhandled(cap: string, message: string): void {
+    const name: string = cap != "" ? cap : "a capability"
+    devWarn("unhandled:" + cap + "|" + message,
+            name + " failed and nothing is listening: \"" + message + "\". " +
+            "Pass an onError to see this in the app rather than in the log.")
 }
 
 /**

@@ -325,6 +325,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        pipeStdioToLog()
         density = resources.displayMetrics.density
         // Keyboard avoidance. adjustResize shrinks the WHOLE window, which lifts every
         // bottom-anchored thing -- typing in a field at the top of the screen dragged the
@@ -806,6 +807,44 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             devErrorOverlay = scrim
         }
     }
+
+    // ---- println reaches the log ------------------------------------------
+    //
+    // The engine's println goes to file descriptor 1, and on Android nothing reads that:
+    // an app can print all day and see nothing in logcat. Every other platform gives you
+    // a print statement that shows up somewhere, and a print statement that goes nowhere
+    // is worse than none, because it looks like the code did not run.
+    //
+    // So take the descriptor over. A pipe replaces stdout and stderr, and one daemon
+    // thread pumps whole lines into logcat under the "Chuks" tag. This catches the AOT
+    // binary, the CMR VM and anything a native package prints, because it works at the
+    // descriptor rather than at any one of them.
+    //
+    // The reader must outlive everything that writes: a pipe whose buffer fills blocks
+    // the writer, so a reader that stopped would freeze the app on its next print.
+    private var stdioPumped = false
+    private fun pipeStdioToLog() {
+        if (stdioPumped) return
+        stdioPumped = true
+        try {
+            val fds = android.system.Os.pipe()
+            android.system.Os.dup2(fds[1], 1)   // stdout
+            android.system.Os.dup2(fds[1], 2)   // stderr, so a panic is not lost either
+            val t = Thread {
+                try {
+                    val r = java.io.BufferedReader(java.io.InputStreamReader(
+                        java.io.FileInputStream(fds[0]), Charsets.UTF_8))
+                    while (true) {
+                        val line = r.readLine() ?: break
+                        if (line.isNotEmpty()) android.util.Log.i("Chuks", line)
+                    }
+                } catch (_: Throwable) { }
+            }
+            t.isDaemon = true
+            t.start()
+        } catch (_: Throwable) { }   // never let logging stop the app from starting
+    }
+
     private fun dismissDevError() {
         runOnUiThread { devErrorOverlay?.let { root.removeView(it) }; devErrorOverlay = null }
     }
@@ -1513,6 +1552,9 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             }
             "tts.stop" -> tts?.stop()
             "tts.isSpeaking" -> resolve(token, if (tts?.isSpeaking == true) "1" else "0")
+            // The framework noticed something the app probably did not mean. Logged
+            // natively because the engine's own println reaches nothing on Android.
+            "dev.warn" -> android.util.Log.w("Chuks", args)
             "clipboard.set" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
             "clipboard.get" -> {
                 val t = clipboard().primaryClip?.let { if (it.itemCount > 0) it.getItemAt(0).coerceToText(this).toString() else "" } ?: ""
