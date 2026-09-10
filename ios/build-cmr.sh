@@ -43,7 +43,10 @@ else
     SDKPATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"; CLANG="$(xcrun --sdk iphonesimulator --find clang)"
     TRIPLE="arm64-apple-ios15.0-simulator"; CMRLIB="$PKGDIR/cmr/sim/libcmr.a"
 fi
-YOGA="$PKGDIR/yoga"; YOGA_INC="$SDKROOT/core/yoga/include"
+# Yoga has a slice per target, exactly as in build.sh. Picking the simulator archive for
+# a device build links "built for iOS-simulator" and fails at the very last step.
+YOGA="$PKGDIR/yoga"; [ "$IOS_TARGET" = "device" ] && YOGA="$PKGDIR/yoga-device"
+YOGA_INC="$SDKROOT/core/yoga/include"
 
 echo "1. Using the prebuilt CMR runtime shipped with the package ($IOS_TARGET)"
 [ -f "$CMRLIB" ] || { echo "prebuilt libcmr.a missing at $CMRLIB (rebuild via tools/build-libcmr.sh)"; exit 1; }
@@ -58,7 +61,19 @@ echo "   bundle: $(grep -c '^--- module:' "$APP/cmr.bundle") modules, $(wc -c < 
 # baked bundle above stays as a first-launch fallback if the server is down. The
 # simulator reaches the Mac at localhost; a device needs the Mac's LAN IP (IOS_DEV_HOST).
 if [ "${DEV:-0}" = "1" ]; then
-    DEVHOST="${IOS_DEV_HOST:-localhost:7799}"
+    # The simulator shares the Mac's loopback; a phone does not, and pointing it at
+    # localhost meant a device build silently never reached the dev server and sat on its
+    # baked fallback bundle for ever. Detect the Mac's LAN address the way the Android
+    # script does, and let IOS_DEV_HOST override for anything unusual.
+    if [ -n "${IOS_DEV_HOST:-}" ]; then
+        DEVHOST="$IOS_DEV_HOST"
+    elif [ "$IOS_TARGET" = "device" ]; then
+        LANIP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+        [ -n "$LANIP" ] || { echo "no LAN address found for this Mac (set IOS_DEV_HOST=host:7799)"; exit 1; }
+        DEVHOST="$LANIP:7799"
+    else
+        DEVHOST="localhost:7799"
+    fi
     printf '%s' "$DEVHOST" > "$APP/cmr-dev.txt"
     echo "   CMR dev: app will fetch the bundle from $DEVHOST (first run: chuks dev)"
 fi
@@ -68,7 +83,16 @@ fi
 BENCH_FLAG=""; [ "${BENCHMARK:-0}" = "1" ] && BENCH_FLAG="-D BENCHMARK"
 echo "3. Building the UIKit host (CMR mode)"
 printf '#include "libcmr.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
-swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" -sdk "$SDKPATH" -target "$TRIPLE" \
+# The same autolinking the AOT build does. The dev path needs it just as much: the host
+# references ChuksModuleHost, ChuksViewHost and ChuksNativeView unconditionally, so
+# leaving these out did not merely drop a package's capabilities, it failed to compile at
+# all. Any app with one native package was locked out of hot reload entirely.
+# shellcheck source=native-packages.sh
+source "$PKGDIR/native-packages.sh"
+chuks_ios_native_packages
+chuks_capability_check
+swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" "$PKGDIR/ChuksModule.swift" \
+    "$OUT/ChuksPackageModules.swift" $PKG_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$PKGDIR/cmr" -I "$YOGA_INC" \
     "$CMRLIB" "$YOGA/libyoga.a" -lc++ \
     -Xclang-linker -Wno-incompatible-sysroot \
@@ -109,9 +133,22 @@ $IOS_PLIST_EXTRA
 </dict></plist>
 PLIST
 
-echo "5. Installing + launching (CMR — the VM runs on the device)"
-chuks_ensure_sim || exit 1
-xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
-xcrun simctl install "$UDID" "$APP"
-xcrun simctl launch "$UDID" "$BID"
-echo "   launched $BID on $UDID"
+# Install where the toolchain above was actually pointed. This used to run simctl
+# unconditionally, so IOS_TARGET=device built a device-signed arm64 binary and then tried
+# to put it on the simulator. Sensor and permission work only reproduces on a phone, so
+# that was the one target the dev loop could not reach.
+if [ "$IOS_TARGET" = "device" ]; then
+    # shellcheck source=device.sh
+    source "$PKGDIR/device.sh"
+    echo "5. Signing for your device"
+    chuks_ios_sign_device
+    echo "6. Installing + launching on your device (CMR — the VM runs on the device)"
+    chuks_ios_install_device
+else
+    echo "5. Installing + launching (CMR — the VM runs on the device)"
+    chuks_ensure_sim || exit 1
+    xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
+    xcrun simctl install "$UDID" "$APP"
+    xcrun simctl launch "$UDID" "$BID"
+    echo "   launched $BID on $UDID"
+fi

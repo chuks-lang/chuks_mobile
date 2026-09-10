@@ -80,8 +80,18 @@ if [ "${DEV:-0}" = "1" ]; then
 fi
 
 echo "3. Building the Android host (Kotlin)"
-kotlinc "$PKGDIR/MainActivity.kt" "$PKGDIR/ChuksEffects.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1 \
-    || { echo "  kotlin build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1; }
+# The same source set and autolinking the AOT build uses. Naming two files by hand here
+# was wrong twice over: it left out ChuksBuild, ChuksModule and the two services, which
+# the host references unconditionally, and it left out every installed package's Kotlin
+# along with the registry that routes commands to it.
+# shellcheck source=native-packages.sh
+source "$PKGDIR/native-packages.sh"
+chuks_android_native_packages
+chuks_capability_check
+chuks_android_kotlin_sources
+if ! kotlinc $KT_SRC -cp "$KT_CP" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1; then
+    echo "  kotlin build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1
+fi
 
 echo "4. Dexing"
 "$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar" > "$OUT/d8.log" 2>&1 \
