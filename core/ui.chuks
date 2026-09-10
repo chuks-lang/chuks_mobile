@@ -315,7 +315,7 @@ export class Node {
     var kids: []Node
     var comp: any        // kind=="Comp": the component render fn () -> Node (lazy)
     var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
-    var ckey: string     // kind=="Comp": explicit identity key (KeyedComp); "" = use path
+    var ckey: string     // explicit identity key (.key(...)); "" = identify by position
     // Controlled TextInput: `hasVal` marks the field controlled, `val` is its text.
     // onSubmit/onFocus/onBlur are the extra input events (kept `any` like onPress).
     var hasVal: bool
@@ -363,6 +363,38 @@ export class Node {
 //      are the public API). Not exported, so they don't collide with the
 //      capitalized public builders when transpiled to Go. -------------------
 // Build a container node (native View). Holds children laid out by its Style.
+/**
+ * What may appear in a children list: a node, a nested list of nodes (what `.map`
+ * returns), or `null` for "nothing here". A plain `[]Node` is still accepted, so every
+ * existing call site is unaffected.
+ */
+export unionType Kid = Node | []Node | null
+
+/**
+ * Normalise a children list.
+ *
+ * Children may be written as a Node, as `null`, or as a nested `[]Node` (what `.map`
+ * returns). This flattens the nested arrays and turns each null into a NONE node.
+ *
+ * A null becomes a node rather than disappearing, and that is the whole design. Sibling
+ * identity is positional for unkeyed children, so collapsing a null would shift every
+ * following sibling's id and re-mount views that did not change: the id-churn bug class.
+ * A NONE node holds the position, emits nothing, and takes up no room in the host's
+ * child order. React survives the same problem the same way, by leaving a `false` in the
+ * children array rather than removing the slot.
+ */
+function flatKids(kids: []Kid): []Node {
+    var out: []Node = []
+    for (var i: int = 0; i < kids.length; i = i + 1) {
+        const e: any = kids[i]
+        if (e == null) { out.push(new Node("None", new Style(), "", [])); continue }
+        if (e instanceof Node) { const one: Node = e; out.push(one); continue }
+        const nested: []Node = e
+        for (var j: int = 0; j < nested.length; j = j + 1) { out.push(nested[j]) }
+    }
+    return out
+}
+
 function mkView(style: Style, kids: []Node): Node { return new Node("View", style, "", kids) }
 // Build a text node (native Text/label). Self-sizes to its string.
 function mkText(style: Style, t: string): Node { return new Node("Text", style, t, []) }
@@ -722,13 +754,13 @@ dataType MediaEventProps {
  * ])
  * ```
  */
-export function Row(first: ViewProps | []Node, kids: []Node = []): Node {
+export function Row(first: ViewProps | []Kid, kids: []Kid = []): Node {
     const s: Style = new Style(); s.dir = "row"
     // props-or-content: `Row([...])` (no config) passes children first; `Row({...}, [...])`
     // passes props then children. Discriminate by type — an array is content, a `{...}` is props.
-    if (typeof(first) == "array") { const c: []Node = first; return mkView(s, c) }
+    if (typeof(first) == "array") { const c: []Kid = first; return mkView(s, flatKids(c)) }
     const p: ViewProps = first  // typeof-guard narrowed the union to its dataType arm
-    applyLayoutV(s, p); const n: Node = mkView(s, kids); applyEventsV(n, p); return n
+    applyLayoutV(s, p); const n: Node = mkView(s, flatKids(kids)); applyEventsV(n, p); return n
 }
 /**
  * A vertical column (flex-direction: col): lays its children top-to-bottom.
@@ -742,12 +774,12 @@ export function Row(first: ViewProps | []Node, kids: []Node = []): Node {
  * ])
  * ```
  */
-export function Column(first: ViewProps | []Node, kids: []Node = []): Node {
+export function Column(first: ViewProps | []Kid, kids: []Kid = []): Node {
     const s: Style = new Style(); s.dir = "col"; s.just = "center"
     // props-or-content (see Row): `Column([...])` or `Column({...}, [...])`.
-    if (typeof(first) == "array") { const c: []Node = first; return mkView(s, c) }
+    if (typeof(first) == "array") { const c: []Kid = first; return mkView(s, flatKids(c)) }
     const p: ViewProps = first  // narrowed to the dataType arm
-    applyLayoutV(s, p); const n: Node = mkView(s, kids); applyEventsV(n, p); return n
+    applyLayoutV(s, p); const n: Node = mkView(s, flatKids(kids)); applyEventsV(n, p); return n
 }
 /**
  * A plain box (the base container). No default direction or alignment — just the
@@ -759,11 +791,11 @@ export function Column(first: ViewProps | []Node, kids: []Node = []): Node {
  * View({ w: 44, h: 44, radius: 22, bg: tk("primary") }, [])
  * ```
  */
-export function View(first: ViewProps | []Node, kids: []Node = []): Node {
+export function View(first: ViewProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") { return View({}, first) }   // content-only: `View([...])`
     const p: ViewProps = first
     const s: Style = new Style(); applyLayoutV(s, p)
-    const n: Node = mkView(s, kids); applyEventsV(n, p); return n
+    const n: Node = mkView(s, flatKids(kids)); applyEventsV(n, p); return n
 }
 /**
  * A run of text; `t` is the string to display. Text self-sizes to its content.
@@ -923,14 +955,14 @@ dataType ImageBackgroundProps { ViewProps; src: string?; resize: string? }
  * ImageBackground({ src: HERO_URL, pad: 24, radius: 16 }, [ Text(...), ... ])
  * ```
  */
-export function ImageBackground(first: ImageBackgroundProps | []Node, kids: []Node = []): Node {
+export function ImageBackground(first: ImageBackgroundProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") { return ImageBackground({}, first) }   // content-only
     const p: ImageBackgroundProps = first
     const s: Style = new Style()
     s.resize = pvS(p, "resize", "cover")
     if (p["radius"] != null) { s.radius = pvI(p, "radius", 0) }
     applyLayoutV(s, p)
-    return new Node("ImageBackground", s, pvS(p, "src", ""), kids)   // URL in text; children on top
+    return new Node("ImageBackground", s, pvS(p, "src", ""), flatKids(kids))   // URL in text; children on top
 }
 dataType WebViewProps { ViewProps; url: string? }
 /**
@@ -981,10 +1013,10 @@ dataType WebViewProps { ViewProps; url: string? }
  *
  * Taps need no new mechanism: wrap it in a `Pressable` the way you would any other view.
  */
-export function nativeView(kind: string, props: any, layout: any, kids: []Node): Node {
+export function nativeView(kind: string, props: any, layout: any, kids: []Kid): Node {
     const s: Style = new Style()
     applyLayoutV(s, layout)
-    return new Node(kind, s, json.stringify(props), kids)
+    return new Node(kind, s, json.stringify(props), flatKids(kids))
 }
 
 export function WebView(p: WebViewProps): Node {
@@ -1108,14 +1140,15 @@ dataType SafeAreaViewProps { ViewProps; edges: string? }
  * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
  * ```
  */
-export function SafeAreaView(first: SafeAreaViewProps | []Node, kids: []Node = []): Node {
+export function SafeAreaView(first: SafeAreaViewProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") { return SafeAreaView({}, first) }   // content-only (default edges)
     const p: SafeAreaViewProps = first
     const edges: string = pvS(p, "edges", "top,bottom")
     const all: bool = edges.contains("all")
     var out: []Node = []
     if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
-    for (var i: int = 0; i < kids.length; i = i + 1) { out.push(kids[i]) }
+    const inner: []Node = flatKids(kids)
+    for (var i: int = 0; i < inner.length; i = i + 1) { out.push(inner[i]) }
     if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
     // Fill the available space by default (a screen-level wrapper), so a grow child
     // like a Scroll has a bounded height to size into on the Yoga hosts (UIKit/Android).
@@ -1150,7 +1183,7 @@ dataType LinearGradientProps {
  * ])
  * ```
  */
-export function LinearGradient(p: LinearGradientProps, kids: []Node = []): Node {
+export function LinearGradient(p: LinearGradientProps, kids: []Kid = []): Node {
     const s: Style = new Style(); s.dir = "col"
     applyLayoutV(s, p)
     s.grad = p.colors.join(",")
@@ -1161,7 +1194,7 @@ export function LinearGradient(p: LinearGradientProps, kids: []Node = []): Node 
         for (var i: int = 0; i < st.length; i = i + 1) { parts.push(string(st[i])) }
         s.gradStop = parts.join(",")
     }
-    return mkView(s, kids)
+    return mkView(s, flatKids(kids))
 }
 
 dataType BlurProps {
@@ -1190,12 +1223,12 @@ dataType BlurProps {
  * ])
  * ```
  */
-export function Blur(p: BlurProps, kids: []Node = []): Node {
+export function Blur(p: BlurProps, kids: []Kid = []): Node {
     const s: Style = new Style(); s.dir = "col"
     applyLayoutV(s, p)
     s.bkBlur = p.intensity ?? 60
     s.bkTint = p.tint ?? "system"
-    return mkView(s, kids)
+    return mkView(s, flatKids(kids))
 }
 
 // A fixed-height empty row (a safe-area spacer).
@@ -1213,7 +1246,7 @@ dataType ScrollProps {
 function scrollContent(kids: []Node, horizontal: bool): []Node {
     if (kids.length <= 1) { return kids }
     const cs: Style = new Style(); cs.dir = horizontal ? "row" : "col"
-    return [ mkView(cs, kids) ]
+    return [ mkView(cs, flatKids(kids)) ]
 }
 /**
  * A scroll container: children stack and scroll when they overflow. Grows to fill
@@ -1237,13 +1270,13 @@ function scrollContent(kids: []Node, horizontal: bool): []Node {
  *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
  *     Scroll({ horizontal: true, paging: true }, [ Row([ page0, page1, page2 ]) ])
  */
-export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
+export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     // props-or-content: `Scroll([...])` is a default vertical scroll of the given content;
     // `Scroll({...}, [...])` configures it. Discriminate by type (array = content, `{...}` = props).
     if (typeof(first) == "array") {
-        const c: []Node = first
+        const c: []Kid = first
         const s0: Style = new Style(); s0.dir = "col"; s0.grow = 1; s0.basis = 0
-        return new Node("Scroll", s0, "", scrollContent(c, false))
+        return new Node("Scroll", s0, "", scrollContent(flatKids(c), false))
     }
     const p: ScrollProps = first  // narrowed to the dataType arm: typed field access below
     // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
@@ -1266,7 +1299,7 @@ export function Scroll(first: ScrollProps | []Node, kids: []Node = []): Node {
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
     if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
-    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", scrollContent(kids, horizontal))
+    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", scrollContent(flatKids(kids), horizontal))
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
@@ -1290,7 +1323,7 @@ dataType PressableProps { ViewProps; activeOpacity: int?; delayLongPress: int?; 
  * Pressable({ onPress: open, bg: CARD, radius: 12, pad: 16 }, [ Text(...) ])
  * ```
  */
-export function Pressable(first: PressableProps | []Node, kids: []Node = []): Node {
+export function Pressable(first: PressableProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") { return Pressable({}, first) }   // content-only
     const p: PressableProps = first
     const s: Style = new Style(); s.dir = "col"
@@ -1299,7 +1332,7 @@ export function Pressable(first: PressableProps | []Node, kids: []Node = []): No
     s.hitSlop = pvI(p, "hitSlop", -1)                     // extra tappable px beyond the bounds
     if (p["disabled"] != null) { s.disabled = pvB(p, "disabled", false) ? 1 : 0 }   // dim + block taps
     applyLayoutV(s, p)
-    const n: Node = mkView(s, kids)
+    const n: Node = mkView(s, flatKids(kids))
     applyEventsV(n, p)   // onPress + onLongPress + onPressIn/onPressOut
     return n
 }
@@ -1391,7 +1424,7 @@ dataType ModalProps { ViewProps; visible: bool?; position: string?; onDismiss: (
  * ])
  * ```
  */
-export function Modal(first: ModalProps | []Node, kids: []Node = []): Node {
+export function Modal(first: ModalProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") { return Modal({}, first) }   // content-only (hidden until visible)
     const p: ModalProps = first
     const vis: bool = pvB(p, "visible", false)
@@ -1399,7 +1432,7 @@ export function Modal(first: ModalProps | []Node, kids: []Node = []): Node {
     s.mvis = vis ? 1 : 0
     s.mpos = pvS(p, "position", "center")
     // Hidden: emit the node but with NO children, so the content isn't mounted.
-    const n: Node = mkModal(s, vis ? kids : [])
+    const n: Node = mkModal(s, vis ? flatKids(kids) : [])
     const od: any = p["onDismiss"]           // scrim tap fires onDismiss (wired as onPress)
     if (od != null) { n.onPress = od }
     return n
@@ -1685,10 +1718,10 @@ export function Menu(p: MenuProps, items: []string): Node {
  *             [ Card({ children: [ Text(tw("text-text"), "Long-press me") ] }) ])
  * ```
  */
-export function ContextMenu(p: ViewProps, items: []string, kids: []Node): Node {
+export function ContextMenu(p: ViewProps, items: []string, kids: []Kid): Node {
     const s: Style = new Style()
     applyLayoutV(s, p)
-    const n: Node = mkContextMenu(s, items.join("\t"), kids)     // items in the text channel
+    const n: Node = mkContextMenu(s, items.join("\t"), flatKids(kids))     // items in the text channel
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
@@ -1835,12 +1868,12 @@ dataType GestureProps {
  * } }, [ card ])
  * ```
  */
-export function Gesture(first: GestureProps | []Node, kids: []Node = []): Node {
+export function Gesture(first: GestureProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") { return Gesture({}, first) }   // content-only (no recognizers)
     const p: GestureProps = first
     const s: Style = new Style()
     applyLayoutV(s, p)
-    const n: Node = new Node("Gesture", s, "", kids)
+    const n: Node = new Node("Gesture", s, "", flatKids(kids))
     const og: any = p["onGesture"]      // discrete: swipe/doubletap/longpress
     const onPan: any = p["onPan"]        // continuous, each a function(v: string): void
     const onPinch: any = p["onPinch"]
@@ -1964,12 +1997,12 @@ export function decodeRotate(v: string): RotateEvent {
  * ])
  * ```
  */
-export function Screen(first: ViewProps | []Node, kids: []Node = []): Node {
+export function Screen(first: ViewProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") { return Screen({}, first) }   // content-only: `Screen([...])`
     const p: ViewProps = first
     const s: Style = new Style(); s.dir = "col"; s.pad = pvI(p, "pad", 12); s.gap = pvI(p, "gap", 10)
     s.bg = pvS(p, "bg", "")
-    return mkView(s, kids)
+    return mkView(s, flatKids(kids))
 }
 /**
  * A virtualized list: only the on-screen rows are mounted, the rest recycled, so
@@ -2472,8 +2505,15 @@ export class Reconciler {
         if (n.hasVal) { this.emit("V|" + id + "|" + escText(n.val)) }   // controlled TextInput value
         this.bindEvents(n, id)
         this.emit("I|" + id + "|" + parent + "|" + string(index))
+        // `live` is the position among children that actually produce a view, which is
+        // what the host inserts by. The SLOT still comes from the array index, so a NONE
+        // holds its place and its siblings keep their ids.
+        var live: int = 0
         for (var i: int = 0; i < n.kids.length; i = i + 1) {
-            this.mountNode(n.kids[i], id + "." + string(i), id, i)
+            const k: Node = n.kids[i]
+            if (k.kind == "None") { continue }
+            this.mountNode(k, id + "." + this.childSlot(k, i), id, live)
+            live = live + 1
         }
     }
     // Diff `prev` against `next` at tree position `id` and emit the minimal mutation
@@ -2548,15 +2588,62 @@ export class Reconciler {
             this.scrollToPos[id] = next.scrollTo
             this.emit("LS|" + id + "|" + string(next.scrollTo))
         }
-        for (var i: int = 0; i < next.kids.length; i = i + 1) {
-            const child: Node? = i < p.kids.length ? p.kids[i] : null
-            this.reconcile(child, next.kids[i], id + "." + string(i), id, i)
+        // Children are paired by SLOT, not by array position, so a keyed child is diffed
+        // against its own previous self wherever it has moved to. Unkeyed children slot on
+        // their index, which is the behaviour this replaces, so nothing changes for them.
+        var prevBySlot: map[string]Node = {}
+        var prevLive: map[string]int = {}
+        var pLive: int = 0
+        for (var i: int = 0; i < p.kids.length; i = i + 1) {
+            const slot: string = this.childSlot(p.kids[i], i)
+            prevBySlot[slot] = p.kids[i]
+            if (p.kids[i].kind != "None") { prevLive[slot] = pLive; pLive = pLive + 1 }
         }
-        // remove old children the new tree no longer has
-        for (var i: int = next.kids.length; i < p.kids.length; i = i + 1) {
-            this.emit("R|" + id + "." + string(i))
+        var seen: map[string]bool = {}
+        var live: int = 0
+        for (var i: int = 0; i < next.kids.length; i = i + 1) {
+            const nk: Node = next.kids[i]
+            const slot: string = this.childSlot(nk, i)
+            seen[slot] = true
+            const childId: string = id + "." + slot
+            const was: Node? = prevBySlot.has(slot) ? prevBySlot[slot] : null
+            const had: bool = was != null
+            const wasNone: bool = was == null || was.kind == "None"
+            if (nk.kind == "None") {
+                // Present last frame, absent now: tear the view down but keep the slot,
+                // so the siblings after it are not renumbered.
+                if (had && !wasNone) { this.emit("R|" + childId) }
+                continue
+            }
+            if (wasNone) {
+                this.mountNode(nk, childId, id, live)     // absent last frame, here now
+            } else {
+                this.reconcile(was, nk, childId, id, live)
+                // It existed and it has moved: re-insert at the new position. The host
+                // treats this as a MOVE (it detaches the Yoga node from its old owner and
+                // insertSubview relocates the view), so the child keeps its state, its
+                // handlers and any native view state instead of being rebuilt elsewhere.
+                if (prevLive.getOr(slot, -1) != live) {
+                    this.emit("I|" + childId + "|" + id + "|" + string(live))
+                }
+            }
+            live = live + 1
+        }
+        // remove old children the new tree no longer has, by slot rather than by tail
+        // index: with keys a departing child can be anywhere, not only at the end.
+        for (var i: int = 0; i < p.kids.length; i = i + 1) {
+            if (p.kids[i].kind == "None") { continue }
+            const slot: string = this.childSlot(p.kids[i], i)
+            if (!seen.getOr(slot, false)) { this.emit("R|" + id + "." + slot) }
         }
     }
+
+    // Where a child sits among its siblings, for identity purposes.
+    //
+    // A keyed child is identified by its KEY, an unkeyed one by its POSITION. This one
+    // function is used by mount, by diff and by removal, so all three agree: if they ever
+    // disagreed, a child would be reconciled at one id and removed at another.
+    childSlot(n: Node, i: int): string { return n.ckey != "" ? "k" + n.ckey : string(i) }
 
     // True if string slice `a` contains `x`. Small helper for the mount window.
     containsStr(a: []string, x: string): bool {
