@@ -3,7 +3,7 @@
 // tokens (tk) so it adapts to light/dark, and icons come from @chuks/lucide via
 // utils/icons.chuks.
 import { Node, Column, Row, Text, Pressable, Image, Scroll, Comp, Route } from "pkg/@chuks/mobile/core/ui.chuks";
-import { useState, Cell } from "pkg/@chuks/mobile/core/state.chuks";
+import { useState } from "pkg/@chuks/mobile/core/state.chuks";
 import { tk } from "pkg/@chuks/mobile/core/theme.chuks";
 import { lucide } from "../../utils/icons.chuks";
 
@@ -29,7 +29,7 @@ function step(icon: string, title: string, desc: string): Node {
         }
 
         function body(): Node {
-            var taps: Cell = useState(0)
+            var taps = useState(0)
             return Scroll({ dir: "col", grow: 1, bg: tk("bg") }, [
                 Column({ dir: "col", pad: 14, gap: 18, align: "stretch" }, [
 
