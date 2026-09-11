@@ -2,7 +2,7 @@
 // change the copy, restyle it, or replace it entirely. Colors come from theme
 // tokens (tk) so it adapts to light/dark, and icons come from @chuks/lucide via
 // utils/icons.chuks.
-import { Node, Column, Row, Text, Pressable, Image, Scroll, Comp, Route, safeTop, safeBottom } from "pkg/@chuks/mobile/core/ui.chuks";
+import { Node, Column, Row, Text, Pressable, Image, Scroll, SafeAreaView, Comp, Route } from "pkg/@chuks/mobile/core/ui.chuks";
 import { useState } from "pkg/@chuks/mobile/core/state.chuks";
 import { tk } from "pkg/@chuks/mobile/core/theme.chuks";
 import { lucide } from "../../utils/icons.chuks";
@@ -31,9 +31,10 @@ function step(icon: string, title: string, desc: string): Node {
         function body(): Node {
             var taps = useState(0)
             return Scroll({ dir: "col", grow: 1, bg: tk("bg") }, [
-                // A screen at the top of the window starts below the notch and the status
-                // bar. safeTop() is that inset, and 0 when chrome above has already cleared it.
-                Column({ dir: "col", px: 14, pt: 14 + safeTop(), pb: 14 + safeBottom(), gap: 18, align: "stretch" }, [
+                // SafeAreaView keeps everything below the notch and above the home indicator.
+                // Inside the Scroll, so content scrolls under the status bar the way the
+                // system's own apps do; the padding is fourteen points inside each inset.
+                SafeAreaView({ pad: 14, gap: 18, align: "stretch" }, [
 
                     // ── Hero ──
                     Column({ dir: "col", gap: 12, align: "center", pad: 10 }, [

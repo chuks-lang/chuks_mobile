@@ -1125,36 +1125,64 @@ export function TextInput(p: TextInputProps): Node {
     n.onBlur = p["onBlur"]
     applyEventsV(n, p); return n
 }
-dataType SafeAreaViewProps { ViewProps; edges: string? }
+export dataType SafeAreaViewProps { ViewProps; edges: string? }
 /**
- * Insets its children clear of the device safe area (notch/status bar, home
- * indicator). Composed from the host-reported insets, so it's cross-platform and
- * needs no host code. Use it for EDGE-TO-EDGE content: a full-bleed screen, or an
- * overlay/modal that spans the whole window. (Regular screens are already inset by
- * the app root, so a SafeAreaView there is a no-op.)
+ * A `Column` that keeps its children inside the safe area: below the notch and the
+ * status bar, above the home indicator, clear of a landscape notch on either side.
  *
- * Props: `edges` ("top,bottom" default; "all" | "top" | "bottom" | any combination),
- * plus any layout/style prop.
+ * Every `ViewProps` field works as it does on `Column`, and padding ADDS to the inset:
+ * `pt: 14` is fourteen points below the safe edge, `pad: 14` is fourteen inside it on
+ * every side. `edges` picks which sides count: `"all"` (the default), or any of
+ * `"top"`, `"bottom"`, `"left"`, `"right"` joined with commas; `edges: "top"` for a
+ * screen whose bottom a tab bar owns.
+ *
+ * It fills the available space by default, so a `Scroll` inside it has a height to size
+ * into; `grow: 0` makes it content-sized, for a bottom bar or a sheet. Where it sits
+ * decides how a scrolling screen behaves, and both are right somewhere:
  *
  * ```chuks
- * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
+ * // content scrolls UNDER the notch and status bar, the way Settings and Mail do
+ * Scroll({ dir: "col", grow: 1, bg: tk("bg") }, [
+ *     SafeAreaView({ pad: 14, gap: 18 }, kids),
+ * ])
+ * // content is clipped at the safe edge; the band under the notch stays empty
+ * SafeAreaView({ bg: tk("bg") }, [
+ *     Scroll({ dir: "col", grow: 1 }, kids),
+ * ])
  * ```
+ *
+ * Inside a tab whose header has already cleared the top, `safeTop()` is 0 and this adds
+ * nothing there, so one screen lays out correctly pushed full-screen or inside a tab.
+ * `safeTop()` and its siblings stay available for what a container cannot express: a
+ * floating bar's gap, a header measuring itself.
  */
 export function SafeAreaView(first: SafeAreaViewProps | []Kid, kids: []Kid = []): Node {
-    if (typeof(first) == "array") { return SafeAreaView({}, first) }   // content-only (default edges)
-    const p: SafeAreaViewProps = first
-    const edges: string = pvS(p, "edges", "top,bottom")
+    var p: any = {}
+    var c: []Kid = kids
+    if (typeof(first) == "array") { const arr: []Kid = first; c = arr } else { p = first }
+    const edges: string = p["edges"] != null ? string(p["edges"]) : "all"
     const all: bool = edges.contains("all")
-    var out: []Node = []
-    if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
-    const inner: []Node = flatKids(kids)
-    for (var i: int = 0; i < inner.length; i = i + 1) { out.push(inner[i]) }
-    if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
-    // Fill the available space by default (a screen-level wrapper), so a grow child
-    // like a Scroll has a bounded height to size into on the Yoga hosts (UIKit/Android).
-    // Overridable with grow:0 for a content-sized safe inset (e.g. a bottom bar).
-    const s: Style = new Style(); s.dir = "col"; s.grow = 1; applyLayoutV(s, p)
-    return mkView(s, out)
+    // The inset joins whatever padding was asked for on that side. Per-side beats the
+    // axis beats `pad`, the same precedence Style itself applies, so `pad: 14` with a
+    // `pt: 0` is fourteen everywhere but the top.
+    var q: map[string]any = {}
+    const keys: []string = p.keys()
+    var i: int = 0
+    while (i < keys.length) { q[keys[i]] = p[keys[i]]; i = i + 1 }
+    q["pt"] = safeSide(p, "pt", "py") + ((all || edges.contains("top")) ? safeTop() : 0)
+    q["pb"] = safeSide(p, "pb", "py") + ((all || edges.contains("bottom")) ? safeBottom() : 0)
+    q["pl"] = safeSide(p, "pl", "px") + ((all || edges.contains("left")) ? safeLeft() : 0)
+    q["pr"] = safeSide(p, "pr", "px") + ((all || edges.contains("right")) ? safeRight() : 0)
+    const s: Style = new Style(); s.dir = "col"; s.grow = 1
+    applyLayoutV(s, q)
+    const n: Node = mkView(s, flatKids(c)); applyEventsV(n, q); return n
+}
+// The padding a caller asked for on one side, before the inset is added.
+function safeSide(p: any, side: string, axis: string): int {
+    if (p[side] != null) { return int(p[side]) }
+    if (p[axis] != null) { return int(p[axis]) }
+    if (p["pad"] != null) { return int(p["pad"]) }
+    return 0
 }
 dataType LinearGradientProps {
     ViewProps;
@@ -1232,7 +1260,6 @@ export function Blur(p: BlurProps, kids: []Kid = []): Node {
 }
 
 // A fixed-height empty row (a safe-area spacer).
-function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
 
 dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
