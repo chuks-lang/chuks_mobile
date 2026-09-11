@@ -19,6 +19,10 @@ BT="$SDK/build-tools/35.0.0"; AJAR="$SDK/platforms/android-35/android.jar"
 BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 CC="$BIN/aarch64-linux-android24-clang"; CXX="$BIN/aarch64-linux-android24-clang++"
 ADB="$SDK/platform-tools/adb"
+# shellcheck source=device.sh
+source "$PKGDIR/device.sh"
+# Start the device/emulator up front so it is ready by the time the build finishes.
+chuks_ensure_device || exit 1
 # App identity from chuks.json: displayName (launcher label), bundleId (applicationId).
 # CODEPKG is the host's fixed Kotlin package; --rename-manifest-package keeps components
 # resolving to it while the app installs under APPID.
@@ -43,12 +47,17 @@ if [ "$PREVIEW" = "1" ]; then
 fi
 PKG="$APPID"; OUT="$PROJDIR/.chuks/android-out"
 export CHUKS_NO_WARNINGS=1
-rm -rf "$OUT" ~/.chuks/cache/builds/*; mkdir -p "$OUT"
+# shellcheck source=../buildcache.sh
+source "$SDKROOT/buildcache.sh"
+rm -rf "$OUT"; chuks_clear_build_cache; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the .so is compiled inside the cache dir, so its -o must be absolute
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
+BDSTAMP="$OUT/.build-started"; : > "$BDSTAMP"   # only cache dirs newer than this are ours
 ( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )   # --c-archive emits the chuks_* C-ABI bridge
-BD="$( { set +o pipefail; ls -dt "$HOME"/.chuks/cache/builds/*/ 2>/dev/null | head -1; } )"   # generated sources live here, under ~/.chuks/cache
+BD="$(chuks_latest_build_dir "$BDSTAMP")"        # generated sources, under ~/.chuks/cache
+[ -n "$BD" ] && [ -f "$BD/go.mod" ] || {
+    echo "  the Chuks build produced no Go sources in $CHUKS_BUILD_CACHE"; exit 1; }
 # Stage the JNI bridge + cgo link flags + Yoga (from the PACKAGE) next to the generated Go.
 cp "$PKGDIR/jni.cpp" "$PKGDIR/cgo_android.go" "$BD/"
 mkdir -p "$BD/yoga"; cp "$PKGDIR/yoga/libyoga.a" "$BD/yoga/"; cp -r "$SDKROOT/core/yoga/include" "$BD/yoga/"
@@ -57,8 +66,18 @@ echo "2. Building the Android engine (arm64)"
 ( cd "$BD" && CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC" CXX="$CXX" \
     go build -buildmode=c-shared -o "$OUTABS/libapp.so" . )
 
-echo "3. Building the Android host${PREVIEW:+ (Chuks Preview)}"
-KT_SRC="$PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt"; KT_CP="$AJAR"; ZXING="$PKGDIR/libs/zxing-core.jar"
+PREVIEW_LABEL=""; [ "$PREVIEW" = "1" ] && PREVIEW_LABEL=" (Chuks Preview)"
+echo "3. Building the Android host$PREVIEW_LABEL"
+# Native capabilities from installed packages, and the framework/package capability
+# symmetry check. Both live in native-packages.sh so the CMR dev build gets exactly the
+# same autolinking: an app with a native package must not be locked out of hot reload.
+# shellcheck source=native-packages.sh
+source "$PKGDIR/native-packages.sh"
+chuks_android_native_packages
+chuks_capability_check
+
+chuks_android_kotlin_sources
+ZXING="$PKGDIR/libs/zxing-core.jar"
 if [ "$PREVIEW" = "1" ]; then
     KT_SRC="$KT_SRC $PKGDIR/ConnectActivity.kt $PKGDIR/ScannerActivity.kt"   # + in-app QR scanner
     [ -f "$ZXING" ] && KT_CP="$AJAR:$ZXING"
@@ -97,6 +116,57 @@ else
     sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
     # app.json -> fill the manifest's permission block, deep-link schemes, and version
     chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" patch-manifest "$OUT/AndroidManifest.xml" 2>/dev/null
+
+    # Launch assets the app declared. Android has no "one source, every size" step of its
+    # own, so the icon is resized into each density bucket here; the splash is a theme
+    # whose windowBackground the system paints before the process is even alive, which is
+    # the only way to control the very first frame.
+    APP_ICON="$(AJ icon)"; SPLASH_IMG="$(AJ splash-image)"; SPLASH_BG="$(AJ splash-bg)"
+    HAVE_RES=0
+    if [ -n "$APP_ICON" ] && [ -f "$APP_ICON" ]; then
+        for d in "mdpi 48" "hdpi 72" "xhdpi 96" "xxhdpi 144" "xxxhdpi 192"; do
+            set -- $d; mkdir -p "$OUT/res/mipmap-$1"
+            sips -z "$2" "$2" "$APP_ICON" --out "$OUT/res/mipmap-$1/ic_launcher.png" >/dev/null 2>&1
+        done
+        HAVE_RES=1
+        sed -i '' 's#android:icon="[^"]*"##' "$OUT/AndroidManifest.xml"
+        sed -i '' "s#<application #<application android:icon=\"@mipmap/ic_launcher\" #" "$OUT/AndroidManifest.xml"
+    fi
+    if [ -n "$SPLASH_BG" ]; then
+        mkdir -p "$OUT/res/values" "$OUT/res/drawable"
+        # A layer-list rather than a bare colour so an optional logo sits centred on it,
+        # which is what every splash actually is.
+        SPLASH_LAYER=""
+        if [ -n "$SPLASH_IMG" ] && [ -f "$SPLASH_IMG" ]; then
+            mkdir -p "$OUT/res/drawable-xxhdpi"
+            cp "$SPLASH_IMG" "$OUT/res/drawable-xxhdpi/splash_logo.png"
+            SPLASH_LAYER='  <item><bitmap android:gravity="center" android:src="@drawable/splash_logo" /></item>'
+        fi
+        cat > "$OUT/res/drawable/chuks_splash.xml" <<SPD
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+  <item android:drawable="@color/chuks_splash_bg" />
+$SPLASH_LAYER
+</layer-list>
+SPD
+        cat > "$OUT/res/values/chuks_splash.xml" <<SPV
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <color name="chuks_splash_bg">$SPLASH_BG</color>
+  <style name="ChuksSplash" parent="@android:style/Theme.Material.NoActionBar">
+    <item name="android:windowBackground">@drawable/chuks_splash</item>
+  </style>
+</resources>
+SPV
+        HAVE_RES=1
+        # The launch theme replaces the stock one. The activity swaps to the normal
+        # background once it draws, so the splash is only ever the first frame.
+        sed -i '' 's#android:theme="@android:style/Theme.Material.NoActionBar"#android:theme="@style/ChuksSplash"#' "$OUT/AndroidManifest.xml"
+    fi
+    if [ "$HAVE_RES" = "1" ]; then
+        "$BT/aapt2" compile --dir "$OUT/res" -o "$OUT/res.zip" >/dev/null 2>&1 && RESZIP="$OUT/res.zip"
+        echo "   launch assets compiled"
+    fi
 fi
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
     $RESZIP --rename-manifest-package "$APPID" \
@@ -114,12 +184,11 @@ mkdir -p "$OUT/assets"
 # emulator reaches the host loopback via 10.0.2.2; a real device reaches the Mac over
 # Wi-Fi at its LAN IP (needs the dev server bound to 0.0.0.0, which it is).
 if [ "${DEV:-0}" = "1" ]; then
-    DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
     case "$DEV_ID" in
         emulator-*) DEV_HOST="10.0.2.2" ;;   # emulator's alias for the host loopback
         *) # Real device: tunnel its localhost to the Mac over the adb (USB) link — no Wi-Fi,
            # LAN IP, or firewall needed. Fall back to the Mac's LAN IP if the tunnel fails.
-           if "$ADB" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then DEV_HOST="localhost"
+           if "$ADB" -s "$DEV_ID" reverse tcp:7799 tcp:7799 >/dev/null 2>&1; then DEV_HOST="localhost"
            else DEV_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 10.0.2.2)"; fi ;;
     esac
     printf '%s:7799' "$DEV_HOST" > "$OUT/assets/chuks-dev.txt"
@@ -144,7 +213,8 @@ done
     || { echo "  Signing failed:"; cat "$OUT/apksigner.log"; exit 1; }
 
 echo "7. Installing + launching"
-"$ADB" install -r "$OUT/chuks.apk" > "$OUT/adb.log" 2>&1 || { echo "  Install failed:"; cat "$OUT/adb.log"; exit 1; }
-"$ADB" shell am force-stop "$PKG" > /dev/null 2>&1 || true
-"$ADB" shell am start -n "$PKG/$CODEPKG.$LAUNCH_ACTIVITY" > /dev/null 2>&1
+chuks_ensure_device || exit 1
+"$ADB" -s "$DEV_ID" install -r "$OUT/chuks.apk" > "$OUT/adb.log" 2>&1 || { echo "  Install failed:"; cat "$OUT/adb.log"; exit 1; }
+"$ADB" -s "$DEV_ID" shell am force-stop "$PKG" > /dev/null 2>&1 || true
+"$ADB" -s "$DEV_ID" shell am start -n "$PKG/$CODEPKG.$LAUNCH_ACTIVITY" > /dev/null 2>&1
 echo "   Done."

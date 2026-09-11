@@ -2,13 +2,13 @@
 // server (DEV mode), so this engine is never invoked at runtime; it exists only to
 // provide the native host C-ABI symbols the Swift host links against. It renders a
 // single placeholder screen and nothing else.
-import { NavStack, Node, Text, setSafeInsets } from "../core/ui.chuks";
+import { NavStack, Node, Route, Text, setSafeInsets } from "../core/ui.chuks";
 import { syncSystemTheme, followingSystem } from "../core/theme.chuks";
 import { setPlatformInfo } from "../core/platform.chuks";
 
 function createRoot(): NavStack {
-    var routes: map[string]function(): Node = {}
-    routes["home"] = function(): Node { return Text({}, "Chuks Preview") }
+    var routes: map[string]function(r: Route): Node = {}
+    routes["home"] = function(_: Route): Node { return Text({}, "Chuks Preview") }
     return new NavStack(routes, "home")
 }
 
@@ -17,7 +17,7 @@ var APP = createRoot()
 export function set_count(n: int): void { APP.setup(n) }
 export function mount(): int { return APP.mount() }
 export function remount(): int { return APP.remount() }
-export function setViewport(top: int, height: int): int { return APP.setViewport(top, height) }
+export function setViewport(top: int, height: int, width: int): int { return APP.setViewport(top, height, width) }
 export function tick(): int { return APP.tick() }
 export function dispatch(action: string): int { return APP.dispatch(action) }
 export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }

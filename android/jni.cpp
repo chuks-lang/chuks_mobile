@@ -22,6 +22,24 @@ JNIEXPORT jstring JNICALL J(drain)(JNIEnv* e, jobject) {
     chuks_free_str(s);
     return r;
 }
+// System back button / gesture. Returns 1 when the app consumed it, so the activity
+// knows whether to fall through to the default (leave the app).
+JNIEXPORT jint JNICALL J(back)(JNIEnv*, jobject) { return chuks_back(); }
+
+// State restoration: the route stack, every tab's own history, and the useState cells,
+// as one string. The same pair the dev server uses for hot reload.
+JNIEXPORT jstring JNICALL J(saveState)(JNIEnv* e, jobject) {
+    char* s = chuks_saveState();
+    jstring r = e->NewStringUTF(s);
+    chuks_free_str(s);
+    return r;
+}
+JNIEXPORT void JNICALL J(loadState)(JNIEnv* e, jobject, jstring d) {
+    const char* c = e->GetStringUTFChars(d, 0);
+    chuks_loadState((char*)c);
+    e->ReleaseStringUTFChars(d, c);
+}
+
 JNIEXPORT jint JNICALL J(event)(JNIEnv* e, jobject, jstring a) {
     const char* c = e->GetStringUTFChars(a, 0);
     int m = chuks_dispatch((char*)c);

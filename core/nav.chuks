@@ -5,7 +5,11 @@
 // never imports an icon package. You pass icons in — a prebuilt node for the bar
 // actions, or a render function for the tabs (whose color depends on the active
 // state). Bring @chuks/lucide, or any other icon set, from the app side.
-import { Node, Row, Column, Text, KeyedComp } from "./ui.chuks";
+import { Node, Row, Column, Text, KeyedComp, safeBottom, Route, Style, NavStack,
+         setNestedNavigator, activeNav, safeTop, setConsumedTop, consumedTop,
+         setNestedStateHandlers } from "./ui.chuks";
+import { json } from "std/json";
+import { hookPark } from "./state.chuks";
 import { tk } from "./theme.chuks";
 
 // A round, tappable icon button around a NON-NULL icon node. `hasPress` says
@@ -85,18 +89,392 @@ export function TabBar(names: []string, labels: []string, iconFor: any, active: 
     ])
 }
 
-// TabView: a bottom-tab scaffold — the active screen above a shared TabBar. It is
-// a plain, stateless render function (everything returns Node); the app owns the
-// active-tab index (a module-level var) and passes it in, and `onSelect(i)` sets
-// it. `screens` is parallel to `icons`/`labels`; each is a () -> Node screen
-// function that fills the area above the bar.
-//   TabView(["house","bell"], ["Home","Alerts"], iconFor, [Home, Alerts], active, onSelect)
-export function TabView(icons: []string, labels: []string, iconFor: any, screens: []any, active: int, onSelect: any): Node {
-    const build: any = screens[active]
-    return Column({ tw: "bg-bg" }, [
-            // Place the active screen lazily, keyed by tab, so it runs with its own
-            // identity (its useState is per-tab and doesn't leak to the next tab).
-            KeyedComp("tab:" + string(active), build),
-            TabBar(icons, labels, iconFor, active, onSelect),
+// ── Composable tabs ─────────────────────────────────────────────────────────
+// TabView is a bottom-tab scaffold you COMPOSE: declare each tab with `Tab({...})`
+// and pass the list. The scaffold owns the shared bar and the per-tab keyed remount
+// (so a tab's state never leaks to the next, and a reused node can't carry a stale
+// event binding into the next tab). Every bit of chrome is a prop or slot — a top
+// `header` bar, a floating `accessory`, a per-tab `badge`, a raised `fab` center tab,
+// or a fully custom `bar` — so you never have to hand-roll the shell (and lose the
+// keyed remount) just to customize it.
+//
+//   TabView({ active: idx, onSelect: onSelect, iconFor: iconFor, header: appBar }, [
+//       Tab({ name: "home",  icon: "house", label: "Home", screen: Home }),
+//       Tab({ name: "track", icon: "plus",  fab: true,      screen: Track }),
+//       Tab({ name: "you",   icon: "user",  label: "You", badge: "3", screen: Profile }),
+//   ])
+
+// One tab: its bar appearance plus the screen it shows. Only `name` + `screen` are required.
+export dataType TabSpec {
+    name: string,                 // stable id for this tab
+    icon: string?,                // icon name passed to iconFor; omit for a label-only tab
+    iconSelected: string?,        // icon name when active (default: same as `icon`)
+    label: string?,               // omit -> use `name`; "" -> icon-only (no text)
+    badge: string?,               // "" = a dot, "3" / "9+" = a count bubble
+    fab: bool?,                   // render as a raised center action (a FAB tab)
+    hidden: bool?,                // keep out of the bar (still selectable from code)
+    disabled: bool?,              // show but don't allow taps
+    // Full control (the Expo / React Navigation model): draw the tab's inner content
+    // yourself from the focused state, and style it however you like (bigger when active,
+    // any color / layout / icon). When set, `icon` / `label` / `badge` / `fab` are ignored
+    // for this tab; the framework still owns the pressable slot, the tap, and the layout.
+    render: function?(focused: bool): Node,
+    screen: function(): Node,     // the screen this tab renders
+    // Give this tab its own navigation history. navigate() from inside it pushes onto
+    // THIS tab's stack: the bar stays visible, and leaving the tab and coming back
+    // returns to the screen you left rather than the tab's root. Without it a push
+    // covers the whole shell, which is the older behaviour and still the right one for
+    // a flow that should own the display (see navigateRoot).
+    stack: bool?,
+}
+// Declare one tab. A named builder over a TabSpec literal, so the fields autocomplete
+// and typos are caught at the call site.
+export function Tab(spec: TabSpec): TabSpec { return spec }
+
+// ---- Per-tab navigation history ---------------------------------------------
+//
+// Keyed by tab NAME rather than index, so reordering or hiding a tab does not hand one
+// tab another's history. Module-level because a tab's history has to outlive both the
+// TabView function (which re-runs every render) and the tab being off screen, which is
+// exactly the state that makes switching away and back feel native instead of resetting.
+var TAB_STACKS: map[string][]Route = {}
+
+// The stack for a tab, empty when it has pushed nothing.
+function tabStack(name: string): []Route {
+    const cur: ([]Route)? = TAB_STACKS[name]
+    if (cur == null) { var fresh: []Route = []; return fresh }
+    return cur
+}
+
+/**
+ * Clear one tab's history, back to its root screen.
+ *
+ * The common use is the platform convention of tapping the active tab to go home:
+ * call this from `onSelect` when the tapped index is already active.
+ *
+ * ```chuks
+ * onSelect: function(i: int): void {
+ *     if (i == active) { resetTabStack(tabs[i].name) } else { setActive(i) }
+ * }
+ * ```
+ */
+export function resetTabStack(name: string): void { var empty: []Route = []; TAB_STACKS[name] = empty }
+
+// Per-tab history for saveState/loadState. Registered once at module load so it is in
+// place before the first save, and shaped like the app stack's own entries: a name and
+// its params, with `body` deliberately dropped because it is in-memory only and a
+// restored screen has to be able to rebuild itself from params alone.
+setNestedStateHandlers(
+    function(): string {
+        var doc: map[string]any = {}
+        const names: []string = TAB_STACKS.keys()
+        for (var i: int = 0; i < names.length; i = i + 1) {
+            const st: []Route = tabStack(names[i])
+            var arr: []any = []
+            for (var j: int = 0; j < st.length; j = j + 1) {
+                var e: map[string]any = {}
+                e["n"] = st[j].name
+                e["p"] = st[j].params
+                arr.push(e)
+            }
+            if (arr.length > 0) { doc[names[i]] = arr }
+        }
+        return json.stringify(doc)
+    },
+    function(data: string): void {
+        if (data == "") { return }
+        const doc: any = json.parse(data)
+        const names: []string = doc.keys()
+        for (var i: int = 0; i < names.length; i = i + 1) {
+            const arr: []any = doc[names[i]]
+            var out: []Route = []
+            for (var j: int = 0; j < arr.length; j = j + 1) {
+                const e: any = arr[j]
+                if (e == null || e["n"] == null) { continue }
+                var pm: map[string]any = {}
+                const raw: any = e["p"]
+                if (raw != null) { pm = raw }
+                out.push(new Route(string(e["n"]), pm, null))
+            }
+            TAB_STACKS[names[i]] = out
+        }
+    })
+
+// TabView props. `active` indexes `tabs`; `onSelect(i)` fires on tap; `iconFor` is the
+// icon-agnostic renderer (name, color, size) -> Node. Everything else is optional chrome.
+export dataType TabViewProps {
+    active: int,
+    onSelect: function(i: int): void,
+    iconFor: function(name: string, color: string, size: int): Node,
+    // Default-path colors (used only for tabs WITHOUT a `render` fn, like Expo's
+    // tabBarActiveTintColor). For anything beyond color, use a tab's `render`.
+    activeColor: string?,         // active icon/label color   (default tk("primary"))
+    inactiveColor: string?,       // inactive icon/label color (default tk("subtle"))
+    bg: string?,                  // bar background (default tk("surface"))
+    // Liquid Glass for the bar: the real iOS 26 material, a frosted panel elsewhere.
+    //
+    // `bg` becomes the FALLBACK rather than the background. An opaque colour behind the
+    // material is exactly what the material would sample, so it is not painted while the
+    // glass is live; it is painted when the glass cannot be, which is what Reduce
+    // Transparency asks for. Set both, or a walker with that setting on gets a bar with
+    // no surface at all.
+    glass: bool?,
+    fabColor: string?,            // FAB glyph color on the tint circle (default tk("primaryText"))
+    header: Node?,                // a fixed slot ABOVE the content (a top app bar)
+    accessory: Node?,             // a floating slot just above the bar (a mini-player / banner)
+    bar: function?(tabs: []TabSpec, active: int, onSelect: any): Node,   // replace the whole bar
+}
+// The active tab's content: its root screen, plus its own pushed routes above it.
+//
+// Laid out exactly the way the app stack lays out its screens, and for the same
+// reasons. Every entry gets a full-screen absolute container in stack order so the top
+// one covers the rest; a container is emitted for EVERY entry, even the deep ones that
+// render empty, so a screen's node id is a function of its depth and nothing else. Push
+// a screen without that and every id shifts by one, the reconciler tears down trees
+// that did not change, and native scroll positions go with them.
+//
+// Deep entries are PARKED rather than unmounted, so a screen two levels down keeps its
+// state and its effects while it waits.
+function tabContent(spec: TabSpec, tabIndex: int, consume: int): Node {
+    const stack: []Route = tabStack(spec.name)
+    const rootKey: string = "tab:" + string(tabIndex)
+    if (stack.length == 0) {
+        // No history: the tab is just its screen, as it always was.
+        return Column({ grow: 1 }, [ KeyedComp(rootKey, tabRootThunk(spec.screen, consume)) ])
+    }
+    const nav: NavStack? = activeNav()
+    if (nav == null) { return Column({ grow: 1 }, [ KeyedComp(rootKey, tabRootThunk(spec.screen, consume)) ]) }
+
+    const n: int = stack.length + 1                  // +1 for the tab's own root screen
+    const live: int = n >= 2 ? n - 2 : 0             // only the top two render
+    var kids: []Node = []
+    var parked: []string = []
+    for (var i: int = 0; i < n; i = i + 1) {
+        const cs: Style = new Style()
+        cs.pos = "abs"; cs.top = 0; cs.left = 0; cs.right = 0; cs.bottom = 0
+        var key: string = rootKey
+        if (i > 0) { key = "tabroute:" + spec.name + ":" + string(i) + ":" + stack[i - 1].name }
+        if (i < live) {
+            parked.push("key:" + key + "#")
+            kids.push(new Node("View", cs, "", []))
+            continue
+        }
+        if (i == 0) {
+            kids.push(new Node("View", cs, "", [ KeyedComp(rootKey, tabRootThunk(spec.screen, consume)) ]))
+            continue
+        }
+        const e: Route = stack[i - 1]
+        const f: any = nav.screenFor(e.name)
+        if (f == null) { kids.push(new Node("View", cs, "", [])); continue }
+        kids.push(new Node("View", cs, "", [ KeyedComp(key, tabScreenThunk(f, e, consume)) ]))
+    }
+    hookPark(parked)
+    const outer: Style = new Style(); outer.grow = 1; outer.basis = 0
+    // "StackHost" rather than "View": the host draws it the same, but the kind tells the
+    // engine this container's last two children are the pair a back gesture drags. Only
+    // emitted while the tab actually has something pushed, since with one screen there
+    // is nothing to reveal and the gesture should fall through to the app stack.
+    return new Node("StackHost", outer, "", kids)
+}
+
+// A route's screen bound to its Route, deferred so it runs inside the reconciler's
+// walk and its useState() needs no key. Mirrors the app stack's screenThunk, and
+// brackets the render so a screen inside a tab sees the top inset its header already
+// consumed. Restores the previous value rather than zeroing, so nesting composes.
+function tabScreenThunk(f: any, e: Route, consume: int): function(): Node {
+    return function(): Node {
+        const prev: int = consumedTop()
+        setConsumedTop(consume)
+        const out: Node = f(e)
+        setConsumedTop(prev)
+        return out
+    }
+}
+// The same bracket for a tab's own root screen, which takes no Route.
+function tabRootThunk(f: any, consume: int): function(): Node {
+    return function(): Node {
+        const prev: int = consumedTop()
+        setConsumedTop(consume)
+        const out: Node = f()
+        setConsumedTop(prev)
+        return out
+    }
+}
+
+export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
+    const spec: TabSpec = tabs[p.active]
+    // Claim navigate()/back() while a tab that owns its history is the visible one, and
+    // release the claim otherwise, so a tab without `stack` behaves exactly as before.
+    if (spec.stack == true) {
+        setNestedNavigator(
+            function(name: string, params: (map[string]any)?, body: any?): bool {
+                var cur: []Route = tabStack(spec.name)
+                cur.push(new Route(name, params, body))
+                TAB_STACKS[spec.name] = cur
+                return true
+            },
+            function(result: any?): bool {
+                var cur: []Route = tabStack(spec.name)
+                if (cur.length == 0) { return false }      // at the tab's root: not ours to pop
+                var out: []Route = []
+                for (var i: int = 0; i < cur.length - 1; i = i + 1) { out.push(cur[i]) }
+                TAB_STACKS[spec.name] = out
+                // The result lands on whatever is underneath, which is the previous
+                // pushed screen, or the tab's root when there is none.
+                if (result != null && out.length > 0) { out[out.length - 1].result = result }
+                return true
+            },
+            function(name: string, params: (map[string]any)?, body: any?): bool {
+                // Replace the tab's top screen. At the tab's root there is nothing to
+                // replace, so this becomes the first push.
+                var cur: []Route = tabStack(spec.name)
+                if (cur.length == 0) { cur.push(new Route(name, params, body)) }
+                else { cur[cur.length - 1] = new Route(name, params, body) }
+                TAB_STACKS[spec.name] = cur
+                return true
+            },
+            function(): Route? {
+                const cur: []Route = tabStack(spec.name)
+                if (cur.length == 0) { return null }       // at the tab's root screen
+                return cur[cur.length - 1]
+            })
+    } else {
+        setNestedNavigator(null, null, null, null)
+    }
+    var kids: []Node = []
+    if (p.header != null) { kids.push(p.header) }                                    // top bar (optional)
+    // Keyed by tab so the active screen REMOUNTS on switch: its useState is per-tab
+    // and a reused native node can't carry a stale event binding into the next tab.
+    // A header sits above the content and has already cleared the notch, so screens
+    // inside the tab must not inset for it again. Without a header the content IS at the
+    // top of the window and keeps the full inset.
+    const consumed: int = p.header != null ? safeTop() : 0
+    kids.push(tabContent(spec, p.active, consumed))
+    if (p.accessory != null) { kids.push(p.accessory) }                             // floating accessory
+    var barNode: Node = defaultTabBar(tabs, p)
+    if (p.bar != null) { const bf: any = p.bar; barNode = bf(tabs, p.active, p.onSelect) }   // custom bar
+    if (p.glass ?? false) {
+        // A glass bar has to FLOAT, or the material has nothing to work with. In flow it
+        // sits on the app background, and a material over one flat colour is just a
+        // tinted panel: that is the whole reason glass can look disappointing. Out of
+        // flow, the content scrolls under it and the material has something to refract.
+        //
+        // The content keeps the full height, so screens must clear the bar themselves.
+        // tabBarHeight() is what they pad by.
+        kids.push(Column({ abs: true, bottom: 0, left: 0, right: 0, z: 20 }, [ barNode ]))
+    } else {
+        kids.push(barNode)
+    }
+    return Column({ grow: 1, tw: "bg-bg" }, kids)
+}
+
+/**
+ * How tall the default tab bar is, in points, including the bottom safe-area inset.
+ *
+ * Exported because a glass bar FLOATS over the content, so every screen has to keep its
+ * last row clear of it, and the only alternative to a real number is each app guessing
+ * one and getting it wrong on the next device.
+ *
+ * The tallest item sets the height: a raised `fab` is 56, and a plain icon-and-label
+ * column comes to about 54. The bar adds 6 above and the home-indicator inset below,
+ * or 6 on a device without one.
+ */
+export function tabBarHeight(): int { return 56 + 10 + floatingBarGap() }
+
+/**
+ * How far a floating bar sits above the bottom edge.
+ *
+ * NOT the whole safe-area inset, which is the mistake that leaves an iPhone with a
+ * conspicuous band of empty background under the bar. That inset exists so CONTENT clears
+ * the home indicator, and an edge-to-edge bar spent it as internal padding, so its
+ * background still reached the screen edge and none of it was visible. A floating capsule
+ * spends it as margin instead, and 34pt of margin is a hole. The capsule only has to clear
+ * the indicator itself, which sits a few points up from the edge.
+ *
+ * A device with no home indicator gets a plain breathing gap, and the result never falls
+ * below 8 so the bar cannot end up flush against the edge on some future inset.
+ */
+function floatingBarGap(): int {
+    const inset: int = safeBottom()
+    if (inset <= 0) { return 10 }
+    const g: int = inset - 14
+    return g < 8 ? 8 : g
+}
+
+// A small notification bubble drawn over a tab icon (top-right). "" renders a dot.
+function tabBadge(text: string): Node {
+    if (text == "") { return Row({ abs: true, top: 0, right: 0, w: 8, h: 8, radius: 4, bg: tk("danger") }, []) }
+    return Row({ abs: true, top: -6, right: -12, h: 16, radius: 8, bg: tk("danger"), justify: "center", align: "center", px: 5 }, [
+            Text({ size: 10, weight: "bold", color: tk("primaryText") }, text),
+    ])
+}
+// The default bottom bar, built from the tab specs: icon (+ a selected variant), an
+// optional label, an optional badge, a raised `fab` center tab, and dimmed `disabled`
+// tabs. Hidden tabs are skipped. Pass `bar` to TabView to replace this entirely.
+function defaultTabBar(tabs: []TabSpec, p: TabViewProps): Node {
+    const activeC: string = p.activeColor ?? tk("primary")
+    const inactiveC: string = p.inactiveColor ?? tk("subtle")
+    const bg: string = p.bg ?? tk("surface")
+    const iconFor: any = p.iconFor
+    var items: []Node = []
+    for (var i: int = 0; i < tabs.length; i = i + 1) {
+        const spec: TabSpec = tabs[i]
+        // A guard-`continue` here would jump over the `var`s below (miscompiles under
+        // AOT), so build the whole item inside the not-hidden branch instead.
+        if (!(spec.hidden ?? false)) {
+            const sel: bool = i == p.active
+            const disabled: bool = spec.disabled ?? false
+            const onP: any = disabled ? null : tabPress(p.onSelect, i)
+            const rf: any = spec.render
+            if (rf != null) {
+                // Full control (Expo model): the app draws the tab's inner content from
+                // the focused state; the framework only owns the pressable slot + tap.
+                const inner: Node = rf(sel)
+                items.push(Column({ tw: "grow items-center justify-center", opacity: disabled ? 40 : 100, onPress: onP }, [ inner ]))
+            } else {
+                const col: string = sel ? activeC : inactiveC
+                const iconName: string = sel ? (spec.iconSelected ?? (spec.icon ?? "")) : (spec.icon ?? "")
+                const build: any = iconFor
+                if (spec.fab ?? false) {
+                    // A raised circular center action (the FAB tab).
+                    const glyph: Node = build(iconName, p.fabColor ?? tk("primaryText"), 26)
+                    items.push(Column({ tw: "grow items-center justify-center", onPress: onP }, [
+                            Row({ tw: "w-14 h-14 rounded-full items-center justify-center", bg: activeC, shadow: 3 }, [ glyph ]),
+                    ]))
+                } else {
+                    var glyph: Node = build(iconName, col, 24)
+                    if (spec.badge != null) { glyph = Row({}, [ glyph, tabBadge(spec.badge ?? "") ]) }
+                    // Label: omitted -> use name; "" -> icon-only.
+                    var showLabel: bool = true
+                    var labelText: string = spec.name
+                    if (spec.label != null) { const l: string = spec.label ?? ""; if (l == "") { showLabel = false } else { labelText = l } }
+                    var col2: []Node = [ glyph ]
+                    if (showLabel) { col2.push(Text({ size: 12, weight: sel ? "semibold" : "regular", color: col }, labelText)) }
+                    items.push(Column({ tw: "grow items-center justify-center gap-xs p-sm", opacity: disabled ? 40 : 100, onPress: onP }, col2))
+                }
+            }
+        }
+    }
+    // Glass carries its own rim, so the hairline that separates a solid bar from the
+    // content above it would read as a second, harder edge on top of it.
+    const isGlass: bool = p.glass ?? false
+    if (isGlass) {
+        // A floating capsule, inset from the edges, the way iOS 26 draws a tab bar.
+        // The inset is not decoration: an edge-to-edge slab has no visible boundary, so
+        // the material reads as a tinted panel no matter how good it is. Seeing the page
+        // continue AROUND and UNDER the bar is what makes glass look like glass.
+        return Row({ px: 12, pb: floatingBarGap() }, [
+                Row({ grow: 1, glass: true, bg: bg, radius: 30, px: 4, py: 5 }, items),
+        ])
+    }
+    return Column({ bg: bg }, [
+            Row({ tw: "h-1 bg-borderSoft" }, []),   // top hairline
+            // Bake the bottom safe-area inset into the bar so its background reaches the
+            // screen edge and the tabs clear the home indicator on every device. The
+            // inset IS the clearance: adding a constant on top of it (we used to add 6)
+            // makes the bar visibly taller than the platform's own tab bar on any device
+            // with a home indicator. Devices without one get the 6 instead, so the labels
+            // are not flush against the screen edge.
+            Row({ px: 6, pt: 6, pb: safeBottom() > 0 ? safeBottom() : 6 }, items),
     ])
 }

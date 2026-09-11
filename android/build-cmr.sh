@@ -18,12 +18,16 @@ SDK="$HOME/Library/Android/sdk"; NDK="$SDK/ndk/27.1.12297006"
 BT="$SDK/build-tools/35.0.0"; AJAR="$SDK/platforms/android-35/android.jar"
 BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 ADB="$SDK/platform-tools/adb"
+# shellcheck source=device.sh
+source "$PKGDIR/device.sh"
+# Start the device/emulator up front: it is ready by the time the build finishes,
+# and the ABI probe below reads the real target instead of guessing.
+chuks_ensure_device || exit 1
 # Match the connected device/emulator ABI (arm64 on real phones and Apple-Silicon
 # emulators; x86_64 on emulators run on Intel Mac / Windows / Linux). Override with
 # CMR_ABI. The prebuilt libapp.so + libc++_shared.so are picked for this ABI.
 if [ -n "${CMR_ABI:-}" ]; then ABI="$CMR_ABI"; else
-    _dev="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
-    ABI="$("$ADB" -s "${_dev:-none}" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+    ABI="$("$ADB" -s "$DEV_ID" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
     ABI="${ABI:-arm64-v8a}"
 fi
 case "$ABI" in
@@ -60,7 +64,6 @@ for wf in "$PKGDIR"/webassets/*; do [ -e "$wf" ] && cp "$wf" "$OUT/assets/"; don
 # source bundle over HTTP and re-boots the on-device VM on each .chuks change. The
 # baked bundle above stays as a fallback for the first launch if the server is down.
 if [ "${DEV:-0}" = "1" ]; then
-    DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
     # Prefer an `adb reverse` tunnel (works for emulators AND USB devices): the app
     # then talks to localhost, which handles the held-open /hmr long-poll reliably.
     # The emulator's 10.0.2.2 NAT stalls long-polls, so use it only as a fallback.
@@ -77,8 +80,18 @@ if [ "${DEV:-0}" = "1" ]; then
 fi
 
 echo "3. Building the Android host (Kotlin)"
-kotlinc "$PKGDIR/MainActivity.kt" "$PKGDIR/ChuksEffects.kt" -cp "$AJAR" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1 \
-    || { echo "  kotlin build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1; }
+# The same source set and autolinking the AOT build uses. Naming two files by hand here
+# was wrong twice over: it left out ChuksBuild, ChuksModule and the two services, which
+# the host references unconditionally, and it left out every installed package's Kotlin
+# along with the registry that routes commands to it.
+# shellcheck source=native-packages.sh
+source "$PKGDIR/native-packages.sh"
+chuks_android_native_packages
+chuks_capability_check
+chuks_android_kotlin_sources
+if ! kotlinc $KT_SRC -cp "$KT_CP" -include-runtime -d "$OUT/app.jar" > "$OUT/kotlinc.log" 2>&1; then
+    echo "  kotlin build failed:"; grep -iE "error:" "$OUT/kotlinc.log" | head -20; exit 1
+fi
 
 echo "4. Dexing"
 "$BT/d8" --min-api 24 --lib "$AJAR" --output "$OUT" "$OUT/app.jar" > "$OUT/d8.log" 2>&1 \
@@ -98,9 +111,9 @@ cp "$BIN/../sysroot/usr/lib/$CXXLIB/libc++_shared.so" "$OUT/lib/$ABI/"
 # relative to assets/, so you can organize them in subfolders and reference them as
 # src:"sub/dir/name.png" (basenames no longer collide across folders).
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
-find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev/null | while IFS= read -r f; do
+find -L "$PROJDIR/assets" \( -name "*.png" -o -name "*.jpg" \) 2>/dev/null | { while IFS= read -r f; do
     rel="${f#"$PROJDIR/assets/"}"; mkdir -p "$OUT/assets/$(dirname "$rel")"; cp "$f" "$OUT/assets/$rel"
-done
+done; } || true   # a project with no assets/ dir is fine: find exits non-zero, not fatal
 ( cd "$OUT" && zip -qj base.apk classes.dex \
     && zip -q base.apk "lib/$ABI/libapp.so" "lib/$ABI/libc++_shared.so" \
     && zip -q base.apk assets/cmr.bundle \
@@ -115,8 +128,7 @@ echo "7. Signing + installing + launching (CMR — the VM runs on the device)"
     -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
     -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
 "$BT/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android "$OUT/chuks.apk" >/dev/null 2>&1
-DEV_ID="$("$ADB" devices | awk '/\tdevice$/{print $1; exit}')"
-[ -z "$DEV_ID" ] && { echo "no android device/emulator (adb devices)"; exit 1; }
+chuks_ensure_device || exit 1
 "$ADB" -s "$DEV_ID" install -r "$OUT/chuks.apk"
 "$ADB" -s "$DEV_ID" shell am start -n "$APPID/$CODEPKG.MainActivity"
 echo "   launched $APPID on $DEV_ID"

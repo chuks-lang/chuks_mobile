@@ -50,6 +50,7 @@ import android.nfc.NdefRecord
 import android.nfc.tech.Ndef
 import java.util.UUID
 import android.view.WindowManager
+import android.view.WindowInsets
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
@@ -76,6 +77,7 @@ object N {
     external fun tick(): Int
     external fun viewport(top: Int, h: Int, w: Int): Int
     external fun event(action: String): Int
+    external fun back(): Int                                    // system back: 1 = the app handled it
     external fun input(action: String, value: String): Int
     external fun resolve(token: String, payload: String): Int   // F3: async capability result
     external fun fail(token: String, message: String): Int      // F3: capability failure (error channel)
@@ -84,6 +86,8 @@ object N {
     external fun setInsets(top: Int, right: Int, bottom: Int, left: Int)
     external fun setPlatform(os: String, version: String, model: String, isTablet: Int)
     external fun drain(): String
+    external fun saveState(): String                            // route stack + useState cells
+    external fun loadState(data: String)
     external fun cmrBoot(bundle: ByteArray, tmpdir: String): Int   // CMR: load a chukspack bundle (libcmr only)
     external fun cmrApplyDelta(delta: ByteArray): Int              // CMR: merge only the changed modules + re-init
     external fun cmrLastError(): String                            // CMR: why the last boot/delta failed (dev error overlay)
@@ -119,7 +123,50 @@ object N {
     }
 }
 
-class MainActivity : Activity() {
+// Every colour on the wire, parsed the one way.
+//
+// Style values carry a bare hex ("2F7A4F") because that is how the theme stores them, and
+// every site used to write Color.parseColor("#$vl") on that assumption. An app that wrote
+// the colour the way a person writes one, "#2F7A4F", produced "##..." and an uncaught
+// NumberFormatException that killed the process, from a style value correct by every
+// other measure. Accept both, and never throw: a misspelled colour should not be fatal.
+fun hexColorStatic(h: String, fallback: Int = android.graphics.Color.TRANSPARENT): Int {
+    val t = h.trim()
+    if (t.isEmpty()) return fallback
+    return try { android.graphics.Color.parseColor(if (t.startsWith("#")) t else "#$t") }
+    catch (e: Throwable) { android.util.Log.w("chuks", "bad colour: \"$h\""); fallback }
+}
+
+// Text arriving on the P|/V| channels, restored.
+//
+// The engine escapes a backslash and the two line endings before putting text into a
+// newline-delimited stream, because a newline inside a label used to end the op early and
+// leave the rest standing as a line the host would then RUN. See escText in core/ui.chuks.
+// One left-to-right scan, because search-and-replace would corrupt a label ending in a
+// real backslash.
+fun chuksUnescapeText(s: String): String {
+    if (s.indexOf('\\') < 0) return s
+    val out = StringBuilder(s.length)
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        if (c == '\\' && i + 1 < s.length) {
+            when (s[i + 1]) {
+                '\\' -> out.append('\\')
+                'n' -> out.append('\n')
+                'r' -> out.append('\r')
+                else -> out.append(s[i + 1])
+            }
+            i += 2
+            continue
+        }
+        out.append(c)
+        i++
+    }
+    return out.toString()
+}
+
+class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val views = HashMap<String, View>()
     private val ynodes = HashMap<String, Long>()
     // Incremental apply: relayout() reassigns a view's LayoutParams (which triggers a child
@@ -131,6 +178,8 @@ class MainActivity : Activity() {
 
     private lateinit var root: FrameLayout
     private var listScroll: FrameLayout? = null   // a ScrollView (vertical) or HorizontalScrollView (carousel)
+    private val horizScrollIds = HashSet<String>()   // which scroll ids scroll sideways, by id rather than
+                                                     // by inference: LV can hand the live slot to any of them
     private var listHoriz = false                 // the tracked list scrolls horizontally (report x, not y)
     private var scrollId = ""
     private var stickBottomOn = false   // Scroll stickBottom: keep pinned to newest (chat)
@@ -276,11 +325,17 @@ class MainActivity : Activity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        pipeStdioToLog()
         density = resources.displayMetrics.density
-        // Keyboard avoidance: adjustResize shrinks the window content when the keyboard
-        // shows, so a bottom input bar rises above it (set here too, not only in the
-        // manifest, in case the manifest is regenerated from app.json).
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        // Keyboard avoidance. adjustResize shrinks the WHOLE window, which lifts every
+        // bottom-anchored thing -- typing in a field at the top of the screen dragged the
+        // tab bar up over the keyboard. Let the keyboard overlay instead and lift only
+        // what it actually covers (see applyKeyboard). Needs ime() insets to know the
+        // keyboard's height, which is API 30+; older devices keep the resize behaviour,
+        // where the platform gives no reliable height with ADJUST_NOTHING.
+        window.setSoftInputMode(
+            if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            else WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         root = FrameLayout(this)
         root.setBackgroundColor(Color.parseColor("#0E1116"))
         setContentView(root)
@@ -343,11 +398,41 @@ class MainActivity : Activity() {
             N.setPlatform("android", android.os.Build.VERSION.RELEASE, android.os.Build.MODEL, isTablet)   // platform + device info
             N.setColorScheme(if (osDark()) 1 else 0)   // open in the OS appearance
         }
+        // BEFORE the first mount: loadState replaces the route stack and the useState
+        // cells, so it has to land while there is still nothing on screen.
+        restoreStateIfAppropriate()
         hostMount()
 
         // first layout after the window is measured
         root.post { reportInsets(); relayout(); if (pushViewport()) relayout() }
-        root.setOnApplyWindowInsetsListener { _, insets -> reportInsets(); insets }   // update on inset changes
+        // Predictive back: ride the system's own gesture progress so the pop is
+        // interactive and cancellable, instead of happening all at once on release.
+        if (Build.VERSION.SDK_INT >= 34) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                object : android.window.OnBackAnimationCallback {
+                    override fun onBackStarted(e: android.window.BackEvent) {
+                        val mid = activeModal
+                        if (mid != null && views[mid]?.visibility == View.VISIBLE) return
+                        if (backLayers()) backProgress(0f)
+                    }
+                    override fun onBackProgressed(e: android.window.BackEvent) { backProgress(e.progress) }
+                    override fun onBackCancelled() { backSettle(false) }
+                    override fun onBackInvoked() {
+                        val mid = activeModal
+                        if (mid != null && views[mid]?.visibility == View.VISIBLE) {
+                            modalActions[mid]?.let { fire(it) }   // parent flips `visible`; the re-render hides it
+                            return
+                        }
+                        if (backTop != null) backSettle(true) else doBack()
+                    }
+                })
+        }
+        root.setOnApplyWindowInsetsListener { _, insets ->                            // update on inset changes
+            reportInsets()
+            if (Build.VERSION.SDK_INT >= 30) applyKeyboard(insets.getInsets(WindowInsets.Type.ime()).bottom)
+            insets
+        }
 
         // Text measure callback: needed in BOTH dev and production (the wake/heartbeat setup
         // below is split by devMode, but Yoga's text measurement is not).
@@ -517,8 +602,8 @@ class MainActivity : Activity() {
             when (f.getOrNull(0)) {
                 "C" -> if (f.size >= 3) make(f[1], f[2])
                 "S" -> if (f.size >= 3) style(f[1], f[2])
-                "P" -> if (f.size >= 3) setText(f[1], f.drop(2).joinToString("|"))   // rejoin: text may contain '|'
-                "V" -> if (f.size >= 3) setFieldValue(f[1], f.drop(2).joinToString("|"))   // controlled value (may contain '|')
+                "P" -> if (f.size >= 3) setText(f[1], chuksUnescapeText(f.drop(2).joinToString("|")))   // rejoin: text may contain '|'
+                "V" -> if (f.size >= 3) setFieldValue(f[1], chuksUnescapeText(f.drop(2).joinToString("|")))   // controlled value (may contain '|')
                 "T" -> if (f.size >= 3) bindAction(f[1], f[2])
                 "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
                 "TF" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldFocus[it] = f[1] + ":focus" }
@@ -539,14 +624,40 @@ class MainActivity : Activity() {
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
+                // LV|<id>: the engine names the LIVE list (the one on the top screen).
+                // With several screens mounted, "most recently created scroll" is wrong:
+                // a covered screen's list would take the viewport reports and scroll.
+                // Which container holds the two screens predictive back drags.
+                "SK" -> { stackHostId = if (f.size >= 2) f[1] else "" }
+                "LV" -> {
+                    val lid = if (f.size >= 2) f[1] else ""
+                    if (lid.isEmpty()) { listScroll = null; scrollId = ""; contentId = "" }
+                    // listHoriz MUST move with the live scroll. It used to be set only at
+                    // creation, so once LV handed the slot to a horizontal list (a Carousel
+                    // inside a vertical Scroll) the host kept reporting the vertical axis: it
+                    // sent that list's own HEIGHT as the app viewport, and the engine windowed
+                    // every list against a 96dp-tall screen.
+                    else (views[lid] as? FrameLayout)?.let { sc ->
+                        listScroll = sc; scrollId = lid; contentId = "$lid.0"
+                        listHoriz = horizScrollIds.contains(lid)
+                    }
+                }
                 "FA" -> if (f.size >= 2) setFrameDriver(f[1] == "1")   // per-frame physics on/off
                 "X" -> if (f.size >= 3) {
                     // Async host->engine command: X|token|capability|args. Run AFTER this
                     // applyDrain() (main-looper post), so a sync capability's resolve()
                     // doesn't re-enter applyDrain(). args may contain '|'.
                     val token = f[1]; val cap = f[2]
-                    val args = if (f.size >= 4) f.subList(3, f.size).joinToString("|") else ""
-                    Handler(Looper.getMainLooper()).post { handleCommand(token, cap, args) }
+                    // The arguments are JSON, so a raw pipe inside them is safe here:
+                    // they are everything after the third one, joined back together.
+                    val raw = if (f.size >= 4) f.subList(3, f.size).joinToString("|") else ""
+                    Handler(Looper.getMainLooper()).post {
+                        // Parsed once, centrally, rather than by each capability. `args`
+                        // is the single argument as a string, which is all a one-argument
+                        // capability ever wanted; `a` reads the rest by name.
+                        val a = ChuksArgs(raw, cap, token, this)
+                        handleCommand(token, cap, a.str, a)
+                    }
                 }
             }
         }
@@ -696,6 +807,44 @@ class MainActivity : Activity() {
             devErrorOverlay = scrim
         }
     }
+
+    // ---- println reaches the log ------------------------------------------
+    //
+    // The engine's println goes to file descriptor 1, and on Android nothing reads that:
+    // an app can print all day and see nothing in logcat. Every other platform gives you
+    // a print statement that shows up somewhere, and a print statement that goes nowhere
+    // is worse than none, because it looks like the code did not run.
+    //
+    // So take the descriptor over. A pipe replaces stdout and stderr, and one daemon
+    // thread pumps whole lines into logcat under the "Chuks" tag. This catches the AOT
+    // binary, the CMR VM and anything a native package prints, because it works at the
+    // descriptor rather than at any one of them.
+    //
+    // The reader must outlive everything that writes: a pipe whose buffer fills blocks
+    // the writer, so a reader that stopped would freeze the app on its next print.
+    private var stdioPumped = false
+    private fun pipeStdioToLog() {
+        if (stdioPumped) return
+        stdioPumped = true
+        try {
+            val fds = android.system.Os.pipe()
+            android.system.Os.dup2(fds[1], 1)   // stdout
+            android.system.Os.dup2(fds[1], 2)   // stderr, so a panic is not lost either
+            val t = Thread {
+                try {
+                    val r = java.io.BufferedReader(java.io.InputStreamReader(
+                        java.io.FileInputStream(fds[0]), Charsets.UTF_8))
+                    while (true) {
+                        val line = r.readLine() ?: break
+                        if (line.isNotEmpty()) android.util.Log.i("Chuks", line)
+                    }
+                } catch (_: Throwable) { }
+            }
+            t.isDaemon = true
+            t.start()
+        } catch (_: Throwable) { }   // never let logging stop the app from starting
+    }
+
     private fun dismissDevError() {
         runOnUiThread { devErrorOverlay?.let { root.removeView(it) }; devErrorOverlay = null }
     }
@@ -791,7 +940,11 @@ class MainActivity : Activity() {
         try { N.cmrLoadState(if (lastGoodState.isNotEmpty()) lastGoodState else saved) } catch (e: Throwable) {}  // restore into the fresh VM before mount
         lastGoodState = ""
         dismissDevError()
-        hostMount(); relayout(); if (pushViewport()) relayout()
+        // A hot reload swaps in a FRESH VM whose insets are zero. reportInsets' change-guard
+        // would skip re-sending them, so the new VM would lay out edge-to-edge (content under
+        // the status bar, tab bar under the nav bar). Invalidate the cache so reportInsets resends.
+        lastInsets = intArrayOf(-1, -1, -1, -1)
+        hostMount(); reportInsets(); relayout(); if (pushViewport()) relayout()
     }
     private var lastGoodState: String = ""   // app state kept across a failed reload, restored on the fix
 
@@ -835,23 +988,107 @@ class MainActivity : Activity() {
     // screen. In the JNI (AOT) path the engine is in-process and this never fails.
     private var everMounted = false
     private fun hostMount() { applyStream(engMount()); relayout(); if (views.isNotEmpty()) everMounted = true }
+
+    // ---- State restoration --------------------------------------------------
+    //
+    // The engine already serializes the route stack, every tab's own history, and every
+    // useState cell, because hot reload needs exactly that. Restoring therefore returns
+    // the user to the screen they left with what they had typed and where they had
+    // scrolled, not merely to the right screen.
+    private val stateFile get() = java.io.File(filesDir, "chuks-state.json")
+    // Written at launch, removed on a clean pause. Finding it at launch means the last
+    // run ended without pausing, which usually means it crashed, and dropping someone
+    // straight back onto a screen that crashes can trap them in a loop.
+    private val runMarker get() = java.io.File(filesDir, "chuks-running")
+    // How recently the app must have been backgrounded for its state to count, in
+    // seconds. 0 disables restoration. Baked in from app.json at build time.
+    private val restoreWindow: Int get() = ChuksBuild.STATE_RESTORE_WINDOW
+
+    private fun persistState() {
+        if (devMode || restoreWindow <= 0) return
+        val st = try { N.saveState() } catch (e: Throwable) { "" }
+        if (st.isEmpty()) return
+        val doc = org.json.JSONObject()
+        doc.put("at", System.currentTimeMillis() / 1000)
+        doc.put("state", st)
+        try { stateFile.writeText(doc.toString()); runMarker.delete() } catch (e: Throwable) {}
+    }
+
+    /// Decide whether to restore, and do it. Called once, BEFORE the first mount, because
+    /// loadState replaces the route stack and the cells: restoring afterwards would build
+    /// the wrong screen and then throw it away.
+    private fun restoreStateIfAppropriate() {
+        val crashed = runMarker.exists()
+        try { runMarker.writeText("1") } catch (e: Exception) {}     // arm for this run
+
+        if (devMode || restoreWindow <= 0) return
+        if (!lastUrl.isNullOrEmpty()) return              // a deep link is a deliberate destination
+        if (crashed) {
+            stateFile.delete()
+            android.util.Log.w("chuks-state", "not restoring, the previous run did not exit cleanly")
+            return
+        }
+        if (!stateFile.exists()) return
+        try {
+            val doc = org.json.JSONObject(stateFile.readText())
+            val age = System.currentTimeMillis() / 1000 - doc.getLong("at")
+            if (age > restoreWindow) { stateFile.delete(); return }   // stale: start fresh
+            N.loadState(doc.getString("state"))
+        } catch (e: Throwable) { stateFile.delete() }
+    }
     private fun hostEvent(a: String) { applyStream(engEvent(a)); relayout() }
     private fun hostInput(a: String, v: String) { applyStream(engInput(a, v)); relayout() }
 
     // Deliver a native capability result back to the engine and apply the re-render.
-    private fun resolve(token: String, payload: String) {
+    // Public because a package's module answers through the same channel the framework's
+    // own capabilities do (ChuksModuleHost).
+    override fun resolve(token: String, payload: String) {
         applyStream(engResolve(token, payload)); relayout()
     }
     // Report a capability failure back to the engine (fires the request's onErr).
-    private fun fail(token: String, message: String) {
+    // Token "0" means the caller passed no callback, so the engine allocated nothing and
+    // there is no closure anywhere to hand this to. The engine's own unhandled-failure
+    // warning cannot reach these, because there is no token for it to fail: a
+    // fire-and-forget capability has nowhere to report to BY CONSTRUCTION. The host is
+    // the last place that still knows both the capability and the reason, so it says so
+    // here rather than letting the failure evaporate.
+    override fun fail(token: String, message: String) {
+        if (token == "0") {
+            val what = if (dispatchingCap.isEmpty()) "a capability" else dispatchingCap
+            android.util.Log.w("Chuks", "chuks warning: $what failed and nothing is listening: " +
+                "\"$message\". It was called without a callback, so nothing could be told.")
+            return
+        }
         applyStream(engFail(token, message)); relayout()
     }
+    // The capability currently being dispatched, so a failure can name itself.
+    private var dispatchingCap: String = ""
+    // ChuksModuleHost: a module gets the Activity the framework's own capabilities use.
+    override val activity: Activity get() = this
+
+    // ChuksModuleHost: a module's stream is torn down through the same map the
+    // framework's own streams use, so `__cancel__` releases both alike.
+    override fun onCancel(token: String, teardown: () -> Unit) { streamTeardown[token] = teardown }
+
+    // ChuksModuleHost: a runtime permission request rides the host's existing pending-token
+    // plumbing, because only the Activity receives onRequestPermissionsResult.
+    override fun requestPermission(token: String, permissions: Array<String>) {
+        val code = ++permSeq
+        pendingPerms[code] = token
+        requestPermissions(permissions, code)
+    }
+
+    // Capabilities installed packages provide, consulted for any command the framework's
+    // own `when` does not claim. Lazy: an app with no native package never builds it.
+    private val packageModules by lazy { ChuksModuleRegistry(this) }
 
     // Live native subscriptions (stream token -> repeating Runnable), for teardown.
     private val streamHandler = Handler(Looper.getMainLooper())
     private val activeStreams = mutableMapOf<String, Runnable>()
     // Real OS streams (battery/app-state/network): a teardown closure per token,
     // run on __cancel__ so the receiver/callback is unregistered.
+    // Live package-supplied views, by node id.
+    private val packageViews = HashMap<String, ChuksNativeView>()
     private val streamTeardown = mutableMapOf<String, () -> Unit>()
     private val appStateTokens = mutableSetOf<String>()   // tokens watching foreground/background
     private val orientationTokens = mutableSetOf<String>()   // tokens watching device orientation
@@ -860,7 +1097,65 @@ class MainActivity : Activity() {
 
     // Execute a native capability requested via an `X|` command (F3). Fire-and-forget
     // commands (token "0") just perform the side effect; async reads call resolve().
-    private fun handleCommand(token: String, cap: String, args: String) {
+    // The live view tree, for Debug.viewTree. Node ids are structural paths ("app.0.1"),
+    // so sorting them puts a parent before its children and the dot count is the depth.
+    // Frames are reported in dp, matching what the Chuks side asked for.
+    private val DETACHED_MARK = "\u0000detached"
+
+    private fun viewTreeDump(): String {
+        // Asked before the first layout pass, every frame would read 0 and the dump
+        // would call the whole tree ZERO-SIZED, which is a lie that looks exactly like
+        // the bug this tool exists to find. Say what is actually true instead.
+        val rootNode = ynodes["app"]
+        if (rootNode == null || N.yGet(rootNode, 2).toInt() == 0) {
+            return "(no frames yet: the first layout pass has not run, so nothing has a resolved size)"
+        }
+        // The app's own tree first. Ids sort as strings, and a recycled list cell is
+        // named ".0.cellN", so a plain sort puts a pool of detached cells above the
+        // screen you are looking at and fills the first screenful with them. They are
+        // real views and worth seeing, so they follow under a heading rather than
+        // being dropped.
+        val rooted = views.keys.filter { it == "app" || it.startsWith("app.") }.sorted()
+        val detached = views.keys.filter { !(it == "app" || it.startsWith("app.")) }.sorted()
+        val sb = StringBuilder()
+        for (id in rooted + listOf(DETACHED_MARK) + detached) {
+            if (id == DETACHED_MARK) {
+                if (detached.isEmpty()) continue
+                sb.append("-- not attached to the app root (recycled list cells, torn-down screens) --\n")
+                continue
+            }
+            val v = views[id] ?: continue
+            val depth = id.count { it == '.' }
+            val pad = "  ".repeat(depth)
+            // The frame comes from Yoga, not from the View. Android applies a frame by
+            // assigning LayoutParams and asking for a layout pass, and that pass has not
+            // run yet when a capability answers on the main looper: every v.width would
+            // read 0 and the dump would call the whole tree ZERO-SIZED. The Yoga node
+            // holds the resolved frame the moment relayout() computed it, which is the
+            // number this dump claims to show, and it is what iOS reports too (there the
+            // frame is assigned to the view directly, so the two agree).
+            val yn = ynodes[id]
+            val x: Int; val y: Int; val w: Int; val h: Int
+            if (yn != null) {
+                x = (N.yGet(yn, 0) / density).toInt(); y = (N.yGet(yn, 1) / density).toInt()
+                w = (N.yGet(yn, 2) / density).toInt(); h = (N.yGet(yn, 3) / density).toInt()
+            } else {
+                x = (v.x / density).toInt(); y = (v.y / density).toInt()
+                w = (v.width / density).toInt(); h = (v.height / density).toInt()
+            }
+            sb.append("$pad$id  ${v.javaClass.simpleName}  $x,$y ${w}x$h")
+            if (v.visibility != View.VISIBLE) sb.append("  hidden")
+            if (w == 0 || h == 0) sb.append("  ZERO-SIZED")
+            (v as? TextView)?.text?.toString()?.let {
+                if (it.isNotEmpty()) sb.append("  \"" + (if (it.length > 30) it.take(30) + "…" else it) + "\"")
+            }
+            sb.append("\n")
+        }
+        return if (sb.isEmpty()) "(no views)" else sb.toString()
+    }
+
+    private fun handleCommand(token: String, cap: String, args: String, a: ChuksArgs) {
+        dispatchingCap = cap
         when (cap) {
             "__cancel__" -> {
                 // Chuks cancelled this token (unmount / explicit): stop + drop the
@@ -944,6 +1239,31 @@ class MainActivity : Activity() {
                     streamTeardown[token] = { try { lm.removeUpdates(listener) } catch (e: Exception) {} }
                 } catch (e: SecurityException) { fail(token, "location permission denied") }
             }
+            "location.watchBackground" -> {
+                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+                // A foreground service started while the app is on screen keeps the
+                // "while in use" grant with the screen off, so this needs no separate
+                // ACCESS_BACKGROUND_LOCATION prompt.
+                val title = a.s("title").ifEmpty { "Location" }
+                val body = a.s("body")
+                ChuksLocation.token = token
+                ChuksLocation.deliver = { t, fix -> resolve(t, fix) }
+                val svc = Intent(this, ChuksLocationService::class.java)
+                svc.putExtra("title", title)
+                svc.putExtra("body", body)
+                try {
+                    startForegroundService(svc)
+                } catch (e: Throwable) {
+                    ChuksLocation.deliver = null
+                    fail(token, "background location unavailable: " + (e.message ?: e.toString()))
+                    return
+                }
+                streamTeardown[token] = {
+                    ChuksLocation.deliver = null
+                    ChuksLocation.token = ""
+                    try { stopService(Intent(this, ChuksLocationService::class.java)) } catch (e: Throwable) {}
+                }
+            }
             "motion.accel" -> startSensor(token, android.hardware.Sensor.TYPE_ACCELEROMETER)
             "motion.gyro" -> startSensor(token, android.hardware.Sensor.TYPE_GYROSCOPE)
             "motion.mag" -> startSensor(token, android.hardware.Sensor.TYPE_MAGNETIC_FIELD)
@@ -956,25 +1276,6 @@ class MainActivity : Activity() {
             }
             "pedometer.watch" -> startPedometer(token)
             "pedometer.query" -> fail(token, "historical steps need Health Connect on Android; use Pedometer.watch for a live count")
-            "health.available" -> {
-                val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
-                resolve(token, if (sm.getDefaultSensor(android.hardware.Sensor.TYPE_HEART_RATE) != null) "true" else "false")
-            }
-            "health.authorize" -> {
-                // No Health Connect in the base runtime: the only readable source is the
-                // body heart-rate sensor, gated by the BODY_SENSORS runtime permission.
-                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) == PackageManager.PERMISSION_GRANTED) resolve(token, "granted")
-                else {
-                    val code = ++permSeq
-                    pendingPerms[code] = token       // resolved "granted"/"denied" in onRequestPermissionsResult
-                    requestPermissions(arrayOf(Manifest.permission.BODY_SENSORS), code)
-                }
-            }
-            "health.read" -> fail(token, "reading health totals needs Health Connect on Android; use Pedometer for steps/distance")
-            "health.heartRate" -> {
-                if (checkSelfPermission(Manifest.permission.BODY_SENSORS) != PackageManager.PERMISSION_GRANTED) { fail(token, "body-sensors permission denied"); return }
-                startLightSensor(token, android.hardware.Sensor.TYPE_HEART_RATE) { v -> v[0].toInt().toString() }
-            }
             "deviceinfo.screen" -> {
                 val dm = resources.displayMetrics
                 val wdp = (dm.widthPixels / dm.density).toInt()
@@ -990,6 +1291,17 @@ class MainActivity : Activity() {
             "deviceinfo.locale" -> {
                 val loc = resources.configuration.locales[0]
                 resolve(token, "${loc.language},${loc.country}")
+            }
+            "deviceinfo.id" -> {
+                @Suppress("HardwareIds")
+                val id = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+                resolve(token, id ?: "")
+            }
+            "deviceinfo.appid" -> resolve(token, packageName)
+            "deviceinfo.appname" -> resolve(token, applicationInfo.loadLabel(packageManager).toString())
+            "deviceinfo.installtime" -> {
+                val pi = packageManager.getPackageInfo(packageName, 0)
+                resolve(token, pi.firstInstallTime.toString())
             }
             "contacts.list" -> {
                 if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) { fail(token, "contacts permission denied"); return }
@@ -1023,7 +1335,7 @@ class MainActivity : Activity() {
             "calendar.upcoming" -> {
                 if (checkSelfPermission(Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
                 try {
-                    val days = args.toLongOrNull() ?: 7L
+                    val days = a.num()?.toLong() ?: return
                     val now = System.currentTimeMillis()
                     val sb = StringBuilder()
                     contentResolver.query(CalendarContract.Events.CONTENT_URI, arrayOf(CalendarContract.Events.TITLE, CalendarContract.Events.DTSTART, CalendarContract.Events.DTEND),
@@ -1037,9 +1349,8 @@ class MainActivity : Activity() {
             "calendar.create" -> {
                 if (checkSelfPermission(Manifest.permission.WRITE_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
                 try {
-                    val parts = args.split("|")
-                    if (parts.size < 3) { fail(token, "bad args"); return }
-                    val startMin = parts[1].toLongOrNull() ?: 0L; val durMin = parts[2].toLongOrNull() ?: 0L
+                    val startMin = a.num("startInMin")?.toLong() ?: return
+                    val durMin = a.num("durationMin")?.toLong() ?: return
                     var calId = -1L
                     contentResolver.query(CalendarContract.Calendars.CONTENT_URI, arrayOf(CalendarContract.Calendars._ID),
                         "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ?", arrayOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR.toString()), null)?.use { c ->
@@ -1048,7 +1359,7 @@ class MainActivity : Activity() {
                     if (calId < 0) { fail(token, "no writable calendar"); return }
                     val now = System.currentTimeMillis()
                     val values = android.content.ContentValues().apply {
-                        put(CalendarContract.Events.CALENDAR_ID, calId); put(CalendarContract.Events.TITLE, parts[0])
+                        put(CalendarContract.Events.CALENDAR_ID, calId); put(CalendarContract.Events.TITLE, a.s("title"))
                         put(CalendarContract.Events.DTSTART, now + startMin * 60000L); put(CalendarContract.Events.DTEND, now + (startMin + durMin) * 60000L)
                         put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
                     }
@@ -1111,14 +1422,10 @@ class MainActivity : Activity() {
             "ble.connect" -> ensureBle().connect(args, { p -> resolve(token, p) }, { m -> fail(token, m) })
             "ble.disconnect" -> bleManager?.disconnect(args)
             "ble.read" -> {
-                val a = args.split("\t")
-                if (a.size == 3) ensureBle().read(a[0], a[1], a[2], { p -> resolve(token, p) }, { m -> fail(token, m) })
-                else fail(token, "ble.read needs id, service, characteristic")
+                ensureBle().read(a.s("deviceId"), a.s("service"), a.s("characteristic"), { p -> resolve(token, p) }, { m -> fail(token, m) })
             }
             "ble.write" -> {
-                val a = args.split("\t")
-                if (a.size == 4) ensureBle().write(a[0], a[1], a[2], a[3], { p -> resolve(token, p) }, { m -> fail(token, m) })
-                else fail(token, "ble.write needs id, service, characteristic, hex")
+                ensureBle().write(a.s("deviceId"), a.s("service"), a.s("characteristic"), a.s("valueHex"), { p -> resolve(token, p) }, { m -> fail(token, m) })
             }
             "ble.subscribe" -> {
                 val a = args.split("\t")
@@ -1154,6 +1461,7 @@ class MainActivity : Activity() {
             }
             "biometrics.authenticate" -> authenticateBiometric(token, args)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
+            "debug.viewTree" -> resolve(token, viewTreeDump())
             "debug.fail" -> fail(token, "simulated native failure")
             "permission.status" -> {
                 val p = permString(args)
@@ -1172,12 +1480,9 @@ class MainActivity : Activity() {
                 }
             }
             "fs.write" -> {
-                val bar = args.indexOf('|')   // "name|<base64 content>"
-                if (bar >= 0) {
-                    val name = args.substring(0, bar)
-                    val content = String(android.util.Base64.decode(args.substring(bar + 1), android.util.Base64.DEFAULT))
-                    java.io.File(filesDir, name).writeText(content)
-                }
+                // The content arrives as an ordinary field: the wire packs arguments,
+                // so a multi-line body needs no encoding of its own any more.
+                java.io.File(filesDir, a.s("name")).writeText(a.s("content"))
             }
             "fs.read" -> {
                 val f = java.io.File(filesDir, args)
@@ -1186,19 +1491,14 @@ class MainActivity : Activity() {
             "fs.list" -> resolve(token, (filesDir.listFiles()?.map { it.name } ?: emptyList()).joinToString("\n"))
             "fs.delete" -> java.io.File(filesDir, args).delete()
             "secure.set" -> {
-                val bar = args.indexOf('|')   // "key|<base64 value>"
-                if (bar >= 0) {
-                    val key = args.substring(0, bar)
-                    val value = String(android.util.Base64.decode(args.substring(bar + 1), android.util.Base64.DEFAULT))
-                    secureSet(key, value)
-                }
+                secureSet(a.s("key"), a.s("value"))
             }
             "secure.get" -> { val v = secureGet(args); if (v != null) resolve(token, v) else fail(token, "no such key: $args") }
             "secure.delete" -> securePrefs().edit().remove(args).apply()
             "notif.notify" -> {
-                val bar = args.indexOf('|')   // "<base64 title>|<base64 body>"
-                val title = if (bar >= 0) decodeB64(args.substring(0, bar)) else decodeB64(args)
-                val body = if (bar >= 0) decodeB64(args.substring(bar + 1)) else ""
+
+                val title = a.s("title")
+                val body = a.s("body")
                 notify(title, body)
             }
             "audio.play" -> {
@@ -1261,12 +1561,20 @@ class MainActivity : Activity() {
                 streamHandler.postDelayed(r, 80)
             }
             "tts.speak" -> {
-                val text = decodeB64(args)
+                val text = args
                 ensureTts()
                 if (ttsReady) speakNow(text) else pendingSpeak = text   // speak once the engine finishes init
             }
             "tts.stop" -> tts?.stop()
             "tts.isSpeaking" -> resolve(token, if (tts?.isSpeaking == true) "1" else "0")
+            // The framework noticed something the app probably did not mean. Logged
+            // natively because the engine's own println reaches nothing on Android.
+            "dev.warn" -> android.util.Log.w("Chuks", args)
+            // Which appearance the APP is in. Android's glass is a static scrim rather
+            // than a system material, so nothing here resolves against a trait and this
+            // is recorded rather than applied; it exists so the capability answers on
+            // both platforms instead of failing on one.
+            "appearance.set" -> appAppearance = args
             "clipboard.set" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
             "clipboard.get" -> {
                 val t = clipboard().primaryClip?.let { if (it.itemCount > 0) it.getItemAt(0).coerceToText(this).toString() else "" } ?: ""
@@ -1282,11 +1590,11 @@ class MainActivity : Activity() {
                 startActivity(Intent.createChooser(i, null))
             }
             "haptics.impact" -> fireHaptic(args)
-            "haptics.vibrate" -> hapticVibrate(args.toLongOrNull() ?: 0L)
+            "haptics.vibrate" -> a.num()?.let { hapticVibrate(it.toLong()) }
             "haptics.pattern" -> hapticPattern(args)
             "torch.set" -> setTorch(args == "1")
-            "brightness.set" -> args.toFloatOrNull()?.let {
-                val lp = window.attributes; lp.screenBrightness = it.coerceIn(0f, 1f); window.attributes = lp
+            "brightness.set" -> a.num()?.let {
+                val lp = window.attributes; lp.screenBrightness = it.toFloat().coerceIn(0f, 1f); window.attributes = lp
             }
             "brightness.keepAwake" ->
                 if (args == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -1296,10 +1604,48 @@ class MainActivity : Activity() {
                 streamTeardown[token] = { orientationTokens.remove(token) }
                 resolve(token, currentOrientation())
             }
+            // ---- Background tasks ----
+            "bg.define" -> {
+                // Remember the token process-wide: a job may be handled by the service
+                // with this Activity alive, in which case it uses what we learned here
+                // rather than mounting again.
+                ChuksBg.tokens[args] = token
+                streamTeardown[token] = { ChuksBg.tokens.remove(args) }
+            }
+            "bg.result" -> {
+                ChuksBg.finish(a.s("name"), a.bool("ok"))
+            }
+            "bg.periodic", "bg.once", "bg.processing" -> {
+                // Same three arguments whichever of the three schedulers this is.
+                val secs = a.int("seconds") ?: return
+                val cons = HashMap<String, String>()
+                for (pair in a.s("constraints").split(";")) {
+                    if (pair.isEmpty()) continue
+                    val kv = pair.split("=")
+                    if (kv.size == 2) cons[kv[0]] = kv[1]
+                }
+                // A processing task is long work that wants power, so it is a one-off
+                // job with those constraints rather than a repeating one.
+                scheduleChuksJob(this, a.s("name"), secs, cap == "bg.periodic", cons)
+            }
+            "bg.cancel" -> cancelChuksJob(this, args)
+            "bg.cancelAll" -> cancelAllChuksJobs(this)
+            "bg.status" -> resolve(token, chuksJobStatus(this, args))
+
             "orientation.lock" -> requestedOrientation = when (args) {
                 "portrait"  -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
                 else        -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+            // Not a framework capability. An installed package may claim this namespace.
+            // If none does the command is unknown, and saying nothing was the worst
+            // answer available: a misspelt capability, one a package forgot to declare,
+            // and one that simply does not exist on this platform all behaved like a
+            // call that quietly worked. Route it through fail(), which reaches the app
+            // when somebody is listening and the log when nobody is.
+            else -> if (!packageModules.handle(token, cap, args, a)) {
+                fail(token, "no capability named $cap on Android. Check the spelling, or " +
+                    "whether the package that provides it declares this platform.")
             }
         }
     }
@@ -1517,7 +1863,6 @@ class MainActivity : Activity() {
         return String(c.doFinal(ct))
     }
 
-    private fun decodeB64(s: String) = String(android.util.Base64.decode(s, android.util.Base64.DEFAULT))
 
     private var notifId = 1
     private var audioMp: MediaPlayer? = null   // single-track audio playback (Tier B)
@@ -1578,6 +1923,9 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause(); appForeground = false
         appStateTokens.toList().forEach { resolve(it, "background") }
+        // The last reliable moment: Android makes no promise to run anything when it
+        // later kills a backgrounded process.
+        persistState()
     }
     private fun notify(title: String, body: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
@@ -1627,6 +1975,8 @@ class MainActivity : Activity() {
         } catch (_: Exception) {}
     }
 
+    private fun hexColor(h: String, fallback: Int = Color.TRANSPARENT): Int = hexColorStatic(h, fallback)
+
     private fun make(id: String, kind: String) {
         if (views.containsKey(id)) return
         val n = N.yNew()
@@ -1655,7 +2005,7 @@ class MainActivity : Activity() {
                 it.setBackgroundColor(Color.parseColor("#0E1116"))
                 it.webChromeClient = android.webkit.WebChromeClient()   // required for full JS support in the WebView
             }
-            "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics / SwiftUI Canvas)
+            "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics)
             "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press + continuous pan/pinch/rotate
                 gestureIds.add(id)
                 val detector = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
@@ -1866,19 +2216,31 @@ class MainActivity : Activity() {
                 sc.isFillViewport = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
-                listScroll = sc; scrollId = id; listHoriz = false }
+                horizScrollIds.remove(id)
+                if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = false } }
             "HScroll" -> SnapHScrollView(this).also { sc ->   // horizontal list (carousel); snaps when paging=1
                 N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full width
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
                 sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
-                listScroll = sc; scrollId = id; listHoriz = true }
+                horizScrollIds.add(id)
+                if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = true } }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
                 it.setBackgroundColor(Color.argb(128, 0, 0, 0))
                 it.visibility = View.GONE                // shown when mvis=1
                 modalIds.add(id)
             }
-            else -> FrameLayout(this)
+            // A kind the framework does not know may be one a package claims. Only then
+            // do we look: an unknown kind is otherwise a plain container, exactly as
+            // before, so an app with no view packages pays one map miss.
+            else -> {
+                val factory = ChuksPackageModules.views()[kind]
+                if (factory != null) {
+                    val pv = factory(this)
+                    packageViews[id] = pv
+                    pv.view
+                } else FrameLayout(this)
+            }
         }
         views[id] = v
         ynodes[id] = n
@@ -1891,6 +2253,12 @@ class MainActivity : Activity() {
     // pending visual state per view (bg color + radius) -> a GradientDrawable
     private val bgColor = HashMap<String, Int>()
     private val bgRadius = HashMap<String, Float>()
+    private val blurAmt = HashMap<String, Int>()           // id -> 0..100 backdrop-blur strength
+    private val blurTint = HashMap<String, String>()       // id -> light | dark | system
+    private val gradColors = HashMap<String, IntArray>()   // id -> linear-gradient colors
+    private val gradAngle = HashMap<String, Int>()         // id -> angle in degrees (0 = top to bottom)
+    private val gradStops = HashMap<String, FloatArray>()  // id -> 0..1 positions matching the colors
+    private var appAppearance: String = "auto"   // the app's own light/dark choice
     private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a translucent frosted panel
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
     private val longPressActions = HashMap<String, String>()   // id -> onLongPress action
@@ -1959,6 +2327,8 @@ class MainActivity : Activity() {
         v.clipToOutline = false                            // overflow / TextureView+ImageView radius outline
         v.isEnabled = true                                 // dis / edit
         disabledIds.remove(id)                             // dis (alpha handled post-loop)
+        blurAmt.remove(id); blurTint.remove(id)            // backdrop blur (drawn as a scrim)
+        gradColors.remove(id); gradAngle.remove(id); gradStops.remove(id)   // linear gradient
         glassIds.remove(id)                                // glass frosted panel
         pressOpacity.remove(id); longDelayMs.remove(id)    // Pressable active-alpha / long-press
         if (!modalIds.contains(id)) v.visibility = View.VISIBLE   // hidden/mvis (modal drives its own)
@@ -2034,16 +2404,16 @@ class MainActivity : Activity() {
                 "right" -> N.ySetF(n, 12, dpf(f))
                 "on" -> (v as? Switch)?.isChecked = (vl == "1")
                 "bg" -> if (v is Switch) {
-                    v.trackTintList = ColorStateList.valueOf(Color.parseColor("#$vl"))   // on-track = primary
+                    v.trackTintList = ColorStateList.valueOf(hexColor(vl))   // on-track = primary
                     v.thumbTintList = ColorStateList.valueOf(switchThumb[id] ?: Color.WHITE)   // white thumb, like iOS (unless thumbColor set)
-                } else bgColor[id] = Color.parseColor("#$vl")
+                } else bgColor[id] = hexColor(vl)
                 "swtc" -> if (v is Switch) {                                              // Switch thumb (knob) color
-                    val c = Color.parseColor("#$vl"); switchThumb[id] = c
+                    val c = hexColor(vl); switchThumb[id] = c
                     v.thumbTintList = ColorStateList.valueOf(c)
                 }
                 "r" -> bgRadius[id] = dpf(f)
                 "bw" -> borderW[id] = dpf(f)
-                "bc" -> borderC[id] = Color.parseColor("#$vl")
+                "bc" -> borderC[id] = hexColor(vl)
                 "bstyle" -> if (vl == "dashed" || vl == "dotted") borderStyleM[id] = vl
                 "bwt" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[0] = dpf(f)
                 "bwr" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[1] = dpf(f)
@@ -2057,6 +2427,17 @@ class MainActivity : Activity() {
                 "anim" -> animMs = f.toInt()
                 "ez" -> animEz = vl
                 "shadow" -> v.elevation = dpf(if (f >= 3f) 12f else if (f == 2f) 6f else 3f)
+                "bkblur" -> blurAmt[id] = vl.toIntOrNull() ?: 60
+                "bktint" -> blurTint[id] = vl
+                "grad" -> {
+                    val cs = vl.split(",").filter { it.isNotEmpty() }.map { hexColor(it) }
+                    if (cs.size >= 2) gradColors[id] = cs.toIntArray() else gradColors.remove(id)
+                }
+                "gradang" -> gradAngle[id] = vl.toIntOrNull() ?: 0
+                "gradstop" -> {
+                    val ps = vl.split(",").mapNotNull { it.toFloatOrNull() }
+                    if (ps.isNotEmpty()) gradStops[id] = ps.map { it / 100f }.toFloatArray() else gradStops.remove(id)
+                }
                 "glass" -> if (vl == "1") glassIds.add(id) else glassIds.remove(id)
                 "wrap" -> N.ySetF(n, 13, if (vl == "wrap") 1f else 0f)
                 "fs" -> fsPx = dpf(f)
@@ -2095,8 +2476,14 @@ class MainActivity : Activity() {
                     val st = if (vl == "contain") ImageView.ScaleType.FIT_CENTER else if (vl == "center") ImageView.ScaleType.CENTER else ImageView.ScaleType.CENTER_CROP
                     (v as? ImageView)?.scaleType = st; bgImageViews[id]?.scaleType = st
                 }
-                "fg" -> { val c = Color.parseColor("#$vl")
+                "fg" -> { val c = hexColor(vl)
                     (v as? TextView)?.setTextColor(c); (v as? EditText)?.setTextColor(c)
+                    // A field's placeholder must follow its text color. The platform default
+                    // hint color comes from the Activity theme, not from the field's own
+                    // colors, so on a light surface under a dark theme (or the reverse) the
+                    // hint renders invisible. iOS's UITextField.placeholder derives from the
+                    // text color for the same reason; match it at ~45% alpha.
+                    (v as? EditText)?.setHintTextColor(Color.argb(115, Color.red(c), Color.green(c), Color.blue(c)))
                     if (v is SeekBar) { v.progressTintList = ColorStateList.valueOf(c); v.thumbTintList = ColorStateList.valueOf(c) }
                     else if (v is ProgressBar) { if (v.isIndeterminate) v.indeterminateTintList = ColorStateList.valueOf(c) else v.progressTintList = ColorStateList.valueOf(c) } }
                 "ta" -> (v as? TextView)?.gravity =
@@ -2122,7 +2509,7 @@ class MainActivity : Activity() {
                 }
                 "stick" -> if (v is ScrollView) stickBottomOn = (vl == "1")   // Scroll stickBottom (chat)
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
-                "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (UIKit/SwiftUI do), an explicit `ellip` overrides
+                "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (as UIKit does), an explicit `ellip` overrides
                     val n = f.toInt()                 // nlines=-1 means "no cap" -> unlimited, and no forced ellipsis
                     if (n > 0) { it.maxLines = n; if (it.ellipsize == null) it.ellipsize = android.text.TextUtils.TruncateAt.END }
                     else { it.maxLines = Integer.MAX_VALUE }
@@ -2289,14 +2676,30 @@ class MainActivity : Activity() {
         // bg + radius + border -> GradientDrawable (a large radius clamps to a pill)
         val hasPerCorner = rcTL >= 0f || rcTR >= 0f || rcBR >= 0f || rcBL >= 0f
         val side = bwSideM[id]
-        if (side != null && v !is TextureView) {   // per-side border: a custom drawable draws the set edges
+        val gcs = gradColors[id]
+        if (gcs != null && v !is TextureView) {
+            // A gradient owns the whole background: fill, corners and stroke together, the
+            // same way the solid path below does, so radius and border keep working on it.
+            val radii = if (hasPerCorner) {
+                val tl = if (rcTL >= 0f) rcTL else 0f; val tr = if (rcTR >= 0f) rcTR else 0f
+                val br = if (rcBR >= 0f) rcBR else 0f; val bl = if (rcBL >= 0f) rcBL else 0f
+                floatArrayOf(tl, tl, tr, tr, br, br, bl, bl)
+            } else null
+            v.background = LinearGradientDrawable(gcs, gradStops[id], gradAngle[id] ?: 0,
+                radii, bgRadius[id] ?: 0f, borderW[id] ?: 0f,
+                borderC[id] ?: Color.parseColor("#334155"))
+        } else if (side != null && v !is TextureView) {   // per-side border: a custom drawable draws the set edges
             val bc = borderC[id] ?: Color.parseColor("#334155")
             v.background = SideBorderDrawable(bgColor[id] ?: Color.TRANSPARENT, bgRadius[id] ?: 0f,
                 if (side[0] >= 0f) side[0] else 0f, if (side[1] >= 0f) side[1] else 0f,
                 if (side[2] >= 0f) side[2] else 0f, if (side[3] >= 0f) side[3] else 0f, bc)
-        } else if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id) || hasPerCorner) {
+        } else if (bgColor.containsKey(id) || bgRadius.containsKey(id) || borderW.containsKey(id) || glassIds.contains(id) || blurAmt.containsKey(id) || hasPerCorner) {
             val gd = GradientDrawable()
-            gd.setColor(if (glassIds.contains(id)) Color.argb(56, 255, 255, 255) else (bgColor[id] ?: Color.TRANSPARENT))   // frosted translucent
+            gd.setColor(when {
+                blurAmt.containsKey(id) -> blurScrim(id)                       // Blur -> tinted scrim
+                glassIds.contains(id) -> Color.argb(56, 255, 255, 255)         // frosted translucent
+                else -> bgColor[id] ?: Color.TRANSPARENT
+            })
             if (hasPerCorner) {   // rounded-t-*, rounded-bl-*, … : per-corner radii (tl, tr, br, bl x2)
                 val tl = if (rcTL >= 0f) rcTL else 0f; val tr = if (rcTR >= 0f) rcTR else 0f
                 val br = if (rcBR >= 0f) rcBR else 0f; val bl = if (rcBL >= 0f) rcBL else 0f
@@ -2524,6 +2927,9 @@ class MainActivity : Activity() {
     }
 
     private fun setText(id: String, t: String) {
+        // A package view's "text" is its props, as JSON. Layout and background have
+        // already been applied by the framework; this is the package's own half.
+        packageViews[id]?.let { it.apply(ChuksArgs(t, "view", "0", this)); return }
         if (gestureIds.contains(id)) {                       // a Gesture's "text" is its continuous-recognizer list
             gestureCont[id] = t
             return
@@ -2746,7 +3152,7 @@ class MainActivity : Activity() {
         var shapes: String = ""
             set(value) { field = value; invalidate() }
         private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-        private fun col(h: String) = Color.parseColor("#$h")
+        private fun col(h: String) = hexColorStatic(h)
         override fun onDraw(c: android.graphics.Canvas) {
             for (shape in shapes.split(";")) {
                 if (shape.isEmpty()) continue
@@ -3003,6 +3409,67 @@ class MainActivity : Activity() {
 
     // Draws a (rounded) background fill plus per-side border edges. Android has no native
     // per-side border, so we paint the edges ourselves. Radius applies to the fill only.
+    // A rounded-rect fill painted with a LinearGradient shader, plus the same stroke a
+    // GradientDrawable would draw. GradientDrawable only accepts orientation in 45-degree
+    // steps, so using it would have made an angle mean something different on each host;
+    // a shader takes the angle as given and keeps the two in step.
+    /// Android has no backdrop blur for an in-window view: its blur effect blurs a view's
+    /// OWN content, which would blur the children drawn on top. So a Blur is a translucent
+    /// tinted scrim here: the same shape and the same weight in the layout, without the live
+    /// sampling iOS gets. Documented on the component, because designing for the blur and
+    /// getting the scrim is how a screen ends up looking thin on Android.
+    private fun blurScrim(id: String): Int {
+        val amt = (blurAmt[id] ?: 60).coerceIn(0, 100)
+        val alpha = (30 + amt * 1.5f).toInt().coerceIn(0, 200)
+        val night = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        val light = when (blurTint[id] ?: "system") {
+            "light" -> true
+            "dark" -> false
+            else -> !night                         // system: match the OS appearance, as the iOS material does
+        }
+        return if (light) Color.argb(alpha, 255, 255, 255) else Color.argb(alpha, 20, 20, 22)
+    }
+
+    inner class LinearGradientDrawable(
+        private val colors: IntArray, private val stops: FloatArray?, private val angleDeg: Int,
+        private val radii: FloatArray?, private val radius: Float,
+        private val strokeW: Float, private val strokeC: Int
+    ) : android.graphics.drawable.Drawable() {
+        private val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        private val path = android.graphics.Path()
+        private fun rrect(): android.graphics.Path {
+            val b = bounds; path.reset()
+            val r = android.graphics.RectF(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat())
+            if (radii != null) path.addRoundRect(r, radii, android.graphics.Path.Direction.CW)
+            else path.addRoundRect(r, radius, radius, android.graphics.Path.Direction.CW)
+            return path
+        }
+        override fun draw(canvas: android.graphics.Canvas) {
+            val b = bounds
+            if (b.width() <= 0 || b.height() <= 0) return
+            // 0 degrees runs top to bottom and the angle grows clockwise, matching iOS. Both
+            // endpoints sit on a unit vector through the centre, scaled to the bounds.
+            val rad = Math.toRadians(angleDeg.toDouble())
+            val cx = b.exactCenterX(); val cy = b.exactCenterY()
+            val dx = (Math.sin(rad) * b.width() / 2.0).toFloat()
+            val dy = (Math.cos(rad) * b.height() / 2.0).toFloat()
+            p.shader = android.graphics.LinearGradient(cx - dx, cy - dy, cx + dx, cy + dy,
+                colors, stops, android.graphics.Shader.TileMode.CLAMP)
+            p.style = android.graphics.Paint.Style.FILL
+            canvas.drawPath(rrect(), p)
+            if (strokeW > 0f) {
+                p.shader = null; p.style = android.graphics.Paint.Style.STROKE
+                p.strokeWidth = strokeW; p.color = strokeC
+                canvas.drawPath(rrect(), p)   // inset by half the stroke, as GradientDrawable does
+            }
+        }
+        override fun setAlpha(a: Int) { p.alpha = a }
+        override fun setColorFilter(cf: android.graphics.ColorFilter?) { p.colorFilter = cf }
+        @Deprecated("deprecated in API 29, still required by the base class")
+        override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
+    }
+
     inner class SideBorderDrawable(
         private val bg: Int, private val radius: Float,
         private val t: Float, private val r: Float, private val b: Float, private val l: Float,
@@ -3203,6 +3670,10 @@ class MainActivity : Activity() {
     private fun ensureNfc(): NfcReader { val n = nfcReader ?: NfcReader().also { nfcReader = it }; return n }
 
     private fun remove(id: String) {
+        // Unknown id: nothing to tear down. Mounts emit R| before C| (see mountNode in
+        // core/ui.chuks), so keep this a map miss rather than the O(views) sweep below.
+        if (!views.containsKey(id) && !ynodes.containsKey(id)) return
+        packageViews.remove(id)?.destroy()
         views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
         ynodes[id]?.let { textNodes.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
@@ -3225,6 +3696,19 @@ class MainActivity : Activity() {
             is EditText -> v.setTag(TAG, action)
             is SeekBar -> v.setTag(TAG, action)      // Slider: the change listener reads this
             else -> {
+                // Reset any prior interaction binding before (re)binding. Node ids are
+                // reused when a screen swaps in place, so a Pressable can become an inert
+                // row at the same id; its old touch listener consumes ACTION_UP and fires
+                // the PREVIOUS action, so it must be cleared or the reused view keeps
+                // firing it (RN resets a recycled view to defaults — this is that reset).
+                // A press that is IN FLIGHT when we rebind never gets its ACTION_UP:
+                // clearing the listener cancels the touch silently, so the press dim
+                // would stick on the view forever (and that press is lost -- RN cancels
+                // it the same way when a view is recycled mid-touch).
+                if (v.alpha != 1f && !disabledIds.contains(id)) { v.animate().cancel(); v.alpha = 1f }
+                v.setOnTouchListener(null)
+                v.setOnClickListener(null)
+                v.isClickable = false
                 val ao = pressOpacity[id]
                 if (ao != null) {
                     // Pressable: dim on touch-down, restore on release/cancel, fire only
@@ -3262,7 +3746,8 @@ class MainActivity : Activity() {
                             else -> false
                         }
                     }
-                } else { v.isClickable = true; v.setOnClickListener { if (!disabledIds.contains(id)) fire(action) } }
+                } else if (action.isNotEmpty()) { v.isClickable = true; v.setOnClickListener { if (!disabledIds.contains(id)) fire(action) } }
+                // else: empty action + not pressable -> leave the view non-interactive (default)
             }
         }
     }
@@ -3276,12 +3761,62 @@ class MainActivity : Activity() {
     // consume the press, matching iOS's expectation that back closes the top sheet
     // first. Only when no Modal is showing does back fall through to the default
     // (finish the activity).
+    // ---- predictive back (API 34+): an INTERACTIVE pop ------------------------
+    // The engine mounts the top two routes as full-screen sibling containers under the
+    // app root (see NavStack.render), so the system's back progress can drag the top
+    // screen off and slide the one beneath it in, and cancelling puts it back. Below
+    // API 34 the platform reports no progress, so back stays instant there (onBackPressed).
+    private var backTop: View? = null
+    private var backBelow: View? = null
+    private val backParallax = 0.28f
+    // Which container holds the pair. "" = the app stack's root; a tab that owns its
+    // history announces its own, so the screens that move are the ones on screen rather
+    // than the shell behind them. Set from the engine's SK| line, like the live list.
+    private var stackHostId: String = ""
+
+    private fun backLayers(): Boolean {
+        val host = (if (stackHostId.isEmpty()) views["app"] else (views[stackHostId] ?: views["app"])) as? ViewGroup ?: return false
+        if (host.childCount < 2) return false
+        backTop = host.getChildAt(host.childCount - 1)
+        backBelow = host.getChildAt(host.childCount - 2)
+        return true
+    }
+    private fun backProgress(p: Float) {
+        val w = root.width.toFloat().coerceAtLeast(1f)
+        val t = (p.coerceIn(0f, 1f)) * w
+        backTop?.translationX = t
+        backBelow?.translationX = -w * backParallax * (1f - t / w)
+    }
+    private fun backSettle(commit: Boolean) {
+        val w = root.width.toFloat().coerceAtLeast(1f)
+        val top = backTop; val below = backBelow
+        backTop = null; backBelow = null
+        if (top == null || below == null) { if (commit) doBack(); return }
+        top.animate().translationX(if (commit) w else 0f).setDuration(180).withEndAction {
+            top.translationX = 0f
+            below.translationX = 0f
+            if (commit) doBack()
+        }.start()
+        below.animate().translationX(if (commit) 0f else -w * backParallax).setDuration(180).start()
+    }
+    // The pop itself: ask the app first (a handler or a stacked route consumes it);
+    // only when nothing does are we really at the root and the activity should finish.
+    private fun doBack() {
+        if (N.back() > 0) { applyDrain(); relayout(); return }
+        finish()
+    }
+
     override fun onBackPressed() {
         val mid = activeModal
         if (mid != null && views[mid]?.visibility == View.VISIBLE) {
             modalActions[mid]?.let { fire(it) }   // parent flips `visible` false; the re-render hides it
             return
         }
+        // Ask the app before leaving. A registered back handler or a stacked route
+        // consumes the press; only when nothing does are we really at the root, and the
+        // default (finish the activity) is correct. Without this, back exited the app
+        // from any pushed screen, which is not what any Android user expects.
+        if (N.back() > 0) { applyDrain(); relayout(); return }
         super.onBackPressed()
     }
 
@@ -3522,10 +4057,50 @@ class MainActivity : Activity() {
     }
 
     // ---- Yoga layout -> Android frames ------------------------------------
+    // How far the tree is lifted for the keyboard: the OVERLAP of the focused field, not
+    // the keyboard height. See applyKeyboard.
+    private var kbShift = 0
+    private var kbScroll: ScrollView? = null
+
+    // The keyboard overlays the app; lift only what it covers, and only as much as it
+    // takes. A focused field inside a Scroll gets bottom padding on that scroll and is
+    // scrolled into view (nothing else moves); a field pinned to the bottom outside a
+    // scroll (a chat composer) shifts the tree by exactly the overlap; a field already
+    // above the keyboard moves nothing. Mirrors the iOS host.
+    private fun applyKeyboard(imeH: Int) {
+        kbScroll?.let { it.setPadding(it.paddingLeft, it.paddingTop, it.paddingRight, 0) }
+        kbScroll = null
+        if (imeH <= 0) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
+        val f = currentFocus
+        if (f == null) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
+        val loc = IntArray(2); f.getLocationInWindow(loc)
+        val rootLoc = IntArray(2); root.getLocationInWindow(rootLoc)
+        // Measured against the UNLIFTED layout (add back the current shift), so repeated
+        // inset callbacks can't measure the field where the previous pass put it and
+        // collapse the lift to nothing.
+        val bottomInRoot = loc[1] - rootLoc[1] + f.height + kbShift
+        val overlap = maxOf(0, bottomInRoot + dp(8) - (root.height - imeH))
+
+        var p: View? = f.parent as? View
+        while (p != null && p !is ScrollView) { p = p.parent as? View }
+        if (p is ScrollView) {
+            val isNew = (kbScroll !== p)                              // scroll only on the way in
+            kbScroll = p
+            p.clipToPadding = false
+            p.setPadding(p.paddingLeft, p.paddingTop, p.paddingRight, imeH)
+            if (isNew && overlap > 0) p.smoothScrollBy(0, overlap)
+            if (kbShift != 0) { kbShift = 0; relayout() }
+            return
+        }
+        if (overlap == kbShift) return
+        kbShift = overlap
+        relayout()
+    }
+
     private fun relayout() {
         val app = ynodes["app"] ?: return
         val topY = dp(6)
-        val w = root.width; val h = root.height - topY
+        val w = root.width; val h = root.height - topY - kbShift
         if (w <= 0 || h <= 0) return
         N.ySetF(app, 5, w.toFloat()); N.ySetF(app, 6, h.toFloat())
         N.yCalc(app, w.toFloat(), h.toFloat())

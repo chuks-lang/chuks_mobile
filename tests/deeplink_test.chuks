@@ -1,0 +1,84 @@
+// Deep-link resolution: URL in, route name and params out.
+//
+// Runs headlessly against the real matcher (core/deeplink.chuks), because the parts
+// that go wrong here are pure string handling and they go wrong on a device, where a
+// failing match looks like "the link did nothing" and tells you nothing else.
+//
+// The case that motivates most of this: a custom scheme and an https link put the
+// first meaningful segment in different places. `chuksdemo://walk/abc` has "walk" as
+// the URL's host; `https://chuks.org/walk/abc` has "chuks.org" there and "walk" in the
+// path. One pattern table has to serve both.
+//
+// Run:  chuks run tests/deeplink_test.chuks   (exits non-zero on failure)
+import { resolveLink, linkSegments, linkQuery, LinkTarget } from "../core/deeplink.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+// A resolved link, flattened to "name id=..&tab=.." so a whole case is one comparison.
+function flat(t: LinkTarget?, keys: []string): string {
+    if (t == null) { return "<no match>" }
+    var out: string = t.name
+    for (var i: int = 0; i < keys.length; i = i + 1) {
+        const v: any = t.params[keys[i]]
+        out = out + " " + keys[i] + "=" + (v == null ? "-" : string(v))
+    }
+    return out
+}
+
+function main(): void {
+    var pat: map[string]string = {}
+    pat["/walk/:id"] = "walk"
+    pat["/walk/new"] = "walkNew"          // a literal that also matches "/walk/:id"
+    pat["/club/:id/members"] = "roster"
+    pat["/settings"] = "settings"
+    pat["/"] = "root"
+
+    println("segments")
+    check(linkSegments("chuksdemo://walk/abc").join(",") == "walk,abc", "custom scheme keeps its host as the first segment")
+    check(linkSegments("https://chuks.org/walk/abc").join(",") == "walk,abc", "https drops the domain")
+    check(linkSegments("chuksdemo:///walk/abc").join(",") == "walk,abc", "an empty host is not a segment")
+    check(linkSegments("chuksdemo://walk/abc?tab=stats").join(",") == "walk,abc", "the query is not a segment")
+    check(linkSegments("chuksdemo://walk/abc#top").join(",") == "walk,abc", "the fragment is not a segment")
+    check(linkSegments("chuksdemo://").length == 0, "a bare scheme has no segments")
+
+    println("query")
+    check(string(linkQuery("x://a?tab=stats")["tab"]) == "stats", "one pair")
+    check(string(linkQuery("x://a?a=1&b=2")["b"]) == "2", "two pairs")
+    check(string(linkQuery("x://a?flag")["flag"]) == "", "a valueless key is empty, not missing")
+    check(linkQuery("x://a").keys().length == 0, "no query at all")
+
+    println("matching")
+    var idOnly: []string = ["id"]
+    check(flat(resolveLink("chuksdemo://walk/abc", pat), idOnly) == "walk id=abc", "custom scheme captures a param")
+    check(flat(resolveLink("https://chuks.org/walk/abc", pat), idOnly) == "walk id=abc", "https captures the same param")
+    check(flat(resolveLink("chuksdemo://settings", pat), []) == "settings", "a literal route")
+    check(flat(resolveLink("chuksdemo://", pat), []) == "root", "the empty path is the root pattern")
+    check(resolveLink("chuksdemo://nope/here", pat) == null, "no match returns null rather than guessing")
+    check(resolveLink("chuksdemo://walk", pat) == null, "a shorter path does not match a longer pattern")
+    check(resolveLink("chuksdemo://walk/a/b", pat) == null, "a longer path does not match a shorter pattern")
+
+    println("specificity")
+    // Both "/walk/new" and "/walk/:id" match this URL. The literal has to win, and it
+    // has to win regardless of which order the pattern map happens to iterate in.
+    check(flat(resolveLink("chuksdemo://walk/new", pat), []) == "walkNew", "a literal segment beats a capture")
+    check(flat(resolveLink("chuksdemo://club/xyz/members", pat), ["id"]) == "roster id=xyz", "a capture in the middle")
+
+    println("params")
+    var both: []string = ["id", "tab"]
+    check(flat(resolveLink("chuksdemo://walk/abc?tab=stats", pat), both) == "walk id=abc tab=stats", "path and query merge")
+    // The path is the identity of the thing being opened, so it cannot be overridden by
+    // a query key that happens to share its name.
+    check(flat(resolveLink("chuksdemo://walk/abc?id=zzz", pat), idOnly) == "walk id=abc", "a path param wins over a query key of the same name")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "deeplink_test failed" }
+}
+
+main()

@@ -107,6 +107,7 @@ extern int chuks_remount(void);
 extern int chuks_tick(void);
 extern int chuks_dispatch(char* action);
 extern int chuks_dispatchInput(char* action, char* value);
+extern int chuks_back(void);
 extern int chuks_setViewport(int top, int height, int width);
 extern char* chuks_drain(void);
 extern void chuks_free_str(char* p);

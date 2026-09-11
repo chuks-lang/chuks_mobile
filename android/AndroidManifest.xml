@@ -4,7 +4,7 @@
     android:versionCode="__VERSION_CODE__" android:versionName="__VERSION_NAME__">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
     <!--CHUKS_PERMISSIONS-->
-    <application
+    <application android:enableOnBackInvokedCallback="true"
         android:label="Chuks"
         android:hasCode="true"
         android:usesCleartextTraffic="true"
@@ -19,5 +19,15 @@
             </intent-filter>
             <!--CHUKS_VIEW_FILTER-->
         </activity>
+        <!-- Background tasks. BIND_JOB_SERVICE is required by the platform: without it
+             JobScheduler refuses to start the service and the failure is silent. -->
+        <service android:name=".ChuksJobService"
+                 android:permission="android.permission.BIND_JOB_SERVICE"
+                 android:exported="false" />
+        <!-- Background location. The type is mandatory from Android 14: a foreground
+             service that does not declare one is refused at start. -->
+        <service android:name=".ChuksLocationService"
+                 android:foregroundServiceType="location"
+                 android:exported="false" />
     </application>
 </manifest>

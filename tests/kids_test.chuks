@@ -1,0 +1,46 @@
+// Children may be a node, a null, or a nested list.
+import { Node, Column, Row, Text } from "../core/ui.chuks";
+import { render, Screen } from "../core/testing.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(c: bool, name: string): void {
+    if (c) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+var SHOW: bool = true
+var ITEMS: []string = ["one", "two", "three"]
+
+function screen(): Node {
+    return Column({ dir: "col" }, [
+        Text({ size: 12 }, "header"),
+        SHOW ? Text({ size: 12 }, "conditional") : null,
+        ITEMS.map((it: string): Node => { return Row({ dir: "row" }, [ Text({ size: 12 }, it) ]) }),
+        Text({ size: 12 }, "footer"),
+    ])
+}
+
+function main(): void {
+    println("kids_test")
+    const s: Screen = render(function(): Node { return screen() })
+    check(s.has("header") && s.has("footer"), "plain nodes render")
+    check(s.has("conditional"), "a present conditional renders")
+    check(s.has("one") && s.has("two") && s.has("three"), "a mapped array is flattened into the parent")
+
+    SHOW = false
+    s.frame()
+    check(!s.has("conditional"), "a null child renders nothing")
+    check(s.has("header") && s.has("footer"), "and its siblings survive")
+    check(s.has("one") && s.has("three"), "including the mapped list after it")
+
+    SHOW = true
+    s.frame()
+    check(s.has("conditional"), "and it comes back")
+    check(s.has("footer"), "with the siblings still in place")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { println(s.dump()); throw new Error("kids_test failed") }
+}
+main()

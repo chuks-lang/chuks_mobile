@@ -1,4 +1,4 @@
-// The GPU op-chain executor (iOS), shared by the UIKit and SwiftUI hosts. Runs a Chuks
+// The GPU op-chain executor (iOS), used by the UIKit host. Runs a Chuks
 // effects.chain (JSON op list) on the GPU via Core Image (Metal-backed). Ops are generic
 // primitives; filters are Chuks packages that compose them. See effects.chuks +
 // docs/mobile-compute-and-effects.md. abi 1.

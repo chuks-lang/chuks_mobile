@@ -1,0 +1,203 @@
+// Deep links: turning an inbound URL into a route push.
+//
+// The host already delivers URLs. `Linking.onURL` fires with the URL that launched the
+// app (even for a subscriber that registers late) and again on every subsequent open.
+// What was missing was the last step: deciding which screen a URL means. That is this
+// module, and it is deliberately small, because the route stack already carries a name
+// and a params map, which is exactly what a URL carries.
+//
+//   bindLinks({
+//       "/walk/:id":  "walk",
+//       "/club/:id":  "club",
+//       "/settings":  "settings",
+//   })
+//
+// A pattern is a path with `:name` segments. Matching a URL captures those segments as
+// params, merges anything in the query string, and navigates to the route the pattern
+// names. `chuksdemo://walk/abc?tab=stats` becomes route "walk" with
+// `{ id: "abc", tab: "stats" }`, read on the screen as `r.str("id", "")`.
+//
+// WHY NOT FILE-BASED ROUTING. The obvious alternative is deriving routes from the file
+// tree, the way a web framework does. Chuks compiles to a native binary and has no
+// dynamic import, so a file-based router could not discover screens at runtime: it would
+// have to GENERATE the route map at build time, which is the map you already write by
+// hand. It would also make file names public API, so renaming a screen would break a
+// published link. Patterns are explicit, they live next to the routes they name, and a
+// link keeps working when a file moves.
+import { navigate, navReplace, currentRoute, Route } from "./ui.chuks";
+import { Linking } from "./native.chuks";
+import { NativeSub } from "./ui.chuks";
+
+// A URL reduced to what routing cares about: path segments and query params.
+export dataType LinkTarget {
+    name: string                 // the route to open
+    params: map[string]any       // captured path params, merged with the query string
+}
+
+// Split a URL into its path segments, discarding the parts routing does not use.
+//
+// The trap here is that a custom scheme and an https link put the first meaningful
+// segment in different places. `chuksdemo://walk/abc` has "walk" as the URL's HOST,
+// while `https://chuks.org/walk/abc` has the host "chuks.org" and "walk" in the path.
+// Reading both the same way is what makes one pattern table serve both a custom scheme
+// and a universal link, so the scheme decides whether the first segment is dropped.
+export function linkSegments(url: string): []string {
+    var rest: string = url
+    const mark: int = rest.indexOf("://")
+    var httpLike: bool = false
+    if (mark >= 0) {
+        const scheme: string = rest.substring(0, mark).toLowerCase()
+        httpLike = scheme == "http" || scheme == "https"
+        rest = rest.substring(mark + 3, rest.length)
+    }
+    const q: int = rest.indexOf("?")
+    if (q >= 0) { rest = rest.substring(0, q) }
+    const h: int = rest.indexOf("#")
+    if (h >= 0) { rest = rest.substring(0, h) }
+
+    var out: []string = []
+    const parts: []string = rest.split("/")
+    for (var i: int = 0; i < parts.length; i = i + 1) {
+        if (parts[i] != "") { out.push(parts[i]) }
+    }
+    // For http(s) the first segment is the domain, which is not part of the route.
+    if (httpLike && out.length > 0) {
+        var tail: []string = []
+        for (var j: int = 1; j < out.length; j = j + 1) { tail.push(out[j]) }
+        return tail
+    }
+    return out
+}
+
+// The query string as params. Absent, empty, and valueless keys all behave.
+export function linkQuery(url: string): map[string]any {
+    var out: map[string]any = {}
+    const q: int = url.indexOf("?")
+    if (q < 0) { return out }
+    var qs: string = url.substring(q + 1, url.length)
+    const h: int = qs.indexOf("#")
+    if (h >= 0) { qs = qs.substring(0, h) }
+    const pairs: []string = qs.split("&")
+    for (var i: int = 0; i < pairs.length; i = i + 1) {
+        const p: string = pairs[i]
+        if (p == "") { continue }
+        const eq: int = p.indexOf("=")
+        if (eq < 0) { out[p] = "" } else { out[p.substring(0, eq)] = p.substring(eq + 1, p.length) }
+    }
+    return out
+}
+
+// Match one pattern against a URL's segments, returning the captured params or null.
+// A `:name` segment captures; anything else must match exactly.
+function matchOne(pattern: string, segs: []string): (map[string]any)? {
+    var pat: []string = []
+    const raw: []string = pattern.split("/")
+    for (var i: int = 0; i < raw.length; i = i + 1) { if (raw[i] != "") { pat.push(raw[i]) } }
+    if (pat.length != segs.length) { return null }
+    var out: map[string]any = {}
+    for (var j: int = 0; j < pat.length; j = j + 1) {
+        const p: string = pat[j]
+        if (p.slice(0, 1) == ":") { out[p.substring(1, p.length)] = segs[j] }
+        else if (p != segs[j]) { return null }
+    }
+    return out
+}
+
+// How specific a pattern is: literal segments beat captures, so "/walk/new" wins over
+// "/walk/:id" no matter which order the table happens to iterate in. Without this a
+// route table would behave differently depending on map ordering, which is exactly the
+// kind of bug that only appears in someone else's app.
+function specificity(pattern: string): int {
+    var score: int = 0
+    const raw: []string = pattern.split("/")
+    for (var i: int = 0; i < raw.length; i = i + 1) {
+        if (raw[i] == "") { continue }
+        score = score + (raw[i].slice(0, 1) == ":" ? 1 : 2)
+    }
+    return score
+}
+
+/**
+ * Resolve a URL against a pattern table, or null when nothing matches.
+ *
+ * Exported so it can be tested without a device, and so an app that wants to handle
+ * links itself (analytics, an auth gate before navigating) can use the matching
+ * without the navigation.
+ *
+ * ```chuks
+ * const t: LinkTarget? = resolveLink("chuksdemo://walk/abc?tab=stats", patterns)
+ * // t.name == "walk", t.params == { id: "abc", tab: "stats" }
+ * ```
+ */
+export function resolveLink(url: string, patterns: map[string]string): LinkTarget? {
+    const segs: []string = linkSegments(url)
+    var bestName: string = ""
+    var bestParams: map[string]any = {}
+    var bestScore: int = -1
+    const keys: []string = patterns.keys()
+    for (var i: int = 0; i < keys.length; i = i + 1) {
+        const pattern: string = keys[i]
+        const got: (map[string]any)? = matchOne(pattern, segs)
+        if (got == null) { continue }
+        const sc: int = specificity(pattern)
+        if (sc > bestScore) { bestScore = sc; bestName = patterns.getOr(pattern, ""); bestParams = got }
+    }
+    if (bestScore < 0) { return null }
+    const q: map[string]any = linkQuery(url)
+    const qk: []string = q.keys()
+    // Path params win over a query key of the same name: the path is the identity.
+    for (var k: int = 0; k < qk.length; k = k + 1) {
+        if (bestParams[qk[k]] == null) { bestParams[qk[k]] = q[qk[k]] }
+    }
+    const hit: LinkTarget = { name: bestName, params: bestParams }
+    return hit
+}
+
+/**
+ * Subscribe to inbound URLs and navigate on a match.
+ *
+ * Call it once, where the app starts. It fires immediately with the URL that launched
+ * the app, so a cold start from a link lands on the right screen.
+ *
+ * ```chuks
+ * var patterns: map[string]string = {}
+ * patterns["/walk/:id"] = "walk"
+ * patterns["/club/:id"] = "club"
+ * useEffect(function(): any {
+ *     const sub: NativeSub = bindLinks(patterns)
+ *     return function(): void { sub.cancel() }
+ * }, [])
+ * ```
+ *
+ * A link that matches nothing is ignored rather than navigating somewhere arbitrary,
+ * and `onUnmatched` lets the app decide what to do about it (a not-found screen, a log).
+ */
+export function bindLinks(patterns: map[string]string, onUnmatched: ((string)=> void)? = null): NativeSub {
+    return Linking.onURL(function(url: string): void {
+        const t: LinkTarget? = resolveLink(url, patterns)
+        if (t == null) {
+            if (onUnmatched != null) { onUnmatched(url) }
+            return
+        }
+        openLink(t)
+    })
+}
+
+/**
+ * Navigate to a resolved target, choosing push or reset the way a user expects.
+ *
+ * A link that arrives while the app is sitting at its root is almost always a COLD
+ * start: pushing gives a back stack of exactly root then target, which is what you
+ * want, so back returns home rather than closing the app. A link that arrives while
+ * the user is already several screens deep is a live open, and pushing again would
+ * bury whatever they were doing under an unrelated screen, so the stack is reset to
+ * root then target. Either way back goes home, and the user never lands somewhere
+ * with a history they did not create.
+ */
+export function openLink(t: LinkTarget): void {
+    const cur: Route? = currentRoute()
+    // Already on that exact screen: replace so the params update rather than stacking
+    // a second copy of the same page.
+    if (cur != null && cur.name == t.name) { navReplace(t.name, t.params, null); return }
+    navigate(t.name, t.params, null)
+}
