@@ -52,18 +52,27 @@ function packageManifests(projdir: string): []any {
     while (i < tops.length) {
         const t: DirEntry = tops[i]
         i = i + 1
-        if (!t.isDir) { continue }
         const tp: string = root + "/" + t.name
+        // A package is a directory with a chuks.json in it. That is asked with fs.exists
+        // rather than DirEntry.isDir, because isDir reports the entry itself and not what
+        // it points at (the Go and Node convention): a package SYMLINKED into
+        // chuks_packages/, which is how one is developed against an app, read as a file
+        // and was never built. Its Swift and Kotlin were left out of the app without a
+        // word. fs.exists and fs.readDir both follow the link.
+        //
         // A scope directory (@chuks) holds packages; anything else IS one.
         var dirs: []string = []
         if (strStartsWith(t.name, "@")) {
-            const inner: []DirEntry = fs.readDir(tp)
+            const inner: any = fs.readDir(tp)          // null for a plain file
+            if (inner == null) { continue }
+            const entries: []DirEntry = inner
             var j: int = 0
-            while (j < inner.length) {
-                if (inner[j].isDir) { dirs.push(tp + "/" + inner[j].name) }
+            while (j < entries.length) {
+                const ip: string = tp + "/" + entries[j].name
+                if (fs.exists(ip + "/chuks.json")) { dirs.push(ip) }
                 j = j + 1
             }
-        } else {
+        } else if (fs.exists(tp + "/chuks.json")) {
             dirs.push(tp)
         }
         var k: int = 0
