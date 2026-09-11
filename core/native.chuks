@@ -77,8 +77,20 @@ export class Haptics {
 }
 
 // ---- Torch / flashlight -----------------------------------------------------
+// set() lights the rear flash and leaves it there; turn it off when your screen goes
+// away, because the OS will not. available() answers whether there is a rear flash to
+// light: false on both simulators and on a device without one, where set() is silent.
 export class Torch {
     public static set(on: bool): void { emitNativeCommand("torch.set", on, null) }
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("torch.available", "", function(s: string): void { onResult(s == "1") })
+    }
+
+    /** Whether this device has a torch, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("torch.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
 }
 
 // ---- Screen brightness ------------------------------------------------------
@@ -95,7 +107,12 @@ export class Brightness {
 // the device again. (`lock` is a Chuks keyword, hence `lockTo`.)
 export class Orientation {
     public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("orientation.watch", "", onChange, null) }
+    // The value watch() would fire right now, read once.
+    public static current(onResult: (string)=> void): void { emitNativeCommand("orientation.current", "", onResult) }
     public static lockTo(mode: string): void { emitNativeCommand("orientation.lock", mode, null) }
+
+    /** Which way the device is held right now, awaited. */
+    public static async currentAsync(): Task<string> { return await awaitCommand("orientation.current", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Location / GPS ---------------------------------------------------------
@@ -205,6 +222,12 @@ export class Camera {
 // bridge as hex strings (binary-safe); service/characteristic are UUID strings. There
 // is no BLE radio on the iOS Simulator or the Android emulator, so test on a device.
 export class Bluetooth {
+    // Whether this device has a Bluetooth Low Energy radio your app can use. False on
+    // both simulators. Ask before offering the feature: state() answers "unsupported"
+    // for the same case, but only after you have opened a stream to hear it.
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("ble.available", "", function(s: string): void { onResult(s == "1") })
+    }
     // Adapter state, fires on change until cancelled: "on" | "off" | "unauthorized" | "unsupported".
     public static state(onState: (string)=> void): NativeSub {
         return emitNativeStream("ble.state", "", onState, null)
@@ -235,6 +258,11 @@ export class Bluetooth {
     }
 
     /** Connect to a scanned peripheral, awaited. Resolves once services are discovered. */
+    /** Whether this device has a usable BLE radio, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("ble.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
     public static async connectAsync(deviceId: string): Task<string> { return await awaitCommand("ble.connect", deviceId, true, CAP_HARDWARE_MS) }
     /** Read a characteristic once, awaited. Answers a hex string. */
     public static async readAsync(deviceId: string, service: string, characteristic: string): Task<string> {
@@ -398,6 +426,23 @@ export class Motion {
     // Barometer: "pressureHpa,relativeAltitudeMeters" (relative altitude is measured
     // from the moment the stream starts). Needs a device with a pressure sensor.
     public static barometer(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("motion.barometer", "", onData, onError) }
+
+    // Whether ONE named sensor exists on this device, asked before opening its stream.
+    // `sensor` is "accelerometer", "gyroscope", "magnetometer", "proximity", "light" or
+    // "barometer"; an unknown name answers false rather than failing, so a typo shows up
+    // as a feature that never appears rather than a crash.
+    //
+    // Without this the only way to find out was to open the stream and wait for onError,
+    // which means a screen that renders a sensor readout it can never fill.
+    public static available(sensor: string, onResult: (bool)=> void): void {
+        emitNativeCommand("motion.available", sensor, function(s: string): void { onResult(s == "1") })
+    }
+
+    /** Whether one named sensor exists here, awaited. */
+    public static async availableAsync(sensor: string): Task<bool> {
+        const s: string = await awaitCommand("motion.available", sensor, false, CAP_QUICK_MS)
+        return s == "1"
+    }
 }
 
 // ---- Pedometer: the on-device motion coprocessor (steps/distance/pace) ----------
@@ -713,7 +758,17 @@ export class Recorder {
     public static levels(onLevel: (string)=> void): NativeSub {
         return emitNativeStream("recorder.levels", "", onLevel, null)
     }
+    // Whether there is an audio input to record from. Separate from the microphone
+    // permission: a device with no input answers false however the permission stands.
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("recorder.available", "", function(s: string): void { onResult(s == "1") })
+    }
 
+    /** Whether there is an audio input to record from, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("recorder.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
     /** Stop recording, awaited. Answers a "file://" path to the m4a. */
     public static async stopAsync(): Task<string> { return await awaitCommand("recorder.stop", "", true, CAP_QUICK_MS) }
 }
@@ -730,10 +785,21 @@ export class Tts {
     public static isSpeaking(onResult: (bool)=> void): void {
         emitNativeCommand("tts.isSpeaking", "", function(s: string): void { onResult(s == "1") })
     }
+    // Whether a synthesizer with a voice for the device language is installed. On
+    // Android the engine or its voice data can be missing, and speak() is then silent
+    // with nothing to catch: this is how you find out before offering the button.
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("tts.available", "", function(s: string): void { onResult(s == "1") })
+    }
 
     /** Whether the synthesizer is currently speaking, awaited. */
     public static async isSpeakingAsync(): Task<bool> {
         const s: string = await awaitCommand("tts.isSpeaking", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** Whether a usable synthesizer is installed, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("tts.available", "", false, CAP_QUICK_MS)
         return s == "1"
     }
 }
@@ -743,18 +809,47 @@ export class Tts {
 // then again on every change, until the returned NativeSub is cancelled (which
 // unregisters the underlying OS observer -- teardown is verified via
 // Debug.activeStreams reading 0 after cancel, same as Pulse).
+//
+// Every one of them also has a current(): the value watch() would fire right now, read
+// once, with the same payload. Opening a stream and cancelling it after one tick is how
+// you used to read a single value, and that is a stream whose teardown you can forget.
 export class Battery {
     // onChange gets "level,charging", e.g. "87,1" (level 0..100, charging 1/0).
     // Comma, not "|": "|" is the mutation-wire field delimiter and is unsafe in a payload.
     public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("battery.watch", "", onChange, null) }
+    // The same payload, read once.
+    public static current(onResult: (string)=> void): void { emitNativeCommand("battery.current", "", onResult) }
+    // Whether this device reports a battery at all. False on the iOS Simulator, where
+    // the level it hands back is a fixed placeholder rather than a reading.
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("battery.available", "", function(s: string): void { onResult(s == "1") })
+    }
+
+    /** "level,charging" right now, awaited. */
+    public static async currentAsync(): Task<string> { return await awaitCommand("battery.current", "", false, CAP_QUICK_MS) }
+    /** Whether this device reports a real battery, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("battery.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
 }
 export class AppState {
     // onChange gets "active" | "inactive" | "background".
     public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("appstate.watch", "", onChange, null) }
+    // Which phase the app is in right now, read once.
+    public static current(onResult: (string)=> void): void { emitNativeCommand("appstate.current", "", onResult) }
+
+    /** "active" | "inactive" | "background" right now, awaited. */
+    public static async currentAsync(): Task<string> { return await awaitCommand("appstate.current", "", false, CAP_QUICK_MS) }
 }
 export class Network {
     // onChange gets "wifi" | "cellular" | "none" | "other".
     public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("network.watch", "", onChange, null) }
+    // Which transport the device is on right now, read once.
+    public static current(onResult: (string)=> void): void { emitNativeCommand("network.current", "", onResult) }
+
+    /** "wifi" | "cellular" | "none" | "other" right now, awaited. */
+    public static async currentAsync(): Task<string> { return await awaitCommand("network.current", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Debug ------------------------------------------------------------------

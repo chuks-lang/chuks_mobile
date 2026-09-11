@@ -1632,6 +1632,48 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             "bg.cancelAll" -> cancelAllChuksJobs(this)
             "bg.status" -> resolve(token, chuksJobStatus(this, args))
 
+            // ---- One-shot reads of live OS state --------------------------
+            // The value the matching watch() would fire right now. Before these, reading
+            // one value meant opening a stream and cancelling it, which is a teardown to
+            // forget.
+            "battery.current" -> {
+                val i = batterySticky()
+                if (i == null) fail(token, "battery state unavailable on this device")
+                else resolve(token, batteryPayload(i))
+            }
+            "battery.available" -> {
+                val i = batterySticky()
+                val lvl = i?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                resolve(token, if (lvl >= 0) "1" else "0")
+            }
+            "appstate.current" -> resolve(token, if (appForeground) "active" else "background")
+            "network.current" -> {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                resolve(token, networkState(cm))
+            }
+            "orientation.current" -> resolve(token, currentOrientation())
+
+            // ---- Availability ----------------------------------------------
+            // "Does this device have the hardware", asked before a feature is offered
+            // rather than discovered from a stream that never fires.
+            "torch.available" -> resolve(token,
+                if (packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_CAMERA_FLASH)) "1" else "0")
+            "motion.available" -> resolve(token, if (sensorAvailable(args)) "1" else "0")
+            "recorder.available" -> resolve(token,
+                if (packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_MICROPHONE)) "1" else "0")
+            "tts.available" -> {
+                ensureTts()
+                // The engine initializes asynchronously, so an early caller waits for it
+                // rather than being told "no" because we had not asked yet.
+                if (ttsReady) resolve(token, if (ttsHasVoice()) "1" else "0")
+                else ttsAvailWaiters.add(token)
+            }
+            "ble.available" -> {
+                val hasLe = packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_BLUETOOTH_LE)
+                val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+                resolve(token, if (hasLe && mgr?.adapter != null) "1" else "0")
+            }
+
             "orientation.lock" -> requestedOrientation = when (args) {
                 "portrait"  -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -1874,6 +1916,8 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private var tts: android.speech.tts.TextToSpeech? = null
     private var ttsReady = false
     private var pendingSpeak: String? = null
+    // Tokens from tts.available() that arrived before the engine finished initializing.
+    private val ttsAvailWaiters = ArrayList<String>()
     private fun ensureTts() {
         if (tts != null) return
         tts = android.speech.tts.TextToSpeech(this) { status ->
@@ -1889,6 +1933,14 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                         .build())
                 pendingSpeak?.let { speakNow(it); pendingSpeak = null }
             }
+            // Answer everyone who asked whether TTS works before we knew. Outside the
+            // ready branch: a failed init is an answer too, and "0" is that answer.
+            if (ttsAvailWaiters.isNotEmpty()) {
+                val waiting = ArrayList(ttsAvailWaiters)
+                ttsAvailWaiters.clear()
+                val ok = if (ttsHasVoice()) "1" else "0"
+                runOnUiThread { for (t in waiting) resolve(t, ok) }
+            }
         }
     }
     private fun speakNow(text: String) {
@@ -1897,24 +1949,66 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
     // ---- Real streams: battery / app-state / network ----
     private var appForeground = true
-    private fun emitBattery(token: String, i: Intent) {
+    // The battery reading, in one place, so watch() and current() cannot drift apart.
+    private fun batteryPayload(i: Intent): String {
         val level = i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
         val pct = if (level >= 0 && scale > 0) level * 100 / scale else -1
         val status = i.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
         val charging = if (status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
                            status == android.os.BatteryManager.BATTERY_STATUS_FULL) 1 else 0
-        runOnUiThread { resolve(token, "$pct,$charging") }
+        return "$pct,$charging"
     }
-    private fun emitNetwork(token: String, cm: android.net.ConnectivityManager) {
+    private fun emitBattery(token: String, i: Intent) {
+        val s = batteryPayload(i)
+        runOnUiThread { resolve(token, s) }
+    }
+    // ACTION_BATTERY_CHANGED is sticky: registering a null receiver returns the last
+    // broadcast synchronously, which is the current state with no subscription to undo.
+    private fun batterySticky(): Intent? =
+        registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    // The transport, in one place, for watch() and current() alike.
+    private fun networkState(cm: android.net.ConnectivityManager): String {
         val caps = cm.getNetworkCapabilities(cm.activeNetwork)
-        val s = when {
+        return when {
             caps == null -> "none"
             caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
             caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
             else -> "other"
         }
+    }
+    private fun emitNetwork(token: String, cm: android.net.ConnectivityManager) {
+        val s = networkState(cm)
         runOnUiThread { resolve(token, s) }
+    }
+
+    // Whether ONE named motion sensor exists here, for Motion.available(). An unknown
+    // name is "no" rather than a crash, so a typo shows up as a feature that never
+    // appears instead of taking the app down.
+    private fun sensorAvailable(name: String): Boolean {
+        val type = when (name) {
+            "accelerometer" -> android.hardware.Sensor.TYPE_ACCELEROMETER
+            "gyroscope"     -> android.hardware.Sensor.TYPE_GYROSCOPE
+            "magnetometer"  -> android.hardware.Sensor.TYPE_MAGNETIC_FIELD
+            "proximity"     -> android.hardware.Sensor.TYPE_PROXIMITY
+            "light"         -> android.hardware.Sensor.TYPE_LIGHT
+            "barometer"     -> android.hardware.Sensor.TYPE_PRESSURE
+            else -> return false
+        }
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        return sm.getDefaultSensor(type) != null
+    }
+
+    // Whether the synthesizer has a voice for the device language. The engine and its
+    // voice data are separate installs on Android, and a missing voice makes speak() a
+    // silent no-op with nothing to catch.
+    private fun ttsHasVoice(): Boolean {
+        val t = tts ?: return false
+        if (!ttsReady) return false
+        val r = try { t.isLanguageAvailable(java.util.Locale.getDefault()) } catch (e: Exception) { -2 }
+        return r == android.speech.tts.TextToSpeech.LANG_AVAILABLE ||
+               r == android.speech.tts.TextToSpeech.LANG_COUNTRY_AVAILABLE ||
+               r == android.speech.tts.TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE
     }
     override fun onResume() {
         super.onResume(); appForeground = true

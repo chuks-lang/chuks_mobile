@@ -629,6 +629,46 @@ func hexColor(_ h: String) -> UIColor {
                    blue: CGFloat(v & 0xff) / 255, alpha: 1)
 }
 
+// The battery reading, in one place. watch() and current() answer the same payload
+// because they call the same function; two copies of this would drift the first time
+// one of them learned about a new battery state.
+func chuksBatteryNow() -> String {
+    UIDevice.current.isBatteryMonitoringEnabled = true
+    let d = UIDevice.current
+    let lvl = d.batteryLevel < 0 ? -1 : Int((d.batteryLevel * 100).rounded())
+    let chg = (d.batteryState == .charging || d.batteryState == .full) ? 1 : 0
+    return "\(lvl),\(chg)"
+}
+
+// The transport a network path is on, for watch() and current() alike.
+func chuksPathString(_ path: NWPath) -> String {
+    if path.status != .satisfied { return "none" }
+    if path.usesInterfaceType(.wifi) { return "wifi" }
+    if path.usesInterfaceType(.cellular) { return "cellular" }
+    return "other"
+}
+
+// Whether ONE named motion sensor exists here. Asked by Motion.available() before a
+// screen commits to showing a readout it may never be able to fill.
+func chuksSensorAvailable(_ name: String, _ motion: CMMotionManager) -> Bool {
+    switch name {
+    case "accelerometer": return motion.isAccelerometerAvailable
+    case "gyroscope":     return motion.isGyroAvailable
+    case "magnetometer":  return motion.isMagnetometerAvailable
+    case "barometer":     return CMAltimeter.isRelativeAltitudeAvailable()
+    // There is no query for the proximity sensor. Enabling monitoring and reading the
+    // flag back is the documented way: it stays false on a device without one.
+    case "proximity":
+        UIDevice.current.isProximityMonitoringEnabled = true
+        let has = UIDevice.current.isProximityMonitoringEnabled
+        UIDevice.current.isProximityMonitoringEnabled = false
+        return has
+    // iOS exposes no public ambient-light API, which is why motion.light fails here.
+    case "light": return false
+    default: return false     // an unknown name is "no", not a crash
+    }
+}
+
 // Orientation capability helpers: the current interface orientation as a string, and a
 // lock through the mask the AppDelegate reports to UIKit.
 var chuksOrientationMask: UIInterfaceOrientationMask = .all
@@ -2655,12 +2695,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             activeStreams[token] = t
         case "battery.watch":
             UIDevice.current.isBatteryMonitoringEnabled = true
-            let emit = { [weak self] in
-                let d = UIDevice.current
-                let lvl = d.batteryLevel < 0 ? -1 : Int((d.batteryLevel * 100).rounded())
-                let chg = (d.batteryState == .charging || d.batteryState == .full) ? 1 : 0
-                self?.resolve(token, "\(lvl),\(chg)")
-            }
+            let emit = { [weak self] in self?.resolve(token, chuksBatteryNow()) }
             let o1 = NotificationCenter.default.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main) { _ in emit() }
             let o2 = NotificationCenter.default.addObserver(forName: UIDevice.batteryStateDidChangeNotification, object: nil, queue: .main) { _ in emit() }
             streamTeardown[token] = { NotificationCenter.default.removeObserver(o1); NotificationCenter.default.removeObserver(o2) }
@@ -2675,11 +2710,66 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "network.watch":
             let mon = NWPathMonitor()
             mon.pathUpdateHandler = { [weak self] path in
-                let s = path.status != .satisfied ? "none" : path.usesInterfaceType(.wifi) ? "wifi" : path.usesInterfaceType(.cellular) ? "cellular" : "other"
+                let s = chuksPathString(path)
                 DispatchQueue.main.async { self?.resolve(token, s) }
             }
             mon.start(queue: DispatchQueue.global(qos: .utility))
             streamTeardown[token] = { mon.cancel() }
+
+        // ---- One-shot reads of live OS state --------------------------------
+        // The value the matching watch() would fire right now. Before these, reading one
+        // value meant opening a stream and cancelling it, which is a teardown to forget.
+        case "battery.current":
+            resolve(token, chuksBatteryNow())
+        case "battery.available":
+            // The Simulator hands back a fixed placeholder rather than a reading, and
+            // reports it as a negative level.
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            resolve(token, UIDevice.current.batteryLevel >= 0 ? "1" : "0")
+        case "appstate.current":
+            let st = UIApplication.shared.applicationState
+            resolve(token, st == .active ? "active" : st == .background ? "background" : "inactive")
+        case "network.current":
+            // NWPath has no reliable synchronous read before the monitor has started, so
+            // take the first update and stop. It arrives in well under a frame.
+            let one = NWPathMonitor()
+            var answered = false
+            one.pathUpdateHandler = { [weak self] path in
+                if answered { return }
+                answered = true
+                let s = chuksPathString(path)
+                DispatchQueue.main.async { self?.resolve(token, s); one.cancel() }
+            }
+            one.start(queue: DispatchQueue.global(qos: .utility))
+        case "orientation.current":
+            resolve(token, currentOrientationString())
+
+        // ---- Availability -----------------------------------------------------
+        // "Does this device have the hardware", asked before a feature is offered
+        // rather than discovered from a stream that never fires.
+        case "torch.available":
+            resolve(token, (AVCaptureDevice.default(for: .video)?.hasTorch ?? false) ? "1" : "0")
+        case "motion.available":
+            resolve(token, chuksSensorAvailable(args, motion) ? "1" : "0")
+        case "recorder.available":
+            resolve(token, AVAudioSession.sharedInstance().isInputAvailable ? "1" : "0")
+        case "tts.available":
+            // A synthesizer with a voice for the device language. iOS always ships one,
+            // but the check is what makes the question answerable on both platforms.
+            let lang = AVSpeechSynthesisVoice.currentLanguageCode()
+            resolve(token, AVSpeechSynthesisVoice(language: lang) != nil ? "1" : "0")
+        case "ble.available":
+            // Deliberately NOT a CoreBluetooth state read: constructing a
+            // CBCentralManager is what triggers the Bluetooth permission prompt, and an
+            // availability check that prompts is not an availability check. Every iOS
+            // device the deployment target admits has a BLE radio; the Simulator has
+            // none. ble.state still reports "unsupported" for anyone who wants the
+            // radio's own answer.
+            #if targetEnvironment(simulator)
+            resolve(token, "0")
+            #else
+            resolve(token, "1")
+            #endif
         case "location.once":
             let fix = LocFix(once: true,
                 onFix: { [weak self] s in self?.resolve(token, s); self?.locFixes[token] = nil },
