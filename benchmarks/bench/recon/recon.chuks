@@ -1,0 +1,43 @@
+// Memoized reconcile: N rows, ~N/stride change per frame, K frames. Only changed
+// rows rebuild their text. Prints a checksum (must match the JS versions) and the
+// per-frame cost.
+//
+// Timed IN-PROCESS, the way recon.js times itself. It used to be timed from outside
+// with `time -p` minus a startup baseline, which is 10ms resolution over a 100ms run:
+// the Chuks column jittered by a third while the JS columns held steady, and the
+// comparison was between a coarse number and two precise ones.
+import { time } from "std/time";
+
+function bench(): int {
+    const N: int = 2000
+    const STRIDE: int = 20
+    const FRAMES: int = 30000
+    const VALUES: []int = []
+    const PREV: []int = []
+    for (var i: int = 0; i < N; i = i + 1) { VALUES.push(0); PREV.push(0) }
+    var checksum: int = 0
+    for (var f: int = 0; f < FRAMES; f = f + 1) {
+        var k: int = f % STRIDE
+        while (k < N) { VALUES[k] = VALUES[k] + 1; k = k + STRIDE }
+        for (var j: int = 0; j < N; j = j + 1) {
+            if (VALUES[j] != PREV[j]) {
+                const t: string = "Row " + string(j) + ": " + string(VALUES[j])
+                checksum = checksum + t.length
+                PREV[j] = VALUES[j]
+            }
+        }
+    }
+    return checksum
+}
+
+function main(): void {
+    bench()                                  // warm, as recon.js does
+    const t0: int = time.now()
+    const c: int = bench()
+    const dt: int = time.now() - t0
+    // ns rather than us: integer division on us threw away a digit and printed "3"
+    // beside the JS columns' "3.90", which reads as a precision we did not have.
+    const perFrameNs: int = (dt * 1000000) / 30000
+    println(string(c) + " | " + string(perFrameNs) + " ns/frame | " + string(dt) + " ms")
+}
+main()

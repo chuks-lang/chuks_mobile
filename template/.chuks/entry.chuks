@@ -14,6 +14,7 @@ export function remount(): int { return APP.remount() }   // dev server: full tr
 export function setViewport(top: int, height: int, width: int): int { return APP.setViewport(top, height, width) }
 export function tick(): int { return APP.tick() }
 export function dispatch(action: string): int { return APP.dispatch(action) }
+export function back(): int { return APP.dispatchBack() }   // system back / edge swipe: 1 = handled
 export function dispatchInput(action: string, value: string): int { return APP.dispatchInput(action, value) }
 export function resolve(token: string, payload: string): int { return APP.resolve(token, payload) }
 export function cancelToken(token: string): int { return APP.cancelToken(token) }

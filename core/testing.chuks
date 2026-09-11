@@ -1,0 +1,204 @@
+// Testing a screen, headlessly.
+//
+// A screen is a function that returns a Node, so it can be exercised without a device:
+// render it, look for what should be on it, press what a user would press, and look
+// again. That is the whole idea, and everything it needs already existed. The framework
+// has always tested itself this way; this is that machinery with a name an app author
+// can use.
+//
+//     import { render, Screen } from "pkg/@chuks/mobile/core/testing.chuks";
+//
+//     const s: Screen = render(function(): Node { return Track() })
+//     check(s.has("Start a walk"), "the idle screen offers a walk")
+//     s.press("Start a walk")
+//     check(s.has("Recording your route"), "pressing it starts tracking")
+//
+// It runs a real frame: hooks are begun and swept and effects run, so useState and
+// useEffect behave as they do on a device. What it does NOT do is talk to a host, so a
+// capability call goes out and never answers, exactly as it would with the phone in
+// aeroplane mode. Assert on what the screen shows, not on what a device would say back.
+import { Node, Column, Reconciler } from "./ui.chuks";
+import { hookBegin, hookSweep, hookEnter, runEffects } from "./state.chuks";
+
+/** What a rendered screen lets you ask and do. */
+export class Screen {
+    var recon: Reconciler
+    var build: function(): Node
+    var tree: Node
+    var lines: []string
+
+    public constructor(build: function(): Node) {
+        this.recon = new Reconciler()
+        this.build = build
+        this.lines = []
+        // Not built here: a component run outside the frame below would take hook slots
+        // that the frame then takes again, and the two would disagree about which cell is
+        // whose. The first frame builds it, and this is a placeholder until it does.
+        this.tree = Column({ dir: "col" }, [])
+        this.frame()
+    }
+
+    // One frame, the same shape App.tick uses: hooks bracket the render and effects run
+    // after it, so a component that reads state on its first pass sees what it would see
+    // on a device.
+    frame(): void {
+        const b: function(): Node = this.build
+        hookBegin()
+        // The screen function is called here rather than placed as a component, so give
+        // it the hook context the reconciler would have given it. Without this, `_slot`
+        // never returns to zero and every frame hands the same useState call a NEW cell,
+        // so a value set by a press is read back as the initial one. On a device the
+        // route is placed as a Comp and gets this for free.
+        hookEnter("test")
+        this.tree = b()
+        this.recon.renderRoot(this.tree)
+        runEffects()
+        hookSweep()
+        this.lines = this.recon.drain().split("\n")
+    }
+
+    /** Every piece of text on the screen, in tree order. */
+    public texts(): []string {
+        var out: []string = []
+        collectText(this.tree, out)
+        return out
+    }
+
+    /** Is this text on the screen? Matches a whole label or any part of one. */
+    public has(text: string): bool {
+        const all: []string = this.texts()
+        var i: int = 0
+        while (i < all.length) {
+            if (contains(all[i], text)) { return true }
+            i = i + 1
+        }
+        return false
+    }
+
+    /** How many labels contain this text. Useful for "exactly one row said Paused". */
+    public count(text: string): int {
+        const all: []string = this.texts()
+        var n: int = 0
+        var i: int = 0
+        while (i < all.length) {
+            if (contains(all[i], text)) { n = n + 1 }
+            i = i + 1
+        }
+        return n
+    }
+
+    /**
+     * Press whatever a user would press to act on this text: the nearest enclosing
+     * pressable, which is how a button with a label inside it behaves. Returns false if
+     * the text is not there or nothing around it is pressable, so a test can assert on
+     * the press itself rather than on a silent no-op.
+     */
+    public press(text: string): bool {
+        const target: any = findPressable(this.tree, text, null)
+        if (target == null) { return false }
+        const f: any = target
+        f()
+        this.frame()
+        return true
+    }
+
+    /** Type into the field whose current value or placeholder contains `text`. */
+    public type(text: string, value: string): bool {
+        const target: any = findChange(this.tree, text)
+        if (target == null) { return false }
+        const f: any = target
+        f(value)
+        this.frame()
+        return true
+    }
+
+    /** The mutations the last frame emitted, for a test that cares about the wire. */
+    public mutations(): []string { return this.lines }
+
+    /**
+     * The screen as text, for a failure message. A test that says "expected Paused"
+     * should be able to show what was there instead without a device or a screenshot.
+     */
+    public dump(): string { return dumpNodeStr(this.tree, 0) }
+}
+
+/** Render a screen function and return something to ask questions of. */
+export function render(build: function(): Node): Screen { return new Screen(build) }
+
+// ---- walking the tree -------------------------------------------------------
+
+// A component is PLACED lazily: `Comp(fn)` is a node whose children do not exist until
+// the reconciler runs the function, and what it produced hangs off `produced`. Walking
+// the tree an app built would therefore see one "Comp" node and nothing inside it, which
+// is exactly what the first version of this harness saw when it met a real screen.
+// Every walk below goes through here.
+function kidsOf(n: Node): []Node {
+    if (n.kind == "Comp" && n.produced != null) {
+        const p: Node? = n.produced
+        if (p != null) { return [p] }
+    }
+    return n.kids
+}
+
+function contains(s: string, sub: string): bool {
+    if (sub.length == 0) { return true }
+    if (sub.length > s.length) { return false }
+    var i: int = 0
+    while (i + sub.length <= s.length) {
+        if (s.slice(i, i + sub.length) == sub) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+function collectText(n: Node, out: []string): void {
+    if (n.text != "") { out.push(n.text) }
+    const kids: []Node = kidsOf(n)
+    var i: int = 0
+    while (i < kids.length) { collectText(kids[i], out); i = i + 1 }
+}
+
+// The nearest enclosing pressable of a node carrying `text`. `inherited` is the closest
+// pressable seen on the way down, which is what makes a label inside a button work:
+// the label is not pressable, the button around it is.
+function findPressable(n: Node, text: string, inherited: any): any {
+    const here: any = n.onPress != null ? n.onPress : inherited
+    if (n.text != "" && contains(n.text, text)) { return here }
+    const kids: []Node = kidsOf(n)
+    var i: int = 0
+    while (i < kids.length) {
+        const hit: any = findPressable(kids[i], text, here)
+        if (hit != null) { return hit }
+        i = i + 1
+    }
+    return null
+}
+
+function findChange(n: Node, text: string): any {
+    if (n.onChange != null) {
+        if (contains(n.text, text) || contains(n.val, text)) { return n.onChange }
+    }
+    const kids: []Node = kidsOf(n)
+    var i: int = 0
+    while (i < kids.length) {
+        const hit: any = findChange(kids[i], text)
+        if (hit != null) { return hit }
+        i = i + 1
+    }
+    return null
+}
+
+function dumpNodeStr(n: Node, depth: int): string {
+    var pad: string = ""
+    var d: int = 0
+    while (d < depth) { pad = pad + "  "; d = d + 1 }
+    var line: string = pad + n.kind
+    if (n.text != "") { line = line + " \"" + n.text + "\"" }
+    if (n.onPress != null) { line = line + " [pressable]" }
+    if (n.onChange != null) { line = line + " [input]" }
+    var out: string = line + "\n"
+    const kids: []Node = kidsOf(n)
+    var i: int = 0
+    while (i < kids.length) { out = out + dumpNodeStr(kids[i], depth + 1); i = i + 1 }
+    return out
+}

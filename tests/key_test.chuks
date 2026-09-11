@@ -1,0 +1,86 @@
+// `.key(...)`: identity that survives a reorder.
+//
+// Without it, children are paired by array position: reorder a list and child 0 is
+// diffed against whatever used to be child 0, so every row is rebuilt in place and
+// anything the row was holding follows the SLOT instead of the item. With it, a child is
+// paired with its own previous self wherever it moved to, and the host is told to move
+// the existing view rather than rebuild it somewhere else.
+//
+// The same key also decides which useState cells a Comp gets, so one mechanism covers
+// both jobs and there is only one thing to learn.
+//
+// Run:  chuks run tests/key_test.chuks   (exits non-zero on failure)
+import { Node, Column, Text, Row } from "../core/ui.chuks";
+import { render, Screen } from "../core/testing.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+// The list the screen renders, swapped between frames.
+var ORDER: []string = ["a", "b", "c"]
+
+function rows(): Node {
+    var kids: []Node = []
+    for (var i: int = 0; i < ORDER.length; i = i + 1) {
+        const name: string = ORDER[i]
+        kids.push(Row({ dir: "row" }, [ Text({ size: 12 }, name) ]).key(name))
+    }
+    return Column({ dir: "col" }, kids)
+}
+
+// The same list with no keys, for the contrast.
+function unkeyedRows(): Node {
+    var kids: []Node = []
+    for (var i: int = 0; i < ORDER.length; i = i + 1) {
+        kids.push(Row({ dir: "row" }, [ Text({ size: 12 }, ORDER[i]) ]))
+    }
+    return Column({ dir: "col" }, kids)
+}
+
+/** Every mutation line emitted by the LAST frame, joined for searching. */
+function lastFrame(s: Screen): string { return s.mutations().join("\n") }
+
+function main(): void {
+    println("key_test")
+
+    // ---- keyed ----
+    ORDER = ["a", "b", "c"]
+    const s: Screen = render(function(): Node { return rows() })
+    check(s.has("a") && s.has("c"), "the keyed list renders")
+
+    ORDER = ["c", "a", "b"]
+    s.frame()
+    const moved: string = lastFrame(s)
+    // A reorder must MOVE existing children (I| lines), never destroy them (R| lines).
+    check(moved.contains("I|"), "a reorder re-inserts the children that moved")
+    check(!moved.contains("R|"), "and destroys none of them")
+    check(s.has("a") && s.has("b") && s.has("c"), "all three are still on screen after the reorder")
+
+    // Removing one keyed child removes THAT child, not the tail.
+    ORDER = ["c", "b"]
+    s.frame()
+    const removed: string = lastFrame(s)
+    check(removed.contains("R|"), "dropping an item removes a child")
+    check(!s.has("a"), "and the one that left is the one that is gone")
+    check(s.has("b") && s.has("c"), "while the others stay")
+
+    // ---- unkeyed, for the contrast ----
+    // Position-paired children are diffed against whoever held the slot, so a reorder is
+    // a rewrite in place: the text of each row changes, and nothing moves.
+    ORDER = ["a", "b", "c"]
+    const u: Screen = render(function(): Node { return unkeyedRows() })
+    check(u.has("a"), "the unkeyed list renders")
+    ORDER = ["c", "a", "b"]
+    u.frame()
+    const uMoved: string = lastFrame(u)
+    check(!uMoved.contains("I|"), "an unkeyed reorder moves nothing (it rewrites in place)")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("key_test failed") }
+}
+main()

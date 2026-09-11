@@ -6,14 +6,28 @@
 //
 // Fire-and-forget capabilities pass no callback (the token is "0"); async reads
 // pass a `(string) -> void` that receives the host's result payload.
-import { emitNativeCommand, emitNativeCommandE, emitNativeStream, NativeSub } from "./ui.chuks";
-import { Base64 } from "std/base64";
+import { emitNativeCommand, awaitCommand, emitNativeCommandE, emitNativeStream, NativeSub, setTaskExpireHandler, onHostReady } from "./ui.chuks";
 
 // ---- Clipboard --------------------------------------------------------------
 // set() copies text; get() reads it (async — the OS pasteboard read is deferred).
+// How long an awaited capability may take before it gives up and throws. Chosen from
+// what the capability is waiting ON, not from how important it is:
+//   quick     a device reading, answered from memory or a sensor
+//   hardware  radio, GPS or storage that legitimately takes its time
+//   prompt    a person: an OS permission sheet, a picker, tapping a tag to the phone
+// The short one matters for more than tidiness: awaiting a capability on the host
+// thread deadlocks the app, and a 10-second explanatory throw is a far better way to
+// discover that than a freeze.
+const CAP_QUICK_MS: int = 10000
+const CAP_HARDWARE_MS: int = 60000
+const CAP_PROMPT_MS: int = 300000
+
 export class Clipboard {
     public static set(text: string): void { emitNativeCommand("clipboard.set", text, null) }
     public static get(onResult: (string)=> void): void { emitNativeCommand("clipboard.get", "", onResult) }
+
+    /** The clipboard's text, awaited. Await it inside an async function, not in a handler. */
+    public static async getAsync(): Task<string> { return await awaitCommand("clipboard.get", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Linking ----------------------------------------------------------------
@@ -34,6 +48,12 @@ export class Linking {
     public static onURL(onURL: (string)=> void): NativeSub {
         return emitNativeStream("linking.onurl", "", onURL, null)
     }
+
+    /** Whether the OS can open this url, awaited. */
+    public static async canOpenAsync(url: string): Task<bool> {
+        const s: string = await awaitCommand("linking.canOpen", url, false, CAP_QUICK_MS)
+        return s == "1"
+    }
 }
 
 // ---- Share ------------------------------------------------------------------
@@ -52,20 +72,20 @@ export class Share {
 // that supports it (older/haptics-less devices fall back to a medium impact).
 export class Haptics {
     public static impact(style: string): void { emitNativeCommand("haptics.impact", style, null) }
-    public static vibrate(ms: int): void { emitNativeCommand("haptics.vibrate", string(ms), null) }
+    public static vibrate(ms: int): void { emitNativeCommand("haptics.vibrate", ms, null) }
     public static pattern(msSequence: string): void { emitNativeCommand("haptics.pattern", msSequence, null) }
 }
 
 // ---- Torch / flashlight -----------------------------------------------------
 export class Torch {
-    public static set(on: bool): void { emitNativeCommand("torch.set", on ? "1" : "0", null) }
+    public static set(on: bool): void { emitNativeCommand("torch.set", on, null) }
 }
 
 // ---- Screen brightness ------------------------------------------------------
 // level is 0.0..1.0. keepAwake() toggles the idle timer (keep the screen on).
 export class Brightness {
-    public static set(level: float): void { emitNativeCommand("brightness.set", string(level), null) }
-    public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", on ? "1" : "0", null) }
+    public static set(level: float): void { emitNativeCommand("brightness.set", level, null) }
+    public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", on, null) }
 }
 
 // ---- Orientation ------------------------------------------------------------
@@ -88,13 +108,52 @@ export class Orientation {
 // value means that field is unavailable on this fix). Needs the "location" permission
 // — request it via Permission.request("location", ...) first; onError fires if the
 // permission is denied or no location provider is available.
+// What the user is told while tracking continues in the background. Android REQUIRES a
+// visible notification for the whole session and there is no way to hide it: that is the
+// deal the platform offers, show the user what you are doing and you may keep tracking.
+// iOS shows its own blue status-bar indicator instead, which you do not control.
+export dataType TrackingNotice {
+    title: string,      // Android notification title, e.g. "Recording your walk"
+    body: string,       // Android notification text, e.g. "Tap to return"
+}
+
 export class Location {
     public static once(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("location.once", "", onResult, onError)
     }
+    /**
+     * Location updates while your app is on screen. Stops when the app is backgrounded.
+     */
     public static watch(onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
         return emitNativeStream("location.watch", "", onUpdate, onError)
     }
+    /**
+     * Location updates that keep arriving with the screen off and the phone pocketed.
+     *
+     * This is what recording a walk, a run or a delivery route needs, and it is visible
+     * to the user by design on both platforms: Android shows the notification you supply
+     * for the whole session, iOS shows its blue status-bar indicator. Neither can be
+     * hidden, and an app that tracks someone silently is one the platforms are actively
+     * trying to prevent.
+     *
+     * Cancel the returned NativeSub when the activity ends. Forgetting to is not a small
+     * leak: it keeps the GPS alive and the notification on screen until the app is killed.
+     *
+     * ```chuks
+     * const sub: NativeSub = Location.watchBackground(
+     *     { title: "Recording your walk", body: "Tap to return to the app" },
+     *     function(fix: string): void { addPoint(fix) },
+     *     function(e: string): void { println(e) })
+     * // later, when the walk ends
+     * sub.cancel()
+     * ```
+     */
+    public static watchBackground(notice: TrackingNotice, onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
+        return emitNativeStream("location.watchBackground", { title: notice.title, body: notice.body }, onUpdate, onError)
+    }
+
+    /** One fix, awaited. Throws the host's message if location is off or denied. */
+    public static async onceAsync(): Task<string> { return await awaitCommand("location.once", "", true, CAP_HARDWARE_MS) }
 }
 
 // ---- Media picker + camera --------------------------------------------------
@@ -115,6 +174,14 @@ export class MediaPicker {
     public static saveImage(fileUri: string, onOk: ()=> void, onError: (string)=> void): void {
         emitNativeCommandE("mediapicker.save", fileUri, function(_: string): void { onOk() }, onError)
     }
+
+    /** Pick one photo, awaited. Throws if the user cancels or the permission is denied. */
+    public static async pickImageAsync(): Task<string> { return await awaitCommand("mediapicker.image", "", true, CAP_PROMPT_MS) }
+    /** Save a "file://" image to the gallery, awaited. Throws on failure. */
+    public static async saveImageAsync(fileUri: string): Task<void> {
+        await awaitCommand("mediapicker.save", fileUri, true, CAP_HARDWARE_MS)
+        return
+    }
 }
 export class Camera {
     public static takePhoto(onResult: (string)=> void, onError: (string)=> void): void {
@@ -125,6 +192,11 @@ export class Camera {
     public static capturePreview(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("camera.capturePreview", "", onResult, onError)
     }
+
+    /** Take a photo, awaited. Throws if the user cancels or the permission is denied. */
+    public static async takePhotoAsync(): Task<string> { return await awaitCommand("camera.photo", "", true, CAP_PROMPT_MS) }
+    /** Capture a still from a mounted CameraView, awaited. */
+    public static async capturePreviewAsync(): Task<string> { return await awaitCommand("camera.capturePreview", "", true, CAP_QUICK_MS) }
 }
 
 // ---- Bluetooth LE -----------------------------------------------------------
@@ -151,15 +223,26 @@ export class Bluetooth {
     }
     // Read a characteristic once; onOk gets its value as a hex string.
     public static read(deviceId: string, service: string, characteristic: string, onOk: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("ble.read", deviceId + "\t" + service + "\t" + characteristic, onOk, onError)
+        emitNativeCommandE("ble.read", { deviceId: deviceId, service: service, characteristic: characteristic }, onOk, onError)
     }
     // Write a hex-string value to a characteristic; onOk fires when the write completes.
     public static write(deviceId: string, service: string, characteristic: string, valueHex: string, onOk: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("ble.write", deviceId + "\t" + service + "\t" + characteristic + "\t" + valueHex, onOk, onError)
+        emitNativeCommandE("ble.write", { deviceId: deviceId, service: service, characteristic: characteristic, valueHex: valueHex }, onOk, onError)
     }
     // Subscribe to notifications/indications; onValue fires with each new value (hex) until cancelled.
     public static subscribe(deviceId: string, service: string, characteristic: string, onValue: (string)=> void, onError: (string)=> void): NativeSub {
-        return emitNativeStream("ble.subscribe", deviceId + "\t" + service + "\t" + characteristic, onValue, onError)
+        return emitNativeStream("ble.subscribe", { deviceId: deviceId, service: service, characteristic: characteristic }, onValue, onError)
+    }
+
+    /** Connect to a scanned peripheral, awaited. Resolves once services are discovered. */
+    public static async connectAsync(deviceId: string): Task<string> { return await awaitCommand("ble.connect", deviceId, true, CAP_HARDWARE_MS) }
+    /** Read a characteristic once, awaited. Answers a hex string. */
+    public static async readAsync(deviceId: string, service: string, characteristic: string): Task<string> {
+        return await awaitCommand("ble.read", { deviceId: deviceId, service: service, characteristic: characteristic }, true, CAP_HARDWARE_MS)
+    }
+    /** Write a hex value to a characteristic, awaited. Resolves when the write completes. */
+    public static async writeAsync(deviceId: string, service: string, characteristic: string, valueHex: string): Task<string> {
+        return await awaitCommand("ble.write", { deviceId: deviceId, service: service, characteristic: characteristic, valueHex: valueHex }, true, CAP_HARDWARE_MS)
     }
 }
 
@@ -181,6 +264,16 @@ export class Nfc {
     public static writeText(text: string, onOk: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("nfc.write", text, onOk, onError)
     }
+
+    /** Whether this device has usable NFC hardware, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("nfc.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** Scan one tag, awaited. The user has to tap the tag, so this waits on a person. */
+    public static async readTagAsync(): Task<string> { return await awaitCommand("nfc.read", "", true, CAP_PROMPT_MS) }
+    /** Write a text record to the next tag tapped, awaited. */
+    public static async writeTextAsync(text: string): Task<string> { return await awaitCommand("nfc.write", text, true, CAP_PROMPT_MS) }
 }
 
 // ---- Calendar ---------------------------------------------------------------
@@ -192,10 +285,17 @@ export class Nfc {
 // calendar goes to onError.
 export class Calendar {
     public static upcoming(days: int, onResult: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("calendar.upcoming", string(days), onResult, onError)
+        emitNativeCommandE("calendar.upcoming", days, onResult, onError)
     }
     public static createEvent(title: string, startInMin: int, durationMin: int, onOk: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("calendar.create", title + "|" + string(startInMin) + "|" + string(durationMin), onOk, onError)
+        emitNativeCommandE("calendar.create", { title: title, startInMin: startInMin, durationMin: durationMin }, onOk, onError)
+    }
+
+    /** Upcoming events for the next `days` days, awaited. */
+    public static async upcomingAsync(days: int): Task<string> { return await awaitCommand("calendar.upcoming", days, true, CAP_PROMPT_MS) }
+    /** Create an event, awaited. Answers the new event's id. */
+    public static async createEventAsync(title: string, startInMin: int, durationMin: int): Task<string> {
+        return await awaitCommand("calendar.create", { title: title, startInMin: startInMin, durationMin: durationMin }, true, CAP_PROMPT_MS)
     }
 }
 
@@ -208,6 +308,9 @@ export class Contacts {
     public static list(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("contacts.list", "", onResult, onError)
     }
+
+    /** The address book, awaited. First call may show the OS permission prompt. */
+    public static async listAsync(): Task<string> { return await awaitCommand("contacts.list", "", true, CAP_PROMPT_MS) }
 }
 
 // ---- Device info ------------------------------------------------------------
@@ -223,6 +326,29 @@ export class DeviceInfo {
     public static appVersion(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appversion", "", onResult) }
     // The device language + region, as "language,region" (e.g. "en,US").
     public static locale(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.locale", "", onResult) }
+    // A STABLE per-vendor device id: iOS identifierForVendor, Android ANDROID_ID. It
+    // survives app updates; it resets on a factory reset (Android) or when all of the
+    // vendor's apps are removed (iOS). Needs no permission. (RN's expo-application
+    // getIosIdForVendorAsync / getAndroidId.) Occasionally "" on iOS just after boot.
+    public static deviceId(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.id", "", onResult) }
+    // The app's bundle id (iOS) / application id (Android), e.g. "com.acme.myapp".
+    public static appId(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appid", "", onResult) }
+    // The app's human-readable display name.
+    public static appName(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.appname", "", onResult) }
+    // First-install time as epoch milliseconds (a string; parse with int()). Resets on
+    // reinstall. On iOS this is the app's document-directory creation time (no OS API).
+    public static installTime(onResult: (string)=> void): void { emitNativeCommand("deviceinfo.installtime", "", onResult) }
+
+    // Awaited forms. Every one of these answers in milliseconds, so a short timeout
+    // turns the await-on-the-host-thread mistake into a quick, explanatory error
+    // rather than a long freeze.
+    public static async screenAsync(): Task<string> { return await awaitCommand("deviceinfo.screen", "", false, CAP_QUICK_MS) }
+    public static async appVersionAsync(): Task<string> { return await awaitCommand("deviceinfo.appversion", "", false, CAP_QUICK_MS) }
+    public static async localeAsync(): Task<string> { return await awaitCommand("deviceinfo.locale", "", false, CAP_QUICK_MS) }
+    public static async deviceIdAsync(): Task<string> { return await awaitCommand("deviceinfo.id", "", false, CAP_QUICK_MS) }
+    public static async appIdAsync(): Task<string> { return await awaitCommand("deviceinfo.appid", "", false, CAP_QUICK_MS) }
+    public static async appNameAsync(): Task<string> { return await awaitCommand("deviceinfo.appname", "", false, CAP_QUICK_MS) }
+    public static async installTimeAsync(): Task<string> { return await awaitCommand("deviceinfo.installtime", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Biometrics -------------------------------------------------------------
@@ -239,6 +365,17 @@ export class Biometrics {
     }
     public static authenticate(reason: string, onOk: ()=> void, onError: (string)=> void): void {
         emitNativeCommandE("biometrics.authenticate", reason, function(_: string): void { onOk() }, onError)
+    }
+
+    /** Whether Face ID / Touch ID / fingerprint is usable here, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("biometrics.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** Prompt for biometric authentication, awaited. Returns on success, throws on cancel or failure. */
+    public static async authenticateAsync(reason: string): Task<void> {
+        await awaitCommand("biometrics.authenticate", reason, true, CAP_PROMPT_MS)
+        return
     }
 }
 
@@ -280,31 +417,189 @@ export class Pedometer {
     // One-shot count for the last `secondsAgo` seconds -> "steps,distanceMeters".
     // iOS only (CMPedometer history); on Android onError fires with a message pointing
     // to watch() (no on-device history without Health Connect).
-    public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", string(secondsAgo), onResult, onError) }
+    public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", secondsAgo, onResult, onError) }
+
+    /** "true"/"false": is there a hardware step counter, awaited. */
+    public static async availableAsync(): Task<string> { return await awaitCommand("pedometer.available", "", false, CAP_QUICK_MS) }
+    /** Steps and distance over the last `secondsAgo` seconds, awaited. iOS only; throws on Android. */
+    public static async queryAsync(secondsAgo: int): Task<string> { return await awaitCommand("pedometer.query", secondsAgo, true, CAP_QUICK_MS) }
 }
 
-// ---- Health: the health database + heart rate --------------------------------
-// iOS: HealthKit — aggregated across every source (iPhone, Apple Watch, other apps).
-// Android: no Health Connect in the base runtime (it needs a Gradle/AAR dependency),
-// so only the live heart-rate SENSOR is wired (TYPE_HEART_RATE, present on watches /
-// a few phones); read() of steps/distance/energy fails with a message pointing to
-// Pedometer / Health Connect. Call authorize() once before reading. A device build
-// needs the HealthKit capability in its provisioning profile; the metric strings for
-// read() are "steps" | "distanceMeters" | "activeEnergyKcal" | "heartRate".
-export class Health {
-    // "true"/"false": is health data available at all (HealthKit present / a body sensor).
-    public static available(onResult: (string)=> void): void { emitNativeCommand("health.available", "", onResult) }
-    // Request read access. `metrics` is a comma list ("heartRate,steps,distanceMeters,
-    // activeEnergyKcal"); iOS shows the HealthKit sheet, Android maps to its runtime
-    // permissions. onResult "granted"; onError with the reason if it fails.
-    public static authorize(metrics: string, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("health.authorize", metrics, onResult, onError) }
-    // Aggregate a metric over the last `secondsAgo` seconds -> a number as a string
-    // (steps/energy = sum, heartRate = average bpm, distance = meters). iOS: HealthKit;
-    // Android: onError unless the runtime gains Health Connect.
-    public static read(metric: string, secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("health.read", metric + "|" + string(secondsAgo), onResult, onError) }
-    // Live heart rate in bpm. iOS: HealthKit anchored query (updates as new samples
-    // land, e.g. from a paired Watch). Android: the TYPE_HEART_RATE sensor directly.
-    public static heartRate(onData: (string)=> void, onError: (string)=> void): NativeSub { return emitNativeStream("health.heartRate", "", onData, onError) }
+// ---- Health -----------------------------------------------------------------
+// Health moved OUT of the framework and into @chuks/health. It is the one capability
+// that needs an iOS ENTITLEMENT (com.apple.developer.healthkit), and an entitlement can
+// only come from an explicit App ID, which the wildcard development profile the
+// framework builds against can never carry. Kept here it was permanently unsigned.
+//
+//   chuks install @chuks/health
+//   import { Health } from "pkg/@chuks/health";
+//
+// Pedometer, just above, stays here: step counts need no entitlement, so an app that
+// only wants steps needs no package and no App ID registration.
+
+// ---- Background tasks -------------------------------------------------------
+//
+// Work the OS runs while your app is not on screen: syncing, uploading, cleaning up.
+//
+// THE ONE RULE. Define your tasks at MODULE scope, never inside a screen or an effect:
+//
+//     // app/tasks.chuks, at the top level of the file
+//     Background.define("sync", async function(): Task<bool> {
+//         await uploadPending()
+//         return true
+//     })
+//
+// When the OS wakes your app for a task it may be a COLD start with no UI at all. A
+// handler registered inside a screen is registered by code that never runs, so the task
+// silently does nothing, and it does nothing only in the case you cannot easily test.
+// Every framework that does this hits the same wall: Expo requires defineTask at module
+// scope, Flutter needs a top-level entry point marked so it is not tree-shaken. Ours is
+// the same rule for the same reason, minus the ceremony, because a Chuks app is one
+// native binary and a task shares memory with the rest of it.
+//
+// WHAT THE OS PROMISES, WHICH IS LESS THAN IT SOUNDS. An interval is a floor, not a
+// schedule. iOS learns your usage and budgets accordingly, often running refresh tasks
+// overnight and ignoring short intervals entirely; a user who force-quits the app gets
+// nothing until they open it again. Android batches jobs and defers them in Doze. Write
+// tasks that catch up from whatever state they find, not tasks that assume they ran an
+// hour ago.
+
+// What must be true before the OS runs a task.
+//
+// Android honours all of these through JobScheduler. iOS honours `network` and
+// `charging` on a processing task and NOTHING on a refresh task, because BGTaskScheduler
+// offers only requiresNetworkConnectivity and requiresExternalPower. The build reports
+// which constraints the iOS half cannot enforce rather than dropping them quietly, so a
+// wifi-only sync that will run on cellular is something you find out at build time and
+// not from a user's data bill.
+export dataType TaskConstraints {
+    network: string?,        // "none" (default), "any", or "unmetered" (wifi-like)
+    charging: bool?,         // both platforms
+    batteryNotLow: bool?,    // Android only
+    deviceIdle: bool?,       // Android only
+    storageNotLow: bool?,    // Android only
+}
+
+// name -> handler, for the host to invoke by name once it has mounted.
+var TASKS: map[string]async function(): Task<bool> = {}
+// Set while a handler runs, cleared when it returns. Read by Background.expired().
+var TASK_EXPIRING: bool = false
+
+export class Background {
+    /**
+     * Register a handler. Call this at MODULE scope, not inside a screen.
+     *
+     * Return true when the work finished, false when it failed and should be retried on
+     * the platform's backoff schedule. Returning is how completion is signalled: an
+     * explicit "finish" call is easy to forget, and forgetting it on iOS gets the app
+     * killed and its future background budget cut.
+     *
+     * ```chuks
+     * Background.define("sync", async function(): Task<bool> {
+     *     const pending: []Item = unsynced()
+     *     if (pending.length == 0) { return true }
+     *     await uploadAll(pending)      // spawn and await both work here
+     *     return true
+     * })
+     * ```
+     */
+    public static define(name: string, run: async function(): Task<bool>): void {
+        TASKS[name] = run
+        // Hand the host a token it can fire. On a cold background wake the host mounts
+        // first, which runs this line, which is how the token exists at all.
+        //
+        // Deferred through onHostReady because define() is meant to be called from app
+        // construction, which happens BEFORE the App exists. Emitting straight into a
+        // null host would drop the registration without a word, and the task would
+        // simply never run.
+        onHostReady(function(): void {
+            emitNativeStream("bg.define", name, function(_: string): void { Background.invoke(name) }, null)
+        })
+    }
+
+    // Framework-internal: run a defined task and report the result back to the host,
+    // which is what lets the OS mark the work finished and stop pumping.
+    static invoke(name: string): void {
+        const f: (async function(): Task<bool>)? = TASKS[name]
+        if (f == null) { emitNativeCommand("bg.result", { name: name, ok: false }, null); return }
+        // Spawned, so an awaiting handler does not block the host's call. The result
+        // comes back through bg.result whenever it finishes, which is what tells the OS
+        // the work is done and the host it can stop pumping.
+        spawn Background.runAndReport(name, f)
+    }
+    static async runAndReport(name: string, f: async function(): Task<bool>): Task<void> {
+        TASK_EXPIRING = false
+        var ok: bool = false
+        // A handler that throws is a failed task, not a crashed app: the OS is told it
+        // failed so it retries on the platform's backoff rather than never running again.
+        try { ok = await f() } catch (e) { ok = false }
+        emitNativeCommand("bg.result", { name: name, ok: ok }, null)
+        return
+    }
+
+    /** True when the OS has warned that this task is out of time. Checkpoint and return. */
+    public static expired(): bool { return TASK_EXPIRING }
+    // Framework-internal: the host says time is up.
+    public static markExpired(): void { TASK_EXPIRING = true }
+
+    /**
+     * Repeat this task, no sooner than `minIntervalSeconds` apart. Both platforms floor
+     * this at 15 minutes and neither treats it as a promise.
+     */
+    public static periodic(name: string, minIntervalSeconds: int, c: TaskConstraints?): void {
+        const secs: int = minIntervalSeconds
+        const cons: string = encodeConstraints(c)
+        onHostReady(function(): void { emitNativeCommand("bg.periodic", { name: name, seconds: secs, constraints: cons }, null) })
+    }
+
+    /** Run once, no sooner than `delaySeconds` from now. */
+    public static once(name: string, delaySeconds: int, c: TaskConstraints?): void {
+        const secs: int = delaySeconds
+        const cons: string = encodeConstraints(c)
+        onHostReady(function(): void { emitNativeCommand("bg.once", { name: name, seconds: secs, constraints: cons }, null) })
+    }
+
+    /**
+     * Long work that wants power and a network: a large upload, a database compaction.
+     * iOS runs this as a processing task, which is the only iOS shape that honours any
+     * constraints at all; Android schedules a job with the same requirements.
+     */
+    public static processing(name: string, delaySeconds: int, c: TaskConstraints?): void {
+        const secs: int = delaySeconds
+        const cons: string = encodeConstraints(c)
+        onHostReady(function(): void { emitNativeCommand("bg.processing", { name: name, seconds: secs, constraints: cons }, null) })
+    }
+
+    /** Stop scheduling this task. Already-running work is allowed to finish. */
+    public static cancel(name: string): void { emitNativeCommand("bg.cancel", name, null) }
+    /** Stop scheduling every task this app registered. */
+    public static cancelAll(): void { emitNativeCommand("bg.cancelAll", "", null) }
+
+    /**
+     * What the OS says about this task: "scheduled", "notScheduled", or "restricted"
+     * when the user or the system has disabled background activity for the app. The
+     * last one is worth surfacing, since nothing you schedule will ever run.
+     */
+    public static status(name: string, onResult: (string)=> void): void {
+        onHostReady(function(): void { emitNativeCommand("bg.status", name, onResult) })
+    }
+}
+
+// Wire the host's expiry signal to the flag Background.expired() reads. Done once at
+// module load, so it is in place before any task can run.
+setTaskExpireHandler(function(): void { Background.markExpired() })
+
+// Constraints as `k=v` pairs, so the hosts parse one format and an absent field stays
+// absent rather than becoming a default the caller never asked for.
+function encodeConstraints(c: TaskConstraints?): string {
+    if (c == null) { return "" }
+    var out: string = ""
+    if (c.network != null) { out = out + "network=" + string(c.network) + ";" }
+    if (c.charging != null) { out = out + "charging=" + (c.charging ? "1" : "0") + ";" }
+    if (c.batteryNotLow != null) { out = out + "batteryNotLow=" + (c.batteryNotLow ? "1" : "0") + ";" }
+    if (c.deviceIdle != null) { out = out + "deviceIdle=" + (c.deviceIdle ? "1" : "0") + ";" }
+    if (c.storageNotLow != null) { out = out + "storageNotLow=" + (c.storageNotLow ? "1" : "0") + ";" }
+    return out
 }
 
 // ---- Pulse (a STREAM: the host ticks a monotonic counter every ~50ms) -------
@@ -329,17 +624,21 @@ export class Permission {
     public static request(kind: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("permission.request", kind, onResult, onError)
     }
+
+    /** A permission's current state, awaited. */
+    public static async statusAsync(kind: string): Task<string> { return await awaitCommand("permission.status", kind, false, CAP_QUICK_MS) }
+    /** Request a permission, awaited. Waits on the OS prompt, so waits on a person. */
+    public static async requestAsync(kind: string): Task<string> { return await awaitCommand("permission.request", kind, true, CAP_PROMPT_MS) }
 }
 
 // ---- File system (Tier B) ---------------------------------------------------
 // Read / write / list / delete files in the app's private document directory.
-// write()'s content is base64-encoded on the wire, because the command channel is
-// newline-delimited and file content is arbitrary/multiline; the host decodes it.
-// read() returns the content directly (the result channel is binary-safe). read of
-// a missing file goes to onError.
+// Content crosses as an ordinary argument: the wire packs arguments, so a multi-line
+// file body needs no encoding of its own. read() returns the content directly. A read
+// of a missing file goes to onError.
 export class FileSystem {
     public static write(name: string, content: string): void {
-        emitNativeCommand("fs.write", name + "|" + new Base64().encode(content), null)
+        emitNativeCommand("fs.write", { name: name, content: content }, null)
     }
     public static read(name: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("fs.read", name, onResult, onError)
@@ -348,31 +647,36 @@ export class FileSystem {
         emitNativeCommand("fs.list", "", onResult)
     }
     public static delete(name: string): void { emitNativeCommand("fs.delete", name, null) }
+
+    /** A file's contents, awaited. Throws if it does not exist. */
+    public static async readAsync(name: string): Task<string> { return await awaitCommand("fs.read", name, true, CAP_QUICK_MS) }
+    /** The private directory's file names, newline-joined, awaited. */
+    public static async listAsync(): Task<string> { return await awaitCommand("fs.list", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Secure storage (Tier B) ------------------------------------------------
 // Encrypted key/value backed by the OS keystore (iOS Keychain, Android Keystore
-// AES-GCM) — for tokens, secrets, small sensitive values. Same content encoding
-// as FileSystem (the value is base64 on the wire); get() of a missing key ->
-// onError. Not for large blobs; use FileSystem for those.
+// AES-GCM) — for tokens, secrets, small sensitive values. get() of a missing key
+// goes to onError. Not for large blobs; use FileSystem for those.
 export class SecureStore {
     public static set(key: string, value: string): void {
-        emitNativeCommand("secure.set", key + "|" + new Base64().encode(value), null)
+        emitNativeCommand("secure.set", { key: key, value: value }, null)
     }
     public static get(key: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("secure.get", key, onResult, onError)
     }
     public static delete(key: string): void { emitNativeCommand("secure.delete", key, null) }
+
+    /** A stored secret, awaited. Throws if the key is not there. */
+    public static async getAsync(key: string): Task<string> { return await awaitCommand("secure.get", key, true, CAP_QUICK_MS) }
 }
 
 // ---- Local notifications (Tier B) -------------------------------------------
-// Post a local notification. Requires the "notifications" permission (see F2).
-// Both title and body are base64 on the wire (arbitrary text). Fires shortly
-// after the call and appears in the notification shade / as a banner.
+// Post a local notification. Requires the "notifications" permission (see F2). Fires
+// shortly after the call and appears in the notification shade / as a banner.
 export class Notifications {
     public static notify(title: string, body: string): void {
-        const b: Base64 = new Base64()
-        emitNativeCommand("notif.notify", b.encode(title) + "|" + b.encode(body), null)
+        emitNativeCommand("notif.notify", { title: title, body: body }, null)
     }
 }
 
@@ -387,6 +691,9 @@ export class Audio {
     public static resume(): void { emitNativeCommand("audio.resume", "", null) }
     public static stop(): void { emitNativeCommand("audio.stop", "", null) }
     public static position(onResult: (string)=> void): void { emitNativeCommand("audio.position", "", onResult) }
+
+    /** "posMs/durMs" for the current track, awaited. */
+    public static async positionAsync(): Task<string> { return await awaitCommand("audio.position", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Microphone recording (Tier C) ------------------------------------------
@@ -406,19 +713,28 @@ export class Recorder {
     public static levels(onLevel: (string)=> void): NativeSub {
         return emitNativeStream("recorder.levels", "", onLevel, null)
     }
+
+    /** Stop recording, awaited. Answers a "file://" path to the m4a. */
+    public static async stopAsync(): Task<string> { return await awaitCommand("recorder.stop", "", true, CAP_QUICK_MS) }
 }
 
 // ---- Text-to-speech (Tier B) ------------------------------------------------
 // Speak text aloud via the OS speech synthesizer. speak() replaces any current
-// utterance; stop() cancels it. text is base64 on the wire (arbitrary/multiline).
+// utterance; stop() cancels it.
 // isSpeaking() answers (async) a bool -- true while speaking -- the proof that the
 // synthesizer engaged. On Android the engine + voice data must be present (it usually
 // is); if absent, isSpeaking stays false.
 export class Tts {
-    public static speak(text: string): void { emitNativeCommand("tts.speak", new Base64().encode(text), null) }
+    public static speak(text: string): void { emitNativeCommand("tts.speak", text, null) }
     public static stop(): void { emitNativeCommand("tts.stop", "", null) }
     public static isSpeaking(onResult: (bool)=> void): void {
         emitNativeCommand("tts.isSpeaking", "", function(s: string): void { onResult(s == "1") })
+    }
+
+    /** Whether the synthesizer is currently speaking, awaited. */
+    public static async isSpeakingAsync(): Task<bool> {
+        const s: string = await awaitCommand("tts.isSpeaking", "", false, CAP_QUICK_MS)
+        return s == "1"
     }
 }
 
@@ -448,5 +764,24 @@ export class Network {
 // fail() always resolves via the ERROR channel, to exercise onErr end-to-end.
 export class Debug {
     public static activeStreams(onResult: (string)=> void): void { emitNativeCommand("debug.activeStreams", "", onResult) }
+    /**
+     * The live view tree, as the host has it: one line per view, indented by depth,
+     * with the frame Yoga resolved.
+     *
+     *     app              View        0,0 390x844
+     *       app.0          UIScrollView 0,44 390x756
+     *         app.0.1      UILabel     16,12 358x0        <- the answer to "why is it invisible"
+     *
+     * This is the inspector, and a `w x 0` or an off-screen origin is usually what you
+     * are looking for. Print it, or write it to a file when there is no console:
+     *
+     * ```chuks
+     * Debug.viewTree(function(t: string): void { println(t) })
+     * ```
+     *
+     * A debugging tool, not an API: the shape of a line may change, and reading it in
+     * app logic would be reading the host's mind.
+     */
+    public static viewTree(onResult: (string)=> void): void { emitNativeCommand("debug.viewTree", "", onResult) }
     public static fail(onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("debug.fail", "", onResult, onError) }
 }

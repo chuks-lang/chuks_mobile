@@ -1,0 +1,173 @@
+// The boundary, measured.
+//
+// Expo published a number for theirs in September 2026: 100,000 no-op calls across the
+// JS/native boundary in 9ms with Modules 2.0, against 52ms with 1.0. We had no number
+// for ours at all, which is a bad position from which to either worry or boast. This
+// produces one, on a real device, from the AOT build the app actually ships.
+//
+// WHAT THIS MEASURES, and what it does not. A Chuks capability call is not the same
+// shape as theirs: theirs is a synchronous function call across a bridge, ours is a
+// command appended to a mutation stream that the host drains and dispatches on a later
+// runloop turn. So there is no honest single number to put beside 9ms. What IS
+// comparable is the ENCODING: the per-call work of turning a capability call into
+// something the other side can read, which is exactly the part Expo's macro removed.
+// That is measured here. The runloop hop is not, and is reported separately as the
+// latency it is.
+//
+// Run it from an app screen rather than a test: `chuks run` uses the VM, and the number
+// that matters is the AOT one on the device. walkSocials has a card for it on the
+// Capabilities screen; the report is shown there and written to bench.txt, which is how
+// a device with no console gives it back.
+//
+// WHAT IT FOUND, 9 September 2026. The phone is the column that counts; the other two
+// are there because they agree, which is how you know the harness is measuring the code
+// rather than the machine.
+//
+//                        iPhone 12 Pro    iOS simulator   Android emulator
+//   capability encode       280ns/call      160ns/call      310ns/call
+//   first render (60 rows)  17ms            10ms            11ms          (1384 mutations, 28KB)
+//   tree build              13670us/frame   8870us/frame    9890us/frame
+//   diff + drain              250us/frame    176us/frame     180us/frame  (2 mutations, 44B)
+//
+// The stream is not the cost. On the phone, a frame that changes one row diffs and
+// serializes in 250 microseconds and puts 44 BYTES on the wire: one and a half percent
+// of a 60Hz budget.
+//
+// What costs is BUILDING the tree the screen function returns. Sixty rows of nodes is
+// 13.7ms on the phone, fifty-five times the diff, and 82% of a frame on its own. So the
+// thing to optimise is how often an app rebuilds a subtree it did not change, which is
+// exactly what Comp and the List windowing exist to avoid, and NOT the reconciler, the
+// stream or the encoding.
+//
+// For scale: Expo published 100,000 no-op calls across their boundary in 9ms. Ours is
+// 100,000 encodes in 28ms, carrying two JSON arguments where a no-op carries none. Same
+// order, doing more work: not a race won or lost.
+import { Reconciler, Node, Column, Row, Text, Style } from "../core/ui.chuks";
+import { time } from "std/time";
+
+dataType Result { name: string, iterations: int, ms: int, perCallNs: int, note: string }
+
+function fmtRow(r: Result): string {
+    var out: string = "  " + pad(r.name, 22) + pad(string(r.iterations), 9)
+    out = out + pad(string(r.ms) + "ms", 8)
+    if (r.perCallNs >= 0) { out = out + pad(string(r.perCallNs) + "ns", 9) } else { out = out + pad("", 9) }
+    return out + r.note
+}
+function pad(s: string, w: int): string {
+    var out: string = s
+    while (out.length < w) { out = out + " " }
+    return out
+}
+
+// ---- 1. The capability boundary, per call ----------------------------------
+//
+// One command carrying two arguments, built and serialized the way every capability
+// call is: the JSON encode, the token, the line into the buffer. The callback map grows
+// as it would in an app that fired this many requests without answering them.
+function benchCommandEncode(n: int): Result {
+    const r: Reconciler = new Reconciler()
+    const cb: function(v: string): void = function(_v: string): void { }
+    const t0: int = time.now()
+    var i: int = 0
+    while (i < n) {
+        r.command("bench.noop", "{\"a\":1,\"b\":\"x\"}", cb, null, false)
+        i = i + 1
+    }
+    const ms: int = time.now() - t0
+    const bytes: int = r.drain().length
+    const per: int = n > 0 ? (ms * 1000000) / n : 0
+    return { name: "capability encode", iterations: n, ms: ms, perCallNs: per,
+             note: string(bytes / 1024) + "KB of stream" }
+}
+
+// ---- 2. A frame of mutations on a real tree --------------------------------
+//
+// A screen with `rows` rows, each a Row of two Texts with styles: the shape of an
+// ordinary list cell rather than a microbenchmark's bare node. Mounted once, then
+// re-rendered `frames` times with one row's text changed each frame, which is the
+// steady state of an app that is updating rather than navigating.
+function screenTree(rows: int, tick: int): Node {
+    var kids: []Node = []
+    var i: int = 0
+    while (i < rows) {
+        const label: string = i == (tick % rows) ? ("Row " + string(i) + " · " + string(tick)) : ("Row " + string(i))
+        kids.push(Row({ dir: "row", gap: 12, pad: 8, radius: 12, bg: "FFFFFF", align: "center" }, [
+            Column({ dir: "col", grow: 1, gap: 2 }, [
+                Text({ size: 15, weight: "bold", color: "16211C" }, label),
+                Text({ size: 12, color: "5C6B63" }, "steady-state cell"),
+            ]),
+            Text({ size: 12, color: "8A9890" }, string(i)),
+        ]))
+        i = i + 1
+    }
+    return Column({ dir: "col", grow: 1, gap: 8, pad: 12, bg: "F6F7F5" }, kids)
+}
+
+function benchMount(rows: int): Result {
+    const r: Reconciler = new Reconciler()
+    const t0: int = time.now()
+    r.renderRoot(screenTree(rows, 0))
+    const ms: int = time.now() - t0
+    const muts: int = r.count()
+    return { name: "first render", iterations: rows, ms: ms, perCallNs: -1,
+             note: string(muts) + " mutations, " + string(r.drain().length / 1024) + "KB" }
+}
+
+// A frame is two costs that look like one: BUILDING the node tree the screen function
+// returns, and DIFFING it against the last. Measured apart, because they are fixed by
+// different things: building is what memoizing a component avoids, diffing is what the
+// reconciler itself costs.
+function benchTreeBuild(rows: int, frames: int): Result {
+    var sink: int = 0
+    const t0: int = time.now()
+    var f: int = 0
+    while (f < frames) {
+        const n: Node = screenTree(rows, f)
+        sink = sink + n.kids.length          // keep the build from being optimised away
+        f = f + 1
+    }
+    const ms: int = time.now() - t0
+    const per: int = frames > 0 ? (ms * 1000) / frames : 0
+    return { name: "tree build", iterations: frames, ms: ms, perCallNs: -1,
+             note: string(per) + "us/frame for " + string(sink / frames) + " rows" }
+}
+
+// Diff alone: every tree is built BEFORE the clock starts, so what is timed is the
+// reconciler walking two trees and emitting the difference.
+function benchDiff(rows: int, frames: int): Result {
+    const r: Reconciler = new Reconciler()
+    var trees: []Node = []
+    var b: int = 0
+    while (b <= frames) { trees.push(screenTree(rows, b)); b = b + 1 }
+    r.renderRoot(trees[0])
+    r.drain()
+    var muts: int = 0
+    var bytes: int = 0
+    const t0: int = time.now()
+    var f: int = 1
+    while (f <= frames) {
+        r.begin()
+        r.renderRoot(trees[f])
+        muts = muts + r.count()
+        bytes = bytes + r.drain().length
+        f = f + 1
+    }
+    const ms: int = time.now() - t0
+    const per: int = frames > 0 ? (ms * 1000) / frames : 0
+    const note: string = string(per) + "us/frame, " + string(muts / frames) + " mutations, " + string(bytes / frames) + "B"
+    return { name: "diff + drain", iterations: frames, ms: ms, perCallNs: -1, note: note }
+}
+
+/**
+ * Run every measurement and return the report. Cheap enough to run on a device from a
+ * screen, and slow enough (a few seconds) that it should not be on an app's hot path.
+ */
+export function runBoundaryBench(): string {
+    var out: string = "chuks-mobile boundary benchmark\n"
+    out = out + "  " + pad("measurement", 22) + pad("n", 9) + pad("total", 8) + pad("per call", 9) + "notes\n"
+    out = out + fmtRow(benchCommandEncode(100000)) + "\n"
+    out = out + fmtRow(benchMount(60)) + "\n"
+    out = out + fmtRow(benchTreeBuild(60, 300)) + "\n"
+    out = out + fmtRow(benchDiff(60, 300)) + "\n"
+    return out
+}

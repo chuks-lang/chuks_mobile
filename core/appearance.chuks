@@ -1,0 +1,24 @@
+// Which appearance the APP is in, on its way to the host.
+//
+// A tiny module for one reason: theme.chuks cannot import ui.chuks. The chain
+// ui -> tw -> theme already exists, so an import back the other way is a cycle. Both
+// sides can depend on this instead, and neither depends on the other.
+//
+// What travels here matters more than it sounds. The app's appearance is NOT the same
+// question as the phone's appearance, and everything adaptive that UIKit draws for us
+// resolves against the phone's unless it is told otherwise. An app switched to its own
+// light theme on a phone left in dark mode was getting the DARK Liquid Glass material:
+// a dark slab sitting in a light app. expo-glass-effect exposes the same idea as its
+// `colorScheme` prop; this carries it for the whole window rather than per view.
+
+var PENDING: string = ""     // "light" | "dark" | "auto", or "" when there is nothing to send
+
+/** Record the app's appearance. Called by theme.chuks whenever the theme changes. */
+export function setAppearance(mode: string): void { PENDING = mode }
+
+/** Take the pending appearance, or "" when there is none. Clears it. */
+export function takeAppearance(): string {
+    const v: string = PENDING
+    PENDING = ""
+    return v
+}

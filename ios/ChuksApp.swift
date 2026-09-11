@@ -19,6 +19,7 @@ import PhotosUI
 import UserNotifications
 import CoreLocation
 import CoreMotion
+import os
 import ImageIO
 
 // Per WWDC "Image and Graphics Best Practices": decode a
@@ -60,13 +61,13 @@ import Security
 import Network
 import CoreBluetooth
 import CoreNFC
-import HealthKit
+import BackgroundTasks
 
 // ===== Feed-grade image cache (shared by both iOS hosts) =====
 // Bounded in-memory LRU (NSCache, auto-evicts under pressure) + an on-disk URLCache
 // (survives relaunch) + off-main-thread decode, so a fast-scrolling image feed neither
-// re-downloads nor janks the main thread decoding. Replaces the unbounded dict + the
-// uncached SwiftUI AsyncImage.
+// re-downloads nor janks the main thread decoding. Replaces the earlier unbounded,
+// uncached image dictionary.
 final class ChuksImageLoader {
     static let shared = ChuksImageLoader()
     private let mem = NSCache<NSString, UIImage>()
@@ -239,8 +240,34 @@ final class NfcReader: NSObject, NFCNDEFReaderSessionDelegate {
     func write(_ text: String, _ token: String) { begin(token, write: text) }
     var available: Bool { NFCNDEFReaderSession.readingAvailable }
 
+    /// Why `readingAvailable` is false, which is not the question it looks like.
+    ///
+    /// iOS reports NFC as unavailable when the app is not signed with
+    /// com.apple.developer.nfc.readersession.formats, exactly as it does on a device
+    /// with no NFC reader at all. So an entitled build on an iPhone 12 Pro and an
+    /// unentitled one give the same answer, and "NFC not available" sends the reader
+    /// looking at the hardware when the problem is the signature.
+    ///
+    /// The build writes what it was actually signed for into Info.plist, so this can
+    /// say which of the two it is instead of guessing.
+    static func unavailableReason() -> String {
+        #if targetEnvironment(simulator)
+        return "NFC is unavailable: no simulator has an NFC reader. Test this on a device."
+        #else
+        let granted = Bundle.main.object(forInfoDictionaryKey: "ChuksGrantedEntitlements") as? [String] ?? []
+        if granted.contains("com.apple.developer.nfc.readersession.formats") {
+            return "NFC is unavailable on this device."
+        }
+        return "NFC is unavailable because this build is not signed for it. iOS reports "
+            + "no NFC reader unless the app carries com.apple.developer.nfc.readersession.formats, "
+            + "even on a device that has one. Declare \"nfc\" under permissions in app.json and "
+            + "sign with a profile from an explicit App ID that has NFC Tag Reading enabled; a "
+            + "wildcard development profile cannot carry that entitlement."
+        #endif
+    }
+
     private func begin(_ token: String, write: String?) {
-        guard NFCNDEFReaderSession.readingAvailable else { onFail?(token, "NFC not available"); return }
+        guard NFCNDEFReaderSession.readingAvailable else { onFail?(token, NfcReader.unavailableReason()); return }
         self.token = token; self.writeText = write; self.didComplete = false
         session = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
         session?.alertMessage = write == nil ? "Hold your iPhone near a tag." : "Hold your iPhone near a tag to write."
@@ -282,6 +309,15 @@ final class NfcReader: NSObject, NFCNDEFReaderSessionDelegate {
     func readerSession(_ s: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
         if didComplete { return }
         didComplete = true
+        // A missing entitlement is the one failure whose system message does not say
+        // what to do about it: CoreNFC reports a security violation, which reads like
+        // a tag problem rather than a signing one. NFC needs
+        // com.apple.developer.nfc.readersession.formats, and that entitlement needs an
+        // explicit App ID, so a build on the usual wildcard profile lands here.
+        if let e = error as? NFCReaderError, e.code == .readerErrorSecurityViolation {
+            onFail?(token, "NFC is not entitled for this build. Declare \"nfc\" under permissions in app.json and sign with a profile from an explicit App ID that has NFC Tag Reading enabled; a wildcard development profile cannot carry the entitlement.")
+            return
+        }
         onFail?(token, error.localizedDescription)
     }
 }
@@ -404,20 +440,126 @@ final class CameraController: NSObject, AVCapturePhotoCaptureDelegate {
 // The normal per-app UIKit host. The Chuks Preview build (-D CHUKS_PREVIEW) supplies its
 // own @main in ChuksPreview.swift, gating CardsVC behind a connect/scan screen.
 #if !CHUKS_PREVIEW
+// Cold start: process launch -> the first frame the user could see. Measured the same
+// way as the RN and Flutter benchmark apps (process start time from the kernel, first
+// display-link callback after launch), so the three numbers are comparable. Benchmark
+// builds only.
+final class ColdStartProbe {
+    static let shared = ColdStartProbe()
+    private var link: CADisplayLink?
+    func begin() {
+        let l = CADisplayLink(target: self, selector: #selector(tick))
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+    private var firstFrameMs: Double = -1
+    // Process start, from the kernel.
+    private func sinceLaunchMs() -> Double {
+        var kp = kinfo_proc(); var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        sysctl(&mib, 4, &kp, &size, nil, 0)
+        let st = kp.kp_proc.p_un.__p_starttime
+        let start = Double(st.tv_sec) + Double(st.tv_usec) / 1_000_000.0
+        var tv = timeval(); gettimeofday(&tv, nil)
+        return ((Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000.0) - start) * 1000.0
+    }
+    // A list that has actually rendered: a scroll view whose content is taller than
+    // itself. "First frame" alone is not comparable across frameworks, because a
+    // framework that renders asynchronously shows an EMPTY first frame and would look
+    // faster while the user is still staring at nothing.
+    private func contentReady(_ v: UIView?) -> Bool {
+        guard let v = v else { return false }
+        if let sv = v as? UIScrollView, sv.contentSize.height > sv.bounds.height, sv.bounds.height > 0 { return true }
+        for sub in v.subviews where contentReady(sub) { return true }
+        return false
+    }
+    @objc private func tick() {
+        if firstFrameMs < 0 { firstFrameMs = sinceLaunchMs() }
+        guard contentReady(UIApplication.shared.windows.first) else { return }   // keep waiting
+        link?.invalidate(); link = nil
+        let msg = String(format: "BENCHMARK CHUKS COLDSTART: first frame %.0f ms | CONTENT %.0f ms | mem %.0f MB",
+                         firstFrameMs, sinceLaunchMs(), physFootprintMB())
+        print(msg); NSLog(msg)
+        if let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            try? (msg + "\n").write(to: dir.appendingPathComponent("coldstart.txt"),
+                                    atomically: true, encoding: .utf8)
+        }
+    }
+}
+
+// ---- println reaches the log ----------------------------------------------
+//
+// The engine's println goes to file descriptor 1. On a device that descriptor leads
+// nowhere a developer can see: not the unified log, not idevicesyslog, not Console. An
+// app can print all day and see nothing, which is worse than having no print statement
+// at all, because it reads as code that never ran.
+//
+// So take the descriptor over. A pipe replaces stdout and stderr and each line is
+// re-emitted through NSLog, which does reach the unified log. This works at the
+// descriptor rather than at any one engine, so it catches the AOT binary, the CMR VM,
+// and anything a native package prints.
+private let chuksLog = OSLog(subsystem: "org.chuks.mobile", category: "Chuks")
+private var chuksStdioPipe: Pipe?
+private var chuksStdioTail = ""
+func chuksPipeStdioToLog() {
+    if chuksStdioPipe != nil { return }
+    let p = Pipe()
+    chuksStdioPipe = p
+    setvbuf(stdout, nil, _IOLBF, 0)          // line buffered, so a print appears when written
+    setvbuf(stderr, nil, _IONBF, 0)
+    let w = p.fileHandleForWriting.fileDescriptor
+    dup2(w, STDOUT_FILENO)
+    dup2(w, STDERR_FILENO)                    // so a runtime panic is not lost either
+    // Whole lines only: a read can split mid-line, and half a message logged twice is
+    // harder to read than the one it came from.
+    p.fileHandleForReading.readabilityHandler = { h in
+        let d = h.availableData
+        if d.isEmpty { return }
+        guard let chunk = String(data: d, encoding: .utf8) else { return }
+        chuksStdioTail += chunk
+        while let nl = chuksStdioTail.firstIndex(of: "\n") {
+            let line = String(chuksStdioTail[chuksStdioTail.startIndex..<nl])
+            chuksStdioTail = String(chuksStdioTail[chuksStdioTail.index(after: nl)...])
+            // os_log, NOT NSLog. NSLog can write to stderr, and stderr is one of the
+            // two descriptors redirected into this very pipe: the first print would
+            // have fed itself back in and looped for ever.
+            if !line.isEmpty { os_log("%{public}@", log: chuksLog, type: .info, line) }
+        }
+    }
+}
+
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     func application(_ a: UIApplication, didFinishLaunchingWithOptions o: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        chuksPipeStdioToLog()
         let w = UIWindow(frame: UIScreen.main.bounds)
         let vc = CardsVC()
         if let url = o?[.url] as? URL { vc.lastURL = url.absoluteString }   // deep link that launched the app
         w.rootViewController = vc
         w.makeKeyAndVisible()
         window = w
+        // Background task handlers MUST be registered before this method returns, and
+        // only for identifiers the plist permits. makeKeyAndVisible above has already
+        // loaded the view and mounted the engine, so by the time a handler fires the
+        // app's module scope has run and its Background.define calls have handed us
+        // their tokens. That is what makes a COLD background wake work: there is no
+        // separate context to boot and no entry point to look up by name.
+        for id in CardsVC.permittedTaskIds {
+            BGTaskScheduler.shared.register(forTaskWithIdentifier: id, using: nil) { task in
+                vc.runBackgroundTask(id, task)
+            }
+        }
+        if BENCHMARK_MODE { ColdStartProbe.shared.begin() }
         return true
     }
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         chuksOrientationMask   // Orientation.lockTo() drives this
+    }
+    // Save on the way out rather than on termination: iOS makes no promise to run
+    // anything when it kills a suspended app, so this is the last reliable moment.
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        (window?.rootViewController as? CardsVC)?.persistState()
     }
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
         (window?.rootViewController as? CardsVC)?.receiveURL(url.absoluteString)   // subsequent deep link
@@ -460,9 +602,29 @@ func weightOf(_ s: String) -> UIFont.Weight {
 }
 
 // hex "5B8CFF" -> UIColor
+/// A view whose backing layer is the gradient itself, so it resizes with the view and
+/// needs no manual frame bookkeeping. It goes in as a SUBVIEW (like the glass material)
+/// rather than as a bare sublayer: a sublayer added to a container draws above the
+/// container's subviews on this host, which hid every child behind the gradient.
+/// Tag on every decorative backing view (an ImageBackground's image, the glass material,
+/// a gradient). They are inserted at the BACK of a container, before its children, so the
+/// child-insert index has to skip them; counting them by tag means a new decoration works
+/// without touching the insert path again.
+let CHUKS_DECOR_TAG = 0x43484B44
+
+final class ChuksGradientView: UIView {
+    override class var layerClass: AnyClass { CAGradientLayer.self }
+    var grad: CAGradientLayer { layer as! CAGradientLayer }
+}
+
 func hexColor(_ h: String) -> UIColor {
     var v: UInt64 = 0
-    Scanner(string: h).scanHexInt64(&v)
+    // Style values carry a bare hex ("2F7A4F"), but an app may write the colour the way a
+    // person writes one. Scanner stops at the '#' and leaves 0, so a hash-prefixed colour
+    // used to come out black rather than wrong-looking; on Android the same value crashed
+    // the process. Both accept both now.
+    let t = h.hasPrefix("#") ? String(h.dropFirst()) : h
+    Scanner(string: t).scanHexInt64(&v)
     return UIColor(red: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
                    blue: CGFloat(v & 0xff) / 255, alpha: 1)
 }
@@ -667,9 +829,38 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     private let onFix: (String) -> Void
     private let onErr: (String) -> Void
     private var pending = false   // waiting on the authorization decision to begin
-    init(once: Bool, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
+    init(once: Bool, background: Bool = false, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
         self.once = once; self.onFix = onFix; self.onErr = onErr
-        super.init(); mgr.delegate = self; mgr.desiredAccuracy = kCLLocationAccuracyBest
+        super.init(); mgr.delegate = self
+        if background {
+            // Keep delivering with the screen off. Two things are required and one is a
+            // deliberate choice:
+            //
+            // allowsBackgroundLocationUpdates needs "location" in UIBackgroundModes, and
+            // iOS CRASHES the app at this line if it is missing rather than returning an
+            // error, so the build writes it from app.json.
+            //
+            // showsBackgroundLocationIndicator puts the blue bar in the status bar. It is
+            // on deliberately: tracking someone with nothing on screen to say so is what
+            // both platforms are built to prevent, and the bar is also the user's way back
+            // into the app.
+            //
+            // WHEN IN USE is enough for this, and is what we ask for. "Always" exists for
+            // geofencing while the app is not running, costs a second and more alarming
+            // prompt, and invites App Store review questions we would have no answer to.
+            mgr.allowsBackgroundLocationUpdates = true
+            mgr.showsBackgroundLocationIndicator = true
+        }
+        // Continuous route tracking (a walk, a run, a ride) needs more than the default
+        // setup: the navigation-grade accuracy class, an activity type so Core Location
+        // tunes its filtering for a person on foot, and auto-pause OFF (iOS otherwise
+        // stops updates when it decides you have stopped, silently losing the middle of
+        // a walk). `once` callers get a single fix, so they keep the cheaper class.
+        mgr.desiredAccuracy = once ? kCLLocationAccuracyBest : kCLLocationAccuracyBestForNavigation
+        if !once {
+            mgr.activityType = .fitness
+            mgr.pausesLocationUpdatesAutomatically = false
+        }
     }
     func start() {
         switch mgr.authorizationStatus {
@@ -689,10 +880,23 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
         }
     }
     func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {
-        guard let l = locs.last else { return }
-        let c = l.coordinate
-        onFix("\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course)")
-        if once { m.stopUpdatingLocation() }
+        // Deliver EVERY fix in the batch. Core Location coalesces updates, so keeping
+        // only `locs.last` threw away route points (and the distance between them).
+        // Two kinds of fix are dropped rather than forwarded:
+        //   - horizontalAccuracy < 0 marks an invalid fix, and its coordinate is meaningless;
+        //   - a fix older than 5s is a CACHED one. The first callback after start is
+        //     usually cached, so forwarding it draws a phantom leg from wherever the
+        //     phone last had a fix, which can be streets (or cities) away.
+        let now = Date()
+        var delivered = false
+        for l in locs {
+            if l.horizontalAccuracy < 0 { continue }
+            if now.timeIntervalSince(l.timestamp) > 5 { continue }
+            let c = l.coordinate
+            onFix("\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course)")
+            delivered = true
+        }
+        if once && delivered { m.stopUpdatingLocation() }
     }
     func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
         if (e as? CLError)?.code == .locationUnknown { return }  // transient: no fix yet, keep waiting
@@ -747,11 +951,6 @@ func keychainDelete(_ key: String) {
     SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key] as CFDictionary)
 }
 
-// Decode a base64 string to UTF-8 (for capability args carrying arbitrary text).
-func b64str(_ s: String) -> String {
-    Data(base64Encoded: s).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-}
-
 // Show notifications even while the app is foregrounded (iOS otherwise suppresses
 // the banner for the active app).
 final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
@@ -768,6 +967,38 @@ let notifDelegate = NotifDelegate()
 // @convention(c): no captures, so it reaches the live controller through a file
 // global and hops to the main thread. Coalesced: a burst of messages schedules at
 // most one pending main-thread pump.
+// Text arriving on the P|/V| channels, restored.
+//
+// The engine escapes a backslash and the two line endings before putting text into a
+// newline-delimited stream, because a newline inside a label used to end the op early
+// and leave the rest standing as a line the host would then RUN. See escText in
+// core/ui.chuks. One left-to-right scan, because search-and-replace would corrupt a
+// label ending in a real backslash.
+func chuksUnescapeText(_ s: String) -> String {
+    if !s.contains("\\") { return s }
+    var out = ""
+    var i = s.startIndex
+    while i < s.endIndex {
+        let c = s[i]
+        if c == "\\" {
+            let n = s.index(after: i)
+            if n < s.endIndex {
+                switch s[n] {
+                case "\\": out.append("\\")
+                case "n": out.append("\n")
+                case "r": out.append("\r")
+                default: out.append(s[n])
+                }
+                i = s.index(after: n)
+                continue
+            }
+        }
+        out.append(c)
+        i = s.index(after: i)
+    }
+    return out
+}
+
 private weak var gChuksWakeVC: CardsVC?
 private let gWakeLock = NSLock()
 private var gWakeScheduled = false
@@ -783,7 +1014,7 @@ func chuksWakeThunk() {
     }
 }
 
-final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate {
+final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost, ChuksViewHost {
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
@@ -794,6 +1025,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // of the whole tree. `needsFrame` is a belt-and-suspenders set of just-created views that
     // must get their frame at least once even if Yoga's flag says unchanged.
     var needsFrame = Set<String>()
+    /// Capabilities that installed packages provide, consulted for any command the
+    /// framework's own switch does not claim. Built lazily, so an app with no native
+    /// package never constructs it.
+    lazy var packageModules = ChuksModuleRegistry(host: self)
+    /// Nodes already reported as non-finite, so the warning fires once, not every tick.
+    var warnedNonFinite = Set<String>()
     // Layout timing (env CHUKS_LAYOUT_TIMING=1): logs Yoga compute vs frame-apply µs per
     // relayout, to decide whether moving YGNodeCalculateLayout off the UI thread is warranted.
     let layoutTiming = ProcessInfo.processInfo.environment["CHUKS_LAYOUT_TIMING"] != nil
@@ -810,6 +1047,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
+    var scrollContentIds: [String: String] = [:]      // scroll node id -> its content node id
+    var horizScrollIds = Set<String>()                // which of those scroll sideways
     var scrollId = ""
     var listHoriz = false            // the tracked list scrolls horizontally (report x, not y)
     var stickBottomOn = false        // Scroll stickBottom: keep pinned to newest (chat)
@@ -829,6 +1068,34 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var videoObs: [ObjectIdentifier: NSObjectProtocol] = [:]  // player -> loop observer (persists across reuse)
     var videoNoLoop = Set<ObjectIdentifier>()         // players whose Video set loop=false (checked in the end observer)
     let videoPoolCap = 16                             // bound idle players kept warm
+    // Adaptive viewport throttle. A viewport push is a SYNCHRONOUS engine round trip.
+    // Native code answers in microseconds, so pushing every scroll frame is free; the
+    // on-device dev runtime interprets, costing milliseconds, and pushing every frame
+    // there leaves the engine's window trailing the real offset far enough that every
+    // mounted row sits off-screen and the list renders BLANK until the backlog drains
+    // (seconds, on a fast fling). So: measure the round trip and, when it is slow,
+    // push at most once per ~3x its cost, with a final push once scrolling settles.
+    var vpCost: CFTimeInterval = 0                    // smoothed cost of one push
+    var vpLastPush: CFTimeInterval = 0
+    var vpSettleScheduled = false
+    var vsyncLink: CADisplayLink?
+    var vpDirty = false
+    var vsyncParity = false
+    // Where a scroll frame's time actually goes, so an over-budget frame can be
+    // attributed instead of guessed: engine+apply on frames that produced mutations,
+    // Yoga layout + frame copy on those same frames, and the engine call alone on
+    // frames that produced nothing (the common case between window shifts).
+    var stageMaxEngine: CFTimeInterval = 0
+    var stageMaxLayout: CFTimeInterval = 0
+    var stageMaxIdle: CFTimeInterval = 0
+    var stageFrames = 0
+    var stageMaxCall: CFTimeInterval = 0     // the engine round trip alone
+    var stageMaxApply: CFTimeInterval = 0    // applying the mutation stream to views
+    var stageMaxBytes = 0                    // largest mutation stream in a frame
+    var stageMaxTickWork: CFTimeInterval = 0 // worst synchronous work inside one tick
+    var stageWorstInterval: CFTimeInterval = 0
+    var stageWorkOnWorst: CFTimeInterval = 0 // our work on the frame that took longest
+    var stageMaxCommit: CFTimeInterval = 0   // commit + render after our work returned
     var inViewportSync = false                        // reentrancy guard: relayout() sets contentSize, which can
                                                       // clamp the offset and re-fire scrollViewDidScroll synchronously.
                                                       // Without this the two call each other until the stack overflows.
@@ -844,7 +1111,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var perfMaxFrame: Double = 0, perfSumTime: Double = 0
     var perfLog: [String] = []                        // every velocity's result line, for on-screen + file readout
     // Velocity sweep: ramp the fling speed to find the breaking point.
-    let perfVels: [CGFloat] = [120, 180, 240, 300, 360, 480]
+    // BENCH_LONG=1 repeats the sweep so a memory trend has room to show whether it
+    // plateaus (heap sizing) or climbs without bound (a leak).
+    let perfVels: [CGFloat] = ProcessInfo.processInfo.environment["BENCH_LONG"] == "1"
+        ? Array(repeating: [120, 180, 240, 300, 360, 480], count: 4).flatMap { $0 }
+        : [120, 180, 240, 300, 360, 480]
     var perfVelIdx = 0
     var perfDir: CGFloat = 1
     let perfPhaseFrames = 240   // ~4s per velocity phase
@@ -880,6 +1151,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     static var imageCache: [String: UIImage] = [:]                       // URL -> decoded image (shared)
     var bgImageViews: [String: UIImageView] = [:]                        // ImageBackground id -> its backing image view
     var glassViews: [String: UIVisualEffectView] = [:]                   // id -> Liquid Glass backing view
+    var glassPending: Set<String> = []                                   // glass never built yet (no frame at style time)
+    var glassBuiltFor: [String: UIUserInterfaceStyle] = [:]              // the appearance each material was built against
+    var glassFallbackColor: [String: UIColor] = [:]                      // the `bg` a glass surface falls back to
+    var themeFadeView: UIView?                                           // frozen frame of the old theme, faded out
+    var gradLayers: [String: ChuksGradientView] = [:]                    // id -> linear-gradient background view
+    var blurViews: [String: UIVisualEffectView] = [:]                    // id -> backdrop-blur material view
+    var blurSpec: [String: (intensity: Int, tint: String)] = [:]         // last applied blur, to rebuild on either part changing
+    var gradSpec: [String: (colors: String, angle: Int, stops: String)] = [:]   // last applied gradient, to rebuild on any part changing
     var refreshActions: [UIRefreshControl: String] = [:]                 // pull-to-refresh control -> onRefresh action
     var alertIds: Set<String> = []                                       // Alert node ids (native alerts)
     var alertData: [String: [String]] = [:]                              // id -> [title, message, confirm, cancel]
@@ -954,6 +1233,84 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func eTick() -> String? {
         if DEV_MODE { return devHTTP("/tick", "") }
         _ = chuks_tick(); return drainStr()
+    }
+    // System back (the left-edge swipe here; Android's button/gesture on that host).
+    // Returns true when the app consumed it.
+    // Tell the engine a running task is out of time, so Background.expired() flips and
+    // a handler can checkpoint instead of losing the batch.
+    // ---- State restoration --------------------------------------------------
+    //
+    // The engine already serializes the route stack AND every useState cell, because
+    // hot reload needs exactly that. So restoring puts the user back on the screen they
+    // left WITH what they had typed and where they had scrolled, not merely on the right
+    // screen. All that was missing was somewhere to keep it between launches.
+    var stateFile: URL { appDir().appendingPathComponent("chuks-state.json") }
+    // Written at launch and removed on a clean suspend. Finding it at launch means the
+    // last run ended without suspending, which usually means it crashed, and restoring
+    // straight back onto a screen that crashes can trap someone in a loop. React
+    // Navigation's docs warn about exactly this.
+    var runMarkerFile: URL { appDir().appendingPathComponent("chuks-running") }
+
+    func eSaveState() -> String? {
+        if DEV_MODE { return nil }
+        return String(cString: chuks_saveState())
+    }
+    func eLoadState(_ data: String) {
+        if DEV_MODE { return }
+        _ = data.withCString { chuks_loadState(UnsafeMutablePointer(mutating: $0)) }
+    }
+
+    /// Persist on the way out. Called when the app leaves the screen, not on termination:
+    /// iOS does not promise to run anything when it kills a suspended app.
+    func persistState() {
+        guard restoreWindow > 0, let s = eSaveState(), !s.isEmpty else { return }
+        let doc = ["at": Int(Date().timeIntervalSince1970), "state": s] as [String: Any]
+        if let data = try? JSONSerialization.data(withJSONObject: doc) {
+            try? data.write(to: stateFile)
+        }
+        try? FileManager.default.removeItem(at: runMarkerFile)   // we suspended cleanly
+    }
+
+    /// Decide whether to restore, and do it. Called once, before the first mount.
+    ///
+    /// Four things have to be true, and each of them is a real failure if ignored:
+    /// restoration is enabled; the app was not opened by a deep link (a link is a
+    /// deliberate destination and must beat where the user happened to be); the last run
+    /// suspended cleanly; and the state is recent enough that going back there is
+    /// helpful rather than confusing.
+    func restoreStateIfAppropriate() {
+        let crashed = FileManager.default.fileExists(atPath: runMarkerFile.path)
+        try? "1".write(to: runMarkerFile, atomically: true, encoding: .utf8)   // arm for this run
+
+        guard restoreWindow > 0 else { return }
+        guard lastURL == nil else { return }          // a deep link wins
+        if crashed {
+            try? FileManager.default.removeItem(at: stateFile)
+            NSLog("chuks-state: not restoring, the previous run did not suspend cleanly")
+            return
+        }
+        guard let data = try? Data(contentsOf: stateFile),
+              let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let at = doc["at"] as? Int, let saved = doc["state"] as? String else { return }
+        let age = Int(Date().timeIntervalSince1970) - at
+        if age > restoreWindow {
+            try? FileManager.default.removeItem(at: stateFile)
+            return                                     // stale: start fresh
+        }
+        eLoadState(saved)
+    }
+
+    func eDispatchTaskExpired() -> String? {
+        if DEV_MODE { return nil }
+        _ = "__bgexpire__".withCString { chuks_dispatch(UnsafeMutablePointer(mutating: $0)) }
+        return drainStr()
+    }
+    func eBack() -> Bool {
+        if DEV_MODE { return (devHTTP("/back", "") ?? "").isEmpty == false }
+        let handled = chuks_back() > 0
+        let s = drainStr()               // drainStr returns "" when there is nothing
+        if !s.isEmpty { apply(s); relayout() }
+        return handled
     }
     func eViewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String? {
         if DEV_MODE { return devHTTP("/viewport", "\(top) \(h) \(w)") }
@@ -1031,6 +1388,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             name: UIResponder.keyboardWillShowNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(kbHide(_:)),
             name: UIResponder.keyboardWillHideNotification, object: nil)
+        // Moving focus between fields with the keyboard already up changes its frame
+        // without a new Show, so re-evaluate the overlap for the newly focused field.
+        NotificationCenter.default.addObserver(self, selector: #selector(kbShow(_:)),
+            name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
 
         // Tap anywhere outside a text field to dismiss the keyboard. cancelsTouchesInView
         // = false + simultaneous recognition so it never swallows a node's onPress tap
@@ -1044,10 +1405,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         eSetup()
         ePlatform()                                                 // report platform + device info
         eColorScheme(traitCollection.userInterfaceStyle == .dark)   // open in the OS appearance
+        // Report the safe-area insets BEFORE the first mount. They are normally pushed
+        // from viewDidLayoutSubviews, which runs AFTER this, so the first tree was built
+        // with zero insets and drew under the status bar until the next tick corrected
+        // it. This view is not in a window yet, so take them from the scene's window —
+        // the same reason the hot-reload path re-sends them to a fresh VM.
+        if let w = UIApplication.shared.connectedScenes
+                     .compactMap({ ($0 as? UIWindowScene)?.windows.first }).first {
+            let ins = w.safeAreaInsets
+            if ins.top > 0 || ins.bottom > 0 { lastInsets = ins; eInsets(ins) }
+        }
         // Require a non-empty mount before marking connected: a momentarily unreachable
         // dev server returns nil, but a race can also return an empty body — either way
         // leaving connected=false lets step() keep retrying instead of stranding the app
         // on a blank screen with no recovery (AOT is in-process, so it never hits this).
+        // BEFORE the first mount: loadState replaces the route stack and the useState
+        // cells, so it has to happen while there is still nothing on screen. Restoring
+        // afterwards would mean building the wrong screen and then throwing it away.
+        restoreStateIfAppropriate()
         #if CMR
         // A boot that failed to compile / crashed has no VM to mount: show the dev
         // overlay with the reason and skip eMount (mounting a dead VM strands the app).
@@ -1061,10 +1436,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
         // Register the host wake: a spawned Chuks task that posts to the render thread
         // (dispatchAsync) fires this so we tick immediately instead of on the heartbeat.
+        installBackSwipe()
         gChuksWakeVC = self
         chuks_set_wake(unsafeBitCast(chuksWakeThunk as (@convention(c) () -> Void), to: UnsafeMutableRawPointer.self))
 
-        timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.step() }
+        if !(BENCHMARK_MODE && ProcessInfo.processInfo.environment["NO_HEARTBEAT"] == "1") {
+            timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.step() }
+        }
         // Auto-start the perf harness after a warmup (benchmark builds only — otherwise
         // it would auto-scroll the on-screen Scroll, e.g. the Components gallery).
         if BENCHMARK_MODE {
@@ -1120,19 +1498,94 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let top = Int32(max(0, listHoriz ? sc.contentOffset.x : sc.contentOffset.y))
         let vh = Int32(sc.bounds.height); let vw = Int32(sc.bounds.width)
         if vh <= 0 || vw <= 0 { return false }
+        let _tc0 = BENCHMARK_MODE ? CACurrentMediaTime() : 0
         guard let s = eViewport(top, vh, vw) else { connected = false; return false }
-        if !s.isEmpty { apply(s); return true }
+        let _tc1 = BENCHMARK_MODE ? CACurrentMediaTime() : 0
+        if BENCHMARK_MODE, _tc1 - _tc0 > stageMaxCall { stageMaxCall = _tc1 - _tc0 }
+        if !s.isEmpty {
+            apply(s)
+            if BENCHMARK_MODE {
+                let a = CACurrentMediaTime() - _tc1
+                if a > stageMaxApply { stageMaxApply = a }
+                if s.utf8.count > stageMaxBytes { stageMaxBytes = s.utf8.count }
+            }
+            return true
+        }
         return false
+    }
+
+    // The scroll took the touch: cancel any press in flight so the row un-dims and its
+    // onPress does NOT fire, exactly like a touchable whose touch the scroll steals.
+    // (RCTSurfaceTouchHandler does this with setEnabled:NO/YES; same trick here.)
+    func scrollViewWillBeginDragging(_ sv: UIScrollView) {
+        for (g, entry) in pressGestures where g.state == .began || g.state == .changed {
+            if let v = g.view { UIView.animate(withDuration: 0.09) { v.alpha = 1.0 } }
+            pressLongTimers[ObjectIdentifier(g)]?.invalidate()
+            pressLongTimers[ObjectIdentifier(g)] = nil
+            if let pout = pressOutActions[entry.2] { fire(pout) }
+            g.isEnabled = false
+            g.isEnabled = true
+        }
+    }
+
+    // Per-frame viewport work runs on our OWN display link, not inside the scroll
+    // callback. scrollViewDidScroll fires from within UIScrollView's layout pass, which
+    // is already late in the frame, and it can fire more than once per frame; doing the
+    // engine + layout there left too little of the 16.7ms budget for the commit, so a
+    // frame occasionally missed vsync and landed a whole interval late. Marking the
+    // viewport dirty and servicing it once per vsync does the same work at a predictable
+    // point in the frame.
+    func startVsyncPump() {
+        if vsyncLink != nil { return }
+        let dl = CADisplayLink(target: self, selector: #selector(vsyncTick))
+        dl.add(to: .main, forMode: .common)
+        vsyncLink = dl
+    }
+    @objc func vsyncTick() {
+        // TEMPORARY EXPERIMENT: halve the per-frame main-thread load to test whether the
+        // dropped frames are a throughput problem. If jank collapses, moving the engine
+        // off the main thread is the fix; if it does not, threading would buy nothing.
+        if BENCHMARK_MODE && ProcessInfo.processInfo.environment["HALF_RATE"] == "1" {
+            vsyncParity = !vsyncParity
+            if vsyncParity { return }
+        }
+        guard vpDirty else { return }
+        vpDirty = false
+        serviceViewport()
+    }
+    // The actual work, shared by the pump and by any caller that needs it synchronously.
+    func serviceViewport() {
+        if inViewportSync { return }
+        inViewportSync = true
+        defer { inViewportSync = false }
+        let t0 = CACurrentMediaTime()
+        if BENCHMARK_MODE {
+            let produced = pushViewport()
+            let tApplied = CACurrentMediaTime()
+            if produced { relayout() }
+            let tLaid = CACurrentMediaTime()
+            if produced {
+                let a = tApplied - t0, l = tLaid - tApplied
+                if a > stageMaxEngine { stageMaxEngine = a }
+                if l > stageMaxLayout { stageMaxLayout = l }
+                stageFrames += 1
+            } else if tApplied - t0 > stageMaxIdle {
+                stageMaxIdle = tApplied - t0
+            }
+        } else {
+            if pushViewport() { relayout() }
+        }
+        let spent = CACurrentMediaTime() - t0
+        vpCost = vpCost == 0 ? spent : (vpCost * 0.7 + spent * 0.3)
+        vpLastPush = CACurrentMediaTime()
     }
 
     func scrollViewDidScroll(_ sv: UIScrollView) {
         // relayout() below can nudge contentSize/offset and re-enter this delegate synchronously.
         // Skip the re-entrant call: the outer relayout already positioned for the current offset,
         // and the next real scroll frame picks up any newer offset. Prevents unbounded recursion.
-        if inViewportSync { return }
-        inViewportSync = true
-        defer { inViewportSync = false }
-        if pushViewport() { relayout() }
+        vpDirty = true            // serviced on the next vsync by vsyncTick()
+        startVsyncPump()
         if !perfActive { headerText("scroll \(Int(sv.contentOffset.y))pt") }
         // Scroll onScroll: report the offset along the scrolling axis (points) when it changes.
         if let tag = scrollOnScroll[sv] {
@@ -1141,6 +1594,27 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if scrollLastPos[sv] != pts {
                 scrollLastPos[sv] = pts
                 if let s = eInput(tag, String(pts)) { apply(s); relayout() } else { connected = false }
+            }
+        }
+    }
+
+    // A throttled-away scroll frame must not be the last word: once the offset stops
+    // changing, push it for real so the window matches where the list actually is.
+    func scheduleViewportSettle(_ sv: UIScrollView) {
+        if vpSettleScheduled { return }
+        vpSettleScheduled = true
+        let at = sv.contentOffset
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak sv] in
+            guard let self = self, let sv = sv else { return }
+            self.vpSettleScheduled = false
+            if sv.contentOffset == at {          // settled: this is the offset to render
+                if self.inViewportSync { return }
+                self.inViewportSync = true
+                defer { self.inViewportSync = false }
+                if self.pushViewport() { self.relayout() }
+                self.vpLastPush = CACurrentMediaTime()
+            } else {
+                self.scheduleViewportSettle(sv)  // still moving: check again
             }
         }
     }
@@ -1169,9 +1643,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     func resetPhase() {
         perfFrames = 0; perfJanky = 0; perfMaxFrame = 0; perfSumTime = 0; perfMaxPlayers = 0
+        stageMaxEngine = 0; stageMaxLayout = 0; stageMaxIdle = 0; stageFrames = 0
+        stageMaxCall = 0; stageMaxApply = 0; stageMaxBytes = 0
+        stageMaxTickWork = 0; stageWorstInterval = 0; stageWorkOnWorst = 0; stageMaxCommit = 0
     }
     @objc func perfTick() {
         let now = CACurrentMediaTime(), dt = now - perfLastTs; perfLastTs = now
+        let _tickStart = now
         // Unmeasured warmup: prime video players + reach steady state before sampling.
         if perfWarmup > 0 {
             perfWarmup -= 1
@@ -1199,22 +1677,60 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if y >= maxY { y = maxY; perfDir = -1 }
         if y <= 0 { y = 0; perfDir = 1 }
         sc.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+        let ourWork = CACurrentMediaTime() - _tickStart
+        if ourWork > stageMaxTickWork { stageMaxTickWork = ourWork }
+        if dt > stageWorstInterval { stageWorstInterval = dt; stageWorkOnWorst = ourWork }
+        // Everything AFTER we return: Core Animation's commit, UIKit layout/display, and
+        // the render pass. The completion block fires when this frame's transaction is
+        // done, so the delta is the part of the frame no reconciler change can touch.
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self = self else { return }
+            let after = CACurrentMediaTime() - _tickStart - ourWork
+            if after > self.stageMaxCommit { self.stageMaxCommit = after }
+        }
         if perfFrames >= perfPhaseFrames { logPhase(vel) }
     }
     func logPhase(_ vel: CGFloat) {
         let n = max(1, perfFrames - 1)
         let avg = Double(n) / max(0.0001, perfSumTime)
-        let msg = String(format: "BENCHMARK CHUKS vel=%d: avg %.0f fps | worst frame %.1f ms | janky(<50fps) %d/%d | %d video players peak | mem %.0f MB",
-                         Int(vel), avg, perfMaxFrame * 1000, perfJanky, n, perfMaxPlayers, physFootprintMB())
+        // Census of the per-node host tables alongside memory: cells are recycled, so
+        // these must stay FLAT. If memory climbs while they stay flat, the growth is on
+        // the engine side of the process, not in the host's bookkeeping.
+        let msg = String(format: "BENCHMARK CHUKS vel=%d: avg %.0f fps | worst frame %.1f ms | janky(<50fps) %d/%d | %d video players peak | mem %.0f MB | views %d ynodes %d taps %d press %d",
+                         Int(vel), avg, perfMaxFrame * 1000, perfJanky, n, perfMaxPlayers, physFootprintMB(),
+                         views.count, ynodes.count, taps.count, pressGestures.count)
+            + String(format: " | stages: engine %.1f ms, apply %.1f ms, layout %.1f ms, idle %.1f ms, bytes %d, mutating %d",
+                     stageMaxCall * 1000, stageMaxApply * 1000, stageMaxLayout * 1000, stageMaxIdle * 1000,
+                     stageMaxBytes, stageFrames)
+            + String(format: " | worst frame %.1f ms of which OUR work %.1f ms; worst work %.1f ms; worst commit+render %.1f ms",
+                     stageWorstInterval * 1000, stageWorkOnWorst * 1000, stageMaxTickWork * 1000, stageMaxCommit * 1000)
         print(msg); NSLog(msg); perfLog.append(msg)
+        postBench(msg)   // same collector the RN/Flutter builds report to
         header.numberOfLines = 0; header.text = perfLog.joined(separator: "\n")   // keep all lines on screen
         perfVelIdx += 1
         if perfVelIdx >= perfVels.count { stopPerf(); return }
         resetPhase()
     }
+    // Report one benchmark line to the collector on the Mac. A release build on a
+    // physical device has no reachable console, and every runtime under comparison
+    // needs the SAME reporting path or the comparison measures the reporting.
+    func postBench(_ line: String) {
+        guard let url = URL(string: "http://192.168.1.195:4100/") else { return }
+        var r = URLRequest(url: url); r.httpMethod = "POST"; r.httpBody = line.data(using: .utf8)
+        URLSession.shared.dataTask(with: r).resume()
+    }
+
     func stopPerf() {
         perfActive = false; displayLink?.invalidate(); displayLink = nil
         print("BENCHMARK CHUKS: sweep done")
+        // Settled reading: idle (no scrolling, no rendering) then measure again. A heap
+        // that grew only to hold churn gives most of it back here; a leak does not.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) { [weak self] in
+            guard let self = self else { return }
+            let m = String(format: "BENCHMARK CHUKS settled(+15s idle): mem %.0f MB | views %d ynodes %d",
+                           physFootprintMB(), self.views.count, self.ynodes.count)
+            print(m); NSLog(m)
+        }
         // Persist to the app's Documents so the results can be pulled off a real device
         // (headless syslog capture is unreliable on a locked/untrusted phone).
         let out = (perfLog + ["sweep done"]).joined(separator: "\n") + "\n"
@@ -1408,6 +1924,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         cmrLoadState(cmrPendingState.isEmpty ? saved : cmrPendingState)   // restore before mount
         cmrPendingState = ""
         dismissDevError()
+        // A hot reload swaps in a FRESH VM whose safe-area insets are zero. The change-guard
+        // in viewDidLayoutSubviews (ins == lastInsets) would skip re-sending them, so the new
+        // VM would lay out edge-to-edge (content under the status bar, tab bar under the home
+        // indicator). Force-resend the current insets to the fresh VM before mounting.
+        let ins = view.safeAreaInsets; lastInsets = ins; eInsets(ins)
         if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
     }
     var cmrPendingState = ""   // app state kept across a failed reload, restored on the fix
@@ -1590,7 +2111,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
         if let line = overlay as? MKPolyline {
             let r = MKPolylineRenderer(polyline: line)
-            r.strokeColor = UIColor(red: 0.18, green: 0.83, blue: 0.55, alpha: 1)   // walkSocials green
+            r.strokeColor = UIColor(red: 0.18, green: 0.83, blue: 0.55, alpha: 1)   // route stroke: green
             r.lineWidth = 4
             r.lineCap = .round
             return r
@@ -1609,6 +2130,185 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let cur = tf.text ?? ""
         let next = (cur as NSString).replacingCharacters(in: range, with: string)
         return next.count <= max
+    }
+
+    // The iOS way back: a swipe from the left edge. This fires the same event Android's
+    // system back does, so an app writes ONE handler. What it does not give you is the
+    // interactive drag with parallax and cancel-on-release; that comes from a real
+    // UINavigationController driving its own interactivePopGestureRecognizer (which is
+    // how SwiftUI and react-native-screens get it) and is a separate piece of work.
+    // Ask UIKit to let OUR left-edge gesture win over the system's edge handling. Without
+    // this the first touch of an edge swipe is withheld from the app (the event log shows
+    // systemGestureStateChange with shouldSend: 0) and the recognizer never starts.
+    override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .left }
+
+    func installBackSwipe() {
+        let g = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleBackSwipe(_:)))
+        g.edges = .left
+        g.delegate = self
+        view.addGestureRecognizer(g)
+    }
+    // An INTERACTIVE pop: the top screen follows the finger, the one beneath it slides
+    // in behind, and letting go part-way puts it back. The engine mounts the top two
+    // routes as full-screen sibling containers under "app" (see NavStack.render), which
+    // is what makes this possible at all -- with only the top screen mounted there is
+    // nothing to reveal, and the best you can do is fire back on release.
+    //
+    // The two containers are simply the last two subviews of the app root, so this
+    // needs no extra protocol: the stack's shape is already in the view tree. When
+    // there are not two (the root screen), it falls back to the release-threshold
+    // behaviour so an app that handles back itself still gets the gesture.
+    var swipeTop: UIView?
+    var swipeBelow: UIView?
+    // The container the gesture drags in. "" = the app stack's root ("app"); a tab that
+    // owns its history announces its own container, so the pair that moves is the pair
+    // the user can see rather than the shell sitting behind it.
+    var stackHostId: String = ""
+    // How recently the app must have been backgrounded for its state to be restored, in
+    // seconds. 0 disables restoration. Read from app.json at build time.
+    var restoreWindow: Int {
+        (Bundle.main.object(forInfoDictionaryKey: "ChuksStateRestoreWindow") as? Int) ?? 1800
+    }
+
+    // ---- Background tasks ---------------------------------------------------
+    //
+    // The engine hands us a token per defined task (bg.define). When the OS wakes us we
+    // fire that token, then PUMP the engine until the handler reports back, because a
+    // handler that awaits produces its result on a later turn and the display link that
+    // normally drives those turns is stopped while we are in the background.
+    var bgTokens: [String: String] = [:]        // task name -> engine token
+    var bgRunning: [String: BGTask] = [:]       // name -> the OS task awaiting completion
+    var bgPumpTimer: Timer?
+    // Identifiers the build put in BGTaskSchedulerPermittedIdentifiers. BGTaskScheduler
+    // rejects anything not listed there, so this is the authoritative set.
+    static var permittedTaskIds: [String] {
+        (Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String]) ?? []
+    }
+
+    /// The OS woke us for `name`. Fire the Chuks handler and keep the engine turning
+    /// until it answers, or until the OS takes the time back.
+    func runBackgroundTask(_ name: String, _ task: BGTask) {
+        bgRunning[name] = task
+        // The OS can pull the plug at any point. Tell the engine so a handler can
+        // checkpoint (Background.expired()) rather than losing a half-done batch.
+        task.expirationHandler = { [weak self] in
+            guard let self = self else { return }
+            _ = self.eDispatchTaskExpired()
+            self.finishBackgroundTask(name, success: false)
+        }
+        guard let token = bgTokens[name] else {
+            // Mounted but the app never defined this task: nothing to run, and saying so
+            // is better than leaving the OS waiting for a completion that never comes.
+            task.setTaskCompleted(success: false)
+            bgRunning[name] = nil
+            return
+        }
+        _ = eResolve(token, name)
+        startBackgroundPump()
+    }
+
+    /// Turn the engine on a timer while a task runs. Cheap, and only alive for the
+    /// seconds the OS has granted us.
+    func startBackgroundPump() {
+        if bgPumpTimer != nil { return }
+        bgPumpTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.bgRunning.isEmpty { self.stopBackgroundPump(); return }
+            if let s = self.eTick(), !s.isEmpty { self.apply(s) }
+        }
+    }
+    func stopBackgroundPump() { bgPumpTimer?.invalidate(); bgPumpTimer = nil }
+
+    /// The engine reported a result (bg.result), or the OS expired us.
+    func finishBackgroundTask(_ name: String, success: Bool) {
+        guard let task = bgRunning[name] else { return }
+        bgRunning[name] = nil
+        task.setTaskCompleted(success: success)
+        if bgRunning.isEmpty { stopBackgroundPump() }
+    }
+
+    /// Schedule one request. `kind` is "refresh" or "processing"; iOS honours constraints
+    /// only on the latter, which is why the two shapes stay distinct all the way down.
+    func scheduleBackgroundTask(_ name: String, _ delay: Int, _ kind: String, _ constraints: [String: String]) {
+        guard Self.permittedTaskIds.contains(name) else {
+            NSLog("chuks-bg: \"%@\" is not in BGTaskSchedulerPermittedIdentifiers; add it to backgroundTasks in app.json", name)
+            return
+        }
+        let begin = Date(timeIntervalSinceNow: TimeInterval(max(0, delay)))
+        let request: BGTaskRequest
+        if kind == "processing" {
+            let r = BGProcessingTaskRequest(identifier: name)
+            // The only two constraints iOS can enforce. Everything else the app asked for
+            // is reported at build time rather than silently dropped here.
+            r.requiresNetworkConnectivity = (constraints["network"] ?? "none") != "none"
+            r.requiresExternalPower = constraints["charging"] == "1"
+            request = r
+        } else {
+            request = BGAppRefreshTaskRequest(identifier: name)
+        }
+        request.earliestBeginDate = begin
+        do { try BGTaskScheduler.shared.submit(request) }
+        catch {
+            // Code 1 is "unavailable", and it has two causes that need different answers.
+            // The raw error says neither, and a developer seeing it on a simulator would
+            // reasonably conclude their code is broken.
+            let ns = error as NSError
+            if ns.domain == "BGTaskSchedulerErrorDomain" && ns.code == 1 {
+                #if targetEnvironment(simulator)
+                NSLog("chuks-bg: \"%@\" was not scheduled: BGTaskScheduler does not run on the simulator. Test background tasks on a device.", name)
+                #else
+                NSLog("chuks-bg: \"%@\" was not scheduled: background activity is switched off for this app (Settings > General > Background App Refresh). Background.status reports this as \"restricted\".", name)
+                #endif
+            } else {
+                NSLog("chuks-bg: could not schedule %@: %@", name, String(describing: error))
+            }
+        }
+    }
+    let swipeParallax: CGFloat = 0.28      // how far the revealed screen sits left, as a fraction of width
+    @objc func handleBackSwipe(_ g: UIScreenEdgePanGestureRecognizer) {
+        let w = max(1, view.bounds.width)
+        switch g.state {
+        case .began:
+            let host = stackHostId.isEmpty ? views["app"] : (views[stackHostId] ?? views["app"])
+            let kids = host?.subviews ?? []
+            guard kids.count >= 2 else { swipeTop = nil; swipeBelow = nil; return }
+            swipeTop = kids[kids.count - 1]
+            swipeBelow = kids[kids.count - 2]
+            // Park the revealed screen at its start offset. It is fully covered right
+            // now, so this never shows as a jump.
+            swipeBelow?.transform = CGAffineTransform(translationX: -w * swipeParallax, y: 0)
+        case .changed:
+            guard let top = swipeTop, let below = swipeBelow else { return }
+            let t = min(w, max(0, g.translation(in: g.view).x))
+            top.transform = CGAffineTransform(translationX: t, y: 0)
+            below.transform = CGAffineTransform(translationX: -w * swipeParallax * (1 - t / w), y: 0)
+        case .ended, .cancelled, .failed:
+            guard let top = swipeTop, let below = swipeBelow else {
+                if g.state == .ended {          // no stack to pop: the app may still handle back
+                    let dx = g.translation(in: g.view).x, vx = g.velocity(in: g.view).x
+                    if dx > 60 || (dx > 20 && vx > 300) { _ = eBack() }
+                }
+                return
+            }
+            swipeTop = nil; swipeBelow = nil
+            let t = max(0, g.translation(in: g.view).x), vx = g.velocity(in: g.view).x
+            // Committed: past the half-way-ish mark, or short but thrown (the thresholds
+            // UIKit uses for its own pop feel right here too).
+            let commit = (g.state == .ended) && (t > w * 0.4 || (t > 20 && vx > 300))
+            let rest = max(0.12, min(0.35, Double((w - t) / max(300, vx))))   // shorter throw, shorter animation
+            UIView.animate(withDuration: rest, delay: 0, options: [.curveEaseOut], animations: {
+                top.transform = CGAffineTransform(translationX: commit ? w : 0, y: 0)
+                below.transform = commit ? .identity : CGAffineTransform(translationX: -w * self.swipeParallax, y: 0)
+            }, completion: { _ in
+                // Whatever happened, both screens go back to untransformed: on a commit
+                // the top one is about to be torn down and the revealed one becomes the
+                // top; on a cancel the revealed one is covered again.
+                top.transform = .identity
+                below.transform = .identity
+                if commit { _ = self.eBack() }
+            })
+        default: break
+        }
     }
 
     // Dismiss the keyboard when tapping outside any field.
@@ -1632,23 +2332,62 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return (g is UIPanGestureRecognizer) && (other.view is UIScrollView)
     }
 
-    // Keyboard avoidance (adjust-resize): shrink the app's usable height by the keyboard
-    // height and relayout, so bottom-anchored content (a chat input bar) sits above the
-    // keyboard and scrollable content fits the reduced area. Automatic for every app, no
-    // KeyboardAvoidingView needed. Animated to match the keyboard's own curve.
-    var kbHeight: CGFloat = 0
+    // Keyboard avoidance. The keyboard OVERLAYS the app; it does not resize it. Shrinking
+    // the whole tree by the keyboard height (what this used to do) lifts EVERY
+    // bottom-anchored thing, so typing in a field at the top of the screen dragged the tab
+    // bar up over the keyboard -- which no platform does: a tab bar stays put and the
+    // keyboard covers it.
+    //
+    // So lift only what is actually covered, and only as much as it takes:
+    //   - focused field inside a Scroll: give that scroll a bottom inset and scroll the
+    //     field into view (what UIKit itself does). Nothing else moves.
+    //   - focused field not in a scroll (a chat composer pinned to the bottom): shift the
+    //     tree by exactly the overlap, so the composer clears the keyboard and no more.
+    //   - focused field already above the keyboard: nothing moves at all.
+    var kbHeight: CGFloat = 0            // the SHIFT applied to the tree, not the keyboard height
+    var kbScroll: UIScrollView?          // the scroll we inset, to undo on hide
     @objc func kbShow(_ n: Notification) {
         guard let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
-        let h = max(0, end.height - view.safeAreaInsets.bottom)
-        if h == kbHeight { return }
-        kbHeight = h
+        let kbTop = view.bounds.height - max(0, end.height)          // keyboard's top edge, in view coords
         let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        // The focused field: we own every input view, so find it rather than reaching for
+        // a private first-responder API.
+        var field: UIView? = nil
+        for (_, v) in views where (v is UITextField || v is UITextView) && v.isFirstResponder { field = v; break }
+        guard let f = field else { return }
+        // Measure against the UNLIFTED layout: the tree is already shifted by kbHeight, so
+        // add it back. The keyboard sends several notifications (show, then frame changes
+        // as it settles or as focus moves), and without this each pass would measure the
+        // field where the previous pass put it -- the lift would collapse to nothing.
+        let fFrame = f.convert(f.bounds, to: view)
+        let overlap = max(0, fFrame.maxY + kbHeight + 8 - kbTop)     // 8pt of breathing room
+
+        var scroll: UIScrollView? = nil                              // nearest scrollable ancestor
+        var p: UIView? = f.superview
+        while let cur = p { if let sc = cur as? UIScrollView { scroll = sc; break }; p = cur.superview }
+
+        if let sc = scroll {
+            let inset = max(0, end.height - view.safeAreaInsets.bottom)
+            let isNew = (kbScroll !== sc)                             // scroll only on the way in
+            kbScroll = sc
+            sc.contentInset.bottom = inset
+            sc.verticalScrollIndicatorInsets.bottom = inset
+            if isNew && overlap > 0 { sc.setContentOffset(CGPoint(x: sc.contentOffset.x, y: sc.contentOffset.y + overlap), animated: true) }
+            if kbHeight != 0 { kbHeight = 0; UIView.animate(withDuration: dur) { self.relayout() } }
+            return
+        }
+        if overlap == kbHeight { return }
+        kbHeight = overlap
         UIView.animate(withDuration: dur) { self.relayout() }
     }
     @objc func kbHide(_ n: Notification) {
+        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        if let sc = kbScroll {
+            kbScroll = nil
+            UIView.animate(withDuration: dur) { sc.contentInset.bottom = 0; sc.verticalScrollIndicatorInsets.bottom = 0 }
+        }
         if kbHeight == 0 { return }
         kbHeight = 0
-        let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
         UIView.animate(withDuration: dur) { self.relayout() }
     }
 
@@ -1681,8 +2420,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             switch op {
             case "C" where f.count >= 3: make(f[1], f[2])
             case "S" where f.count >= 3: style(f[1], f[2])
-            case "P" where f.count >= 3: setText(f[1], f[2...].joined(separator: "|"))   // rejoin: text may contain '|'
-            case "V" where f.count >= 3: setFieldValue(f[1], f[2...].joined(separator: "|"))   // controlled value (may contain '|')
+            case "P" where f.count >= 3: setText(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // rejoin: text may contain '|'
+            case "V" where f.count >= 3: setFieldValue(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
             case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }
@@ -1702,27 +2441,97 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
+            // LV|<id>: the engine names the LIVE list, i.e. the one on the screen that is
+            // on top. Several screens are mounted at once, so "the most recently created
+            // scroll view" is the wrong guess: the covered screen's list would receive the
+            // viewport reports and scroll itself. An empty id means the top screen has no
+            // list, and the viewport is the plain root.
+            case "SK":
+                // Which container holds the two screens a back gesture drags. Empty means
+                // the app stack's root, which is what this assumed before a tab could own
+                // its own history.
+                stackHostId = f.count >= 2 ? f[1] : ""
+            case "LV":
+                let lid = f.count >= 2 ? f[1] : ""
+                if lid.isEmpty { listScroll = nil; scrollId = ""; contentId = "" }
+                else if let sc = views[lid] as? UIScrollView {
+                    listScroll = sc; scrollId = lid; contentId = lid + ".0"
+                    // From the recorded axis, not inferred from contentSize: at LV time the
+                    // layout pass may not have sized this scroll yet, so the inference could
+                    // read a horizontal list as vertical and report the wrong viewport.
+                    listHoriz = horizScrollIds.contains(lid)
+                }
             case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             case "X" where f.count >= 3:
                 // Async host->engine command: X|token|capability|args. Run AFTER this
                 // apply() finishes (main.async), so a sync capability's resolve() doesn't
                 // re-enter apply() mid-parse. args may contain '|'.
                 let token = f[1], cap = f[2]
-                let args = f.count >= 4 ? f[3...].joined(separator: "|") : ""
-                DispatchQueue.main.async { [weak self] in self?.handleCommand(token, cap, args) }
+                // The arguments are JSON, so a raw pipe inside them is safe here: they
+                // are everything after the third one, joined back together.
+                let raw = f.count >= 4 ? f[3...].joined(separator: "|") : ""
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    // Parsed once, centrally, rather than by each capability. `args` is
+                    // the single argument as a string, which is all a one-argument
+                    // capability ever wanted; `a` reads the rest by name.
+                    let a = ChuksArgs(raw, cap, token, self)
+                    self.handleCommand(token, cap, a.str, a)
+                }
             default: break
             }
         }
         syncChrome()
+        finishThemeFade()
+    }
+
+    /// Dissolve the frozen old-theme frame, once the new one is fully in place.
+    ///
+    /// Deferred to the next runloop turn so the fade starts against a laid-out tree
+    /// rather than a half-applied one; starting it inside the same batch shows the old
+    /// frame dissolving into an unfinished layout, which looks worse than the hard cut
+    /// it replaces.
+    private func finishThemeFade() {
+        guard let snap = themeFadeView else { return }
+        themeFadeView = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.relayout()
+            UIView.animate(withDuration: 0.28, delay: 0, options: [.curveEaseInOut], animations: {
+                snap.alpha = 0
+            }, completion: { _ in snap.removeFromSuperview() })
+        }
     }
 
     // Deliver a native capability result back to the engine and apply the re-render.
     // Like every other apply path, re-run Yoga layout after applying: a stream tick
     // that changes a label's width (a growing counter, live data) must re-measure
     // its node, or the frame lags the text and truncates it for a frame (the jank).
+    /// ChuksModuleHost: a module presents from this controller, which IS the app's
+    /// root view controller, the same one the framework's own capabilities present from.
+    var presenter: UIViewController { self }
+
+    /// ChuksModuleHost: a module's stream is torn down through the same map the
+    /// framework's own streams use, so `__cancel__` releases both alike.
+    func onCancel(_ token: String, _ teardown: @escaping () -> Void) { streamTeardown[token] = teardown }
+
     func resolve(_ token: String, _ payload: String) { if let s = eResolve(token, payload) { apply(s); relayout() } }
     // Report a capability failure back to the engine (fires the request's onErr).
-    func fail(_ token: String, _ message: String) { if let s = eFail(token, message) { apply(s); relayout() } }
+    // Token "0" means the caller passed no callback, so the engine allocated nothing and
+    // there is no closure anywhere to hand this to. The engine's own unhandled-failure
+    // warning cannot reach these, because there is no token for it to fail: a
+    // fire-and-forget capability has nowhere to report to BY CONSTRUCTION. The host is
+    // the last place that still knows both the capability and the reason, so it says so
+    // here rather than letting the failure evaporate.
+    func fail(_ token: String, _ message: String) {
+        if token == "0" {
+            os_log("%{public}@", log: chuksLog, type: .error,
+                   "chuks warning: \(dispatchingCap.isEmpty ? "a capability" : dispatchingCap) failed and nothing is listening: \"\(message)\". It was called without a callback, so nothing could be told.")
+            return
+        }
+        if let s = eFail(token, message) { apply(s); relayout() }
+    }
+    // The capability currently being dispatched, so a failure can name itself.
+    var dispatchingCap: String = ""
 
     // Live native subscriptions (stream token -> timer/observer), for teardown.
     var activeStreams: [String: Timer] = [:]
@@ -1733,6 +2542,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var accelTokens = Set<String>()
     var gyroTokens = Set<String>()
     var magTokens = Set<String>()
+    // View kinds packages supply: the types by kind, and the live instances by node id.
+    lazy var packageViewTypes: [String: ChuksNativeView.Type] = {
+        var m: [String: ChuksNativeView.Type] = [:]
+        for t in chuksPackageViews() { m[t.kind] = t }
+        return m
+    }()
+    var packageViews: [String: ChuksNativeView] = [:]
+
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
     var urlTokens = Set<String>()             // linking.onurl subscribers
     var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
@@ -1748,11 +2565,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     let pedometer = CMPedometer()       // step counter / distance / pace (Pedometer)
     let altimeter = CMAltimeter()       // barometer: pressure + relative altitude
     var proximityTokens = Set<String>() // motion.proximity subscribers (UIDevice proximity)
-    lazy var healthStore = HKHealthStore()   // HealthKit (Health) — lazy: only if used
 
-    // Execute a native capability requested via an `X|` command (F3). Same UIKit
-    // implementations as the SwiftUI host; only presentShare differs (this host IS a
-    // UIViewController, so it presents directly).
+    // Execute a native capability requested via an `X|` command (F3). This host IS a
+    // UIViewController, so capabilities that present UI (e.g. presentShare) present
+    // directly.
     func ensureBle() {
         if ble == nil {
             let m = BleManager()
@@ -1780,62 +2596,51 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let down = d.floorsDescended?.intValue ?? 0
         return "\(steps),\(dist),\(pace),\(cadence),\(up),\(down)"
     }
-    // A comma list of metric names -> HealthKit read types (drops unknown names).
-    static func hkTypes(_ csv: String) -> Set<HKObjectType> {
-        var out = Set<HKObjectType>()
-        for m in csv.components(separatedBy: ",") {
-            if let t = hkQuantityType(m.trimmingCharacters(in: .whitespaces)) { out.insert(t) }
+
+    // The live view tree, for Debug.viewTree. Node ids are structural paths ("app.0.1"),
+    // so sorting them puts a parent before its children and the dot count is the depth:
+    // the tree draws itself without walking UIKit's hierarchy. The frame is the one Yoga
+    // resolved, which is the number a layout question is actually about.
+    let detachedMark = "\u{0000}detached"
+
+    func viewTreeDump() -> String {
+        // Asked before the first layout pass, every frame would read 0 and the dump
+        // would call the whole tree ZERO-SIZED, which is a lie that looks exactly like
+        // the bug this tool exists to find. Say what is actually true instead.
+        guard let rootView = views["app"], rootView.frame.size.width > 0 else {
+            return "(no frames yet: the first layout pass has not run, so nothing has a resolved size)"
         }
-        return out
-    }
-    static func hkQuantityType(_ metric: String) -> HKQuantityType? {
-        switch metric {
-        case "steps": return HKQuantityType.quantityType(forIdentifier: .stepCount)
-        case "distanceMeters": return HKQuantityType.quantityType(forIdentifier: .distanceWalkingRunning)
-        case "activeEnergyKcal": return HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)
-        case "heartRate": return HKQuantityType.quantityType(forIdentifier: .heartRate)
-        default: return nil
-        }
-    }
-    // Aggregate one metric over [now-secs, now]: sum for steps/distance/energy, average
-    // bpm for heart rate. Answers with the number as a string.
-    func hkRead(_ token: String, _ metric: String, _ secs: Double) {
-        guard HKHealthStore.isHealthDataAvailable(), let qt = Self.hkQuantityType(metric) else { fail(token, "unsupported health metric: \(metric)"); return }
-        let from = Date(timeIntervalSinceNow: -secs)
-        let pred = HKQuery.predicateForSamples(withStart: from, end: Date(), options: .strictStartDate)
-        let isAvg = (metric == "heartRate")
-        let q = HKStatisticsQuery(quantityType: qt, quantitySamplePredicate: pred, options: isAvg ? .discreteAverage : .cumulativeSum) { [weak self] _, stats, err in
-            DispatchQueue.main.async {
-                if let e = err { self?.fail(token, e.localizedDescription); return }
-                let unit: HKUnit
-                switch metric {
-                case "distanceMeters": unit = HKUnit.meter()
-                case "activeEnergyKcal": unit = HKUnit.kilocalorie()
-                case "heartRate": unit = HKUnit.count().unitDivided(by: .minute())
-                default: unit = HKUnit.count()
-                }
-                let quantity = isAvg ? stats?.averageQuantity() : stats?.sumQuantity()
-                self?.resolve(token, String(quantity?.doubleValue(for: unit) ?? 0))
+        // The app's own tree first. Ids sort as strings, and a recycled list cell is
+        // named ".0.cellN", so a plain sort puts a pool of detached cells above the
+        // screen you are looking at and fills the first screenful with them. They are
+        // real views and worth seeing, so they follow under a heading rather than
+        // being dropped.
+        let rooted = views.keys.filter { $0 == "app" || $0.hasPrefix("app.") }.sorted()
+        let detached = views.keys.filter { !($0 == "app" || $0.hasPrefix("app.")) }.sorted()
+        var out = ""
+        for id in rooted + (detached.isEmpty ? [] : [detachedMark]) + detached {
+            if id == detachedMark {
+                out += "-- not attached to the app root (recycled list cells, torn-down screens) --\n"
+                continue
             }
+            guard let v = views[id] else { continue }
+            let depth = id.filter { $0 == "." }.count
+            let pad = String(repeating: "  ", count: depth)
+            let f = v.frame
+            let cls = String(describing: type(of: v))
+            var line = "\(pad)\(id)  \(cls)  \(Int(f.origin.x)),\(Int(f.origin.y)) \(Int(f.size.width))x\(Int(f.size.height))"
+            if v.isHidden { line += "  hidden" }
+            if f.size.width == 0 || f.size.height == 0 { line += "  ZERO-SIZED" }
+            if let t = (v as? UILabel)?.text, !t.isEmpty {
+                line += "  \"" + (t.count > 30 ? String(t.prefix(30)) + "…" : t) + "\""
+            }
+            out += line + "\n"
         }
-        healthStore.execute(q)
-    }
-    // Live heart rate: an anchored query that also fires its updateHandler as new
-    // samples land (e.g. from a paired Apple Watch). Emits the latest bpm as an int.
-    func hkHeartRate(_ token: String) {
-        guard HKHealthStore.isHealthDataAvailable(), let hr = HKQuantityType.quantityType(forIdentifier: .heartRate) else { fail(token, "heart rate unavailable"); return }
-        let unit = HKUnit.count().unitDivided(by: .minute())
-        let handler: (HKAnchoredObjectQuery, [HKSample]?, [HKDeletedObject]?, HKQueryAnchor?, Error?) -> Void = { [weak self] _, samples, _, _, _ in
-            guard let s = samples as? [HKQuantitySample], let last = s.last else { return }
-            DispatchQueue.main.async { self?.resolve(token, String(Int(last.quantity.doubleValue(for: unit)))) }
-        }
-        let q = HKAnchoredObjectQuery(type: hr, predicate: nil, anchor: nil, limit: HKObjectQueryNoLimit, resultsHandler: handler)
-        q.updateHandler = handler
-        healthStore.execute(q)
-        streamTeardown[token] = { [weak self] in self?.healthStore.stop(q) }
+        return out.isEmpty ? "(no views)" : out
     }
 
-    func handleCommand(_ token: String, _ cap: String, _ args: String) {
+    func handleCommand(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) {
+        dispatchingCap = cap
         switch cap {
         case "__cancel__":
             activeStreams[token]?.invalidate(); activeStreams[token] = nil
@@ -1880,8 +2685,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 onFix: { [weak self] s in self?.resolve(token, s); self?.locFixes[token] = nil },
                 onErr: { [weak self] m in self?.fail(token, m); self?.locFixes[token] = nil })
             locFixes[token] = fix; fix.start()
-        case "location.watch":
-            let fix = LocFix(once: false,
+        case "location.watch", "location.watchBackground":
+            let bg = (cap == "location.watchBackground")
+            // The notification text in args is Android's business: iOS shows its own blue
+            // indicator and gives an app no say in it.
+            if bg && !(Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []).contains("location") {
+                // Setting allowsBackgroundLocationUpdates without the mode CRASHES, so
+                // refuse with a message that says what to add rather than taking the app
+                // down at a line the developer never wrote.
+                fail(token, "background location needs \"location\" in UIBackgroundModes: add \"backgroundLocation\": true to app.json")
+                break
+            }
+            let fix = LocFix(once: false, background: bg,
                 onFix: { [weak self] s in self?.resolve(token, s) },
                 onErr: { [weak self] m in self?.fail(token, m) })
             locFixes[token] = fix
@@ -1969,7 +2784,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             streamTeardown[token] = { [weak self] in self?.pedometer.stopUpdates() }
         case "pedometer.query":
             guard CMPedometer.isStepCountingAvailable() else { fail(token, "step counting unavailable"); break }
-            let secs = Double(args) ?? 0
+            guard let secs = a.num() else { break }
             let from = Date(timeIntervalSinceNow: -secs)
             pedometer.queryPedometerData(from: from, to: Date()) { [weak self] data, err in
                 DispatchQueue.main.async {
@@ -1979,25 +2794,6 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     self?.resolve(token, "\(d.numberOfSteps.intValue),\(dist)")
                 }
             }
-        case "health.available":
-            resolve(token, HKHealthStore.isHealthDataAvailable() ? "true" : "false")
-        case "health.authorize":
-            guard HKHealthStore.isHealthDataAvailable() else { fail(token, "health data unavailable"); break }
-            let types = Self.hkTypes(args)
-            if types.isEmpty { fail(token, "no valid health metrics: \(args)"); break }
-            healthStore.requestAuthorization(toShare: nil, read: types) { [weak self] ok, err in
-                DispatchQueue.main.async {
-                    if let e = err { self?.fail(token, e.localizedDescription) }
-                    else { self?.resolve(token, ok ? "granted" : "denied") }
-                }
-            }
-        case "health.read":
-            let parts = args.components(separatedBy: "|")   // "metric|secondsAgo"
-            let metric = parts.first ?? ""
-            let secs = Double(parts.count > 1 ? parts[1] : "0") ?? 0
-            hkRead(token, metric, secs)
-        case "health.heartRate":
-            hkHeartRate(token)
         case "deviceinfo.screen":
             let b = UIScreen.main.bounds
             resolve(token, "\(Int(b.width)),\(Int(b.height)),\(UIScreen.main.scale)")
@@ -2007,6 +2803,24 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             resolve(token, "\(v),\(bld)")
         case "deviceinfo.locale":
             resolve(token, "\(Locale.current.languageCode ?? ""),\(Locale.current.regionCode ?? "")")
+        case "deviceinfo.id":
+            resolve(token, UIDevice.current.identifierForVendor?.uuidString ?? "")
+        case "deviceinfo.appid":
+            resolve(token, Bundle.main.bundleIdentifier ?? "")
+        case "deviceinfo.appname":
+            let name = (Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String)
+                ?? (Bundle.main.infoDictionary?["CFBundleName"] as? String) ?? ""
+            resolve(token, name)
+        case "deviceinfo.installtime":
+            // iOS exposes no install-time API; the document directory's creation date is
+            // the standard proxy (created at first launch, reset on reinstall).
+            var ms = ""
+            if let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+               let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let d = attrs[.creationDate] as? Date {
+                ms = String(Int64(d.timeIntervalSince1970 * 1000))
+            }
+            resolve(token, ms)
         case "contacts.list":
             var contactsOK = CNContactStore.authorizationStatus(for: .contacts) == .authorized
             if #available(iOS 18.0, *) { contactsOK = contactsOK || CNContactStore.authorizationStatus(for: .contacts) == .limited }
@@ -2026,7 +2840,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 } catch { DispatchQueue.main.async { self.fail(token, "read failed") } }
             }
         case "calendar.upcoming":
-            let days = Double(args) ?? 7
+            guard let days = a.num() else { break }
             let store = EKEventStore()
             let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
             let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map {
@@ -2034,18 +2848,51 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
             resolve(token, lines.joined(separator: "\n"))
         case "calendar.create":
-            let parts = args.split(separator: "|", maxSplits: 2).map(String.init)
-            guard parts.count == 3, let startMin = Double(parts[1]), let durMin = Double(parts[2]) else { fail(token, "bad args"); break }
+            guard let startMin = a.num("startInMin"), let durMin = a.num("durationMin") else { break }
             let store = EKEventStore()
             guard let cal = store.defaultCalendarForNewEvents else { fail(token, "no writable calendar"); break }
             let ev = EKEvent(eventStore: store)
-            ev.title = parts[0]; ev.calendar = cal
+            ev.title = a.s("title"); ev.calendar = cal
             ev.startDate = Date(timeIntervalSinceNow: startMin * 60)
             ev.endDate = Date(timeIntervalSinceNow: startMin * 60 + durMin * 60)
             do { try store.save(ev, span: .thisEvent); resolve(token, ev.eventIdentifier ?? "ok") }
             catch { fail(token, "save failed: \(error.localizedDescription)") }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
+        case "bg.define":
+            // args is the task name. Keep the token so a wake can fire this handler, and
+            // release it if the app ever cancels the subscription.
+            bgTokens[args] = token
+            streamTeardown[token] = { [weak self] in self?.bgTokens[args] = nil }
+        case "bg.result":
+            // name, then "1" or "0": the handler finished, so the OS can be told.
+            finishBackgroundTask(a.s("name"), success: a.bool("ok"))
+        case "bg.periodic", "bg.once", "bg.processing":
+            // Same three arguments whichever of the three schedulers this is.
+            guard let secs = a.int("seconds") else { break }
+            var cons: [String: String] = [:]
+            for pair in a.s("constraints").components(separatedBy: ";") where !pair.isEmpty {
+                let kv = pair.components(separatedBy: "=")
+                if kv.count == 2 { cons[kv[0]] = kv[1] }
+            }
+            // iOS has no periodic scheduler: a refresh task is submitted again after each
+            // run, which is what BGTaskScheduler expects you to do anyway. `periodic`
+            // therefore means the same thing here, it is just re-armed rather than
+            // repeating on its own.
+            scheduleBackgroundTask(a.s("name"), secs, cap == "bg.processing" ? "processing" : "refresh", cons)
+        case "bg.cancel":
+            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: args)
+        case "bg.cancelAll":
+            BGTaskScheduler.shared.cancelAllTaskRequests()
+        case "bg.status":
+            // Whether the user or the system has switched background activity off matters
+            // more than whether a request is pending: when it is off, nothing will run.
+            let refreshOff = UIApplication.shared.backgroundRefreshStatus != .available
+            if refreshOff { resolve(token, "restricted"); break }
+            BGTaskScheduler.shared.getPendingTaskRequests { [weak self] reqs in
+                let pending = reqs.contains { $0.identifier == args }
+                DispatchQueue.main.async { self?.resolve(token, pending ? "scheduled" : "notScheduled") }
+            }
         case "linking.onurl":
             urlTokens.insert(token)
             streamTeardown[token] = { [weak self] in self?.urlTokens.remove(token) }
@@ -2086,20 +2933,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "ble.disconnect":
             ble?.disconnect(args)
         case "ble.read":
-            let a = args.components(separatedBy: "\t")
-            if a.count == 3 { ensureBle(); ble!.read(a[0], a[1], a[2], ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) }) }
-            else { fail(token, "ble.read needs id, service, characteristic") }
+            ensureBle(); ble!.read(a.s("deviceId"), a.s("service"), a.s("characteristic"), ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
         case "ble.write":
-            let a = args.components(separatedBy: "\t")
-            if a.count == 4 { ensureBle(); ble!.write(a[0], a[1], a[2], a[3], ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) }) }
-            else { fail(token, "ble.write needs id, service, characteristic, hex") }
+            ensureBle(); ble!.write(a.s("deviceId"), a.s("service"), a.s("characteristic"), a.s("valueHex"), ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
         case "ble.subscribe":
-            let a = args.components(separatedBy: "\t")
-            if a.count == 3 {
-                ensureBle()
-                ble!.subscribe(a[0], a[1], a[2], token: token, err: { [weak self] m in self?.fail(token, m) })
-                streamTeardown[token] = { [weak self] in self?.ble?.unsubscribe(token) }
-            } else { fail(token, "ble.subscribe needs id, service, characteristic") }
+            ensureBle()
+            ble!.subscribe(a.s("deviceId"), a.s("service"), a.s("characteristic"), token: token, err: { [weak self] m in self?.fail(token, m) })
+            streamTeardown[token] = { [weak self] in self?.ble?.unsubscribe(token) }
         case "nfc.available":
             ensureNfc(); resolve(token, nfc!.available ? "1" : "0")
         case "nfc.read":
@@ -2118,16 +2958,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 DispatchQueue.main.async { ok ? self?.resolve(token, "success") : self?.fail(token, e?.localizedDescription ?? "authentication failed") }
             }
         case "debug.activeStreams": resolve(token, String(activeStreams.count + streamTeardown.count))
+        case "debug.viewTree": resolve(token, viewTreeDump())
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)
         case "permission.request": permRequest(args, token)
         case "fs.write":
-            if let bar = args.firstIndex(of: "|") {
-                let name = String(args[..<bar]), b64 = String(args[args.index(after: bar)...])
-                if let d = Data(base64Encoded: b64), let content = String(data: d, encoding: .utf8) {
-                    try? content.write(to: appFile(name), atomically: true, encoding: .utf8)
-                }
-            }
+            // The content arrives as an ordinary field: the wire packs arguments, so a
+            // multi-line body needs no encoding of its own any more.
+            try? a.s("content").write(to: appFile(a.s("name")), atomically: true, encoding: .utf8)
         case "fs.read":
             if let s = try? String(contentsOf: appFile(args), encoding: .utf8) { resolve(token, s) }
             else { fail(token, "no such file: \(args)") }
@@ -2136,18 +2974,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             resolve(token, names.joined(separator: "\n"))
         case "fs.delete": try? FileManager.default.removeItem(at: appFile(args))
         case "secure.set":
-            if let bar = args.firstIndex(of: "|") {
-                let key = String(args[..<bar]), b64 = String(args[args.index(after: bar)...])
-                if let d = Data(base64Encoded: b64), let v = String(data: d, encoding: .utf8) { keychainSet(key, v) }
-            }
+            keychainSet(a.s("key"), a.s("value"))
         case "secure.get":
             if let v = keychainGet(args) { resolve(token, v) } else { fail(token, "no such key: \(args)") }
         case "secure.delete": keychainDelete(args)
         case "notif.notify":
-            // args = "b64title|b64body"
-            let parts = args.split(separator: "|", maxSplits: 1).map(String.init)
             let content = UNMutableNotificationContent()
-            content.title = b64str(parts.first ?? ""); content.body = parts.count > 1 ? b64str(parts[1]) : ""
+            content.title = a.s("title"); content.body = a.s("body")
             content.sound = .default
             UNUserNotificationCenter.current().add(UNNotificationRequest(
                 identifier: UUID().uuidString, content: content,
@@ -2197,9 +3030,43 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)
             if speech.isSpeaking { speech.stopSpeaking(at: .immediate) }
-            speech.speak(AVSpeechUtterance(string: b64str(args)))
+            speech.speak(AVSpeechUtterance(string: args))
         case "tts.stop": speech.stopSpeaking(at: .immediate)
         case "tts.isSpeaking": resolve(token, speech.isSpeaking ? "1" : "0")
+        // The framework noticed something the app probably did not mean. Logged
+        // natively because the engine's own println reaches neither the device console
+        // nor idevicesyslog.
+        case "dev.warn": os_log("%{public}@", log: chuksLog, type: .error, "chuks warning: " + args)
+        // Which appearance the APP is in, which is not the same question as which
+        // appearance the phone is in. Every adaptive thing UIKit draws resolves against
+        // the system trait unless told otherwise, so an app switched to its own light
+        // theme on a phone left in dark mode got the DARK glass material: a dark slab in
+        // a light app. Overriding on the window covers glass, blur and anything else
+        // adaptive in one place rather than per view.
+        case "appearance.set":
+            // Freeze the CURRENT frame on top before anything changes, and dissolve it
+            // once the whole batch has landed. A theme switch is not one property
+            // animating, it is every colour in the tree replaced at once, plus every
+            // glass surface torn down and rebuilt to pick up the new trait: nothing in
+            // that is individually animatable, and done bare it reads as a hard cut with
+            // a flash where the materials pop back. One crossfade over the lot is both
+            // smoother and cheaper than trying to tween the parts.
+            if themeFadeView == nil, let snap = view.snapshotView(afterScreenUpdates: false) {
+                snap.frame = view.bounds
+                snap.isUserInteractionEnabled = false
+                snap.tag = CHUKS_DECOR_TAG
+                view.addSubview(snap)
+                themeFadeView = snap
+            }
+            let style: UIUserInterfaceStyle = args == "light" ? .light : (args == "dark" ? .dark : .unspecified)
+            view.window?.overrideUserInterfaceStyle = style
+            view.overrideUserInterfaceStyle = style
+            // A live material keeps the trait it was built with, so every glass surface
+            // needs rebuilding. Nothing is cleared here: activateGlass compares each
+            // surface against the CURRENT trait on every layout pass and rebuilds what no
+            // longer matches, which is why this only has to ask for a layout. Next runloop
+            // turn, so the trait set just above has actually propagated.
+            DispatchQueue.main.async { [weak self] in self?.relayout() }
         case "clipboard.set": UIPasteboard.general.string = args
         case "clipboard.get": resolve(token, UIPasteboard.general.string ?? "")
         case "linking.open":
@@ -2210,10 +3077,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "share.text": presentShare([args])
         case "share.url": presentShare([URL(string: args) ?? args])
         case "haptics.impact": fireHaptic(args)
-        case "haptics.vibrate": hapticBuzz(Int(args) ?? 0)
+        case "haptics.vibrate": if let ms = a.int() { hapticBuzz(ms) }
         case "haptics.pattern": hapticPattern(args)
         case "torch.set": setTorch(args == "1")
-        case "brightness.set": if let v = Double(args) { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
+        case "brightness.set": if let v = a.num() { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
         case "orientation.watch":
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -2230,7 +3097,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 guard let self = self else { return }
                 self.orientationTokens.forEach { self.resolve($0, currentOrientationString()) }
             }
-        default: break
+        default:
+            // Not a framework capability. An installed package may claim this namespace.
+            // If none does the command is unknown, and saying nothing was the worst
+            // answer available: a misspelt capability, one a package forgot to declare,
+            // and one that simply does not exist on this platform all behaved like a
+            // call that quietly worked. Route it through fail(), which reaches the app
+            // when somebody is listening and the log when nobody is.
+            if !packageModules.handle(token, cap, args, a) {
+                fail(token, "no capability named \(cap) on iOS. Check the spelling, or whether the package that provides it declares this platform.")
+            }
         }
     }
 
@@ -2357,6 +3233,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func setText(_ id: String, _ t: String) {
+        // A package view's "text" is its props, as JSON. Layout and background have
+        // already been applied by the framework; this is the package's own half.
+        if let pv = packageViews[id] {
+            pv.apply(ChuksArgs(t, type(of: pv).kind, "0", self))
+            return
+        }
         if gestureIds.contains(id) {   // a Gesture's "text" is its continuous-recognizer list ("pan,pinch,rotate")
             attachContinuousGestures(id, t)
             return
@@ -2492,6 +3374,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let box = UIView(); box.clipsToBounds = true
             let iv = UIImageView(); iv.contentMode = .scaleAspectFill; iv.clipsToBounds = true
             iv.frame = box.bounds; iv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            iv.tag = CHUKS_DECOR_TAG
             box.addSubview(iv)                              // background, behind children (inserted later)
             bgImageViews[id] = iv; v = box
         case "Video":
@@ -2546,7 +3429,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let dp = UIDatePicker()
             if #available(iOS 14.0, *) { dp.preferredDatePickerStyle = .compact }   // a tappable native field
             dp.datePickerMode = .date                                               // refined by the "dp" style
-            dp.contentHorizontalAlignment = .leading                                // hug the leading edge (match Android/SwiftUI)
+            dp.contentHorizontalAlignment = .leading                                // hug the leading edge (match Android)
             dp.addTarget(self, action: #selector(dateChanged(_:)), for: .valueChanged)
             datePickerModes[dp] = "date"
             let sz = dp.intrinsicContentSize                                        // Yoga needs a leaf size
@@ -2631,7 +3514,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // (overflowing) size along the scroll axis instead of being clamped to the scroll's
             // own bounds. Without this, the content's top/bottom become unreachable.
             YGNodeStyleSetOverflow(n, YGOverflow.scroll)
-            listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll"); v = sc   // horiz confirmed by the style too
+            // NB: creation does NOT make this the live list any more -- the engine says
+            // which one is live with LV|, since several screens can be mounted at once.
+            if kind == "HScroll" { horizScrollIds.insert(id) } else { horizScrollIds.remove(id) }
+            if listScroll == nil { listScroll = sc; scrollId = id; listHoriz = (kind == "HScroll") }
+            v = sc
         case "Modal":
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
             mv.isHidden = true                     // shown when mvis=1
@@ -2640,7 +3527,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let a = UIView(); a.isUserInteractionEnabled = false   // invisible placeholder; the OS alert shows on avis=1
             alertIds.insert(id); v = a
         default:
-            v = HitSlopView()   // a plain container that can also carry a Pressable hitSlop
+            // A kind the framework does not know may be one a package claims. Only then
+            // do we look: an unknown kind is otherwise a plain container, exactly as
+            // before, so an app with no view packages pays one dictionary miss.
+            if let t = packageViewTypes[kind] {
+                let pv = t.init(host: self)
+                packageViews[id] = pv
+                v = pv.view
+            } else {
+                v = HitSlopView()   // a plain container that can also carry a Pressable hitSlop
+            }
         }
         v.translatesAutoresizingMaskIntoConstraints = true   // we drive .frame directly
         views[id] = v
@@ -2684,6 +3580,67 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         YGNodeStyleSetFlexWrap(n, YGWrap.noWrap)
     }
 
+    // Put a blur material behind the view's children. Intensity selects the material
+    // thickness rather than a radius: UIKit's blur is a system material, and picking the
+    // nearest one keeps it looking native and stays cheap, where an animator-driven
+    // fractional blur costs a render pass per frame.
+    func applyBlur(_ id: String, _ v: UIView, _ spec: (intensity: Int, tint: String)) {
+        let style: UIBlurEffect.Style
+        switch spec.tint {
+        case "light": style = spec.intensity < 34 ? .systemUltraThinMaterialLight
+                            : (spec.intensity < 67 ? .systemThinMaterialLight : .systemMaterialLight)
+        case "dark":  style = spec.intensity < 34 ? .systemUltraThinMaterialDark
+                            : (spec.intensity < 67 ? .systemThinMaterialDark : .systemMaterialDark)
+        default:      style = spec.intensity < 34 ? .systemUltraThinMaterial
+                            : (spec.intensity < 67 ? .systemThinMaterial : .systemMaterial)
+        }
+        if let bv = blurViews[id] { bv.effect = UIBlurEffect(style: style); return }
+        let bv = UIVisualEffectView(effect: UIBlurEffect(style: style))
+        bv.isUserInteractionEnabled = false
+        bv.tag = CHUKS_DECOR_TAG                 // counted by the child-insert offset
+        bv.frame = v.bounds
+        bv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        bv.clipsToBounds = true
+        bv.layer.cornerRadius = v.layer.cornerRadius
+        v.insertSubview(bv, at: 0)
+        blurViews[id] = bv
+    }
+
+    // Paint a linear gradient as the view's background. It goes in at sublayer index 0, so
+    // it sits above the view's own background color and below every child, which is what a
+    // background should do. A CALayer does not autoresize, so the frame pass re-sizes it
+    // and copies the (already clamped) corner radius; without that a gradient view would
+    // keep its first frame and square corners.
+    func applyGradient(_ id: String, _ v: UIView, _ spec: (colors: String, angle: Int, stops: String)) {
+        let hexes = spec.colors.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        guard hexes.count >= 2 else {            // one color is a fill, not a gradient
+            if let gv = gradLayers[id] { gv.removeFromSuperview(); gradLayers[id] = nil }
+            return
+        }
+        let gv: ChuksGradientView
+        if let existing = gradLayers[id] { gv = existing } else {
+            gv = ChuksGradientView()
+            gv.isUserInteractionEnabled = false          // never swallow a tap meant for a child
+            gv.tag = CHUKS_DECOR_TAG
+            gv.frame = v.bounds
+            gv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            gv.clipsToBounds = true
+            v.insertSubview(gv, at: 0)                   // behind every child, like the glass view
+            gradLayers[id] = gv
+        }
+        let gl = gv.grad
+        gl.colors = hexes.map { hexColor($0).cgColor }
+        let locs = spec.stops.split(separator: ",").compactMap { Double($0) }
+        gl.locations = (locs.count == hexes.count) ? locs.map { NSNumber(value: $0 / 100) } : nil
+        // 0 degrees runs top to bottom and the angle increases clockwise, so 90 runs left
+        // to right. Both endpoints sit on a unit vector through the centre.
+        let rad = Double(spec.angle) * .pi / 180
+        let dx = sin(rad) / 2, dy = cos(rad) / 2
+        gl.startPoint = CGPoint(x: 0.5 - dx, y: 0.5 - dy)
+        gl.endPoint   = CGPoint(x: 0.5 + dx, y: 0.5 + dy)
+        gv.layer.cornerRadius = v.layer.cornerRadius
+    }
+
     // The paint/layer sibling of resetLayoutStyle: clear the decorative UIView/CALayer
     // properties that style() sets conditionally, so a reused node doesn't keep its
     // previous role's background, border, corner radius, shadow, dashed/side borders or
@@ -2723,6 +3680,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             v.layer.sublayers?.filter { ($0.name ?? "").hasPrefix("chuksDashBorder") || ($0.name ?? "").hasPrefix("chuksSideBorder") }.forEach { $0.removeFromSuperlayer() }
         }
         if let gv = glassViews[id] { gv.removeFromSuperview(); glassViews[id] = nil }
+        if let gv = gradLayers[id] { gv.removeFromSuperview(); gradLayers[id] = nil; gradSpec[id] = nil }
+        if let bv = blurViews[id] { bv.removeFromSuperview(); blurViews[id] = nil; blurSpec[id] = nil }
         // ── Reused-node completeness ──────────────────────────────────────────────
         // Style.str() omits default-valued props, and the reconciler reuses a native
         // view for whatever new role sits at a tree position, so every prop that style()
@@ -2902,7 +3861,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                             if let yn = ynodes[id] { YGNodeStyleSetWidth(yn, Float(sz.width)); YGNodeStyleSetHeight(yn, Float(sz.height)) }
                           }
             case "avis":  if val == "1" { presentAlert(id) } else { dismissAlert(id) }
-            case "bg":  if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) } else { v.backgroundColor = hexColor(val) }
+            case "bg":
+                if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) }
+                else if glassViews[id] != nil || glassPending.contains(id) {
+                    // A glass surface's `bg` is what it falls back to, not what sits
+                    // behind it: an opaque colour behind the material is exactly what the
+                    // material would sample, and the surface would read as a flat panel.
+                    glassFallbackColor[id] = hexColor(val)
+                    if UIAccessibility.isReduceTransparencyEnabled { v.backgroundColor = hexColor(val) }
+                } else { v.backgroundColor = hexColor(val) }
             case "swtc": (v as? UISwitch)?.thumbTintColor = hexColor(val)   // Switch thumb (knob) color
             case "fg":  label?.textColor = hexColor(val); btn?.setTitleColor(hexColor(val), for: .normal)
                         field?.textColor = hexColor(val); imgView?.tintColor = hexColor(val)
@@ -3033,16 +4000,44 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "glass":   // Liquid Glass: a UIGlassEffect view behind the content (blur fallback)
                 if val == "1" {
                     if glassViews[id] == nil {
-                        let eff: UIVisualEffect
-                        if #available(iOS 26.0, *) { eff = UIGlassEffect() } else { eff = UIBlurEffect(style: .systemUltraThinMaterial) }
-                        let gv = UIVisualEffectView(effect: eff)
+                        // Created EMPTY. UIGlassEffect does not render if it is applied
+                        // before the view has been laid out, and at style time the frame
+                        // is usually still zero: that is why this looked like a flat grey
+                        // slab rather than glass. activateGlass() attaches the effect from
+                        // the layout pass, once there is a real frame to refract into.
+                        let gv = UIVisualEffectView(effect: nil)
                         gv.isUserInteractionEnabled = false
+                        gv.tag = CHUKS_DECOR_TAG
                         gv.frame = v.bounds; gv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
                         gv.clipsToBounds = true; gv.layer.cornerRadius = v.layer.cornerRadius
-                        v.insertSubview(gv, at: 0); v.backgroundColor = .clear
+                        v.insertSubview(gv, at: 0)
+                        if let had = v.backgroundColor, had != .clear { glassFallbackColor[id] = had }
+                        v.backgroundColor = .clear
                         glassViews[id] = gv
+                        glassPending.insert(id)
                     }
-                } else { glassViews[id]?.removeFromSuperview(); glassViews[id] = nil }
+                } else {
+                    glassViews[id]?.removeFromSuperview(); glassViews[id] = nil
+                    glassPending.remove(id); glassFallbackColor[id] = nil
+                }
+            // Linear gradient background. The three parts arrive as separate style keys, so
+            // each one re-applies the whole spec rather than trying to patch a live layer.
+            // Backdrop blur: a real UIVisualEffectView, so the system samples what is
+            // behind the view in the window. Both parts arrive as separate keys, so each
+            // re-applies the whole spec.
+            case "bkblur", "bktint":
+                var bs = blurSpec[id] ?? (intensity: 60, tint: "system")
+                if k == "bkblur" { bs.intensity = Int(val) ?? 60 }
+                if k == "bktint" { bs.tint = val }
+                blurSpec[id] = bs
+                applyBlur(id, v, bs)
+            case "grad", "gradang", "gradstop":
+                var spec = gradSpec[id] ?? (colors: "", angle: 0, stops: "")
+                if k == "grad" { spec.colors = val }
+                if k == "gradang" { spec.angle = Int(val) ?? 0 }
+                if k == "gradstop" { spec.stops = val }
+                gradSpec[id] = spec
+                applyGradient(id, v, spec)
             case "pos": if val == "abs" { YGNodeStyleSetPositionType(n, YGPositionType.absolute) }
             case "top":   YGNodeStyleSetPosition(n, YGEdge.top, f)
             case "bottom": YGNodeStyleSetPosition(n, YGEdge.bottom, f)
@@ -3191,9 +4186,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             view.addSubview(child)                           // ROOT, not inline; its Yoga node stays a
             return                                           // separate root (laid out in relayout)
         }
-        if parent == scrollId { contentId = id }             // the scroll's content node
+        if parent == scrollId { contentId = id }             // the live list's content node
+        // Every scroll's FIRST child is its content node. Recorded per id because a screen
+        // can hold several scrolls at once (a vertical Scroll containing a Carousel, whose
+        // horizontal list is itself a scroll), and only one of them can be the "live list".
+        if views[parent] is UIScrollView, scrollContentIds[parent] == nil { scrollContentIds[parent] = id }
         guard let pv = views[parent], let pn = ynodes[parent] else { return }
-        let base = bgImageViews[parent] != nil ? 1 : 0       // keep an ImageBackground's bg image at the back
+        // Skip every decoration already sitting at the back (bg image, glass, gradient), or
+        // the child lands underneath it. Counting the tagged prefix rather than testing one
+        // dictionary keeps this correct as decorations are added.
+        let base = pv.subviews.prefix { $0.tag == CHUKS_DECOR_TAG }.count
         let i = min(index + base, pv.subviews.count)
         pv.insertSubview(child, at: i)
         // A node id can be reused across a kind change (e.g. a Text becomes a container via
@@ -3209,6 +4211,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Recycle a subtree: detach + free its Yoga nodes, remove the views, and drop
     // every id under this prefix from both maps (and its recognizers/actions).
     func remove(_ id: String) {
+        // Unknown id: nothing to tear down. Every mount now emits R| before C| (a mount
+        // must not inherit a stale subtree at the same path id), so this is the hot case
+        // and must stay a dictionary miss -- never the O(views) prefix sweep below.
+        if views[id] == nil && ynodes[id] == nil { return }
+        if let pv = packageViews.removeValue(forKey: id) { pv.destroy() }
         if let v = views[id] {
             for g in v.gestureRecognizers ?? [] {
                 if let t = g as? UITapGestureRecognizer { taps[t] = nil }
@@ -3227,6 +4234,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
             if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil; sliderDoneAction[sl] = nil }
             if let sc = views[k] as? UIScrollView { scrollOnScroll[sc] = nil; scrollLastPos[sc] = nil }
+            scrollContentIds.removeValue(forKey: k); horizScrollIds.remove(k)   // per-scroll content sizing
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
@@ -3285,9 +4293,40 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let dp = v as? UIDatePicker { datePickerActions[dp] = action; return }
         if let tv = v as? UITextView { textAreaActions[tv] = action; return }
         v.isUserInteractionEnabled = true
+        // Reset any tap/press recognizer WE previously attached to this view before
+        // (re)binding. Node ids are reused when a screen swaps in place, so a tappable
+        // card can become an inert row at the same id; without this the old recognizer
+        // survives and keeps firing the previous role's action (RN resets a recycled
+        // view to its defaults — this is that reset). Only our own recognizers are
+        // touched (guarded by the taps/pressGestures maps), so a Text's copy long-press
+        // or a Gesture node's recognizers are preserved.
+        for g in (v.gestureRecognizers ?? []) {
+            if let t = g as? UITapGestureRecognizer, taps[t] != nil { taps[t] = nil; v.removeGestureRecognizer(t) }
+            else if let lp = g as? UILongPressGestureRecognizer, pressGestures[lp] != nil {
+                // A press that is IN FLIGHT when we rebind never gets its .ended:
+                // removing the recognizer cancels the touch silently, so the press dim
+                // would stick on the view forever (and that press is lost -- RN cancels
+                // it the same way when a view is recycled mid-touch). Undo the visual
+                // and drop any pending long-press so it can't fire on a stale binding.
+                let gid = ObjectIdentifier(lp)
+                pressLongTimers[gid]?.invalidate(); pressLongTimers[gid] = nil
+                pressLongFired.remove(gid)
+                if (lp.state == .began || lp.state == .changed), !disabledIds.contains(id) { v.alpha = 1.0 }
+                pressGestures[lp] = nil; v.removeGestureRecognizer(lp)
+            }
+        }
+        if action.isEmpty { return }   // binding removed: leave the view non-interactive (no recognizer)
         if let ao = pressOpacity[id] {                          // Pressable: press-feedback gesture, not a plain tap
             let g = UILongPressGestureRecognizer(target: self, action: #selector(handlePress(_:)))
             g.minimumPressDuration = 0
+            // A press must never block an enclosing scroll. RN's touch handler sets
+            // cancelsTouchesInView = NO, refuses to prevent any other recognizer, and
+            // cancels its own touches when an ancestor recognizer takes over; that is
+            // what lets you drag a list by starting on a row. We do the same: the press
+            // stays instant (minimumPressDuration 0, so the dim is immediate), it never
+            // delays or prevents the pan, and scrollViewWillBeginDragging cancels it.
+            g.cancelsTouchesInView = false
+            g.delegate = self
             v.addGestureRecognizer(g)
             pressGestures[g] = (action, ao, id)
             return
@@ -3697,6 +4736,86 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     // ---- run Yoga on the app tree and copy computed rects onto the UIViews ---
+    /// Yoga's "undefined" IS NaN, and Yoga hands it back for any node a layout pass did
+    /// not resolve. CoreAnimation raises CALayerInvalidGeometry on a NaN or infinite
+    /// geometry value, and an uncaught Objective-C exception in Swift aborts the process,
+    /// so one unresolved node anywhere in the tree kills the app on the next vsync tick.
+    ///
+    /// React Native carries the same guard for the same reason ("CALayer will crash if we
+    /// pass NaN or Inf values"), and skips the update rather than substituting a value:
+    /// a view's previous frame is a better guess than zero, and for a view created this
+    /// pass the previous frame is already zero.
+    ///
+    /// Returns nil when the node is not safe to place, having logged which node it was
+    /// (once per node, so a persistently bad node cannot flood the log at 60Hz).
+    private func yogaFrame(_ n: YGNodeRef, _ id: String) -> CGRect? {
+        let l = YGNodeLayoutGetLeft(n), t = YGNodeLayoutGetTop(n)
+        let w = YGNodeLayoutGetWidth(n), h = YGNodeLayoutGetHeight(n)
+        guard l.isFinite, t.isFinite, w.isFinite, h.isFinite else {
+            if warnedNonFinite.insert(id).inserted {
+                NSLog("chuks-layout: node %@ has a non-finite frame (%f,%f %fx%f) and was not placed", id, l, t, w, h)
+            }
+            return nil
+        }
+        return CGRect(x: CGFloat(l), y: CGFloat(t), width: CGFloat(w), height: CGFloat(h))
+    }
+
+    /// Attach the Liquid Glass material, once the view has a real frame, and REATTACH it
+    /// whenever the appearance it was built against is no longer the current one.
+    ///
+    /// Driven by comparing the trait rather than by a flag set when the theme changes.
+    /// The flag version raced: the rebuild and the layout pass are both async, so a
+    /// rebuild that landed AFTER the activations left surfaces cleared with nothing
+    /// re-applied, and the bar simply vanished. Comparing state cannot race, and any pass
+    /// that misses is corrected by the next one.
+    ///
+    /// Everything here is a workaround for the same fact: UIGlassEffect is laid out, not
+    /// merely drawn, so it renders nothing useful until the view it belongs to has a size.
+    /// Applying it at style time gives an opaque panel that looks like a mistake, which is
+    /// exactly what it looked like.
+    ///
+    /// The three moves, in order, all of them load-bearing:
+    ///   1. clear to a plain UIVisualEffect first, so UIKit tears the old effect down;
+    ///      re-assigning over a live effect does not take.
+    ///   2. shape it with cornerConfiguration rather than layer.cornerRadius, so the
+    ///      material's edge refracts along the corner instead of being clipped square.
+    ///   3. assign `effect` again at the end. Configuring the effect object after it is
+    ///      attached does nothing until it is re-set.
+    ///
+    /// Below iOS 26 there is no glass, so this falls back to the thinnest blur material,
+    /// which is the nearest honest thing the platform has.
+    private func activateGlass(_ id: String, _ gv: UIVisualEffectView, _ fr: CGRect) {
+        guard fr.width > 0, fr.height > 0 else { return }
+        let want = view.traitCollection.userInterfaceStyle
+        // Already correct for this appearance: nothing to do, and this runs every layout
+        // pass so the early exit matters.
+        if !glassPending.contains(id), glassBuiltFor[id] == want, gv.effect != nil { return }
+        glassPending.remove(id)
+        glassBuiltFor[id] = want
+
+        if UIAccessibility.isReduceTransparencyEnabled {
+            gv.removeFromSuperview(); glassViews[id] = nil; glassBuiltFor[id] = nil
+            if let host = views[id] { host.backgroundColor = glassFallbackColor[id] }
+            return
+        }
+        gv.effect = UIVisualEffect()
+        if #available(iOS 26.0, *), NSClassFromString("UIGlassEffect") != nil {
+            let eff = UIGlassEffect(style: .regular)
+            eff.isInteractive = false          // a backdrop; the children own the touches
+            let r = UICornerRadius(floatLiteral: gv.layer.cornerRadius)
+            gv.cornerConfiguration = .corners(topLeftRadius: r, topRightRadius: r,
+                                              bottomLeftRadius: r, bottomRightRadius: r)
+            gv.layer.cornerCurve = .continuous
+            gv.effect = eff
+        } else {
+            gv.effect = UIBlurEffect(style: .systemUltraThinMaterial)
+        }
+    }
+
+    /// A Yoga measurement for something that needs a number rather than a skip, such as a
+    /// scroll's content size. Undefined collapses to zero, which is inert.
+    private func yogaSize(_ v: Float) -> CGFloat { v.isFinite ? CGFloat(v) : 0 }
+
     func relayout() {
         guard let app = ynodes["app"] else { return }
         let insets = view.safeAreaInsets
@@ -3707,9 +4826,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // indicator); the app pads its content by safeTop()/safeBottom() (reported via
         // setInsets), so an inset is applied ONCE, not twice. Matches the Android host.
         // Without this the tree is inset AND the app pads -> a gap top and bottom.
-        let topY: CGFloat = BENCHMARK_MODE ? header.frame.maxY + 6 : 0
+        let topY: CGFloat = 0
         let W = Float(view.bounds.width)
-        let H = Float(view.bounds.height - topY - kbHeight)   // shrink for the keyboard
+        let H = Float(view.bounds.height - topY - kbHeight)   // kbHeight: only the keyboard OVERLAP of a focused bottom field
         if W <= 0 || H <= 0 { return }
         YGNodeStyleSetWidth(app, W); YGNodeStyleSetHeight(app, H)
         let _tc = layoutTiming ? CACurrentMediaTime() : 0
@@ -3732,8 +4851,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if !YGNodeGetHasNewLayout(n) && !needsFrame.contains(id) { continue }
             YGNodeSetHasNewLayout(n, false)
             _applied += 1
-            let fr = CGRect(x: CGFloat(YGNodeLayoutGetLeft(n)), y: CGFloat(YGNodeLayoutGetTop(n)),
-                            width: CGFloat(YGNodeLayoutGetWidth(n)), height: CGFloat(YGNodeLayoutGetHeight(n)))
+            guard let fr = yogaFrame(n, id) else { continue }
             if let vv = views[id] {
                 // Setting .frame on a view with a non-identity transform corrupts it
                 // (frame is transform-affected); position such views via bounds + center.
@@ -3745,7 +4863,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
             else if let rr = cornerRadii[id] { views[id]?.layer.cornerRadius = min(rr, min(fr.width, fr.height) / 2) }   // clamp numeric radius: never a diamond
             if dashBorders[id] != nil || sideBorders[id] != nil, let vv = views[id] { updateBorderLayers(id, vv) }
-            if let gv = glassViews[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the view's rounding
+            if let gv = glassViews[id] {
+                gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0   // match the view's rounding
+                activateGlass(id, gv, fr)
+            }
+            if let gv = gradLayers[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the clamped rounding
+            if let bv = blurViews[id] { bv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }
         }
         needsFrame.removeAll()   // consumed for this pass
         if layoutTiming {
@@ -3768,8 +4891,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // the scroll's content size comes from its content node's laid-out size. A horizontal
         // list's content node has an explicit WIDTH but no height (its rows are abs), so pin the
         // content height to the scroll's own height — it scrolls sideways only, rows never clip.
+        // Size EVERY scroll from its own content node. This used to run only for the single
+        // "live list", which is a different job: live means whose window follows the user's
+        // scrolling, and only a List/SectionList claims it. So a plain Scroll that contained a
+        // List (a Carousel, say) lost the slot to it and was left with no content size at all,
+        // which reads as a screen that simply will not scroll.
+        for (sid, cid) in scrollContentIds {
+            guard let sv = views[sid] as? UIScrollView, let cnode = ynodes[cid] else { continue }
+            let w = yogaSize(YGNodeLayoutGetWidth(cnode)), h = yogaSize(YGNodeLayoutGetHeight(cnode))
+            sv.contentSize = CGSize(width: w, height: horizScrollIds.contains(sid) ? sv.bounds.height : h)
+        }
         if let sc = listScroll, let cn = ynodes[contentId] {
-            let cw = CGFloat(YGNodeLayoutGetWidth(cn)), chh = CGFloat(YGNodeLayoutGetHeight(cn))
+            let cw = yogaSize(YGNodeLayoutGetWidth(cn)), chh = yogaSize(YGNodeLayoutGetHeight(cn))
             sc.contentSize = CGSize(width: cw, height: listHoriz ? sc.bounds.height : chh)
             // stickBottom (chat): if the user was at the bottom before this layout, stay pinned
             // to the new bottom (a new message, or the keyboard opening and shrinking the view).

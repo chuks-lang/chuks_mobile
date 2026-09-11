@@ -61,6 +61,8 @@ const LIGHT: map[string]string = {
 // "dark"` string-literal union would be nice, but Chuks types a bare "light"
 // literal as `string`, not as the literal, so it can't be compared/assigned to
 // the union; an enum is the idiomatic type-safe closed set.)
+import { setAppearance } from "./appearance.chuks";
+
 export enum ThemeMode {
     Light = "light",
     Dark = "dark"
@@ -71,16 +73,43 @@ var userPicked: bool = false    // true once the user chooses a theme by hand; t
 
 // Switch the whole app between dark and light. Counts as a manual choice, so the
 // app stops following the OS appearance afterwards. Re-render after calling.
-export function setTheme(mode: ThemeMode): void { userPicked = true; THEME_MODE = mode }
+export function setTheme(mode: ThemeMode): void { userPicked = true; THEME_MODE = mode; tellHost() }
 export function currentTheme(): ThemeMode { return THEME_MODE }
-export function toggleTheme(): void { userPicked = true; THEME_MODE = THEME_MODE == ThemeMode.Light ? ThemeMode.Dark : ThemeMode.Light }
+export function toggleTheme(): void {
+    userPicked = true
+    THEME_MODE = THEME_MODE == ThemeMode.Light ? ThemeMode.Dark : ThemeMode.Light
+    tellHost()
+}
+
+/**
+ * Tell the host which appearance the APP is in.
+ *
+ * Not the same question as which appearance the phone is in, and the difference is
+ * visible. Every adaptive thing UIKit draws for us, a Liquid Glass material above all,
+ * resolves against the system trait unless it is told otherwise: an app switched to its
+ * own light theme on a phone left in dark mode gets the DARK material, which is a dark
+ * slab sitting in a light app. That is the bug this exists to close, and it is exactly
+ * what expo-glass-effect exposes as its `colorScheme` prop.
+ *
+ * "auto" while the app still follows the OS, so nothing is overridden until a person
+ * actually chooses.
+ */
+function tellHost(): void {
+    setAppearance(userPicked ? string(THEME_MODE) : "auto")
+}
 
 // The host reports the OS appearance (at launch and whenever it changes). We follow
 // it UNTIL the user picks a theme manually, after which their choice sticks. This is
 // the "system / light / dark" pattern: default = follow system.
 export function syncSystemTheme(dark: bool): void {
     if (userPicked) { return }
-    THEME_MODE = dark ? ThemeMode.Dark : ThemeMode.Light
+    const next: ThemeMode = dark ? ThemeMode.Dark : ThemeMode.Light
+    if (next == THEME_MODE) { return }   // the host reports at launch too; only a CHANGE is news
+    THEME_MODE = next
+    // Still "auto": the app is following the OS, so nothing is overridden. Sent anyway
+    // because the host uses it to cross-fade, and a switch made in Control Centre
+    // repaints every colour in the tree exactly as an in-app toggle does.
+    tellHost()
 }
 // Whether the app is still tracking the OS appearance (false once overridden). The
 // host uses this to decide whether to force the system chrome (status bar) or leave

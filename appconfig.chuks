@@ -4,18 +4,555 @@
 //
 //   chuks run appconfig.chuks <projdir> <field> [arg]
 //     <field> = version | build | name | displayName | ios-bundle | ios-plist
-//               | android-perms | android-schemes            (print the value)
+//               | ios-entitlements | android-perms | android-schemes   (print the value)
 //             | patch-manifest <manifest-path>               (fill the manifest in place)
+//             | mobile-sources <ios|android>                 (native sources from packages)
+//             | mobile-modules <ios|android>                 (namespace<TAB>class per module)
+//             | mobile-views <ios|android>                   (kind<TAB>class per package view)
+//             | mobile-symmetry [sdkroot]                    (iOS/Android capability diff)
+//             | icon | splash-image | splash-bg | splash-bg-dark   (launch assets)
+//             | background-tasks                             (task ids, one per line)
 //
 // app.json (in the project root) is the app's identity + native config, like RN/Expo's
 // app.json; chuks.json stays the package/tooling manifest. Every field is optional and
 // falls back to a default, so a project without app.json still builds.
-import { fs } from "std/fs";
+import { fs, DirEntry } from "std/fs";
 import { json } from "std/json";
 import { os } from "std/os";
 
+// ---- Installed packages that carry native code ------------------------------
+//
+// A pure-Chuks package needs nothing here: the transpiler emits its functions and the
+// Go linker drops whatever the app never calls, so it costs an app that does not use
+// it nothing. A package that reaches a platform API has no such luxury. HealthKit
+// exists only in Swift and Android's calendar only in Java, so the package has to ship
+// Swift and Kotlin and the build has to compile them in.
+//
+// A package declares that in its own chuks.json, explicitly, rather than the build
+// inferring it from an ios/ directory being present:
+//
+//   "mobile": {
+//     "namespace": "health",              // the part before the dot in health.read
+//     "module":    "ChuksHealthModule",   // the class, same name on both platforms
+//     "permissions": ["health"],          // merged into the app's plist / manifest
+//     "ios":     { "sources": ["mobile/ios/Health.swift"] },
+//     "android": { "sources": ["mobile/android/Health.kt"] }
+//   }
+//
+// The declaration is the contract: a package with no "mobile" block is pure Chuks and
+// is skipped entirely.
+
+// Every installed package's chuks.json, scoped (@scope/name) or not.
+function packageManifests(projdir: string): []any {
+    var out: []any = []
+    const root: string = projdir + "/chuks_packages"
+    if (!fs.exists(root)) { return out }
+    const tops: []DirEntry = fs.readDir(root)
+    var i: int = 0
+    while (i < tops.length) {
+        const t: DirEntry = tops[i]
+        i = i + 1
+        if (!t.isDir) { continue }
+        const tp: string = root + "/" + t.name
+        // A scope directory (@chuks) holds packages; anything else IS one.
+        var dirs: []string = []
+        if (strStartsWith(t.name, "@")) {
+            const inner: []DirEntry = fs.readDir(tp)
+            var j: int = 0
+            while (j < inner.length) {
+                if (inner[j].isDir) { dirs.push(tp + "/" + inner[j].name) }
+                j = j + 1
+            }
+        } else {
+            dirs.push(tp)
+        }
+        var k: int = 0
+        while (k < dirs.length) {
+            const mf: string = dirs[k] + "/chuks.json"
+            k = k + 1
+            if (!fs.exists(mf)) { continue }
+            var cfg: any = json.parse(fs.readFile(mf))
+            if (cfg["mobile"] == null) { continue }       // pure Chuks: nothing to compile
+            cfg["__dir"] = dirs[k - 1]
+            out.push(cfg)
+        }
+    }
+    return out
+}
+
+function strStartsWith(s: string, pre: string): bool {
+    return s.length >= pre.length && s.substring(0, pre.length) == pre
+}
+
+// Absolute paths of the native sources every installed package contributes, for the
+// platform's compiler invocation.
+function mobileSourcesStr(projdir: string, platform: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        const plat: any = m[platform]
+        i = i + 1
+        if (plat == null || plat["sources"] == null) { continue }
+        const srcs: []any = plat["sources"]
+        var j: int = 0
+        while (j < srcs.length) {
+            out = out + string(pkgs[i - 1]["__dir"]) + "/" + string(srcs[j]) + "\n"
+            j = j + 1
+        }
+    }
+    return out
+}
+
+// ---- Cross-platform symmetry ------------------------------------------------
+//
+// A capability is ONE thing with two implementations, and nothing until now checked
+// that the two agreed. A package could ship `health.read` in its Swift, forget it in
+// its Kotlin, and the only symptom would be an app whose callback never fires on one
+// platform: shipped, documented and dead, with no build ever saying so.
+//
+// The check is a three-way diff between the capability names in the Swift, the names
+// in the Kotlin, and what the package DECLARES in its chuks.json:
+//
+//   "mobile": {
+//     "namespace": "health",
+//     "capabilities": {                      // optional; omit and only gaps are reported
+//       "available": ["ios", "android"],
+//       "read":      ["ios"]                 // deliberate: Android has no Health Connect
+//     }
+//   }
+//
+// An undeclared gap is loud, because it is almost always a mistake. A declared
+// difference is quiet, because someone decided it. And a capability declared for a
+// platform whose sources never mention it is loud in the other direction: the
+// declaration promised something the code does not do.
+//
+// Note what this does NOT catch, so nobody trusts it further than it goes: a
+// capability present on both sides that FAILS at runtime on one of them. @chuks/health
+// is exactly that case, its Android `read` exists only to return a message pointing at
+// Pedometer. Names are structure; behaviour needs the declaration above to say so.
+
+// Every `"<ns>.<name>"` string literal in `src`. A capability is dispatched by that
+// exact literal on both hosts (`case "health.read":` / `"health.read" ->`), so the
+// literals ARE the implemented surface. Requiring the closing quote right after the
+// name keeps error messages like "health.read is unavailable" out of the results.
+function capNamesIn(src: string, ns: string): []string {
+    var out: []string = []
+    const needle: string = "\"" + ns + "."
+    var rest: string = src
+    while (true) {
+        const at: int = rest.indexOf(needle)
+        if (at < 0) { break }
+        const after: string = rest.slice(at + needle.length, rest.length)
+        const close: int = after.indexOf("\"")
+        rest = after
+        if (close < 0) { break }
+        const name: string = after.slice(0, close)
+        if (name.length > 0 && isPlainName(name) && !contains(out, name)) { out.push(name) }
+    }
+    return out
+}
+
+// Letters, digits and underscore only: anything else is prose, not a capability name.
+function isPlainName(s: string): bool {
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        const ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_"
+        if (!ok) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The capability names a package's sources for `platform` actually implement.
+function implementedCaps(pkg: any, platform: string, ns: string): []string {
+    var out: []string = []
+    const m: any = pkg["mobile"]
+    const plat: any = m[platform]
+    if (plat == null || plat["sources"] == null) { return out }
+    const srcs: []any = plat["sources"]
+    var j: int = 0
+    while (j < srcs.length) {
+        const path: string = string(pkg["__dir"]) + "/" + string(srcs[j])
+        j = j + 1
+        if (!fs.exists(path)) { continue }
+        const found: []string = capNamesIn(fs.readFile(path), ns)
+        var k: int = 0
+        while (k < found.length) {
+            if (!contains(out, found[k])) { out.push(found[k]) }
+            k = k + 1
+        }
+    }
+    return out
+}
+
+// Every `"<ns>.<name>"` a package's own CHUKS source emits.
+//
+// This is the other side of the boundary from implementedCaps: what the package ASKS
+// for, rather than what its native halves answer. A name that appears here and nowhere
+// else is a command or a view kind nobody handles, which fails in the quietest way
+// there is. A mistyped view kind renders a plain empty container: no error, no log, no
+// missing callback, just nothing on screen.
+function chuksEmitted(pkg: any, ns: string): []string {
+    var out: []string = []
+    const dir: string = string(pkg["__dir"])
+    var files: []string = []
+    const main: any = pkg["main"]
+    if (main != null) { files.push(dir + "/" + string(main)) }
+    const srcDir: string = dir + "/src"
+    if (fs.exists(srcDir)) {
+        const entries: []DirEntry = fs.readDir(srcDir)
+        var i: int = 0
+        while (i < entries.length) {
+            const e: DirEntry = entries[i]
+            i = i + 1
+            if (e.isDir) { continue }
+            if (!endsWith(e.name, ".chuks")) { continue }
+            const path: string = srcDir + "/" + e.name
+            if (!contains(files, path)) { files.push(path) }
+        }
+    }
+    var j: int = 0
+    while (j < files.length) {
+        const f: string = files[j]
+        j = j + 1
+        if (!fs.exists(f)) { continue }
+        const found: []string = capNamesIn(fs.readFile(f), ns)
+        var k: int = 0
+        while (k < found.length) {
+            if (!contains(out, found[k])) { out.push(found[k]) }
+            k = k + 1
+        }
+    }
+    return out
+}
+
+function endsWith(s: string, suffix: string): bool {
+    if (suffix.length > s.length) { return false }
+    return s.slice(s.length - suffix.length, s.length) == suffix
+}
+
+// Does the package declare this capability for this platform? An absent
+// "capabilities" block means nothing is declared, so nothing is excused.
+function declaredFor(m: any, name: string, platform: string): bool {
+    const caps: any = m["capabilities"]
+    if (caps == null) { return false }
+    const plats: any = caps[name]
+    if (plats == null) { return false }
+    const arr: []any = plats
+    var i: int = 0
+    while (i < arr.length) {
+        if (string(arr[i]) == platform) { return true }
+        i = i + 1
+    }
+    return false
+}
+function isDeclared(m: any, name: string): bool {
+    const caps: any = m["capabilities"]
+    if (caps == null) { return false }
+    return caps[name] != null
+}
+
+// A VIEW kind is not a capability. It is dispatched by the host's view registry from the
+// package's chuks.json, not by a name-matched branch in each half, so only one side
+// mentions the string at all: the iOS class declares `static var kind`, the Kotlin class
+// is named in the manifest. Comparing them as capabilities reports a mismatch that is
+// not one, which is exactly what happened the first time a package shipped a view.
+function isViewKind(m: any, name: string): bool {
+    const views: any = m["views"]
+    if (views == null) { return false }
+    return views[name] != null
+}
+
+// ---- The framework's own two halves -----------------------------------------
+//
+// Same check, pointed at the hosts themselves. It finds nothing today (89 names on
+// each side, identical), which is exactly when a regression check is cheapest to add:
+// the next capability someone adds to one host and forgets in the other is caught by
+// the build that adds it, rather than by a user whose callback never fires.
+//
+// A deliberate difference goes in the SDK's own chuks.json, so core answers to the
+// same discipline a package does:
+//
+//   "coreCapabilities": { "foo.bar": ["ios"] }
+
+// Every quoted substring on one line.
+function quotedOn(line: string): []string {
+    var out: []string = []
+    var rest: string = line
+    while (true) {
+        const a: int = rest.indexOf("\"")
+        if (a < 0) { break }
+        const after: string = rest.slice(a + 1, rest.length)
+        const b: int = after.indexOf("\"")
+        if (b < 0) { break }
+        out.push(after.slice(0, b))
+        rest = after.slice(b + 1, after.length)
+    }
+    return out
+}
+
+// "ns.name": exactly one dot, plain names either side. That is what excludes a bundle
+// id, a mime type, a file name and every other dotted string in a 4,600-line host.
+function isCapLiteral(s: string): bool {
+    const dot: int = s.indexOf(".")
+    if (dot <= 0 || dot == s.length - 1) { return false }
+    const ns: string = s.slice(0, dot)
+    const name: string = s.slice(dot + 1, s.length)
+    if (name.indexOf(".") >= 0) { return false }
+    return isPlainName(ns) && isPlainName(name)
+}
+
+function trimLeft(s: string): string {
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        if (c != " " && c != "\t") { break }
+        i = i + 1
+    }
+    return s.slice(i, s.length)
+}
+
+// The capability names a HOST dispatches. Only the dispatch sites count: a Swift
+// `case "x.y":` and a Kotlin `"x.y" ->`. Scanning the whole file instead would drag in
+// every dotted string literal the host happens to contain.
+function hostCapNames(path: string, kotlin: bool): []string {
+    var out: []string = []
+    if (!fs.exists(path)) { return out }
+    const lines: []string = fs.readFile(path).split("\n")
+    var i: int = 0
+    while (i < lines.length) {
+        const line: string = trimLeft(lines[i])
+        i = i + 1
+        var isDispatch: bool = false
+        if (kotlin) {
+            isDispatch = line.slice(0, 1) == "\"" && line.indexOf("->") > 0
+        } else {
+            isDispatch = line.slice(0, 6) == "case \""
+        }
+        if (!isDispatch) { continue }
+        const lits: []string = quotedOn(line)
+        var j: int = 0
+        while (j < lits.length) {
+            const lit: string = lits[j]
+            j = j + 1
+            if (isCapLiteral(lit) && !contains(out, lit)) { out.push(lit) }
+        }
+    }
+    return out
+}
+
+// Declared core exceptions, from the SDK's own chuks.json.
+function coreDeclared(sdkroot: string): any {
+    const path: string = sdkroot + "/chuks.json"
+    if (!fs.exists(path)) { return {} }
+    const j: any = json.parse(fs.readFile(path))
+    const c: any = j["coreCapabilities"]
+    return c == null ? {} : c
+}
+function coreDeclaredFor(decl: any, name: string, platform: string): bool {
+    const plats: any = decl[name]
+    if (plats == null) { return false }
+    const arr: []any = plats
+    var i: int = 0
+    while (i < arr.length) {
+        if (string(arr[i]) == platform) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+function coreSymmetryStr(sdkroot: string): string {
+    if (sdkroot == "") { return "" }
+    const ios: []string = hostCapNames(sdkroot + "/ios/ChuksApp.swift", false)
+    const android: []string = hostCapNames(sdkroot + "/android/MainActivity.kt", true)
+    if (ios.length == 0 || android.length == 0) { return "" }   // not a full SDK tree
+    const decl: any = coreDeclared(sdkroot)
+    var out: string = ""
+    var i: int = 0
+    while (i < ios.length) {
+        const c: string = ios[i]
+        i = i + 1
+        if (contains(android, c)) { continue }
+        if (decl[c] != null && !coreDeclaredFor(decl, c, "android")) {
+            out = out + "note\t@chuks/mobile\t" + c + "\tiOS only, as declared\n"
+        } else {
+            out = out + "gap\t@chuks/mobile\t" + c + "\tdispatched by the iOS host, not by the Android host\n"
+        }
+    }
+    var k: int = 0
+    while (k < android.length) {
+        const c2: string = android[k]
+        k = k + 1
+        if (contains(ios, c2)) { continue }
+        if (decl[c2] != null && !coreDeclaredFor(decl, c2, "ios")) {
+            out = out + "note\t@chuks/mobile\t" + c2 + "\tAndroid only, as declared\n"
+        } else {
+            out = out + "gap\t@chuks/mobile\t" + c2 + "\tdispatched by the Android host, not by the iOS host\n"
+        }
+    }
+    return out
+}
+
+// One line per finding: "<level>\t<package>\t<capability>\t<message>".
+// level is "gap" (loud) or "note" (declared, informational).
+function mobileSymmetryStr(projdir: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const pkg: any = pkgs[i]
+        i = i + 1
+        const m: any = pkg["mobile"]
+        if (m == null) { continue }
+        const ns: string = strOr(m["namespace"], "")
+        if (ns == "") { continue }
+        const name: string = strOr(pkg["name"], "(unnamed package)")
+        const ios: []string = implementedCaps(pkg, "ios", ns)
+        const android: []string = implementedCaps(pkg, "android", ns)
+        // A package that ships only one platform's sources is a different thing from
+        // one whose two halves disagree, and saying "everything is missing on Android"
+        // for an iOS-only package would be noise.
+        if (ios.length == 0 || android.length == 0) { continue }
+
+        var j: int = 0
+        while (j < ios.length) {
+            const c: string = ios[j]
+            j = j + 1
+            if (isViewKind(m, c)) { continue }
+            if (contains(android, c)) {
+                // Present on both, but the declaration says one platform. Worth a note:
+                // it is how a package records "the code is there to report it politely".
+                if (isDeclared(m, c) && !declaredFor(m, c, "android")) {
+                    out = out + "note\t" + name + "\t" + ns + "." + c + "\tdeclared iOS-only; the Kotlin implements it (expected to report unsupported)\n"
+                }
+                continue
+            }
+            if (declaredFor(m, c, "android")) {
+                out = out + "gap\t" + name + "\t" + ns + "." + c + "\tdeclared for Android, but no Kotlin source mentions it\n"
+            } else if (isDeclared(m, c)) {
+                out = out + "note\t" + name + "\t" + ns + "." + c + "\tiOS only, as declared\n"
+            } else {
+                out = out + "gap\t" + name + "\t" + ns + "." + c + "\timplemented in Swift, missing from the Kotlin\n"
+            }
+        }
+        // What the package's own Chuks asks for, against what anything answers. A view
+        // kind is answered by the view registry rather than by a native branch, so it
+        // counts as handled when it is declared.
+        const emitted: []string = chuksEmitted(pkg, ns)
+        var e: int = 0
+        while (e < emitted.length) {
+            const name2: string = emitted[e]
+            e = e + 1
+            if (contains(ios, name2) || contains(android, name2)) { continue }
+            if (isViewKind(m, name2)) { continue }
+            out = out + "gap\t" + name + "\t" + ns + "." + name2 + "\tthe package's Chuks emits this, but no native source handles it and no view declares it\n"
+        }
+
+        var k: int = 0
+        while (k < android.length) {
+            const c2: string = android[k]
+            k = k + 1
+            if (isViewKind(m, c2)) { continue }
+            if (contains(ios, c2)) { continue }
+            if (declaredFor(m, c2, "ios")) {
+                out = out + "gap\t" + name + "\t" + ns + "." + c2 + "\tdeclared for iOS, but no Swift source mentions it\n"
+            } else if (isDeclared(m, c2)) {
+                out = out + "note\t" + name + "\t" + ns + "." + c2 + "\tAndroid only, as declared\n"
+            } else {
+                out = out + "gap\t" + name + "\t" + ns + "." + c2 + "\timplemented in Kotlin, missing from the Swift\n"
+            }
+        }
+    }
+    return out
+}
+
+// `namespace<TAB>ClassName` per module, for the generated registration file. Only
+// packages that ship sources for THIS platform are listed: a package with an Android
+// half and no iOS half must not be registered into an iOS build.
+function mobileModulesStr(projdir: string, platform: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        i = i + 1
+        if (m[platform] == null) { continue }
+        const ns: string = strOr(m["namespace"], "")
+        const cls: string = strOr(m["module"], "")
+        if (ns == "" || cls == "") { continue }
+        out = out + ns + "\t" + cls + "\n"
+    }
+    return out
+}
+
+// `kind<TAB>ClassName` per view a package supplies, for the generated registry. A view
+// is declared the way a module is, in the package's chuks.json:
+//
+//   "mobile": {
+//     "namespace": "health",
+//     "views": { "ring": "ChuksHealthRingView" }
+//   }
+//
+// The kind an app writes is namespace-qualified ("health.ring"), so two packages can
+// both call a view "chart" without colliding. Only packages that ship sources for THIS
+// platform are listed, for the same reason modules are.
+function mobileViewsStr(projdir: string, platform: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        i = i + 1
+        if (m == null || m[platform] == null) { continue }
+        const ns: string = strOr(m["namespace"], "")
+        const views: any = m["views"]
+        if (ns == "" || views == null) { continue }
+        const names: []string = views.keys()
+        var j: int = 0
+        while (j < names.length) {
+            const name: string = names[j]
+            j = j + 1
+            const cls: string = string(views[name])
+            if (cls != "") { out = out + ns + "." + name + "\t" + cls + "\n" }
+        }
+    }
+    return out
+}
+
+// The permission kinds installed packages declare, folded into the app's own map so
+// one emitter produces the plist strings and manifest entries for both. A package
+// declares WHICH permission it needs; the app still writes the user-facing reason,
+// since only the app knows what it uses the capability for.
+function withPackagePerms(projdir: string, perms: any): any {
+    const pkgs: []any = packageManifests(projdir)
+    var i: int = 0
+    while (i < pkgs.length) {
+        const m: any = pkgs[i]["mobile"]
+        i = i + 1
+        if (m["permissions"] == null) { continue }
+        const kinds: []any = m["permissions"]
+        var j: int = 0
+        while (j < kinds.length) {
+            const k: string = string(kinds[j])
+            j = j + 1
+            if (perms[k] == null) { perms[k] = "Used by this app." }
+        }
+    }
+    return perms
+}
+
 // A FIXED kind order (not the parsed map's order, which isn't stable) so the generated
 // plist / manifest is deterministic across builds.
+// Set from app.json before the manifest is written: an app that declares backgroundTasks
+// needs one extra Android permission that nothing else implies.
+var HAS_BG_TASKS: bool = false
+// Same idea for background location: it runs in a foreground service, and a foreground
+// service needs permissions no ordinary location read does.
+var HAS_BG_LOCATION: bool = false
+
 const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "bluetooth", "nfc", "activity", "bodySensors", "health"]
 
 // permission kind -> iOS Info.plist usage-description key(s)
@@ -35,6 +572,45 @@ function iosKeysFor(kind: string): []string {
     var empty: []string = []          // notifications / bodySensors need no iOS plist string
     return empty
 }
+// permission kind -> the iOS ENTITLEMENT it needs, as `key<TAB>value-xml` lines.
+//
+// An entitlement is not a usage string. A usage string is text in Info.plist and any
+// build can carry one; an entitlement is signed into the app and must ALSO be present
+// in the provisioning profile, which means an EXPLICIT App ID with the capability
+// enabled. The wildcard development profile the build normally uses can never carry
+// one, so these two kinds are the only capabilities that cannot be developed against
+// with the default signing setup.
+//
+// Emitted as lines rather than plist XML because the build script has to filter them
+// against what the chosen profile actually carries before assembling the plist: an
+// entitlement the profile lacks makes codesign fail outright, which would stop an app
+// that merely DECLARES nfc from reaching a device at all.
+//
+// Everything else on the bus needs no entitlement: local notifications are
+// UNUserNotificationCenter (remote push would need aps-environment, which is not
+// implemented), the keychain uses the default access group application-identifier
+// already grants, and bluetooth, contacts, calendar, camera, location and motion are
+// usage strings only.
+function iosEntitlementFor(kind: string): string {
+    if (kind == "health") { return "com.apple.developer.healthkit\t<true/>\n" }
+    if (kind == "nfc") {
+        return "com.apple.developer.nfc.readersession.formats\t<array><string>NDEF</string></array>\n"
+    }
+    return ""
+}
+
+// The entitlements the app's declared permissions imply, one per line.
+function iosEntitlementsStr(perms: any): string {
+    var out: string = ""
+    var i: int = 0
+    while (i < KINDS.length) {
+        const kind: string = KINDS[i]
+        if (perms[kind] != null) { out = out + iosEntitlementFor(kind) }
+        i = i + 1
+    }
+    return out
+}
+
 // permission kind -> Android manifest uses-permission name(s)
 function androidPermsFor(kind: string): []string {
     if (kind == "camera") { return ["CAMERA"] }
@@ -112,6 +688,17 @@ function iosPlistStr(perms: any, ios: any): string {
 // The Android <uses-permission> block (base entries + whatever the permissions map implies).
 function androidPermsStr(perms: any): string {
     var names: []string = ["INTERNET", "ACCESS_NETWORK_STATE", "VIBRATE", "FLASHLIGHT"]
+    // An app with background tasks needs this to persist jobs across a reboot, and
+    // JobScheduler throws rather than declining when it is missing.
+    if (HAS_BG_TASKS) { names.push("RECEIVE_BOOT_COMPLETED") }
+    // Background location is a foreground service on Android, and since API 34 the
+    // service must hold the permission matching its declared type. POST_NOTIFICATIONS
+    // is what makes the mandatory tracking notification visible on Android 13+.
+    if (HAS_BG_LOCATION) {
+        names.push("FOREGROUND_SERVICE")
+        names.push("FOREGROUND_SERVICE_LOCATION")
+        names.push("POST_NOTIFICATIONS")
+    }
     var i: int = 0
     while (i < KINDS.length) {
         if (perms[KINDS[i]] != null) {
@@ -159,6 +746,24 @@ function trimEnd(s: string): string {
     return s
 }
 
+// ---- Launch assets ----------------------------------------------------------
+//
+// One source image per job, resized by the build for every density and idiom the
+// platforms want. Declared in app.json because they are identity, not code:
+//
+//   "icon": "assets/icon.png",
+//   "splash": { "image": "assets/splash.png", "backgroundColor": "#0F1412" }
+//
+// Paths are relative to the project root. An absent field means the platform default,
+// which is what every app got before this existed.
+function assetPath(projdir: string, rel: string): string {
+    if (rel == "") { return "" }
+    var full: string = projdir + "/" + rel
+    if (strStartsWith(rel, "/")) { full = rel }
+    if (!fs.exists(full)) { return "" }        // a path that is not there is not an asset
+    return full
+}
+
 function main(): void {
     const a: []string = os.args()
     if (a.length < 5) { return }            // chuks run <script> <projdir> <field> [arg]
@@ -173,6 +778,12 @@ function main(): void {
     var android: any = cfg["android"]
     var perms: any = cfg["permissions"]
     if (perms == null) { perms = {} }
+    // An installed package's declared permissions count as the app's: the package knows
+    // which permission its capability needs, the app supplies the reason shown to the user.
+    perms = withPackagePerms(projdir, perms)
+    const btl: any = cfg["backgroundTasks"]
+    if (btl != null) { const arr: []any = btl; HAS_BG_TASKS = arr.length > 0 }
+    HAS_BG_LOCATION = cfg["backgroundLocation"] == true
 
     if (field == "version") { println(strOr(cfg["version"], "1.0")) }
     else if (field == "build") { println(strOr(cfg["buildNumber"], "1")) }
@@ -180,8 +791,50 @@ function main(): void {
     else if (field == "displayName") { println(strOr(cfg["displayName"], strOr(cfg["name"], ""))) }
     else if (field == "ios-bundle") { println(ios == null ? "" : strOr(ios["bundleId"], "")) }
     else if (field == "ios-plist") { print(iosPlistStr(perms, ios)) }
+    else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
+    else if (field == "mobile-views") { print(mobileViewsStr(projdir, a[5])) }
+    else if (field == "mobile-symmetry") { print(coreSymmetryStr(a.length > 5 ? a[5] : "") + mobileSymmetryStr(projdir)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
+    else if (field == "background-location") {
+        // iOS needs "location" in UIBackgroundModes, and CRASHES rather than erroring if
+        // an app sets allowsBackgroundLocationUpdates without it. Android needs the
+        // foreground-service permissions. Declared, so neither is a surprise.
+        println(cfg["backgroundLocation"] == true ? "1" : "0")
+    }
+    else if (field == "state-restore-window") {
+        // How recently the app must have been backgrounded for its state to be restored.
+        // Absent means the default; 0 turns restoration off.
+        const sr: any = cfg["stateRestoration"]
+        println(sr == null ? "1800" : string(sr))
+    }
+    else if (field == "background-tasks") {
+        // BGTaskScheduler refuses any identifier not in the plist, and JobScheduler needs
+        // to know which jobs to persist, so tasks are declared rather than invented at
+        // runtime. One per line, in declaration order.
+        const bt: any = cfg["backgroundTasks"]
+        if (bt != null) {
+            const ids: []any = bt
+            var i: int = 0
+            while (i < ids.length) { println(string(ids[i])) i = i + 1 }
+        }
+    }
+    else if (field == "icon") { println(assetPath(projdir, strOr(cfg["icon"], ""))) }
+    else if (field == "splash-image") {
+        const sp: any = cfg["splash"]
+        println(sp == null ? "" : assetPath(projdir, strOr(sp["image"], "")))
+    }
+    else if (field == "splash-bg") {
+        const sp2: any = cfg["splash"]
+        println(sp2 == null ? "" : strOr(sp2["backgroundColor"], ""))
+    }
+    else if (field == "splash-bg-dark") {
+        const sp3: any = cfg["splash"]
+        // Falls back to the light colour, so declaring one colour is enough.
+        println(sp3 == null ? "" : strOr(sp3["darkBackgroundColor"], strOr(sp3["backgroundColor"], "")))
+    }
+    else if (field == "mobile-sources") { print(mobileSourcesStr(projdir, a[5])) }
+    else if (field == "mobile-modules") { print(mobileModulesStr(projdir, a[5])) }
     else if (field == "patch-manifest") { patchManifest(a[5], cfg, perms, android) }
 }
 
