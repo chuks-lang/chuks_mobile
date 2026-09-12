@@ -853,22 +853,102 @@ export class Notifications {
     }
 }
 
-// ---- Audio playback (Tier B) ------------------------------------------------
-// Play a bundled audio track (an asset filename, e.g. "sample.mp4") through the
-// OS media player. play() (re)loads + starts; pause/resume/stop control it; a
-// single track plays at a time. position() answers (async) with "posMs/durMs" —
-// the proof that playback actually advanced (and freezes while paused).
-export class Audio {
-    public static play(src: string): void { emitNativeCommand("audio.play", src, null) }
-    public static pause(): void { emitNativeCommand("audio.pause", "", null) }
-    public static resume(): void { emitNativeCommand("audio.resume", "", null) }
-    public static stop(): void { emitNativeCommand("audio.stop", "", null) }
-    public static position(onResult: (string)=> void): void { emitNativeCommand("audio.position", "", onResult) }
-
-    /** "posMs/durMs" for the current track, awaited. */
-    public static async positionAsync(): Task<string> { return await awaitCommand("audio.position", "", false, CAP_QUICK_MS) }
+// ---- Audio playback ---------------------------------------------------------
+// A player is an instance. Several can exist at once, each with its own source,
+// position, volume and rate, which is what a feed of voice notes or a soundboard
+// needs. The source is a bundled asset name ("chime.mp3"), a "file://" path (a
+// recording, a download), or an http(s) URL, which streams.
+//
+// Status is one string, "state,posMs,durMs,rate,volume,buffering,error":
+//   state      "loading" | "ready" | "playing" | "paused" | "ended" | "error"
+//   posMs      the playhead, milliseconds
+//   durMs      the track length, or 0 until known (a stream may never know)
+//   rate       playback speed, 1.0 normal
+//   volume     0.0 .. 1.0
+//   buffering  1 while waiting on data, else 0
+//   error      empty, or why state is "error"; it is LAST so a comma inside it cannot
+//              shift the fields before it
+// status() reads it once; watch() streams it on every change and a few times a
+// second while playing, from the platform's own time observer rather than a poll.
+//
+// release() frees the native player. A player is a real resource (a decoder, and on
+// Android one of a small fixed number of MediaPlayer slots), so a screen that makes
+// one must release it on unmount. The host caps live players at 32 and puts the
+// 33rd into state "error" rather than letting the platform fail somewhere less
+// legible; if you hit that, you are not releasing.
+//
+// Interruptions are handled for you: a phone call or Siri pauses every player and,
+// when the OS says the interruption is over, resumes the ones that were playing.
+// Headphones being unplugged pauses, and does not resume, because that is what the
+// user expects. Audio.setMode() decides how this app's sound relates to others'.
+var AUDIO_SEQ: int = 0
+var AUDIO_DEFAULT: AudioPlayer? = null
+function audioPos(status: string): string {
+    const f: []string = status.split(",")
+    if (f.length < 3) { return "0/0" }
+    return f[1] + "/" + f[2]
 }
 
+export class AudioPlayer {
+    id: string
+    // Creates the native player and starts loading the source. Play when ready, or
+    // just call play(): it waits for ready on its own.
+    constructor(src: string) {
+        AUDIO_SEQ = AUDIO_SEQ + 1
+        this.id = "ap" + string(AUDIO_SEQ)
+        emitNativeCommand("audio.create", { id: this.id, src: src }, null)
+    }
+    public play(): void { emitNativeCommand("audio.play", { id: this.id }, null) }
+    public pause(): void { emitNativeCommand("audio.pause", { id: this.id }, null) }
+    // Pause and go back to the start.
+    public stop(): void { emitNativeCommand("audio.stop", { id: this.id }, null) }
+    public seek(ms: int): void { emitNativeCommand("audio.seek", { id: this.id, ms: ms }, null) }
+    public setVolume(v: float): void { emitNativeCommand("audio.volume", { id: this.id, v: v }, null) }
+    // 0.5 .. 2.0 is the range both platforms honour well. Pitch is corrected.
+    public setRate(r: float): void { emitNativeCommand("audio.rate", { id: this.id, r: r }, null) }
+    public setLoop(on: bool): void { emitNativeCommand("audio.loop", { id: this.id, on: on }, null) }
+    public status(onResult: (string)=> void): void { emitNativeCommand("audio.status", { id: this.id }, onResult) }
+    public watch(onStatus: (string)=> void): NativeSub { return emitNativeStream("audio.watch", { id: this.id }, onStatus, null) }
+    // Frees the native player. The instance is dead after this.
+    public release(): void { emitNativeCommand("audio.release", { id: this.id }, null) }
+
+    /** The status string, awaited. */
+    public async statusAsync(): Task<string> { return await awaitCommand("audio.status", { id: this.id }, false, CAP_QUICK_MS) }
+}
+
+// The one-track convenience, and how this app's audio relates to everyone else's.
+// play/pause/resume/stop/position drive a default player, so code written against
+// them keeps working; anything beyond one track wants an AudioPlayer of its own.
+export class Audio {
+    public static play(src: string): void {
+        if (AUDIO_DEFAULT != null) { AUDIO_DEFAULT.release() }
+        const p: AudioPlayer = new AudioPlayer(src)
+        AUDIO_DEFAULT = p
+        p.play()
+    }
+    public static pause(): void { if (AUDIO_DEFAULT != null) { AUDIO_DEFAULT.pause() } }
+    public static resume(): void { if (AUDIO_DEFAULT != null) { AUDIO_DEFAULT.play() } }
+    public static stop(): void { if (AUDIO_DEFAULT != null) { AUDIO_DEFAULT.stop() } }
+    // "posMs/durMs" of the default player, the two middle fields of its status.
+    public static position(onResult: (string)=> void): void {
+        if (AUDIO_DEFAULT == null) { onResult("0/0"); return }
+        AUDIO_DEFAULT.status(function(s: string): void { onResult(audioPos(s)) })
+    }
+    // How this app's sound sits with other apps' and the silent switch:
+    //   "playback"  the default. Plays with the silent switch on; other audio stops.
+    //   "ambient"   respects the silent switch; mixes with other audio. Sound effects.
+    //   "duck"      plays in silent mode and lowers other audio rather than stopping it.
+    //               Navigation prompts, a voice note over music.
+    // Set it once, before the first player, and change it only for a reason.
+    public static setMode(mode: string): void { emitNativeCommand("audio.mode", mode, null) }
+
+    /** "posMs/durMs" for the default player, awaited. */
+    public static async positionAsync(): Task<string> {
+        if (AUDIO_DEFAULT == null) { return "0/0" }
+        const s: string = await AUDIO_DEFAULT.statusAsync()
+        return audioPos(s)
+    }
+}
 // ---- Microphone recording (Tier C) ------------------------------------------
 // Record audio from the mic to a file, with a live input-level stream for a VU meter.
 // start() begins recording (needs the "microphone" permission — request it via

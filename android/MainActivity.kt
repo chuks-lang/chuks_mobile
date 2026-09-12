@@ -1593,31 +1593,40 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     ChuksNotif.pending = null; resolve(token, it)
                 }
             }
-            "audio.play" -> {
-                audioMp?.release(); audioMp = null
-                val mp = MediaPlayer()
-                try {
-                    if (args.startsWith("file://")) {
-                        mp.setDataSource(args.substring(7))   // a recording / downloaded file
-                    } else {
-                        val afd = assets.openFd(args)         // a bundled asset
-                        mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length); afd.close()
-                    }
-                    mp.setAudioAttributes(
-                        android.media.AudioAttributes.Builder()
-                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build())
-                    mp.prepare(); mp.start()   // synchronous prepare: the asset is a local file
-                    audioMp = mp
-                } catch (e: Exception) { mp.release() }   // bad asset / bad state: leave nothing playing
+            // ---- Audio: see ChuksAudio.kt ----
+            "audio.mode" -> ChuksAudio.mode = args
+            "audio.create" -> {
+                val id = a.s("id"); val src = a.s("src")
+                if (ChuksAudio.players.size >= ChuksAudio.CAP) {
+                    val msg = "too many players (${ChuksAudio.CAP}); release() the ones you are done with"
+                    audioWatchers[id]?.forEach { resolve(it, "error,0,0,1,1,0,$msg") }
+                    android.util.Log.w("Chuks", "Audio: $msg")
+                    return
+                }
+                ChuksAudio.listen(this)
+                ChuksAudio.players.remove(id)?.release()
+                val p = ChuksAudioPlayer(id) { st -> runOnUiThread { audioWatchers[id]?.toList()?.forEach { resolve(it, st) } } }
+                ChuksAudio.players[id] = p
+                p.load(this, src)
             }
-            "audio.pause" -> audioMp?.let { if (it.isPlaying) it.pause() }
-            "audio.resume" -> audioMp?.start()
-            "audio.stop" -> audioMp?.let { if (it.isPlaying) it.pause(); it.seekTo(0) }
-            "audio.position" -> {
-                val mp = audioMp
-                resolve(token, "${mp?.currentPosition ?: 0}/${mp?.duration ?: 0}")
+            "audio.play" -> { ChuksAudio.requestFocus(this); ChuksAudio.players[a.s("id")]?.play() }
+            "audio.pause" -> ChuksAudio.players[a.s("id")]?.pause()
+            "audio.stop" -> ChuksAudio.players[a.s("id")]?.stop()
+            "audio.seek" -> ChuksAudio.players[a.s("id")]?.seek(a.int("ms") ?: 0)
+            "audio.volume" -> ChuksAudio.players[a.s("id")]?.setVolume((a.num("v") ?: 1.0).toFloat())
+            "audio.rate" -> ChuksAudio.players[a.s("id")]?.setRate((a.num("r") ?: 1.0).toFloat())
+            "audio.loop" -> ChuksAudio.players[a.s("id")]?.setLoop(a.bool("on"))
+            "audio.status" -> resolve(token, ChuksAudio.players[a.s("id")]?.status() ?: "error,0,0,1,1,0,no such player (released, or never created)")
+            "audio.watch" -> {
+                val id = a.s("id")
+                audioWatchers.getOrPut(id) { HashSet() }.add(token)
+                streamTeardown[token] = { audioWatchers[id]?.remove(token) }
+                ChuksAudio.players[id]?.let { resolve(token, it.status()) }
+            }
+            "audio.release" -> {
+                val id = a.s("id")
+                ChuksAudio.players.remove(id)?.release()
+                audioWatchers.remove(id)
             }
             "recorder.start" -> {
                 if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) { fail(token, "microphone permission denied"); return }
@@ -2025,7 +2034,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
 
     private var notifId = 1
-    private var audioMp: MediaPlayer? = null   // single-track audio playback (Tier B)
+    private val audioWatchers = HashMap<String, HashSet<String>>()   // AudioPlayer id -> watch tokens
     private var mediaRecorder: android.media.MediaRecorder? = null   // mic recording (Tier C)
     private var recPath: String? = null
 

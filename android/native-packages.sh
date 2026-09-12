@@ -83,7 +83,7 @@ object ChuksBuild {
     const val STATE_RESTORE_WINDOW = $restore_window
 }
 KTB
-    KT_SRC="$OUT/ChuksBuild.kt $PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt $PKGDIR/ChuksModule.kt $PKGDIR/ChuksJobService.kt $PKGDIR/ChuksLocationService.kt $PKGDIR/ChuksNotifications.kt $OUT/ChuksPackageModules.kt $PKG_KT"
+    KT_SRC="$OUT/ChuksBuild.kt $PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt $PKGDIR/ChuksModule.kt $PKGDIR/ChuksJobService.kt $PKGDIR/ChuksLocationService.kt $PKGDIR/ChuksNotifications.kt $PKGDIR/ChuksAudio.kt $OUT/ChuksPackageModules.kt $PKG_KT"
     KT_CP="$AJAR"
     return 0
 }

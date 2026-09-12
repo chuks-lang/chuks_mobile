@@ -1025,6 +1025,111 @@ func keychainDelete(_ key: String) {
     SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key] as CFDictionary)
 }
 
+// ── Audio player ─────────────────────────────────────────────────────────────
+// One AVPlayer per Chuks AudioPlayer, observed the way expo-audio observes it:
+// KVO on the item's status for ready/failed, a periodic time observer for the
+// playhead (never a poll), the did-play-to-end notification for finish and loop,
+// and the buffer-empty / likely-to-keep-up pair for buffering. Every change is
+// pushed through `emit` as the one status string the Chuks side documents.
+final class ChuksAudioPlayer {
+    let id: String
+    let player: AVPlayer
+    var emit: ((String) -> Void)?
+    var loop = false
+    var rate: Float = 1.0
+    var volume: Float = 1.0
+    var state = "loading"
+    var error = ""
+    var buffering = false
+    var wantPlay = false                  // play() arrived before the item was ready
+    var wasPlayingBeforeInterruption = false
+    private var timeObs: Any?
+    private var kvo: [NSKeyValueObservation] = []
+    private var endObs: NSObjectProtocol?
+
+    init(id: String, url: URL) {
+        self.id = id
+        let item = AVPlayerItem(url: url)
+        item.audioTimePitchAlgorithm = .timeDomain     // rate changes keep the pitch
+        player = AVPlayer(playerItem: item)
+        player.actionAtItemEnd = .pause
+        kvo.append(item.observe(\.status, options: [.new]) { [weak self] it, _ in
+            guard let self = self else { return }
+            switch it.status {
+            case .readyToPlay:
+                if self.state == "loading" { self.state = "ready" }
+                if self.wantPlay { self.wantPlay = false; self.start() }
+                self.push()
+            case .failed:
+                self.state = "error"
+                self.error = it.error?.localizedDescription ?? "cannot play this source"
+                self.push()
+            default: break
+            }
+        })
+        kvo.append(item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] it, _ in
+            if it.isPlaybackBufferEmpty { self?.buffering = true; self?.push() }
+        })
+        kvo.append(item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] it, _ in
+            if it.isPlaybackLikelyToKeepUp { self?.buffering = false; self?.push() }
+        })
+        endObs = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            if self.loop {
+                self.player.seek(to: .zero) { _ in self.start() }
+            } else {
+                self.state = "ended"; self.push()
+            }
+        }
+        // A quarter-second cadence while playing is enough for any progress bar and
+        // is the cadence the platform delivers, so nothing here wakes on a timer.
+        timeObs = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] _ in
+            guard let self = self, self.state == "playing" else { return }
+            self.push()
+        }
+    }
+
+    private func start() {
+        player.playImmediately(atRate: rate)
+        state = "playing"
+        push()
+    }
+    func play() {
+        if player.currentItem?.status == .readyToPlay { start() } else { wantPlay = true }
+    }
+    func pause() { wantPlay = false; player.pause(); if state == "playing" { state = "paused"; push() } }
+    func stop() { pause(); player.seek(to: .zero); push() }
+    func seek(ms: Int64) {
+        player.seek(to: CMTime(value: ms, timescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in self?.push() }
+    }
+    func setVolume(_ v: Float) { volume = max(0, min(1, v)); player.volume = volume; push() }
+    func setRate(_ r: Float) {
+        rate = max(0.25, min(4, r))
+        if state == "playing" { player.rate = rate }
+        push()
+    }
+
+    func status() -> String {
+        let pos = CMTimeGetSeconds(player.currentTime())
+        let dur = player.currentItem?.duration.seconds ?? 0
+        let posMs = pos.isFinite ? Int(pos * 1000) : 0
+        let durMs = dur.isFinite ? Int(dur * 1000) : 0
+        return "\(state),\(posMs),\(durMs),\(rate),\(volume),\(buffering ? 1 : 0),\(error)"
+    }
+    func push() { emit?(status()) }
+
+    func release() {
+        player.pause()
+        if let t = timeObs { player.removeTimeObserver(t) }
+        timeObs = nil
+        kvo.forEach { $0.invalidate() }; kvo = []
+        if let e = endObs { NotificationCenter.default.removeObserver(e) }
+        endObs = nil
+        emit = nil
+        player.replaceCurrentItem(with: nil)
+    }
+}
+
 // Show notifications even while the app is foregrounded (iOS otherwise suppresses
 // the banner for the active app), and receive the tap.
 //
@@ -2655,7 +2760,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
     // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
     func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
-    var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
+    // Audio: one ChuksAudioPlayer per Chuks AudioPlayer, watch tokens per player, and
+    // the interruption observers installed on the first create. Capped, because a
+    // player holds a decoder and a screen that forgets release() would otherwise find
+    // out from the platform, somewhere less legible than a status string.
+    var audioPlayers: [String: ChuksAudioPlayer] = [:]
+    var audioWatchers: [String: Set<String>] = [:]      // player id -> stream tokens
+    var audioInterruptionObs: [NSObjectProtocol] = []
+    static let audioCap = 32
     var audioRecorder: AVAudioRecorder? = nil   // mic recording (Tier C)
     var cameraController: CameraController? = nil   // live CameraView session (for camera.capturePreview)
     var ble: BleManager? = nil          // CoreBluetooth central (lazy)
@@ -3219,22 +3331,62 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let p = notifDelegate.pending { notifDelegate.pending = nil; resolve(token, p) }
         case "notif.channel":
             break   // Android's concept; iOS has no channels
-        case "audio.play":
-            let src: URL? = args.hasPrefix("file://") ? URL(fileURLWithPath: String(args.dropFirst(7)))   // a recording / downloaded file
-                                                      : bundledAssetURL(args)   // a bundled asset
-            if let url = src {
-                try? AVAudioSession.sharedInstance().setCategory(.playback)
-                try? AVAudioSession.sharedInstance().setActive(true)
-                audioPlayer?.pause()                 // stop any previous track: no overlapping players
-                let p = AVPlayer(url: url); audioPlayer = p; p.play()
+        case "audio.mode":
+            // How this app's sound sits with everyone else's. Set before the first player.
+            let session = AVAudioSession.sharedInstance()
+            switch args {
+            case "ambient": try? session.setCategory(.ambient, options: [.mixWithOthers])
+            case "duck":    try? session.setCategory(.playback, options: [.duckOthers])
+            default:        try? session.setCategory(.playback)
             }
-        case "audio.pause": audioPlayer?.pause()
-        case "audio.resume": audioPlayer?.play()
-        case "audio.stop": audioPlayer?.pause(); audioPlayer?.seek(to: .zero)
-        case "audio.position":
-            let cur = audioPlayer.map { CMTimeGetSeconds($0.currentTime()) } ?? 0
-            let dur = audioPlayer?.currentItem?.duration.seconds ?? 0
-            resolve(token, "\(cur.isFinite ? Int(cur*1000) : 0)/\(dur.isFinite ? Int(dur*1000) : 0)")
+            try? session.setActive(true)
+        case "audio.create":
+            let id = a.s("id"), src = a.s("src")
+            if audioPlayers.count >= CardsVC.audioCap {
+                // Answer through the status the watcher will read, not a crash.
+                let msg = "too many players (\(CardsVC.audioCap)); release() the ones you are done with"
+                for t in audioWatchers[id] ?? [] { resolve(t, "error,0,0,1,1,0,\(msg)") }
+                os_log("%{public}@", log: chuksLog, type: .error, "Audio: " + msg)
+                break
+            }
+            let url: URL?
+            if src.hasPrefix("file://") { url = URL(fileURLWithPath: String(src.dropFirst(7))) }
+            else if src.hasPrefix("http://") || src.hasPrefix("https://") { url = URL(string: src) }
+            else { url = bundledAssetURL(src) }
+            guard let u = url else {
+                for t in audioWatchers[id] ?? [] { resolve(t, "error,0,0,1,1,0,\"\(src)\" is not a file, a URL, or a bundled asset") }
+                break
+            }
+            if audioInterruptionObs.isEmpty { installAudioInterruptionHandling() }
+            if AVAudioSession.sharedInstance().category == .soloAmbient {
+                // The default category never activates; give playback a real one so
+                // the silent switch does not silence a player nobody asked to be silent.
+                try? AVAudioSession.sharedInstance().setCategory(.playback)
+            }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            audioPlayers[id]?.release()
+            let p = ChuksAudioPlayer(id: id, url: u)
+            p.emit = { [weak self] st in for t in self?.audioWatchers[id] ?? [] { self?.resolve(t, st) } }
+            audioPlayers[id] = p
+        case "audio.play":    audioPlayers[a.s("id")]?.play()
+        case "audio.pause":   audioPlayers[a.s("id")]?.pause()
+        case "audio.stop":    audioPlayers[a.s("id")]?.stop()
+        case "audio.seek":    audioPlayers[a.s("id")]?.seek(ms: Int64(a.num("ms") ?? 0))
+        case "audio.volume":  audioPlayers[a.s("id")]?.setVolume(Float(a.num("v") ?? 1))
+        case "audio.rate":    audioPlayers[a.s("id")]?.setRate(Float(a.num("r") ?? 1))
+        case "audio.loop":    audioPlayers[a.s("id")]?.loop = a.bool("on")
+        case "audio.status":
+            resolve(token, audioPlayers[a.s("id")]?.status() ?? "error,0,0,1,1,0,no such player (released, or never created)")
+        case "audio.watch":
+            let id = a.s("id")
+            audioWatchers[id, default: []].insert(token)
+            streamTeardown[token] = { [weak self] in self?.audioWatchers[id]?.remove(token) }
+            if let p = audioPlayers[id] { resolve(token, p.status()) }
+        case "audio.release":
+            let id = a.s("id")
+            audioPlayers[id]?.release()
+            audioPlayers[id] = nil
+            audioWatchers[id] = nil
         case "recorder.start":
             guard AVAudioSession.sharedInstance().recordPermission == .granted else { fail(token, "microphone permission denied"); break }
             let url = appDir().appendingPathComponent("rec-\(UUID().uuidString).m4a")
@@ -3382,6 +3534,39 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let player = try hapticEngine?.makePlayer(with: CHHapticPattern(events: events, parameters: []))
             try player?.start(atTime: 0)
         } catch { fireHaptic("medium") }
+    }
+
+    // A phone call or Siri pauses every player and, when the OS says it is over and
+    // asks us to, resumes the ones that were playing. Headphones being unplugged
+    // pauses and does not resume, because that is what the user expects.
+    private func installAudioInterruptionHandling() {
+        let nc = NotificationCenter.default
+        audioInterruptionObs.append(nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self = self,
+                  let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            switch type {
+            case .began:
+                for p in self.audioPlayers.values {
+                    p.wasPlayingBeforeInterruption = p.state == "playing"
+                    if p.wasPlayingBeforeInterruption { p.pause() }
+                }
+            case .ended:
+                let opts = AVAudioSession.InterruptionOptions(rawValue: n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+                if opts.contains(.shouldResume) {
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    for p in self.audioPlayers.values where p.wasPlayingBeforeInterruption { p.play() }
+                }
+                for p in self.audioPlayers.values { p.wasPlayingBeforeInterruption = false }
+            @unknown default: break
+            }
+        })
+        audioInterruptionObs.append(nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] n in
+            guard let raw = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
+            guard let self = self else { return }
+            for p in self.audioPlayers.values { p.pause() }
+        })
     }
 
     private func setTorch(_ on: Bool) {
