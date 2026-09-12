@@ -626,7 +626,9 @@ function androidPermsFor(kind: string): []string {
     if (kind == "microphone") { return ["RECORD_AUDIO"] }
     if (kind == "location") { return ["ACCESS_FINE_LOCATION"] }
     if (kind == "photos") { return ["READ_MEDIA_IMAGES"] }
-    if (kind == "contacts") { return ["READ_CONTACTS"] }
+    // Android splits the address book into a read and a write permission; one kind
+    // covers both so Contacts.add works wherever Contacts.list does.
+    if (kind == "contacts") { return ["READ_CONTACTS", "WRITE_CONTACTS"] }
     if (kind == "calendar") { return ["READ_CALENDAR", "WRITE_CALENDAR"] }
     if (kind == "faceId") { return ["USE_BIOMETRIC"] }
     // RECEIVE_BOOT_COMPLETED is what lets a scheduled notification survive a reboot.

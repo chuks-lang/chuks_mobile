@@ -1353,34 +1353,52 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val pi = packageManager.getPackageInfo(packageName, 0)
                 resolve(token, pi.firstInstallTime.toString())
             }
-            "contacts.list" -> {
-                if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) { fail(token, "contacts permission denied"); return }
-                try {
-                    // id -> [name, phones, emails]; merge phone + email rows by contact id
-                    val map = LinkedHashMap<String, Array<Any>>()
-                    fun entry(id: String, name: String) = map.getOrPut(id) { arrayOf(name, linkedSetOf<String>(), linkedSetOf<String>()) }
-                    contentResolver.query(android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                        arrayOf(android.provider.ContactsContract.CommonDataKinds.Phone.CONTACT_ID, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY, android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER),
-                        null, null, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY)?.use { c ->
-                        while (c.moveToNext()) {
-                            val id = c.getString(0) ?: continue
-                            @Suppress("UNCHECKED_CAST") (entry(id, c.getString(1) ?: "")[1] as LinkedHashSet<String>).add(c.getString(2) ?: "")
-                        }
-                    }
-                    contentResolver.query(android.provider.ContactsContract.CommonDataKinds.Email.CONTENT_URI,
-                        arrayOf(android.provider.ContactsContract.CommonDataKinds.Email.CONTACT_ID, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY, android.provider.ContactsContract.CommonDataKinds.Email.ADDRESS),
-                        null, null, null)?.use { c ->
-                        while (c.moveToNext()) {
-                            val id = c.getString(0) ?: continue
-                            @Suppress("UNCHECKED_CAST") (entry(id, c.getString(1) ?: "")[2] as LinkedHashSet<String>).add(c.getString(2) ?: "")
-                        }
-                    }
-                    val out = map.values.joinToString("\n") { r ->
-                        @Suppress("UNCHECKED_CAST")
-                        "${r[0]}\t${(r[1] as Set<String>).joinToString(";")}\t${(r[2] as Set<String>).joinToString(";")}"
-                    }
-                    resolve(token, out)
-                } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            // ---- contacts: see ChuksContacts.kt --------------------------------
+            "contacts.pick" -> {
+                // No permission: the picker's answer carries a grant for what was chosen.
+                // A phone or email pick answers ONE data row, readable through that
+                // grant; a whole-card pick grants the card, whose phones and emails
+                // need READ_CONTACTS to read (the card's own name does not).
+                val code = ++mediaSeq
+                pendingContactPick[code] = Pair(token, args)
+                val type = when (args) {
+                    "phone" -> android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_TYPE
+                    "email" -> android.provider.ContactsContract.CommonDataKinds.Email.CONTENT_TYPE
+                    else -> android.provider.ContactsContract.Contacts.CONTENT_TYPE
+                }
+                startActivityForResult(Intent(Intent.ACTION_PICK).setType(type), code)
+            }
+            "contacts.list", "contacts.search" -> withContactsPerm(token, false) {
+                val q = if (cap == "contacts.search") args else ""
+                Thread {
+                    val out = try { ChuksContacts.list(this, q) } catch (e: Exception) { null }
+                    runOnUiThread { if (out != null) resolve(token, out) else fail(token, "read failed") }
+                }.start()
+            }
+            "contacts.get" -> withContactsPerm(token, false) {
+                val l = try { ChuksContacts.get(this, args) } catch (e: Exception) { null }
+                if (l != null) resolve(token, l) else fail(token, "no such contact: $args")
+            }
+            "contacts.add" -> withContactsPerm(token, true) {
+                try { resolve(token, ChuksContacts.add(this, a.s("name"), a.s("phones"), a.s("emails"))) }
+                catch (e: Exception) { fail(token, "cannot add contact: ${e.message}") }
+            }
+            "contacts.update" -> withContactsPerm(token, true) {
+                try { if (ChuksContacts.update(this, a.s("id"), a.s("name"), a.s("phones"), a.s("emails"))) resolve(token, "") else fail(token, "no such contact: ${a.s("id")}") }
+                catch (e: Exception) { fail(token, "cannot update contact: ${e.message}") }
+            }
+            "contacts.delete" -> withContactsPerm(token, true) {
+                try { if (ChuksContacts.delete(this, args)) resolve(token, "") else fail(token, "no such contact: $args") }
+                catch (e: Exception) { fail(token, "cannot delete contact: ${e.message}") }
+            }
+            "contacts.photo" -> withContactsPerm(token, false) {
+                val p = try { ChuksContacts.photo(this, args) } catch (e: Exception) { null }
+                if (p != null) resolve(token, p) else fail(token, "no such contact: $args")
+            }
+            "contacts.watch" -> withContactsPerm(token, false) {
+                val w = ChuksContacts.Watch(this) { resolve(token, "") }
+                w.start()
+                streamTeardown[token] = { w.stop() }
             }
             "calendar.upcoming" -> {
                 if (checkSelfPermission(Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
@@ -1563,7 +1581,11 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     val code = ++permSeq
                     pendingPerms[code] = token       // resolved in onRequestPermissionsResult
                     // calendar needs both read + write; the rest are a single permission
-                    enqueuePermissionRequest(if (args == "calendar") arrayOf(p, Manifest.permission.WRITE_CALENDAR) else arrayOf(p), code)
+                    enqueuePermissionRequest(when (args) {
+                        "calendar" -> arrayOf(p, Manifest.permission.WRITE_CALENDAR)
+                        "contacts" -> arrayOf(p, Manifest.permission.WRITE_CONTACTS)
+                        else -> arrayOf(p)
+                    }, code)
                 }
             }
             // ---- files: see ChuksFiles.kt. A null message is success. ----------
@@ -1843,7 +1865,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(code, permissions, grantResults)
         permInFlight = false
-        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
         pendingPermActions.remove(code)?.let { it(granted) } ?: pendingPerms.remove(code)?.let { resolve(it, if (granted) "granted" else "denied") }
         pumpPermissionQueue()
     }
@@ -1851,6 +1873,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // on when the answer comes, the way iOS's CLLocationManager does: a location read
     // made before the app asked is the prompt, not a failure. A denial fails the token.
     private val pendingPermActions = mutableMapOf<Int, (Boolean) -> Unit>()
+    private fun withContactsPerm(token: String, write: Boolean, run: () -> Unit) {
+        val need = if (write) arrayOf(Manifest.permission.READ_CONTACTS, Manifest.permission.WRITE_CONTACTS) else arrayOf(Manifest.permission.READ_CONTACTS)
+        if (need.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "contacts permission denied") }
+        enqueuePermissionRequest(need, code)
+    }
     private fun withLocationPerm(token: String, run: () -> Unit) {
         if (hasLocationPerm()) { run(); return }
         val code = ++permSeq
@@ -1875,8 +1904,22 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // under its request code; the result is copied into app files and answered as "file://".
     private var mediaSeq = 9000
     private val pendingMedia = mutableMapOf<Int, Pair<String, android.net.Uri?>>()
+    private val pendingContactPick = mutableMapOf<Int, Pair<String, String>>()
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        pendingContactPick.remove(requestCode)?.let { (token, kind) ->
+            val uri = data?.data
+            if (resultCode != RESULT_OK || uri == null) { fail(token, "canceled"); return }
+            val canRead = checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+            val line = try {
+                when (kind) {
+                    "phone", "email" -> ChuksContacts.pickedRow(this, uri, kind)
+                    else -> if (canRead) ChuksContacts.get(this, uri.lastPathSegment ?: "") else ChuksContacts.picked(this, uri)
+                }
+            } catch (e: Exception) { null }
+            if (line != null) resolve(token, line) else fail(token, "cannot read the picked contact")
+            return
+        }
         val entry = pendingMedia.remove(requestCode) ?: return
         val (token, outUri) = entry
         if (resultCode != RESULT_OK) { fail(token, "canceled"); return }

@@ -55,6 +55,7 @@ func downsampledImage(path: String, maxPixel: CGFloat) -> UIImage? {
 }
 import CoreHaptics
 import Contacts
+import ContactsUI
 import EventKit
 import LocalAuthentication
 import Security
@@ -938,6 +939,59 @@ final class LocHeading: NSObject, CLLocationManagerDelegate {
         if (e as? CLError)?.code == .locationUnknown { return }
         onErr(e.localizedDescription)
     }
+}
+
+// ---- contacts ------------------------------------------------------------------
+// One contact is "name\tphones\temails\tid" on both platforms, phones and emails
+// ";"-joined. Reads go through the unified contact (linked cards folded into one),
+// writes through CNSaveRequest, and iOS 18's "limited" access counts as authorized:
+// the user chose which contacts the app sees, and those are the book as far as the
+// app is concerned.
+let chuksContactKeys: [CNKeyDescriptor] = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactOrganizationNameKey,
+                                           CNContactPhoneNumbersKey, CNContactEmailAddressesKey] as [CNKeyDescriptor]
+func chuksContactsAuthorized() -> Bool {
+    let s = CNContactStore.authorizationStatus(for: .contacts)
+    if s == .authorized { return true }
+    if #available(iOS 18.0, *), s == .limited { return true }
+    return false
+}
+func chuksContactLine(_ c: CNContact) -> String {
+    var name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
+    if name.isEmpty, c.isKeyAvailable(CNContactOrganizationNameKey) { name = c.organizationName }
+    let clean: (String) -> String = { $0.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: ";", with: ",") }
+    let phones = c.isKeyAvailable(CNContactPhoneNumbersKey) ? c.phoneNumbers.map { clean($0.value.stringValue) }.joined(separator: ";") : ""
+    let emails = c.isKeyAvailable(CNContactEmailAddressesKey) ? c.emailAddresses.map { clean(String($0.value)) }.joined(separator: ";") : ""
+    return "\(clean(name))\t\(phones)\t\(emails)\t\(c.identifier)"
+}
+// The app gives one name; the first word is the given name and the rest the family
+// name, which is how the OS sorts and displays it.
+func chuksFillContact(_ c: CNMutableContact, name: String, phones: String, emails: String) {
+    let parts = name.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 1).map(String.init)
+    c.givenName = parts.first ?? ""
+    c.familyName = parts.count > 1 ? parts[1] : ""
+    c.phoneNumbers = phones.split(separator: ";").map { CNLabeledValue(label: CNLabelPhoneNumberMobile, value: CNPhoneNumber(stringValue: String($0).trimmingCharacters(in: .whitespaces))) }
+    c.emailAddresses = emails.split(separator: ";").map { CNLabeledValue(label: CNLabelHome, value: String($0).trimmingCharacters(in: .whitespaces) as NSString) }
+}
+// One phone or email chosen off a card: the line carries that value alone.
+final class ChuksContactPropertyPick: NSObject, CNContactPickerDelegate {
+    private let onPick: (String) -> Void
+    private let onCancel: () -> Void
+    init(onPick: @escaping (String) -> Void, onCancel: @escaping () -> Void) { self.onPick = onPick; self.onCancel = onCancel }
+    func contactPicker(_ picker: CNContactPickerViewController, didSelect p: CNContactProperty) {
+        let c = p.contact
+        let name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
+        let clean: (String) -> String = { $0.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: ";", with: ",") }
+        if let n = p.value as? CNPhoneNumber { onPick("\(clean(name))\t\(clean(n.stringValue))\t\t\(c.identifier)") }
+        else { onPick("\(clean(name))\t\t\(clean(String(describing: p.value ?? "")))\t\(c.identifier)") }
+    }
+    func contactPickerDidCancel(_ picker: CNContactPickerViewController) { onCancel() }
+}
+final class ChuksContactPick: NSObject, CNContactPickerDelegate {
+    private let onPick: (CNContact) -> Void
+    private let onCancel: () -> Void
+    init(onPick: @escaping (CNContact) -> Void, onCancel: @escaping () -> Void) { self.onPick = onPick; self.onCancel = onCancel }
+    func contactPicker(_ picker: CNContactPickerViewController, didSelect contact: CNContact) { onPick(contact) }
+    func contactPickerDidCancel(_ picker: CNContactPickerViewController) { onCancel() }
 }
 
 // Location permission needs a CLLocationManager delegate (result via callback).
@@ -2815,6 +2869,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
     var locFixes: [String: LocFix] = [:]    // live Location managers, keyed by token (once + watch)
     var locHeadings: [String: LocHeading] = [:]   // live compass streams, keyed by token
+    var contactPickers: [String: NSObject] = [:]   // picker delegates alive while presented
     let motion = CMMotionManager()          // one shared motion manager; sensors fan out to token sets
     var accelTokens = Set<String>()
     var gyroTokens = Set<String>()
@@ -3200,24 +3255,84 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 ms = String(Int64(d.timeIntervalSince1970 * 1000))
             }
             resolve(token, ms)
-        case "contacts.list":
-            var contactsOK = CNContactStore.authorizationStatus(for: .contacts) == .authorized
-            if #available(iOS 18.0, *) { contactsOK = contactsOK || CNContactStore.authorizationStatus(for: .contacts) == .limited }
-            guard contactsOK else { fail(token, "contacts permission denied"); break }
+        // ---- contacts: see ChuksContacts below ----------------------------------
+        case "contacts.pick":
+            // The OS picker needs no permission: the app sees what was chosen and
+            // nothing else. A property kind shows the card and lets the user pick one
+            // number or address; the delegate that answers decides which mode the
+            // picker runs in, so there is one per kind.
+            let picker = CNContactPickerViewController()
+            let done: (String) -> Void = { [weak self] s in self?.resolve(token, s); self?.contactPickers[token] = nil }
+            let cancel: () -> Void = { [weak self] in self?.fail(token, "canceled"); self?.contactPickers[token] = nil }
+            let d: NSObject & CNContactPickerDelegate
+            switch args {
+            case "phone":
+                picker.displayedPropertyKeys = [CNContactPhoneNumbersKey]
+                picker.predicateForSelectionOfProperty = NSPredicate(format: "key == 'phoneNumbers'")
+                d = ChuksContactPropertyPick(onPick: done, onCancel: cancel)
+            case "email":
+                picker.displayedPropertyKeys = [CNContactEmailAddressesKey]
+                picker.predicateForSelectionOfProperty = NSPredicate(format: "key == 'emailAddresses'")
+                d = ChuksContactPropertyPick(onPick: done, onCancel: cancel)
+            default:
+                d = ChuksContactPick(onPick: { c in done(chuksContactLine(c)) }, onCancel: cancel)
+            }
+            picker.delegate = d
+            contactPickers[token] = d
+            self.present(picker, animated: true)
+        case "contacts.list", "contacts.search":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            let q = cap == "contacts.search" ? args.lowercased() : ""
             let store = CNContactStore()
             DispatchQueue.global(qos: .userInitiated).async {
-                let keys = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactPhoneNumbersKey, CNContactEmailAddressesKey] as [CNKeyDescriptor]
                 var lines: [String] = []
                 do {
-                    try store.enumerateContacts(with: CNContactFetchRequest(keysToFetch: keys)) { c, _ in
-                        let name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
-                        let phones = c.phoneNumbers.map { $0.value.stringValue }.joined(separator: ";")
-                        let emails = c.emailAddresses.map { String($0.value) }.joined(separator: ";")
-                        lines.append("\(name)\t\(phones)\t\(emails)")
+                    let req = CNContactFetchRequest(keysToFetch: chuksContactKeys)
+                    req.sortOrder = .givenName
+                    try store.enumerateContacts(with: req) { c, _ in
+                        let line = chuksContactLine(c)
+                        if q.isEmpty || line.lowercased().contains(q) { lines.append(line) }
                     }
                     DispatchQueue.main.async { self.resolve(token, lines.joined(separator: "\n")) }
-                } catch { DispatchQueue.main.async { self.fail(token, "read failed") } }
+                } catch { DispatchQueue.main.async { self.fail(token, "read failed: \(error.localizedDescription)") } }
             }
+        case "contacts.get":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            if let c = try? CNContactStore().unifiedContact(withIdentifier: args, keysToFetch: chuksContactKeys) { resolve(token, chuksContactLine(c)) }
+            else { fail(token, "no such contact: \(args)") }
+        case "contacts.add":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            let c = CNMutableContact()
+            chuksFillContact(c, name: a.s("name"), phones: a.s("phones"), emails: a.s("emails"))
+            let req = CNSaveRequest(); req.add(c, toContainerWithIdentifier: nil)
+            do { try CNContactStore().execute(req); resolve(token, c.identifier) }
+            catch { fail(token, "cannot add contact: \(error.localizedDescription)") }
+        case "contacts.update":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            guard let existing = try? CNContactStore().unifiedContact(withIdentifier: a.s("id"), keysToFetch: chuksContactKeys),
+                  let c = existing.mutableCopy() as? CNMutableContact else { fail(token, "no such contact: \(a.s("id"))"); break }
+            chuksFillContact(c, name: a.s("name"), phones: a.s("phones"), emails: a.s("emails"))
+            let req = CNSaveRequest(); req.update(c)
+            do { try CNContactStore().execute(req); resolve(token, "") }
+            catch { fail(token, "cannot update contact: \(error.localizedDescription)") }
+        case "contacts.delete":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            guard let existing = try? CNContactStore().unifiedContact(withIdentifier: args, keysToFetch: []),
+                  let c = existing.mutableCopy() as? CNMutableContact else { fail(token, "no such contact: \(args)"); break }
+            let req = CNSaveRequest(); req.delete(c)
+            do { try CNContactStore().execute(req); resolve(token, "") }
+            catch { fail(token, "cannot delete contact: \(error.localizedDescription)") }
+        case "contacts.photo":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            guard let c = try? CNContactStore().unifiedContact(withIdentifier: args, keysToFetch: [CNContactThumbnailImageDataKey as CNKeyDescriptor]) else { fail(token, "no such contact: \(args)"); break }
+            guard let data = c.thumbnailImageData else { resolve(token, ""); break }
+            let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("contact-\(args.hashValue).jpg")
+            do { try data.write(to: url); resolve(token, "file://" + url.path) }
+            catch { fail(token, "cannot write photo: \(error.localizedDescription)") }
+        case "contacts.watch":
+            // One notification for any change, coalesced by the OS. Needs nothing.
+            let obs = NotificationCenter.default.addObserver(forName: .CNContactStoreDidChange, object: nil, queue: .main) { [weak self] _ in self?.resolve(token, "") }
+            streamTeardown[token] = { NotificationCenter.default.removeObserver(obs) }
         case "calendar.upcoming":
             guard let days = a.num() else { break }
             let store = EKEventStore()

@@ -426,17 +426,93 @@ export class Calendar {
 }
 
 // ---- Contacts ---------------------------------------------------------------
-// Read the device address book. list() answers with one contact per line, each line
-// three TAB-separated fields: name, phones, emails (multiple phones/emails joined by
-// ";"). Needs the "contacts" permission — request it via Permission.request("contacts")
-// first; a denial (or a read failure) goes to onError. Read-only for now.
+// The device address book. A contact is one line of four TAB-separated fields:
+// "name\tphones\temails\tid", several phones or emails joined by ";". The id is the
+// platform's and is what get, update, delete and photo take; it is stable for the life
+// of the contact on that device and means nothing on another.
+//
+// pick() opens the OS's own picker and needs NO permission: the user chooses one
+// contact, or one phone number, and that is all the app sees. Most apps want this,
+// not the whole book.
+// Everything else needs the "contacts" permission; on Android that is read and write
+// together, on iOS one grant covers both.
 export class Contacts {
+    /**
+     * The OS contact picker. The user picks one, or cancels, which arrives on onError
+     * as "canceled". No permission, no prompt: the app sees only what was chosen.
+     *
+     * `kind` is what the user is asked to choose. "phone": one phone number, and the
+     * line carries that number alone; "email": likewise one address. "contact": a whole
+     * card. The two property kinds need no permission on either platform. The whole
+     * card needs none on iOS; on Android the picker hands over the name without the
+     * "contacts" permission and the phones and emails only with it, so an app that
+     * wants a number should ask for a number.
+     */
+    public static pick(onResult: (string)=> void, onError: (string)=> void, kind: string = "contact"): void {
+        emitNativeCommandE("contacts.pick", kind, onResult, onError)
+    }
+    /** Every contact, one per line, sorted by name. */
     public static list(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("contacts.list", "", onResult, onError)
     }
+    /** The contacts whose name, a phone or an email contains `query`, case-insensitive. */
+    public static search(query: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("contacts.search", query, onResult, onError)
+    }
+    /** One contact by id. Fails with "no such contact" when it is gone. */
+    public static get(id: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("contacts.get", id, onResult, onError)
+    }
+    /** Creates a contact. onResult gets its id. Phones and emails are ";"-joined. */
+    public static add(name: string, phones: string, emails: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("contacts.add", { name: name, phones: phones, emails: emails }, onResult, onError)
+    }
+    /** Replaces a contact's name, phones and emails. */
+    public static update(id: string, name: string, phones: string, emails: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("contacts.update", { id: id, name: name, phones: phones, emails: emails }, function(_: string): void { onOk() }, onError)
+    }
+    public static delete(id: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("contacts.delete", id, function(_: string): void { onOk() }, onError)
+    }
+    /**
+     * The contact's photo as a "file://" path to a JPEG in the app's cache, or "" when
+     * the contact has none. The thumbnail size, which is what a list row wants.
+     */
+    public static photo(id: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("contacts.photo", id, onResult, onError)
+    }
+    /**
+     * Fires (with "") whenever the address book changes: a contact added in the
+     * Contacts app, a sync, an edit made here. Re-read what you show.
+     */
+    public static watch(onChange: (string)=> void): NativeSub {
+        return emitNativeStream("contacts.watch", "", onChange, null)
+    }
 
+    /** The picker, awaited. Throws "canceled" when the user backs out. */
+    public static async pickAsync(kind: string = "contact"): Task<string> { return await awaitCommand("contacts.pick", kind, true, CAP_PROMPT_MS) }
     /** The address book, awaited. First call may show the OS permission prompt. */
     public static async listAsync(): Task<string> { return await awaitCommand("contacts.list", "", true, CAP_PROMPT_MS) }
+    /** A search, awaited. */
+    public static async searchAsync(query: string): Task<string> { return await awaitCommand("contacts.search", query, true, CAP_PROMPT_MS) }
+    /** One contact, awaited. Throws when it is gone. */
+    public static async getAsync(id: string): Task<string> { return await awaitCommand("contacts.get", id, true, CAP_PROMPT_MS) }
+    /** Create, awaited. Answers the new id. */
+    public static async addAsync(name: string, phones: string, emails: string): Task<string> {
+        return await awaitCommand("contacts.add", { name: name, phones: phones, emails: emails }, true, CAP_PROMPT_MS)
+    }
+    /** Update, awaited. Throws on failure. */
+    public static async updateAsync(id: string, name: string, phones: string, emails: string): Task<void> {
+        await awaitCommand("contacts.update", { id: id, name: name, phones: phones, emails: emails }, true, CAP_PROMPT_MS)
+        return
+    }
+    /** Delete, awaited. Throws on failure. */
+    public static async deleteAsync(id: string): Task<void> {
+        await awaitCommand("contacts.delete", id, true, CAP_PROMPT_MS)
+        return
+    }
+    /** The photo path, awaited; "" when there is none. */
+    public static async photoAsync(id: string): Task<string> { return await awaitCommand("contacts.photo", id, true, CAP_PROMPT_MS) }
 }
 
 // ---- Device info ------------------------------------------------------------
