@@ -1739,13 +1739,16 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 activeStreams[token] = r
                 streamHandler.postDelayed(r, 80)
             }
-            "tts.speak" -> {
-                val text = args
-                ensureTts()
-                if (ttsReady) speakNow(text) else pendingSpeak = text   // speak once the engine finishes init
-            }
-            "tts.stop" -> tts?.stop()
-            "tts.isSpeaking" -> resolve(token, if (tts?.isSpeaking == true) "1" else "0")
+            // ---- text-to-speech: see ChuksSpeech.kt ----------------------------
+            "tts.speak", "tts.say" -> speech.speak(a.s("id"), a.s("text"), a.s("lang"), (a.num("rate") ?: 1.0).toFloat(), (a.num("pitch") ?: 1.0).toFloat(),
+                (a.num("volume") ?: 1.0).toFloat(), a.s("voice"), a.bool("queue"), if (cap == "tts.say") token else null)
+            "tts.stop" -> speech.stop()
+            "tts.pause" -> speech.pause()
+            "tts.resume" -> speech.resume()
+            "tts.isSpeaking" -> resolve(token, if (speech.isSpeaking()) "1" else "0")
+            "tts.status" -> resolve(token, speech.status())
+            "tts.voices" -> speech.whenReady { resolve(token, speech.voices()) }
+            "tts.watch" -> { ttsWatchers.add(token); streamTeardown[token] = { ttsWatchers.remove(token) } }
             // The framework noticed something the app probably did not mean. Logged
             // natively because the engine's own println reaches nothing on Android.
             "dev.warn" -> android.util.Log.w("Chuks", args)
@@ -1898,13 +1901,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             "motion.available" -> resolve(token, if (sensorAvailable(args)) "1" else "0")
             "recorder.available" -> resolve(token,
                 if (packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_MICROPHONE)) "1" else "0")
-            "tts.available" -> {
-                ensureTts()
-                // The engine initializes asynchronously, so an early caller waits for it
-                // rather than being told "no" because we had not asked yet.
-                if (ttsReady) resolve(token, if (ttsHasVoice()) "1" else "0")
-                else ttsAvailWaiters.add(token)
-            }
+            "tts.available" -> speech.whenReady { resolve(token, if (speech.hasVoice()) "1" else "0") }
             "ble.available" -> {
                 val hasLe = packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_BLUETOOTH_LE)
                 val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
@@ -2210,40 +2207,11 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private var mediaRecorder: android.media.MediaRecorder? = null   // mic recording (Tier C)
     private var recPath: String? = null
 
-    // Text-to-speech (Tier B). The engine inits asynchronously; a speak() that
-    // arrives before onInit is stashed in pendingSpeak and flushed once ready.
-    private var tts: android.speech.tts.TextToSpeech? = null
-    private var ttsReady = false
-    private var pendingSpeak: String? = null
-    // Tokens from tts.available() that arrived before the engine finished initializing.
-    private val ttsAvailWaiters = ArrayList<String>()
-    private fun ensureTts() {
-        if (tts != null) return
-        tts = android.speech.tts.TextToSpeech(this) { status ->
-            ttsReady = status == android.speech.tts.TextToSpeech.SUCCESS
-            if (ttsReady) {
-                tts?.setLanguage(java.util.Locale.US)
-                // Route speech through the media/speaker path (same as Audio playback),
-                // else the engine default can land on a track that isn't audible.
-                tts?.setAudioAttributes(
-                    android.media.AudioAttributes.Builder()
-                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build())
-                pendingSpeak?.let { speakNow(it); pendingSpeak = null }
-            }
-            // Answer everyone who asked whether TTS works before we knew. Outside the
-            // ready branch: a failed init is an answer too, and "0" is that answer.
-            if (ttsAvailWaiters.isNotEmpty()) {
-                val waiting = ArrayList(ttsAvailWaiters)
-                ttsAvailWaiters.clear()
-                val ok = if (ttsHasVoice()) "1" else "0"
-                runOnUiThread { for (t in waiting) resolve(t, ok) }
-            }
-        }
-    }
-    private fun speakNow(text: String) {
-        tts?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "chuks")
+    // Text-to-speech: see ChuksSpeech.kt. Watchers get every event; a tts.say token
+    // is settled when its own utterance ends.
+    private val ttsWatchers = HashSet<String>()
+    private val speech by lazy {
+        ChuksSpeech(this, { ev -> for (t in ttsWatchers.toList()) resolve(t, ev) }, { tok, err -> if (err == null) resolve(tok, "") else fail(tok, err) })
     }
 
     // ---- Real streams: battery / app-state / network ----
@@ -2315,17 +2283,6 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         return sm.getDefaultSensor(type) != null
     }
 
-    // Whether the synthesizer has a voice for the device language. The engine and its
-    // voice data are separate installs on Android, and a missing voice makes speak() a
-    // silent no-op with nothing to catch.
-    private fun ttsHasVoice(): Boolean {
-        val t = tts ?: return false
-        if (!ttsReady) return false
-        val r = try { t.isLanguageAvailable(java.util.Locale.getDefault()) } catch (e: Exception) { -2 }
-        return r == android.speech.tts.TextToSpeech.LANG_AVAILABLE ||
-               r == android.speech.tts.TextToSpeech.LANG_COUNTRY_AVAILABLE ||
-               r == android.speech.tts.TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE
-    }
     override fun onResume() {
         super.onResume(); appForeground = true
         appStateTokens.toList().forEach { resolve(it, "active") }

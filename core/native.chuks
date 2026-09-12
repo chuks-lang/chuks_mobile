@@ -1390,35 +1390,86 @@ export class Recorder {
     public static async stopAsync(): Task<string> { return await awaitCommand("recorder.stop", "", true, CAP_QUICK_MS) }
 }
 
-// ---- Text-to-speech (Tier B) ------------------------------------------------
-// Speak text aloud via the OS speech synthesizer. speak() replaces any current
-// utterance; stop() cancels it.
-// isSpeaking() answers (async) a bool -- true while speaking -- the proof that the
-// synthesizer engaged. On Android the engine + voice data must be present (it usually
-// is); if absent, isSpeaking stays false.
+// ---- Text-to-speech ---------------------------------------------------------
+// Speak text aloud through the OS synthesizer. Every utterance has an id ("utN"),
+// answered by speak() and enqueue() and carried by every event on watch(), so an app
+// can tell which sentence just finished. rate is 1.0 for normal speech (0.5 half, 2.0
+// double), pitch 1.0 normal (0.5..2.0), volume 0.0..1.0. language is a BCP-47 tag
+// ("en-GB", "fr-FR"); empty means the device's. voice is an id from voices().
+//
+// isSpeaking() and available() answer whether the synthesizer engaged and whether a
+// voice for the device language is installed at all. On Android the engine and its
+// voice data can be missing, and speak() is then silent with nothing to catch:
+// available() is how you find out before offering the button.
+var TTS_SEQ: int = 0
 export class Tts {
-    public static speak(text: string): void { emitNativeCommand("tts.speak", text, null) }
+    /** Speaks now, replacing whatever was being said. Answers the utterance's id. */
+    public static speak(text: string, language: string = "", rate: float = 1.0, pitch: float = 1.0, volume: float = 1.0, voice: string = ""): string {
+        TTS_SEQ = TTS_SEQ + 1
+        const id: string = "ut" + string(TTS_SEQ)
+        emitNativeCommand("tts.speak", { id: id, text: text, lang: language, rate: rate, pitch: pitch, volume: volume, voice: voice, queue: false }, null)
+        return id
+    }
+    /** Speaks after whatever is queued has finished. Answers the utterance's id. */
+    public static enqueue(text: string, language: string = "", rate: float = 1.0, pitch: float = 1.0, volume: float = 1.0, voice: string = ""): string {
+        TTS_SEQ = TTS_SEQ + 1
+        const id: string = "ut" + string(TTS_SEQ)
+        emitNativeCommand("tts.speak", { id: id, text: text, lang: language, rate: rate, pitch: pitch, volume: volume, voice: voice, queue: true }, null)
+        return id
+    }
+    /** Stops everything, spoken and queued. */
     public static stop(): void { emitNativeCommand("tts.stop", "", null) }
+    /** Pauses at the next word boundary; resume() carries on from there. */
+    public static pause(): void { emitNativeCommand("tts.pause", "", null) }
+    public static resume(): void { emitNativeCommand("tts.resume", "", null) }
     public static isSpeaking(onResult: (bool)=> void): void {
         emitNativeCommand("tts.isSpeaking", "", function(s: string): void { onResult(s == "1") })
     }
-    // Whether a synthesizer with a voice for the device language is installed. On
-    // Android the engine or its voice data can be missing, and speak() is then silent
-    // with nothing to catch: this is how you find out before offering the button.
+    /** "speaking", "paused" or "idle". */
+    public static status(onResult: (string)=> void): void { emitNativeCommand("tts.status", "", onResult) }
+    // Whether a synthesizer with a voice for the device language is installed.
     public static available(onResult: (bool)=> void): void {
         emitNativeCommand("tts.available", "", function(s: string): void { onResult(s == "1") })
     }
+    /**
+     * The installed voices, one per line: "id\tname\tlanguage\tquality", quality
+     * "default", "enhanced" or "premium". Pass an id as `voice` to speak() to use one.
+     */
+    public static voices(onResult: (string)=> void): void { emitNativeCommand("tts.voices", "", onResult) }
+    /**
+     * What the synthesizer is doing, one event per line-less string:
+     * "start,id", "progress,id,charStart,charEnd" (the word being spoken, for
+     * highlighting), "done,id", "canceled,id" (stopped or replaced), "paused,id",
+     * "resumed,id", "error,id,message".
+     */
+    public static watch(onEvent: (string)=> void): NativeSub {
+        return emitNativeStream("tts.watch", "", onEvent, null)
+    }
 
+    /**
+     * Speaks and waits for the end: the way to say two things in a row, or to know
+     * when to re-enable a button. Throws "canceled" if stopped or replaced first.
+     */
+    public static async speakAsync(text: string, language: string = "", rate: float = 1.0, pitch: float = 1.0, volume: float = 1.0, voice: string = ""): Task<void> {
+        TTS_SEQ = TTS_SEQ + 1
+        const id: string = "ut" + string(TTS_SEQ)
+        await awaitCommand("tts.say", { id: id, text: text, lang: language, rate: rate, pitch: pitch, volume: volume, voice: voice, queue: false }, true, CAP_PROMPT_MS)
+        return
+    }
     /** Whether the synthesizer is currently speaking, awaited. */
     public static async isSpeakingAsync(): Task<bool> {
         const s: string = await awaitCommand("tts.isSpeaking", "", false, CAP_QUICK_MS)
         return s == "1"
     }
-    /** Whether a usable synthesizer is installed, awaited. */
+    /** "speaking", "paused" or "idle", awaited. */
+    public static async statusAsync(): Task<string> { return await awaitCommand("tts.status", "", false, CAP_QUICK_MS) }
+    /** Whether a voice for the device language is installed, awaited. */
     public static async availableAsync(): Task<bool> {
         const s: string = await awaitCommand("tts.available", "", false, CAP_QUICK_MS)
         return s == "1"
     }
+    /** The voices, awaited. */
+    public static async voicesAsync(): Task<string> { return await awaitCommand("tts.voices", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Live OS state: battery, app state, network ------------------------------

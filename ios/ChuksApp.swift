@@ -943,6 +943,69 @@ final class LocHeading: NSObject, CLLocationManagerDelegate {
     }
 }
 
+// ---- text-to-speech ------------------------------------------------------------
+// One synthesizer, its delegate, and the ids the app gave each utterance, so every
+// event names the sentence it is about and a waiter (speakAsync) is answered when its
+// own sentence ends, not the one before it.
+//
+// Rate: AVSpeechUtterance's is a 0..1 synthesizer scale where "normal" is the
+// default constant (0.5), so the app's 1.0-is-normal rate is multiplied onto it and
+// clamped to the platform's minimum and maximum, as expo-speech does. A replace
+// (speak) cancels what is queued, and each cancelled utterance says so, once.
+final class ChuksSpeech: NSObject, AVSpeechSynthesizerDelegate {
+    let synth = AVSpeechSynthesizer()
+    weak var host: CardsVC?
+    var watchers = Set<String>()
+    private var ids: [ObjectIdentifier: String] = [:]      // utterance -> app id
+    private var waiters: [String: String] = [:]            // app id -> token to resolve on done
+    // iOS 17 and later answer stopSpeaking with didFinish, not didCancel, for what it
+    // cut off. The ids being stopped are marked first, so a finish that follows a stop
+    // is reported as the cancellation it is.
+    private var stopping = Set<String>()
+    init(host: CardsVC) { self.host = host; super.init(); synth.delegate = self }
+
+    private func emit(_ s: String) { for t in watchers { host?.resolve(t, s) } }
+
+    func speak(_ a: ChuksArgs, waiter: String?) {
+        let id = a.s("id")
+        let u = AVSpeechUtterance(string: a.s("text"))
+        let rate = Float(a.num("rate") ?? 1)
+        u.rate = max(AVSpeechUtteranceMinimumSpeechRate, min(AVSpeechUtteranceMaximumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * rate))
+        u.pitchMultiplier = Float(max(0.5, min(2.0, a.num("pitch") ?? 1)))
+        u.volume = Float(max(0, min(1, a.num("volume") ?? 1)))
+        let voiceId = a.s("voice"), lang = a.s("lang")
+        if !voiceId.isEmpty, let v = AVSpeechSynthesisVoice(identifier: voiceId) { u.voice = v }
+        else if !lang.isEmpty, let v = AVSpeechSynthesisVoice(language: lang) { u.voice = v }
+        if !a.bool("queue") && synth.isSpeaking { stopAll() }
+        ids[ObjectIdentifier(u)] = id
+        if let w = waiter { waiters[id] = w }
+        synth.speak(u)
+    }
+    func stopAll() { for (_, i) in ids { stopping.insert(i) }; synth.stopSpeaking(at: .immediate) }
+    func pause() { synth.pauseSpeaking(at: .word) }
+    func resume() { synth.continueSpeaking() }
+    func status() -> String { synth.isPaused ? "paused" : (synth.isSpeaking ? "speaking" : "idle") }
+
+    private func id(_ u: AVSpeechUtterance) -> String { ids[ObjectIdentifier(u)] ?? "" }
+    private func finish(_ u: AVSpeechUtterance, _ event: String, fail: String?) {
+        let i = id(u)
+        var event = event, fail = fail
+        if stopping.remove(i) != nil { event = "canceled"; fail = "canceled" }
+        emit("\(event),\(i)")
+        if let w = waiters.removeValue(forKey: i) { if let f = fail { host?.fail(w, f) } else { host?.resolve(w, "") } }
+        ids[ObjectIdentifier(u)] = nil
+    }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didStart u: AVSpeechUtterance) { emit("start,\(id(u))") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) { finish(u, "done", fail: nil) }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel u: AVSpeechUtterance) { finish(u, "canceled", fail: "canceled") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didPause u: AVSpeechUtterance) { emit("paused,\(id(u))") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didContinue u: AVSpeechUtterance) { emit("resumed,\(id(u))") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, willSpeakRangeOfSpeechString r: NSRange, utterance u: AVSpeechUtterance) {
+        if s.isPaused { return }   // the word it stopped in front of is reported again on resume
+        emit("progress,\(id(u)),\(r.location),\(r.location + r.length)")
+    }
+}
+
 // ---- clipboard -----------------------------------------------------------------
 // The kinds on the pasteboard, "text,url,image" in that order, read from its types
 // alone (no banner). A URL copied from a browser has a URL type; a URL typed as text
@@ -2989,7 +3052,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var ble: BleManager? = nil          // CoreBluetooth central (lazy)
     var nfc: NfcReader? = nil           // CoreNFC reader (lazy)
     var recURL: URL? = nil
-    let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
+    lazy var speech = ChuksSpeech(host: self)  // text-to-speech
     let pedometer = CMPedometer()       // step counter / distance / pace (Pedometer)
     let altimeter = CMAltimeter()       // barometer: pressure + relative altitude
     var proximityTokens = Set<String>() // motion.proximity subscribers (UIDevice proximity)
@@ -3888,13 +3951,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 self?.resolve(token, String(format: "%.3f", max(0, min(1, lin))))
             }
             activeStreams[token] = t
-        case "tts.speak":
+        // ---- text-to-speech: see ChuksSpeech ---------------------------------------
+        case "tts.speak", "tts.say":
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)
-            if speech.isSpeaking { speech.stopSpeaking(at: .immediate) }
-            speech.speak(AVSpeechUtterance(string: args))
-        case "tts.stop": speech.stopSpeaking(at: .immediate)
-        case "tts.isSpeaking": resolve(token, speech.isSpeaking ? "1" : "0")
+            speech.speak(a, waiter: cap == "tts.say" ? token : nil)
+        case "tts.stop": speech.stopAll()
+        case "tts.pause": speech.pause()
+        case "tts.resume": speech.resume()
+        case "tts.isSpeaking": resolve(token, speech.synth.isSpeaking && !speech.synth.isPaused ? "1" : "0")
+        case "tts.status": resolve(token, speech.status())
+        case "tts.voices":
+            let rows = AVSpeechSynthesisVoice.speechVoices().map { v -> String in
+                let q: String
+                switch v.quality { case .premium: q = "premium"; case .enhanced: q = "enhanced"; default: q = "default" }
+                return "\(v.identifier)\t\(chuksTabClean(v.name))\t\(v.language)\t\(q)"
+            }
+            resolve(token, rows.joined(separator: "\n"))
+        case "tts.watch":
+            speech.watchers.insert(token)
+            streamTeardown[token] = { [weak self] in self?.speech.watchers.remove(token) }
         // The framework noticed something the app probably did not mean. Logged
         // natively because the engine's own println reaches neither the device console
         // nor idevicesyslog.
