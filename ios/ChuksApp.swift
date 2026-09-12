@@ -55,7 +55,10 @@ func downsampledImage(path: String, maxPixel: CGFloat) -> UIImage? {
 }
 import CoreHaptics
 import Contacts
+import ContactsUI
 import EventKit
+import EventKitUI
+import UniformTypeIdentifiers
 import LocalAuthentication
 import Security
 import Network
@@ -416,13 +419,66 @@ final class CameraController: NSObject, AVCapturePhotoCaptureDelegate {
     }
 
     func stop() { q.async { [weak self] in if self?.session.isRunning == true { self?.session.stopRunning() } } }
+    /// After a permission grant: the view is there, the input could not be made before.
+    func reopen() { if session.inputs.isEmpty { let f = facing.isEmpty ? "back" : facing; facing = ""; configure(f) } }
+
+    // ---- controls -------------------------------------------------------------------
+    // Flash is a capture setting (off / on / auto); torch is the light kept on, which
+    // is a device setting. Zoom and focus are device settings too, and every device
+    // setting needs lockForConfiguration around it or it is ignored.
+    private var flashMode: AVCaptureDevice.FlashMode = .off
+    private var device: AVCaptureDevice? { (session.inputs.first as? AVCaptureDeviceInput)?.device }
+    private func configureDevice(_ f: (AVCaptureDevice) -> Void) {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+        f(d); d.unlockForConfiguration()
+    }
+    func hasFlash() -> Bool { device?.hasFlash ?? false }
+    func setFlash(_ mode: String) {
+        flashMode = mode == "on" ? .on : (mode == "auto" ? .auto : .off)
+        q.async { [weak self] in
+            self?.configureDevice { d in
+                guard d.hasTorch else { return }
+                d.torchMode = mode == "torch" && d.isTorchModeSupported(.on) ? .on : .off
+            }
+        }
+    }
+    func zoomRange() -> String {
+        guard let d = device else { return "1,1" }
+        // The upper bound the hardware reports can be 100x and is digital past a few;
+        // it is the platform's number and reported as such.
+        return String(format: "%.1f,%.1f", Double(d.minAvailableVideoZoomFactor), Double(d.maxAvailableVideoZoomFactor))
+    }
+    func setZoom(_ factor: Double) {
+        q.async { [weak self] in
+            self?.configureDevice { d in d.videoZoomFactor = CGFloat(max(Double(d.minAvailableVideoZoomFactor), min(Double(d.maxAvailableVideoZoomFactor), factor))) }
+        }
+    }
+    func focus(x: Double, y: Double) {
+        // The view's fraction to the device's point of interest, which is in the
+        // sensor's own orientation; the preview layer knows the conversion.
+        let layer = previewView.layer as? AVCaptureVideoPreviewLayer
+        let viewPoint = CGPoint(x: previewView.bounds.width * CGFloat(x), y: previewView.bounds.height * CGFloat(y))
+        let devPoint = layer?.captureDevicePointConverted(fromLayerPoint: viewPoint) ?? CGPoint(x: x, y: y)
+        q.async { [weak self] in
+            self?.configureDevice { d in
+                if d.isFocusPointOfInterestSupported && d.isFocusModeSupported(.autoFocus) { d.focusPointOfInterest = devPoint; d.focusMode = .autoFocus }
+                if d.isExposurePointOfInterestSupported && d.isExposureModeSupported(.autoExpose) { d.exposurePointOfInterest = devPoint; d.exposureMode = .autoExpose }
+                // Go back to continuous once this focus has landed, so the view stays
+                // sharp when the scene moves; the device does that when subject-area
+                // change monitoring is on.
+                d.isSubjectAreaChangeMonitoringEnabled = true
+            }
+        }
+    }
 
     func capture(ok: @escaping (String) -> Void, err: @escaping (String) -> Void) {
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { err("camera permission not granted"); return }
         onCapOk = ok; onCapErr = err
         q.async { [weak self] in
             guard let self = self, self.session.isRunning else { DispatchQueue.main.async { err("camera not running") }; return }
-            self.photoOut.capturePhoto(with: AVCapturePhotoSettings(), delegate: self)
+            let settings = AVCapturePhotoSettings()
+            if self.photoOut.supportedFlashModes.contains(self.flashMode) { settings.flashMode = self.flashMode }
+            self.photoOut.capturePhoto(with: settings, delegate: self)
         }
     }
 
@@ -533,6 +589,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     func application(_ a: UIApplication, didFinishLaunchingWithOptions o: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         chuksPipeStdioToLog()
+        // Before anything else. The notification delegate has to be in place before this
+        // method returns, or the tap that LAUNCHED the app is never delivered at all:
+        // iOS hands the launch response only to a delegate that already exists. It used
+        // to be set in viewDidLoad, which is too late for exactly that case.
+        UNUserNotificationCenter.current().delegate = notifDelegate
         let w = UIWindow(frame: UIScreen.main.bounds)
         let vc = CardsVC()
         if let url = o?[.url] as? URL { vc.lastURL = url.absoluteString }   // deep link that launched the app
@@ -629,12 +690,81 @@ func hexColor(_ h: String) -> UIColor {
                    blue: CGFloat(v & 0xff) / 255, alpha: 1)
 }
 
+// The battery reading, in one place. watch() and current() answer the same payload
+// because they call the same function; two copies of this would drift the first time
+// one of them learned about a new battery state.
+func chuksBatteryNow() -> String {
+    UIDevice.current.isBatteryMonitoringEnabled = true
+    let d = UIDevice.current
+    let lvl = d.batteryLevel < 0 ? -1 : Int((d.batteryLevel * 100).rounded())
+    let chg = (d.batteryState == .charging || d.batteryState == .full) ? 1 : 0
+    // The state UIKit already reports, no longer collapsed into the 1/0 above. iOS
+    // has no "plugged in but not charging" state of its own; Android does.
+    let state: String
+    switch d.batteryState {
+    case .unplugged: state = "unplugged"
+    case .charging:  state = "charging"
+    case .full:      state = "full"
+    default:         state = "unknown"
+    }
+    let low = ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0
+    return "\(lvl),\(chg),\(state),\(low)"
+}
+
+// The transport a network path is on, for watch() and current() alike.
+func chuksPathString(_ path: NWPath) -> String {
+    // "transport,reachable". Reachable is whether the path is satisfied, which is
+    // the most iOS offers without sending a probe; Android's half validates the
+    // network for real. A tunnel shows up as an interface of type .other whose name
+    // is utun/ipsec/ppp, so that is how a VPN is told apart from "other".
+    let reachable = path.status == .satisfied ? 1 : 0
+    if path.status != .satisfied { return "none,0" }
+    if path.usesInterfaceType(.wifi) { return "wifi,\(reachable)" }
+    if path.usesInterfaceType(.cellular) { return "cellular,\(reachable)" }
+    if path.usesInterfaceType(.wiredEthernet) { return "ethernet,\(reachable)" }
+    let tunnel = path.availableInterfaces.contains { i in
+        i.name.hasPrefix("utun") || i.name.hasPrefix("ipsec") || i.name.hasPrefix("ppp")
+    }
+    if tunnel { return "vpn,\(reachable)" }
+    return "other,\(reachable)"
+}
+
+// Whether ONE named motion sensor exists here. Asked by Motion.available() before a
+// screen commits to showing a readout it may never be able to fill.
+func chuksSensorAvailable(_ name: String, _ motion: CMMotionManager) -> Bool {
+    switch name {
+    case "accelerometer": return motion.isAccelerometerAvailable
+    case "gyroscope":     return motion.isGyroAvailable
+    case "magnetometer":  return motion.isMagnetometerAvailable
+    case "barometer":     return CMAltimeter.isRelativeAltitudeAvailable()
+    // There is no query for the proximity sensor. Enabling monitoring and reading the
+    // flag back is the documented way: it stays false on a device without one.
+    case "proximity":
+        UIDevice.current.isProximityMonitoringEnabled = true
+        let has = UIDevice.current.isProximityMonitoringEnabled
+        UIDevice.current.isProximityMonitoringEnabled = false
+        return has
+    // iOS exposes no public ambient-light API, which is why motion.light fails here.
+    case "light": return false
+    default: return false     // an unknown name is "no", not a crash
+    }
+}
+
 // Orientation capability helpers: the current interface orientation as a string, and a
 // lock through the mask the AppDelegate reports to UIKit.
 var chuksOrientationMask: UIInterfaceOrientationMask = .all
+// "coarse,edge", where edge is where the TOP OF THE DEVICE points. UIKit's interface
+// orientations name the landscapes by where the home button is, which is the opposite
+// edge, so .landscapeLeft (home button on the left) has the top pointing RIGHT. The
+// Chuks word is defined by the device so the two platforms can agree on it.
 func currentOrientationString() -> String {
     let io = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.interfaceOrientation
-    return (io?.isLandscape ?? false) ? "landscape" : "portrait"
+    switch io {
+    case .portraitUpsideDown: return "portrait,down"
+    case .landscapeLeft:      return "landscape,right"
+    case .landscapeRight:     return "landscape,left"
+    default:                  return "portrait,up"
+    }
 }
 func applyOrientationLock(_ mode: String) {
     switch mode {
@@ -803,6 +933,257 @@ func unAuthStr(_ s: UNAuthorizationStatus) -> String {
     switch s { case .authorized, .provisional, .ephemeral: return "granted"; case .denied: return "denied"; default: return "undetermined" }
 }
 
+// "lat,lng,accuracyM,altitudeM,speedMps,headingDeg,timestampMs": the one fix shape both
+// platforms produce, for once, lastKnown, watch and watchBackground alike.
+func chuksFixString(_ l: CLLocation) -> String {
+    let c = l.coordinate
+    return "\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course),\(Int64(l.timestamp.timeIntervalSince1970 * 1000))"
+}
+// The app's accuracy names, mapped the way expo-location maps them, so the same word
+// costs the same battery on both platforms. Unknown names answer nil and the caller
+// keeps its default.
+func chuksLocAccuracy(_ name: String) -> CLLocationAccuracy? {
+    switch name {
+    case "lowest": return kCLLocationAccuracyThreeKilometers
+    case "low": return kCLLocationAccuracyKilometer
+    case "balanced": return kCLLocationAccuracyHundredMeters
+    case "high": return kCLLocationAccuracyNearestTenMeters
+    case "highest": return kCLLocationAccuracyBest
+    case "navigation": return kCLLocationAccuracyBestForNavigation
+    default: return nil
+    }
+}
+// CLHeading's accuracy is degrees of error (negative: invalid); Android's is a 0..3
+// sensor grade. Both platforms answer the grade, cut the way expo-location cuts it.
+func chuksHeadingGrade(_ degrees: CLLocationDirection) -> Int {
+    if degrees > 50 || degrees < 0 { return 0 }
+    if degrees > 35 { return 1 }
+    if degrees > 20 { return 2 }
+    return 3
+}
+
+// The compass. A CLLocationManager of its own so the heading filter and the location
+// manager's accuracy never fight; trueHeading needs a location fix, so the manager is
+// also started for location at the cheapest class, or trueHeading stays -1.
+final class LocHeading: NSObject, CLLocationManagerDelegate {
+    private let mgr = CLLocationManager()
+    private let onHeading: (String) -> Void
+    private let onErr: (String) -> Void
+    init(onHeading: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
+        self.onHeading = onHeading; self.onErr = onErr
+        super.init(); mgr.delegate = self
+        mgr.headingFilter = 1   // degrees; below this a turn is not reported
+        mgr.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+    }
+    func start() {
+        guard CLLocationManager.headingAvailable() else { onErr("no compass on this device"); return }
+        mgr.startUpdatingHeading()
+        if mgr.authorizationStatus == .authorizedWhenInUse || mgr.authorizationStatus == .authorizedAlways { mgr.startUpdatingLocation() }
+    }
+    func stop() { mgr.stopUpdatingHeading(); mgr.stopUpdatingLocation() }
+    // Permission granted after the watch began: start the location feed now, so
+    // trueHeading stops being -1 from here on.
+    func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+        if m.authorizationStatus == .authorizedWhenInUse || m.authorizationStatus == .authorizedAlways { m.startUpdatingLocation() }
+    }
+    func locationManager(_ m: CLLocationManager, didUpdateHeading h: CLHeading) {
+        onHeading("\(h.trueHeading),\(h.magneticHeading),\(chuksHeadingGrade(h.headingAccuracy))")
+    }
+    func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {}
+    func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
+        if (e as? CLError)?.code == .locationUnknown { return }
+        onErr(e.localizedDescription)
+    }
+}
+
+// ---- text-to-speech ------------------------------------------------------------
+// One synthesizer, its delegate, and the ids the app gave each utterance, so every
+// event names the sentence it is about and a waiter (speakAsync) is answered when its
+// own sentence ends, not the one before it.
+//
+// Rate: AVSpeechUtterance's is a 0..1 synthesizer scale where "normal" is the
+// default constant (0.5), so the app's 1.0-is-normal rate is multiplied onto it and
+// clamped to the platform's minimum and maximum, as expo-speech does. A replace
+// (speak) cancels what is queued, and each cancelled utterance says so, once.
+final class ChuksSpeech: NSObject, AVSpeechSynthesizerDelegate {
+    let synth = AVSpeechSynthesizer()
+    weak var host: CardsVC?
+    var watchers = Set<String>()
+    private var ids: [ObjectIdentifier: String] = [:]      // utterance -> app id
+    private var waiters: [String: String] = [:]            // app id -> token to resolve on done
+    // iOS 17 and later answer stopSpeaking with didFinish, not didCancel, for what it
+    // cut off. The ids being stopped are marked first, so a finish that follows a stop
+    // is reported as the cancellation it is.
+    private var stopping = Set<String>()
+    init(host: CardsVC) { self.host = host; super.init(); synth.delegate = self }
+
+    private func emit(_ s: String) { for t in watchers { host?.resolve(t, s) } }
+
+    func speak(_ a: ChuksArgs, waiter: String?) {
+        let id = a.s("id")
+        let u = AVSpeechUtterance(string: a.s("text"))
+        let rate = Float(a.num("rate") ?? 1)
+        u.rate = max(AVSpeechUtteranceMinimumSpeechRate, min(AVSpeechUtteranceMaximumSpeechRate, AVSpeechUtteranceDefaultSpeechRate * rate))
+        u.pitchMultiplier = Float(max(0.5, min(2.0, a.num("pitch") ?? 1)))
+        u.volume = Float(max(0, min(1, a.num("volume") ?? 1)))
+        let voiceId = a.s("voice"), lang = a.s("lang")
+        if !voiceId.isEmpty, let v = AVSpeechSynthesisVoice(identifier: voiceId) { u.voice = v }
+        else if !lang.isEmpty, let v = AVSpeechSynthesisVoice(language: lang) { u.voice = v }
+        if !a.bool("queue") && synth.isSpeaking { stopAll() }
+        ids[ObjectIdentifier(u)] = id
+        if let w = waiter { waiters[id] = w }
+        synth.speak(u)
+    }
+    func stopAll() { for (_, i) in ids { stopping.insert(i) }; synth.stopSpeaking(at: .immediate) }
+    func pause() { synth.pauseSpeaking(at: .word) }
+    func resume() { synth.continueSpeaking() }
+    func status() -> String { synth.isPaused ? "paused" : (synth.isSpeaking ? "speaking" : "idle") }
+
+    private func id(_ u: AVSpeechUtterance) -> String { ids[ObjectIdentifier(u)] ?? "" }
+    private func finish(_ u: AVSpeechUtterance, _ event: String, fail: String?) {
+        let i = id(u)
+        var event = event, fail = fail
+        if stopping.remove(i) != nil { event = "canceled"; fail = "canceled" }
+        emit("\(event),\(i)")
+        if let w = waiters.removeValue(forKey: i) { if let f = fail { host?.fail(w, f) } else { host?.resolve(w, "") } }
+        ids[ObjectIdentifier(u)] = nil
+    }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didStart u: AVSpeechUtterance) { emit("start,\(id(u))") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish u: AVSpeechUtterance) { finish(u, "done", fail: nil) }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel u: AVSpeechUtterance) { finish(u, "canceled", fail: "canceled") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didPause u: AVSpeechUtterance) { emit("paused,\(id(u))") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, didContinue u: AVSpeechUtterance) { emit("resumed,\(id(u))") }
+    func speechSynthesizer(_ s: AVSpeechSynthesizer, willSpeakRangeOfSpeechString r: NSRange, utterance u: AVSpeechUtterance) {
+        if s.isPaused { return }   // the word it stopped in front of is reported again on resume
+        emit("progress,\(id(u)),\(r.location),\(r.location + r.length)")
+    }
+}
+
+// ---- clipboard -----------------------------------------------------------------
+// The kinds on the pasteboard, "text,url,image" in that order, read from its types
+// alone (no banner). A URL copied from a browser has a URL type; a URL typed as text
+// is text only, as on Android where a text that parses as http(s) counts as a URL.
+func chuksClipboardKinds() -> String {
+    let p = UIPasteboard.general
+    var kinds: [String] = []
+    if p.hasStrings { kinds.append("text") }
+    if p.hasURLs { kinds.append("url") }
+    if p.hasImages { kinds.append("image") }
+    return kinds.joined(separator: ",")
+}
+
+// ---- calendar ------------------------------------------------------------------
+// One event is "title\tstartMs\tendMs\tid\tcalendarId\tlocation\tnotes\tallDay" on both
+// platforms. The id is eventIdentifier, which store.event(withIdentifier:) takes; an
+// occurrence of a repeating event carries the same id as every other.
+// A field of a capability payload. Records are joined by a newline and fields by a
+// tab, and a value can contain either: a filename may hold a newline, a contact may
+// be saved with a tab in the name. Escaping them keeps the record and field COUNT
+// right (three files list as three rows, not four) and keeps the value recoverable,
+// where the old clean() replaced them with spaces and lost what was there.
+// Undone by wireFields() in core/native.chuks.
+func chuksWireEsc(_ s: String, listItem: Bool = false) -> String {
+    if !s.contains("\\") && !s.contains("\t") && !s.contains("\n") && !s.contains("\r") && !(listItem && s.contains(";")) { return s }
+    var out = ""
+    for c in s {
+        switch c {
+        case "\\": out += "\\\\"
+        case "\t": out += "\\t"
+        case "\n": out += "\\n"
+        case "\r": out += "\\r"
+        // Only for an item of a ";"-joined list (a contact's phones and emails): a
+        // number holding a semicolon would otherwise become two numbers. Escaped a step
+        // further than a plain field, and undone by wireList rather than wireFields, so
+        // the semicolon survives the field split and dies at the list split.
+        case ";" where listItem: out += "\\;"
+        default: out.append(c)
+        }
+    }
+    return out
+}
+func chuksHex(_ c: CGColor) -> String {
+    guard let comps = c.converted(to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil)?.components, comps.count >= 3 else { return "000000" }
+    return String(format: "%02X%02X%02X", Int(comps[0] * 255), Int(comps[1] * 255), Int(comps[2] * 255))
+}
+func chuksEventLine(_ e: EKEvent) -> String {
+    let ms: (Date?) -> Int64 = { d in Int64((d?.timeIntervalSince1970 ?? 0) * 1000) }
+    return [chuksWireEsc(e.title ?? ""), "\(ms(e.startDate))", "\(ms(e.endDate))", e.eventIdentifier ?? "", e.calendar?.calendarIdentifier ?? "",
+            chuksWireEsc(e.location ?? ""), chuksWireEsc(e.notes ?? ""), e.isAllDay ? "1" : "0"].joined(separator: "\t")
+}
+// The fields add, update and compose share. An alarm of -1 (or none) clears alarms.
+func chuksFillEvent(_ ev: EKEvent, _ a: ChuksArgs) {
+    ev.title = a.s("title")
+    ev.startDate = Date(timeIntervalSince1970: (a.num("start") ?? 0) / 1000)
+    ev.endDate = Date(timeIntervalSince1970: (a.num("end") ?? 0) / 1000)
+    ev.location = a.s("location").isEmpty ? nil : a.s("location")
+    ev.notes = a.s("notes").isEmpty ? nil : a.s("notes")
+    ev.isAllDay = a.bool("allDay")
+    let alarm = a.num("alarm") ?? -1
+    ev.alarms = alarm >= 0 ? [EKAlarm(relativeOffset: -alarm * 60)] : nil
+}
+final class ChuksEventEditDelegate: NSObject, EKEventEditViewDelegate {
+    private let onDone: (String?) -> Void
+    init(onDone: @escaping (String?) -> Void) { self.onDone = onDone }
+    func eventEditViewController(_ controller: EKEventEditViewController, didCompleteWith action: EKEventEditViewAction) {
+        controller.dismiss(animated: true)
+        onDone(action == .saved ? (controller.event?.eventIdentifier ?? "") : nil)
+    }
+}
+
+// ---- contacts ------------------------------------------------------------------
+// One contact is "name\tphones\temails\tid" on both platforms, phones and emails
+// ";"-joined. Reads go through the unified contact (linked cards folded into one),
+// writes through CNSaveRequest, and iOS 18's "limited" access counts as authorized:
+// the user chose which contacts the app sees, and those are the book as far as the
+// app is concerned.
+let chuksContactKeys: [CNKeyDescriptor] = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactOrganizationNameKey,
+                                           CNContactPhoneNumbersKey, CNContactEmailAddressesKey] as [CNKeyDescriptor]
+func chuksContactsAuthorized() -> Bool {
+    let s = CNContactStore.authorizationStatus(for: .contacts)
+    if s == .authorized { return true }
+    if #available(iOS 18.0, *), s == .limited { return true }
+    return false
+}
+func chuksContactLine(_ c: CNContact) -> String {
+    var name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
+    if name.isEmpty, c.isKeyAvailable(CNContactOrganizationNameKey) { name = c.organizationName }
+    let clean: (String) -> String = { chuksWireEsc($0) }
+    let item: (String) -> String = { chuksWireEsc($0, listItem: true) }
+    let phones = c.isKeyAvailable(CNContactPhoneNumbersKey) ? c.phoneNumbers.map { item($0.value.stringValue) }.joined(separator: ";") : ""
+    let emails = c.isKeyAvailable(CNContactEmailAddressesKey) ? c.emailAddresses.map { item(String($0.value)) }.joined(separator: ";") : ""
+    return "\(clean(name))\t\(phones)\t\(emails)\t\(c.identifier)"
+}
+// The app gives one name; the first word is the given name and the rest the family
+// name, which is how the OS sorts and displays it.
+func chuksFillContact(_ c: CNMutableContact, name: String, phones: String, emails: String) {
+    let parts = name.trimmingCharacters(in: .whitespaces).split(separator: " ", maxSplits: 1).map(String.init)
+    c.givenName = parts.first ?? ""
+    c.familyName = parts.count > 1 ? parts[1] : ""
+    c.phoneNumbers = phones.split(separator: ";").map { CNLabeledValue(label: CNLabelPhoneNumberMobile, value: CNPhoneNumber(stringValue: String($0).trimmingCharacters(in: .whitespaces))) }
+    c.emailAddresses = emails.split(separator: ";").map { CNLabeledValue(label: CNLabelHome, value: String($0).trimmingCharacters(in: .whitespaces) as NSString) }
+}
+// One phone or email chosen off a card: the line carries that value alone.
+final class ChuksContactPropertyPick: NSObject, CNContactPickerDelegate {
+    private let onPick: (String) -> Void
+    private let onCancel: () -> Void
+    init(onPick: @escaping (String) -> Void, onCancel: @escaping () -> Void) { self.onPick = onPick; self.onCancel = onCancel }
+    func contactPicker(_ picker: CNContactPickerViewController, didSelect p: CNContactProperty) {
+        let c = p.contact
+        let name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
+        let clean: (String) -> String = { chuksWireEsc($0) }
+        if let n = p.value as? CNPhoneNumber { onPick("\(clean(name))\t\(clean(n.stringValue))\t\t\(c.identifier)") }
+        else { onPick("\(clean(name))\t\t\(clean(String(describing: p.value ?? "")))\t\(c.identifier)") }
+    }
+    func contactPickerDidCancel(_ picker: CNContactPickerViewController) { onCancel() }
+}
+final class ChuksContactPick: NSObject, CNContactPickerDelegate {
+    private let onPick: (CNContact) -> Void
+    private let onCancel: () -> Void
+    init(onPick: @escaping (CNContact) -> Void, onCancel: @escaping () -> Void) { self.onPick = onPick; self.onCancel = onCancel }
+    func contactPicker(_ picker: CNContactPickerViewController, didSelect contact: CNContact) { onPick(contact) }
+    func contactPickerDidCancel(_ picker: CNContactPickerViewController) { onCancel() }
+}
+
 // Location permission needs a CLLocationManager delegate (result via callback).
 final class LocPerm: NSObject, CLLocationManagerDelegate {
     private let mgr = CLLocationManager()
@@ -829,7 +1210,8 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     private let onFix: (String) -> Void
     private let onErr: (String) -> Void
     private var pending = false   // waiting on the authorization decision to begin
-    init(once: Bool, background: Bool = false, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
+    init(once: Bool, background: Bool = false, accuracy: String = "", distance: Double = 0,
+         onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
         self.once = once; self.onFix = onFix; self.onErr = onErr
         super.init(); mgr.delegate = self
         if background {
@@ -856,7 +1238,11 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
         // tunes its filtering for a person on foot, and auto-pause OFF (iOS otherwise
         // stops updates when it decides you have stopped, silently losing the middle of
         // a walk). `once` callers get a single fix, so they keep the cheaper class.
-        mgr.desiredAccuracy = once ? kCLLocationAccuracyBest : kCLLocationAccuracyBestForNavigation
+        // The accuracy names are the app's; the empty default keeps what each kind of
+        // read has always had. The distance filter is what makes a watch quiet while the
+        // user sits still: kCLDistanceFilterNone (0) reports every fix.
+        mgr.desiredAccuracy = chuksLocAccuracy(accuracy) ?? (once ? kCLLocationAccuracyHundredMeters : kCLLocationAccuracyBestForNavigation)
+        mgr.distanceFilter = distance > 0 ? distance : kCLDistanceFilterNone
         if !once {
             mgr.activityType = .fitness
             mgr.pausesLocationUpdatesAutomatically = false
@@ -893,7 +1279,7 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
             if l.horizontalAccuracy < 0 { continue }
             if now.timeIntervalSince(l.timestamp) > 5 { continue }
             let c = l.coordinate
-            onFix("\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course)")
+            onFix(chuksFixString(l))
             delivered = true
         }
         if once && delivered { m.stopUpdatingLocation() }
@@ -906,8 +1292,8 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
 
 // Media picker + camera: copy the chosen/captured UIImage into the app's Documents and
 // return its path, so the "file://<path>" can feed an Image node.
-func chuksSaveImage(_ img: UIImage) -> String? {
-    guard let data = img.jpegData(compressionQuality: 0.9) else { return nil }
+func chuksSaveImage(_ img: UIImage, quality: Double = 0.9) -> String? {
+    guard let data = img.jpegData(compressionQuality: CGFloat(max(0.05, min(1, quality)))) else { return nil }
     let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("picked-\(UUID().uuidString).jpg")
     do { try data.write(to: url); return url.path } catch { return nil }
@@ -928,38 +1314,300 @@ final class MediaCoordinator: NSObject, PHPickerViewControllerDelegate, UIImageP
     }
     func imagePickerController(_ p: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
         p.dismiss(animated: true)
+        if let movie = info[.mediaURL] as? URL {
+            // The camera's temporary file: copied into the app's storage before iOS reclaims it.
+            let dst = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("cam_\(UUID().uuidString).\(movie.pathExtension.isEmpty ? "mov" : movie.pathExtension)")
+            if (try? FileManager.default.copyItem(at: movie, to: dst)) != nil { done("file://" + dst.path) } else { cancel("cannot keep the video") }
+            return
+        }
         if let path = (info[.originalImage] as? UIImage).flatMap({ chuksSaveImage($0) }) { done("file://" + path) } else { cancel("no image") }
     }
     func imagePickerControllerDidCancel(_ p: UIImagePickerController) { p.dismiss(animated: true); cancel("canceled") }
 }
 
+// ---- the library picker with choices ----------------------------------------------
+// PHPicker for images, videos or both, several at once, in the order chosen. An image
+// comes in through UIImage (which also bakes in its orientation), scaled to maxSize on
+// the longer edge and written as a JPEG at the asked quality; a video is copied as it
+// is. The file URL PHPicker hands over for a video is valid only inside the closure
+// (it is a temporary export), so the copy happens there and not a line later. Every
+// item is described as "path\tkind\twidth\theight\tbytes\tdurationMs".
+final class ChuksMediaPick: NSObject, PHPickerViewControllerDelegate {
+    private let quality: Double
+    private let maxSize: Int
+    private let done: ([String]) -> Void
+    private let cancel: (String) -> Void
+    init(quality: Double, maxSize: Int, done: @escaping ([String]) -> Void, cancel: @escaping (String) -> Void) {
+        self.quality = quality; self.maxSize = maxSize; self.done = done; self.cancel = cancel
+    }
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        if results.isEmpty { cancel("canceled"); return }
+        var lines = [String?](repeating: nil, count: results.count)
+        let group = DispatchGroup()
+        for (i, r) in results.enumerated() {
+            let prov = r.itemProvider
+            group.enter()
+            if prov.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                prov.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                    defer { group.leave() }
+                    guard let url = url else { return }
+                    let dst = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent("picked-\(UUID().uuidString).\(url.pathExtension.isEmpty ? "mov" : url.pathExtension)")
+                    try? FileManager.default.removeItem(at: dst)
+                    if (try? FileManager.default.copyItem(at: url, to: dst)) != nil { lines[i] = chuksMediaInfo(dst).map { chuksWireEsc(dst.path) + "\t" + $0 } }
+                }
+            } else if prov.canLoadObject(ofClass: UIImage.self) {
+                prov.loadObject(ofClass: UIImage.self) { obj, _ in
+                    defer { group.leave() }
+                    guard let img = obj as? UIImage else { return }
+                    if let p = chuksSaveImage(chuksScaleImage(img, maxSize: self.maxSize), quality: self.quality) {
+                        let u = URL(fileURLWithPath: p)
+                        lines[i] = chuksMediaInfo(u).map { chuksWireEsc(u.path) + "\t" + $0 }
+                    }
+                }
+            } else { group.leave() }
+        }
+        group.notify(queue: .main) {
+            let out = lines.compactMap { $0 }.map { "file://" + $0 }
+            if out.isEmpty { self.cancel("no media") } else { self.done(out) }
+        }
+    }
+}
+func chuksScaleImage(_ img: UIImage, maxSize: Int) -> UIImage {
+    guard maxSize > 0 else { return img }
+    let w = img.size.width, h = img.size.height, longest = max(w, h)
+    guard longest > CGFloat(maxSize) else { return img }
+    let k = CGFloat(maxSize) / longest
+    let size = CGSize(width: (w * k).rounded(), height: (h * k).rounded())
+    let f = UIGraphicsImageRendererFormat.default(); f.scale = 1
+    return UIGraphicsImageRenderer(size: size, format: f).image { _ in img.draw(in: CGRect(origin: .zero, size: size)) }
+}
+func chuksIsVideoFile(_ url: URL) -> Bool {
+    guard let t = UTType(filenameExtension: url.pathExtension) else { return false }
+    return t.conforms(to: .movie) || t.conforms(to: .video)
+}
+/// "kind\twidth\theight\tbytes\tdurationMs", or nil for a file that is neither.
+func chuksMediaInfo(_ url: URL) -> String? {
+    let bytes = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+    if !chuksIsVideoFile(url), let src = CGImageSourceCreateWithURL(url as CFURL, nil), let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+       let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int {
+        // EXIF orientation 5..8 means the pixels are stored rotated; report the displayed size.
+        let o = props[kCGImagePropertyOrientation] as? Int ?? 1
+        return o >= 5 ? "image\t\(h)\t\(w)\t\(bytes)\t0" : "image\t\(w)\t\(h)\t\(bytes)\t0"
+    }
+    if chuksIsVideoFile(url) {
+        let asset = AVURLAsset(url: url)
+        let ms = Int64(CMTimeGetSeconds(asset.duration) * 1000)
+        var w = 0, h = 0
+        if let track = asset.tracks(withMediaType: .video).first {
+            let s = track.naturalSize.applying(track.preferredTransform)
+            w = Int(abs(s.width)); h = Int(abs(s.height))
+        }
+        return "video\t\(w)\t\(h)\t\(bytes)\t\(ms)"
+    }
+    return nil
+}
+
 // Secure storage (Tier B): Keychain-backed key/value.
-func keychainSet(_ key: String, _ value: String) {
-    let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key]
+// The read of a keychain item has three ends: the value, no such key, or the user
+// declining the biometric prompt. They are different to the caller (a denial is not
+// "no session"), so get answers which.
+enum KeychainResult { case value(String); case missing; case denied(String) }
+
+// A service name scopes the items to this app's own store, so keys() lists ours alone.
+private let chuksKeychainService = "chuks.securestore"
+
+@discardableResult
+func keychainSet(_ key: String, _ value: String, protected: Bool) -> Bool {
+    let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                               kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key]
     SecItemDelete(base as CFDictionary)
     var add = base; add[kSecValueData as String] = value.data(using: .utf8)!
-    SecItemAdd(add as CFDictionary, nil)
+    if protected {
+        // biometryCurrentSet: the item dies if the enrolled biometrics change, which is
+        // the strong guarantee; .or(.devicePasscode) lets a user with a passcode but no
+        // biometrics still store and read. userPresence is the umbrella of the two.
+        guard let ac = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly, .userPresence, nil) else { return false }
+        add[kSecAttrAccessControl as String] = ac
+    } else {
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    }
+    return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
 }
-func keychainGet(_ key: String) -> String? {
-    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key,
+func keychainGet(_ key: String) -> KeychainResult {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                            kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key,
                             kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
     var out: AnyObject?
-    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
-    return String(data: d, encoding: .utf8)
+    let status = SecItemCopyMatching(q as CFDictionary, &out)
+    if status == errSecSuccess, let d = out as? Data, let s = String(data: d, encoding: .utf8) { return .value(s) }
+    if status == errSecItemNotFound { return .missing }
+    if status == errSecUserCanceled || status == errSecAuthFailed { return .denied("authentication canceled") }
+    return .denied("cannot read \(key): OSStatus \(status)")
+}
+// Existence without the value: no data returned, so a protected item does not prompt.
+func keychainHas(_ key: String) -> Bool {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                            kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key,
+                            kSecReturnData as String: false, kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
+    let status = SecItemCopyMatching(q as CFDictionary, nil)
+    return status == errSecSuccess || status == errSecInteractionNotAllowed   // the latter: it exists but is protected
+}
+func keychainKeys() -> [String] {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                            kSecAttrService as String: chuksKeychainService, kSecMatchLimit as String: kSecMatchLimitAll,
+                            kSecReturnAttributes as String: true, kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
+    var out: AnyObject?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let items = out as? [[String: Any]] else { return [] }
+    return items.compactMap { $0[kSecAttrAccount as String] as? String }.sorted()
 }
 func keychainDelete(_ key: String) {
-    SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key] as CFDictionary)
+    SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                   kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key] as CFDictionary)
+}
+
+// ── Audio player ─────────────────────────────────────────────────────────────
+// One AVPlayer per Chuks AudioPlayer, observed the way expo-audio observes it:
+// KVO on the item's status for ready/failed, a periodic time observer for the
+// playhead (never a poll), the did-play-to-end notification for finish and loop,
+// and the buffer-empty / likely-to-keep-up pair for buffering. Every change is
+// pushed through `emit` as the one status string the Chuks side documents.
+final class ChuksAudioPlayer {
+    let id: String
+    let player: AVPlayer
+    var emit: ((String) -> Void)?
+    var loop = false
+    var rate: Float = 1.0
+    var volume: Float = 1.0
+    var state = "loading"
+    var error = ""
+    var buffering = false
+    var wantPlay = false                  // play() arrived before the item was ready
+    var wasPlayingBeforeInterruption = false
+    private var timeObs: Any?
+    private var kvo: [NSKeyValueObservation] = []
+    private var endObs: NSObjectProtocol?
+
+    init(id: String, url: URL) {
+        self.id = id
+        let item = AVPlayerItem(url: url)
+        item.audioTimePitchAlgorithm = .timeDomain     // rate changes keep the pitch
+        player = AVPlayer(playerItem: item)
+        player.actionAtItemEnd = .pause
+        kvo.append(item.observe(\.status, options: [.new]) { [weak self] it, _ in
+            guard let self = self else { return }
+            switch it.status {
+            case .readyToPlay:
+                if self.state == "loading" { self.state = "ready" }
+                if self.wantPlay { self.wantPlay = false; self.start() }
+                self.push()
+            case .failed:
+                self.state = "error"
+                self.error = it.error?.localizedDescription ?? "cannot play this source"
+                self.push()
+            default: break
+            }
+        })
+        kvo.append(item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] it, _ in
+            if it.isPlaybackBufferEmpty { self?.buffering = true; self?.push() }
+        })
+        kvo.append(item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] it, _ in
+            if it.isPlaybackLikelyToKeepUp { self?.buffering = false; self?.push() }
+        })
+        endObs = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            if self.loop {
+                self.player.seek(to: .zero) { _ in self.start() }
+            } else {
+                self.state = "ended"; self.push()
+            }
+        }
+        // A quarter-second cadence while playing is enough for any progress bar and
+        // is the cadence the platform delivers, so nothing here wakes on a timer.
+        timeObs = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 4), queue: .main) { [weak self] _ in
+            guard let self = self, self.state == "playing" else { return }
+            self.push()
+        }
+    }
+
+    private func start() {
+        player.playImmediately(atRate: rate)
+        state = "playing"
+        push()
+    }
+    func play() {
+        if player.currentItem?.status == .readyToPlay { start() } else { wantPlay = true }
+    }
+    func pause() { wantPlay = false; player.pause(); if state == "playing" { state = "paused"; push() } }
+    func stop() { pause(); player.seek(to: .zero); push() }
+    func seek(ms: Int64) {
+        player.seek(to: CMTime(value: ms, timescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in self?.push() }
+    }
+    func setVolume(_ v: Float) { volume = max(0, min(1, v)); player.volume = volume; push() }
+    func setRate(_ r: Float) {
+        rate = max(0.25, min(4, r))
+        if state == "playing" { player.rate = rate }
+        push()
+    }
+
+    func status() -> String {
+        let pos = CMTimeGetSeconds(player.currentTime())
+        let dur = player.currentItem?.duration.seconds ?? 0
+        let posMs = pos.isFinite ? Int(pos * 1000) : 0
+        let durMs = dur.isFinite ? Int(dur * 1000) : 0
+        return "\(state),\(posMs),\(durMs),\(rate),\(volume),\(buffering ? 1 : 0),\(error)"
+    }
+    func push() { emit?(status()) }
+
+    func release() {
+        player.pause()
+        if let t = timeObs { player.removeTimeObserver(t) }
+        timeObs = nil
+        kvo.forEach { $0.invalidate() }; kvo = []
+        if let e = endObs { NotificationCenter.default.removeObserver(e) }
+        endObs = nil
+        emit = nil
+        player.replaceCurrentItem(with: nil)
+    }
 }
 
 // Show notifications even while the app is foregrounded (iOS otherwise suppresses
-// the banner for the active app).
+// the banner for the active app), and receive the tap.
+//
+// The tap that LAUNCHED the app arrives here before any Chuks code has run, let alone
+// subscribed. It is held in `pending` and handed to the first onResponse subscriber,
+// so a screen that subscribes on mount does not miss the reason it was opened. Same
+// shape as the launch URL in Linking.onURL.
 final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
+    var onResponse: ((String) -> Void)?
+    var pending: String?
     func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
-        done([.banner, .sound])
+        // .list is what keeps a foreground-delivered notification in Notification
+        // Center after its banner goes. Without it the banner was the only trace, and
+        // a user who looked away for five seconds had nothing to tap.
+        done([.banner, .list, .sound])
+    }
+    func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        let id = r.notification.request.identifier
+        let data = r.notification.request.content.userInfo["data"] as? String ?? ""
+        let payload = id + "\t" + data
+        if let cb = onResponse { cb(payload) } else { pending = payload }
+        done()
     }
 }
 let notifDelegate = NotifDelegate()
+
+// A pending request's next fire time as epoch milliseconds, whichever trigger it has.
+func chuksNotifFireAt(_ req: UNNotificationRequest) -> Int64 {
+    var date: Date? = nil
+    if let t = req.trigger as? UNTimeIntervalNotificationTrigger { date = t.nextTriggerDate() }
+    else if let t = req.trigger as? UNCalendarNotificationTrigger { date = t.nextTriggerDate() }
+    return Int64((date?.timeIntervalSince1970 ?? 0) * 1000)
+}
 
 // ── Host wake ────────────────────────────────────────────────────────────────
 // The engine calls this (from a background goroutine, via the chuks_set_wake C
@@ -1092,6 +1740,31 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var stageMaxCall: CFTimeInterval = 0     // the engine round trip alone
     var stageMaxApply: CFTimeInterval = 0    // applying the mutation stream to views
     var stageMaxBytes = 0                    // largest mutation stream in a frame
+    var stageParseSink = 0                   // keeps parseOnly from being optimized away
+    var stageMaxOps = 0                      // most ops (lines) in one crossing: the granularity
+    var stageSumOps = 0                      // total ops over the phase, for an average
+    var stageCrossings = 0                   // crossings that carried at least one op
+    var stageMaxParse: CFTimeInterval = 0    // parse alone (PARSE_PROBE=1): split + dispatch, no view work
+    // A parse-only pass over the same stream, to separate the protocol's cost from the
+    // view mutations that follow it. Behind an env var because it does the work twice and
+    // would make the frame numbers of an ordinary run pessimistic.
+    static let parseProbe = ProcessInfo.processInfo.environment["PARSE_PROBE"] == "1"
+    private func parseOnly(_ stream: String) {
+        var sink = 0
+        for raw in stream.split(separator: "\n") {
+            let f = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            guard let op = f.first else { continue }
+            // The same work the real switch does before it touches a view: the op lookup
+            // and the field reads, including the rejoin for the text-carrying ops.
+            switch op {
+            case "P", "V", "IF", "X": if f.count >= 3 { sink += f[2...].joined(separator: "|").utf8.count }
+            case "C", "S", "T", "LS": if f.count >= 3 { sink += f[1].utf8.count + f[2].utf8.count }
+            case "I": if f.count >= 4 { sink += (Int(f[3]) ?? 0) }
+            default: if f.count >= 2 { sink += f[1].utf8.count }
+            }
+        }
+        stageParseSink += sink
+    }
     var stageMaxTickWork: CFTimeInterval = 0 // worst synchronous work inside one tick
     var stageWorstInterval: CFTimeInterval = 0
     var stageWorkOnWorst: CFTimeInterval = 0 // our work on the frame that took longest
@@ -1366,7 +2039,6 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     override func viewDidLoad() {
         super.viewDidLoad()
         print("BENCHMARK CHUKS: booting…")
-        UNUserNotificationCenter.current().delegate = notifDelegate  // foreground banners
         view.backgroundColor = hexColor("0E1116")
         YGConfigSetPointScaleFactor(config, Float(UIScreen.main.scale))
 
@@ -1645,6 +2317,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         perfFrames = 0; perfJanky = 0; perfMaxFrame = 0; perfSumTime = 0; perfMaxPlayers = 0
         stageMaxEngine = 0; stageMaxLayout = 0; stageMaxIdle = 0; stageFrames = 0
         stageMaxCall = 0; stageMaxApply = 0; stageMaxBytes = 0
+        stageMaxOps = 0; stageSumOps = 0; stageCrossings = 0; stageMaxParse = 0
         stageMaxTickWork = 0; stageWorstInterval = 0; stageWorkOnWorst = 0; stageMaxCommit = 0
     }
     @objc func perfTick() {
@@ -1702,6 +2375,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             + String(format: " | stages: engine %.1f ms, apply %.1f ms, layout %.1f ms, idle %.1f ms, bytes %d, mutating %d",
                      stageMaxCall * 1000, stageMaxApply * 1000, stageMaxLayout * 1000, stageMaxIdle * 1000,
                      stageMaxBytes, stageFrames)
+            + String(format: " | wire: ops/crossing max %d avg %.1f over %d crossings, parse %.3f ms",
+                     stageMaxOps, Double(stageSumOps) / Double(max(1, stageCrossings)), stageCrossings, stageMaxParse * 1000)
             + String(format: " | worst frame %.1f ms of which OUR work %.1f ms; worst work %.1f ms; worst commit+render %.1f ms",
                      stageWorstInterval * 1000, stageWorkOnWorst * 1000, stageMaxTickWork * 1000, stageMaxCommit * 1000)
         print(msg); NSLog(msg); perfLog.append(msg)
@@ -2414,6 +3089,21 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func apply(_ stream: String) {
+        // Every engine -> host crossing lands here, whatever produced it: a render, a
+        // scroll re-window, a tap's re-render, a capability result. Counted here rather
+        // than in one caller so "ops per crossing" means what it says.
+        if BENCHMARK_MODE && !stream.isEmpty {
+            let ops = stream.split(separator: "\n").count
+            if ops > stageMaxOps { stageMaxOps = ops }
+            stageSumOps += ops; stageCrossings += 1
+            if stream.utf8.count > stageMaxBytes { stageMaxBytes = stream.utf8.count }
+            if CardsVC.parseProbe {
+                let p0 = CACurrentMediaTime()
+                parseOnly(stream)
+                let p = CACurrentMediaTime() - p0
+                if p > stageMaxParse { stageMaxParse = p }
+            }
+        }
         for raw in stream.split(separator: "\n") {
             let f = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
             guard let op = f.first else { continue }
@@ -2514,7 +3204,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     /// framework's own streams use, so `__cancel__` releases both alike.
     func onCancel(_ token: String, _ teardown: @escaping () -> Void) { streamTeardown[token] = teardown }
 
-    func resolve(_ token: String, _ payload: String) { if let s = eResolve(token, payload) { apply(s); relayout() } }
+    // Token "0" is a call without a callback: nothing is waiting, so nothing to render.
+    func resolve(_ token: String, _ payload: String) {
+        if token == "0" { return }
+        if let s = eResolve(token, payload) { apply(s); relayout() }
+    }
     // Report a capability failure back to the engine (fires the request's onErr).
     // Token "0" means the caller passed no callback, so the engine allocated nothing and
     // there is no closure anywhere to hand this to. The engine's own unhandled-failure
@@ -2538,6 +3232,47 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var streamTeardown: [String: () -> Void] = [:]   // real OS streams: unregister closure, run on __cancel__
     var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
     var locFixes: [String: LocFix] = [:]    // live Location managers, keyed by token (once + watch)
+    var locHeadings: [String: LocHeading] = [:]   // live compass streams, keyed by token
+    var contactPickers: [String: NSObject] = [:]   // picker delegates alive while presented
+    var calendarEditors: [String: ChuksEventEditDelegate] = [:]   // system add-event forms alive while presented
+    var brightnessWatchers = Set<String>()
+    var appBrightness: CGFloat? = nil      // the level set() asked for, nil when the app has not set one
+    // Wait for the asynchronous brightness write to land, polling the getter; give up
+    // (and carry on) after `tries` x 50 ms so a device that never reports it does not hang a token.
+    private func brightnessSettle(_ target: CGFloat, tries: Int, _ done: @escaping () -> Void) {
+        if abs(UIScreen.main.brightness - target) < 0.005 || tries <= 0 { done(); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.brightnessSettle(target, tries: tries - 1, done) }
+    }
+    var userBrightness: CGFloat? = nil     // the user's level before the first set(), put back on the way out
+    private var brightnessScoped = false
+    private func installBrightnessScoping() {
+        if brightnessScoped { return }
+        brightnessScoped = true
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.appBrightness != nil, let u = self.userBrightness else { return }
+            UIScreen.main.brightness = u
+        }
+        NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, let b = self.appBrightness else { return }
+            // The user may have moved the slider while away: that is the new level to
+            // put back later.
+            self.userBrightness = UIScreen.main.brightness
+            UIScreen.main.brightness = b
+        }
+    }
+    var calendarStores: [String: EKEventStore] = [:]   // one store per calendar.watch, kept so EKEventStoreChanged is posted
+    // Calendar access, asked for on first use the way iOS's own apps do. The store is
+    // handed to the work once access is there; a refusal fails the token.
+    private func withCalendarAccess(_ token: String, _ work: @escaping (EKEventStore) -> Void) {
+        let store = EKEventStore()
+        let s = EKEventStore.authorizationStatus(for: .event)
+        var ok = s == .authorized
+        if #available(iOS 17.0, *) { ok = ok || s == .fullAccess }
+        if ok { work(store); return }
+        if s == .denied || s == .restricted { fail(token, "calendar permission denied"); return }
+        let done: (Bool, Error?) -> Void = { g, _ in DispatchQueue.main.async { if g { work(store) } else { self.fail(token, "calendar permission denied") } } }
+        if #available(iOS 17.0, *) { store.requestFullAccessToEvents(completion: done) } else { store.requestAccess(to: .event, completion: done) }
+    }
     let motion = CMMotionManager()          // one shared motion manager; sensors fan out to token sets
     var accelTokens = Set<String>()
     var gyroTokens = Set<String>()
@@ -2552,16 +3287,59 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
     var urlTokens = Set<String>()             // linking.onurl subscribers
+    var notifTokens = Set<String>()   // Notifications.onResponse subscribers
     var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
     // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
     func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
-    var audioPlayer: AVPlayer? = nil   // single-track audio playback (Tier B); AVPlayer handles mp4 audio
+    // Audio: one ChuksAudioPlayer per Chuks AudioPlayer, watch tokens per player, and
+    // the interruption observers installed on the first create. Capped, because a
+    // player holds a decoder and a screen that forgets release() would otherwise find
+    // out from the platform, somewhere less legible than a status string.
+    var audioPlayers: [String: ChuksAudioPlayer] = [:]
+    var audioWatchers: [String: Set<String>] = [:]      // player id -> stream tokens
+    var audioInterruptionObs: [NSObjectProtocol] = []
+    static let audioCap = 32
     var audioRecorder: AVAudioRecorder? = nil   // mic recording (Tier C)
     var cameraController: CameraController? = nil   // live CameraView session (for camera.capturePreview)
     var ble: BleManager? = nil          // CoreBluetooth central (lazy)
     var nfc: NfcReader? = nil           // CoreNFC reader (lazy)
     var recURL: URL? = nil
-    let speech = AVSpeechSynthesizer()  // text-to-speech (Tier B)
+    var recPaused = false
+    var mediaPick: ChuksMediaPick? = nil   // the library picker with choices, alive while presented
+    var recorderWatchers = Set<String>()
+    private var recorderTicker: Timer? = nil
+    private func recorderLevel() -> Double {
+        guard let r = audioRecorder, r.isRecording else { return 0 }
+        r.updateMeters()
+        return max(0, min(1, pow(10, Double(r.averagePower(forChannel: 0)) / 20)))   // dB (-160..0) -> linear 0..1
+    }
+    private func recorderStatus() -> String {
+        guard let r = audioRecorder else { return "idle,0,0.000" }
+        let state = recPaused ? "paused" : "recording"
+        return "\(state),\(Int(r.currentTime * 1000))," + String(format: "%.3f", recorderLevel())
+    }
+    private func pushRecorderStatus() {
+        let s = recorderStatus()
+        for t in recorderWatchers { resolve(t, s) }
+        if audioRecorder == nil { recorderTicker?.invalidate(); recorderTicker = nil }
+    }
+    private func startRecorderTicker() {
+        recorderTicker?.invalidate()
+        recorderTicker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.audioRecorder == nil { self.recorderTicker?.invalidate(); self.recorderTicker = nil; return }
+            if !self.recorderWatchers.isEmpty { self.pushRecorderStatus() }
+        }
+    }
+    // The microphone permission, asked for on first use; a refusal fails the token.
+    private func withMicPermission(_ token: String, _ work: @escaping () -> Void) {
+        switch AVAudioSession.sharedInstance().recordPermission {
+        case .granted: work()
+        case .denied: fail(token, "microphone permission denied")
+        default: AVAudioSession.sharedInstance().requestRecordPermission { ok in DispatchQueue.main.async { if ok { work() } else { self.fail(token, "microphone permission denied") } } }
+        }
+    }
+    lazy var speech = ChuksSpeech(host: self)  // text-to-speech
     let pedometer = CMPedometer()       // step counter / distance / pace (Pedometer)
     let altimeter = CMAltimeter()       // barometer: pressure + relative altitude
     var proximityTokens = Set<String>() // motion.proximity subscribers (UIDevice proximity)
@@ -2655,15 +3433,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             activeStreams[token] = t
         case "battery.watch":
             UIDevice.current.isBatteryMonitoringEnabled = true
-            let emit = { [weak self] in
-                let d = UIDevice.current
-                let lvl = d.batteryLevel < 0 ? -1 : Int((d.batteryLevel * 100).rounded())
-                let chg = (d.batteryState == .charging || d.batteryState == .full) ? 1 : 0
-                self?.resolve(token, "\(lvl),\(chg)")
-            }
+            let emit = { [weak self] in self?.resolve(token, chuksBatteryNow()) }
             let o1 = NotificationCenter.default.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main) { _ in emit() }
             let o2 = NotificationCenter.default.addObserver(forName: UIDevice.batteryStateDidChangeNotification, object: nil, queue: .main) { _ in emit() }
-            streamTeardown[token] = { NotificationCenter.default.removeObserver(o1); NotificationCenter.default.removeObserver(o2) }
+            // Low Power Mode is a battery fact too, and it changes on its own schedule.
+            let o3 = NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { _ in emit() }
+            streamTeardown[token] = { for o in [o1, o2, o3] { NotificationCenter.default.removeObserver(o) } }
             emit()
         case "appstate.watch":
             let emit: (String) -> Void = { [weak self] s in self?.resolve(token, s) }
@@ -2675,16 +3450,113 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "network.watch":
             let mon = NWPathMonitor()
             mon.pathUpdateHandler = { [weak self] path in
-                let s = path.status != .satisfied ? "none" : path.usesInterfaceType(.wifi) ? "wifi" : path.usesInterfaceType(.cellular) ? "cellular" : "other"
+                let s = chuksPathString(path)
                 DispatchQueue.main.async { self?.resolve(token, s) }
             }
             mon.start(queue: DispatchQueue.global(qos: .utility))
             streamTeardown[token] = { mon.cancel() }
+
+        // ---- One-shot reads of live OS state --------------------------------
+        // The value the matching watch() would fire right now. Before these, reading one
+        // value meant opening a stream and cancelling it, which is a teardown to forget.
+        case "battery.current":
+            resolve(token, chuksBatteryNow())
+        case "battery.available":
+            // The Simulator hands back a fixed placeholder rather than a reading, and
+            // reports it as a negative level.
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            resolve(token, UIDevice.current.batteryLevel >= 0 ? "1" : "0")
+        case "appstate.current":
+            let st = UIApplication.shared.applicationState
+            resolve(token, st == .active ? "active" : st == .background ? "background" : "inactive")
+        case "network.current":
+            // NWPath has no reliable synchronous read before the monitor has started, so
+            // take the first update and stop. It arrives in well under a frame.
+            let one = NWPathMonitor()
+            var answered = false
+            one.pathUpdateHandler = { [weak self] path in
+                if answered { return }
+                answered = true
+                let s = chuksPathString(path)
+                DispatchQueue.main.async { self?.resolve(token, s); one.cancel() }
+            }
+            one.start(queue: DispatchQueue.global(qos: .utility))
+        case "orientation.current":
+            resolve(token, currentOrientationString())
+
+        // ---- Availability -----------------------------------------------------
+        // "Does this device have the hardware", asked before a feature is offered
+        // rather than discovered from a stream that never fires.
+        case "torch.available":
+            resolve(token, (AVCaptureDevice.default(for: .video)?.hasTorch ?? false) ? "1" : "0")
+        case "motion.available":
+            resolve(token, chuksSensorAvailable(args, motion) ? "1" : "0")
+        case "recorder.available":
+            resolve(token, AVAudioSession.sharedInstance().isInputAvailable ? "1" : "0")
+        case "tts.available":
+            // A synthesizer with a voice for the device language. iOS always ships one,
+            // but the check is what makes the question answerable on both platforms.
+            let lang = AVSpeechSynthesisVoice.currentLanguageCode()
+            resolve(token, AVSpeechSynthesisVoice(language: lang) != nil ? "1" : "0")
+        case "ble.available":
+            // Deliberately NOT a CoreBluetooth state read: constructing a
+            // CBCentralManager is what triggers the Bluetooth permission prompt, and an
+            // availability check that prompts is not an availability check. Every iOS
+            // device the deployment target admits has a BLE radio; the Simulator has
+            // none. ble.state still reports "unsupported" for anyone who wants the
+            // radio's own answer.
+            #if targetEnvironment(simulator)
+            resolve(token, "0")
+            #else
+            resolve(token, "1")
+            #endif
         case "location.once":
-            let fix = LocFix(once: true,
+            let fix = LocFix(once: true, accuracy: args,
                 onFix: { [weak self] s in self?.resolve(token, s); self?.locFixes[token] = nil },
                 onErr: { [weak self] m in self?.fail(token, m); self?.locFixes[token] = nil })
             locFixes[token] = fix; fix.start()
+        case "location.lastKnown":
+            // The manager's cached fix costs nothing and needs no start. A fix older
+            // than maxAge or coarser than maxAcc is not an answer; neither is one from
+            // before permission was granted (there is none then).
+            let maxAge = a.num("maxAge") ?? 0, maxAcc = a.num("maxAcc") ?? 0
+            if let l = CLLocationManager().location, l.horizontalAccuracy >= 0,
+               maxAge <= 0 || Date().timeIntervalSince(l.timestamp) * 1000 <= maxAge,
+               maxAcc <= 0 || l.horizontalAccuracy <= maxAcc {
+                resolve(token, chuksFixString(l))
+            } else { resolve(token, "") }
+        case "location.enabled":
+            // locationServicesEnabled() reads a system setting; iOS logs a UI-hang warning
+            // when it is called on the main thread, so it is asked off it.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let on = CLLocationManager.locationServicesEnabled()
+                DispatchQueue.main.async { self.resolve(token, on ? "1" : "0") }
+            }
+        case "location.heading":
+            let h = LocHeading(onHeading: { [weak self] s in self?.resolve(token, s) },
+                               onErr: { [weak self] m in self?.fail(token, m) })
+            locHeadings[token] = h
+            streamTeardown[token] = { [weak self] in self?.locHeadings[token]?.stop(); self?.locHeadings[token] = nil }
+            h.start()
+        case "location.geocode":
+            CLGeocoder().geocodeAddressString(args) { [weak self] marks, err in
+                if let err = err as? CLError, err.code == .geocodeFoundNoResult || err.code == .geocodeFoundPartialResult { self?.resolve(token, ""); return }
+                if let err = err { self?.fail(token, "geocoding failed: \(err.localizedDescription)"); return }
+                let rows = (marks ?? []).compactMap { $0.location }.map { "\($0.coordinate.latitude),\($0.coordinate.longitude)" }
+                self?.resolve(token, rows.joined(separator: "\n"))
+            }
+        case "location.reverseGeocode":
+            CLGeocoder().reverseGeocodeLocation(CLLocation(latitude: a.num("lat") ?? 0, longitude: a.num("lng") ?? 0)) { [weak self] marks, err in
+                if let err = err as? CLError, err.code == .geocodeFoundNoResult || err.code == .geocodeFoundPartialResult { self?.resolve(token, ""); return }
+                if let err = err { self?.fail(token, "geocoding failed: \(err.localizedDescription)"); return }
+                let rows = (marks ?? []).map { p -> String in
+                    let street = [p.subThoroughfare, p.thoroughfare].compactMap { $0 }.joined(separator: " ")
+                    let fields: [String] = [p.name ?? "", street, p.locality ?? "", p.administrativeArea ?? "",
+                                            p.postalCode ?? "", p.country ?? "", p.isoCountryCode ?? ""]
+                    return fields.map { chuksWireEsc($0) }.joined(separator: "\t")
+                }
+                self?.resolve(token, rows.joined(separator: "\n"))
+            }
         case "location.watch", "location.watchBackground":
             let bg = (cap == "location.watchBackground")
             // The notification text in args is Android's business: iOS shows its own blue
@@ -2696,7 +3568,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 fail(token, "background location needs \"location\" in UIBackgroundModes: add \"backgroundLocation\": true to app.json")
                 break
             }
-            let fix = LocFix(once: false, background: bg,
+            let fix = LocFix(once: false, background: bg, accuracy: a.s("acc"), distance: a.num("dist") ?? 0,
                 onFix: { [weak self] s in self?.resolve(token, s) },
                 onErr: { [weak self] m in self?.fail(token, m) })
             locFixes[token] = fix
@@ -2821,42 +3693,176 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 ms = String(Int64(d.timeIntervalSince1970 * 1000))
             }
             resolve(token, ms)
-        case "contacts.list":
-            var contactsOK = CNContactStore.authorizationStatus(for: .contacts) == .authorized
-            if #available(iOS 18.0, *) { contactsOK = contactsOK || CNContactStore.authorizationStatus(for: .contacts) == .limited }
-            guard contactsOK else { fail(token, "contacts permission denied"); break }
+        // ---- contacts: see ChuksContacts below ----------------------------------
+        case "contacts.pick":
+            // The OS picker needs no permission: the app sees what was chosen and
+            // nothing else. A property kind shows the card and lets the user pick one
+            // number or address; the delegate that answers decides which mode the
+            // picker runs in, so there is one per kind.
+            let picker = CNContactPickerViewController()
+            let done: (String) -> Void = { [weak self] s in self?.resolve(token, s); self?.contactPickers[token] = nil }
+            let cancel: () -> Void = { [weak self] in self?.fail(token, "canceled"); self?.contactPickers[token] = nil }
+            let d: NSObject & CNContactPickerDelegate
+            switch args {
+            case "phone":
+                picker.displayedPropertyKeys = [CNContactPhoneNumbersKey]
+                picker.predicateForSelectionOfProperty = NSPredicate(format: "key == 'phoneNumbers'")
+                d = ChuksContactPropertyPick(onPick: done, onCancel: cancel)
+            case "email":
+                picker.displayedPropertyKeys = [CNContactEmailAddressesKey]
+                picker.predicateForSelectionOfProperty = NSPredicate(format: "key == 'emailAddresses'")
+                d = ChuksContactPropertyPick(onPick: done, onCancel: cancel)
+            default:
+                d = ChuksContactPick(onPick: { c in done(chuksContactLine(c)) }, onCancel: cancel)
+            }
+            picker.delegate = d
+            contactPickers[token] = d
+            self.present(picker, animated: true)
+        case "contacts.list", "contacts.search":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            let q = cap == "contacts.search" ? args.lowercased() : ""
             let store = CNContactStore()
             DispatchQueue.global(qos: .userInitiated).async {
-                let keys = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactPhoneNumbersKey, CNContactEmailAddressesKey] as [CNKeyDescriptor]
                 var lines: [String] = []
                 do {
-                    try store.enumerateContacts(with: CNContactFetchRequest(keysToFetch: keys)) { c, _ in
-                        let name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
-                        let phones = c.phoneNumbers.map { $0.value.stringValue }.joined(separator: ";")
-                        let emails = c.emailAddresses.map { String($0.value) }.joined(separator: ";")
-                        lines.append("\(name)\t\(phones)\t\(emails)")
+                    let req = CNContactFetchRequest(keysToFetch: chuksContactKeys)
+                    req.sortOrder = .givenName
+                    try store.enumerateContacts(with: req) { c, _ in
+                        let line = chuksContactLine(c)
+                        if q.isEmpty || line.lowercased().contains(q) { lines.append(line) }
                     }
                     DispatchQueue.main.async { self.resolve(token, lines.joined(separator: "\n")) }
-                } catch { DispatchQueue.main.async { self.fail(token, "read failed") } }
+                } catch { DispatchQueue.main.async { self.fail(token, "read failed: \(error.localizedDescription)") } }
             }
+        case "contacts.get":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            if let c = try? CNContactStore().unifiedContact(withIdentifier: args, keysToFetch: chuksContactKeys) { resolve(token, chuksContactLine(c)) }
+            else { fail(token, "no such contact: \(args)") }
+        case "contacts.add":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            let c = CNMutableContact()
+            chuksFillContact(c, name: a.s("name"), phones: a.s("phones"), emails: a.s("emails"))
+            let req = CNSaveRequest(); req.add(c, toContainerWithIdentifier: nil)
+            do { try CNContactStore().execute(req); resolve(token, c.identifier) }
+            catch { fail(token, "cannot add contact: \(error.localizedDescription)") }
+        case "contacts.update":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            guard let existing = try? CNContactStore().unifiedContact(withIdentifier: a.s("id"), keysToFetch: chuksContactKeys),
+                  let c = existing.mutableCopy() as? CNMutableContact else { fail(token, "no such contact: \(a.s("id"))"); break }
+            chuksFillContact(c, name: a.s("name"), phones: a.s("phones"), emails: a.s("emails"))
+            let req = CNSaveRequest(); req.update(c)
+            do { try CNContactStore().execute(req); resolve(token, "") }
+            catch { fail(token, "cannot update contact: \(error.localizedDescription)") }
+        case "contacts.delete":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            guard let existing = try? CNContactStore().unifiedContact(withIdentifier: args, keysToFetch: []),
+                  let c = existing.mutableCopy() as? CNMutableContact else { fail(token, "no such contact: \(args)"); break }
+            let req = CNSaveRequest(); req.delete(c)
+            do { try CNContactStore().execute(req); resolve(token, "") }
+            catch { fail(token, "cannot delete contact: \(error.localizedDescription)") }
+        case "contacts.photo":
+            guard chuksContactsAuthorized() else { fail(token, "contacts permission denied"); break }
+            guard let c = try? CNContactStore().unifiedContact(withIdentifier: args, keysToFetch: [CNContactThumbnailImageDataKey as CNKeyDescriptor]) else { fail(token, "no such contact: \(args)"); break }
+            guard let data = c.thumbnailImageData else { resolve(token, ""); break }
+            let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("contact-\(args.hashValue).jpg")
+            do { try data.write(to: url); resolve(token, "file://" + url.path) }
+            catch { fail(token, "cannot write photo: \(error.localizedDescription)") }
+        case "contacts.watch":
+            // One notification for any change, coalesced by the OS. Needs nothing.
+            let obs = NotificationCenter.default.addObserver(forName: .CNContactStoreDidChange, object: nil, queue: .main) { [weak self] _ in self?.resolve(token, "") }
+            streamTeardown[token] = { NotificationCenter.default.removeObserver(obs) }
+        // ---- calendar: see ChuksCalendar helpers below ----------------------------
+        // Reads and writes prompt when the app has not asked yet (withCalendarAccess),
+        // the way a location read does. compose needs no access at all.
         case "calendar.upcoming":
             guard let days = a.num() else { break }
-            let store = EKEventStore()
-            let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
-            let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map {
-                "\($0.title ?? "")\t\(Int($0.startDate.timeIntervalSince1970 * 1000))\t\(Int($0.endDate.timeIntervalSince1970 * 1000))"
+            withCalendarAccess(token) { store in
+                let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
+                let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map(chuksEventLine)
+                self.resolve(token, lines.joined(separator: "\n"))
             }
-            resolve(token, lines.joined(separator: "\n"))
+        case "calendar.events":
+            let from = Date(timeIntervalSince1970: (a.num("start") ?? 0) / 1000), to = Date(timeIntervalSince1970: (a.num("end") ?? 0) / 1000)
+            let calId = a.s("cal")
+            withCalendarAccess(token) { store in
+                var cals: [EKCalendar]? = nil
+                if !calId.isEmpty {
+                    guard let c = store.calendar(withIdentifier: calId) else { self.fail(token, "no such calendar: \(calId)"); return }
+                    cals = [c]
+                }
+                let pred = store.predicateForEvents(withStart: from, end: to, calendars: cals)
+                let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map(chuksEventLine)
+                self.resolve(token, lines.joined(separator: "\n"))
+            }
+        case "calendar.get":
+            withCalendarAccess(token) { store in
+                if let ev = store.event(withIdentifier: args) { self.resolve(token, chuksEventLine(ev)) }
+                else { self.fail(token, "no such event: \(args)") }
+            }
+        case "calendar.calendars":
+            withCalendarAccess(token) { store in
+                let lines = store.calendars(for: .event).map { c -> String in
+                    let hex = c.cgColor.map { chuksHex($0) } ?? "000000"
+                    return "\(c.calendarIdentifier)\t\(chuksWireEsc(c.title))\t\(c.allowsContentModifications ? "1" : "0")\t\(hex)"
+                }
+                self.resolve(token, lines.joined(separator: "\n"))
+            }
         case "calendar.create":
             guard let startMin = a.num("startInMin"), let durMin = a.num("durationMin") else { break }
+            withCalendarAccess(token) { store in
+                guard let cal = store.defaultCalendarForNewEvents else { self.fail(token, "no writable calendar"); return }
+                let ev = EKEvent(eventStore: store)
+                ev.title = a.s("title"); ev.calendar = cal
+                ev.startDate = Date(timeIntervalSinceNow: startMin * 60)
+                ev.endDate = Date(timeIntervalSinceNow: startMin * 60 + durMin * 60)
+                do { try store.save(ev, span: .thisEvent); self.resolve(token, ev.eventIdentifier ?? "ok") }
+                catch { self.fail(token, "save failed: \(error.localizedDescription)") }
+            }
+        case "calendar.add":
+            withCalendarAccess(token) { store in
+                let calId = a.s("cal")
+                let cal: EKCalendar? = calId.isEmpty ? store.defaultCalendarForNewEvents : store.calendar(withIdentifier: calId)
+                guard let cal = cal else { self.fail(token, calId.isEmpty ? "no writable calendar" : "no such calendar: \(calId)"); return }
+                guard cal.allowsContentModifications else { self.fail(token, "calendar is read-only: \(cal.title)"); return }
+                let ev = EKEvent(eventStore: store)
+                ev.calendar = cal
+                chuksFillEvent(ev, a)
+                do { try store.save(ev, span: .thisEvent); self.resolve(token, ev.eventIdentifier ?? "ok") }
+                catch { self.fail(token, "save failed: \(error.localizedDescription)") }
+            }
+        case "calendar.update":
+            withCalendarAccess(token) { store in
+                guard let ev = store.event(withIdentifier: a.s("id")) else { self.fail(token, "no such event: \(a.s("id"))"); return }
+                chuksFillEvent(ev, a)
+                do { try store.save(ev, span: .futureEvents); self.resolve(token, "") }
+                catch { self.fail(token, "save failed: \(error.localizedDescription)") }
+            }
+        case "calendar.delete":
+            withCalendarAccess(token) { store in
+                guard let ev = store.event(withIdentifier: args) else { self.fail(token, "no such event: \(args)"); return }
+                do { try store.remove(ev, span: .futureEvents); self.resolve(token, "") }
+                catch { self.fail(token, "delete failed: \(error.localizedDescription)") }
+            }
+        case "calendar.compose":
+            // The system form. Since iOS 17 it needs no calendar access: the user is
+            // the one saving, and the app is told the id. Before 17 it prompted itself.
             let store = EKEventStore()
-            guard let cal = store.defaultCalendarForNewEvents else { fail(token, "no writable calendar"); break }
             let ev = EKEvent(eventStore: store)
-            ev.title = a.s("title"); ev.calendar = cal
-            ev.startDate = Date(timeIntervalSinceNow: startMin * 60)
-            ev.endDate = Date(timeIntervalSinceNow: startMin * 60 + durMin * 60)
-            do { try store.save(ev, span: .thisEvent); resolve(token, ev.eventIdentifier ?? "ok") }
-            catch { fail(token, "save failed: \(error.localizedDescription)") }
+            chuksFillEvent(ev, a)
+            let vc = EKEventEditViewController()
+            vc.eventStore = store; vc.event = ev
+            let d = ChuksEventEditDelegate(onDone: { [weak self] id in
+                if let id = id { self?.resolve(token, id) } else { self?.fail(token, "canceled") }
+                self?.calendarEditors[token] = nil
+            })
+            vc.editViewDelegate = d
+            calendarEditors[token] = d
+            self.present(vc, animated: true)
+        case "calendar.watch":
+            let obs = NotificationCenter.default.addObserver(forName: .EKEventStoreChanged, object: nil, queue: .main) { [weak self] _ in self?.resolve(token, "") }
+            let store = EKEventStore()   // a store must exist for the notification to be posted to this process
+            calendarStores[token] = store
+            streamTeardown[token] = { [weak self] in NotificationCenter.default.removeObserver(obs); self?.calendarStores[token] = nil }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
         case "bg.define":
@@ -2904,6 +3910,25 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             var cfg = PHPickerConfiguration(); cfg.filter = .images; cfg.selectionLimit = 1
             let pk = PHPickerViewController(configuration: cfg); pk.delegate = coord
             present(pk, animated: true)
+        // ---- the library picker with choices: see ChuksMediaPick ---------------------
+        case "mediapicker.video", "mediapicker.pick":
+            let kind = cap == "mediapicker.video" ? "video" : a.s("kind")
+            let limit = cap == "mediapicker.video" ? 1 : (a.int("limit") ?? 1)
+            let pathOnly = cap == "mediapicker.video"
+            let coord = ChuksMediaPick(quality: a.num("quality") ?? 0.9, maxSize: a.int("maxSize") ?? 0,
+                done: { [weak self] lines in
+                    self?.mediaPick = nil
+                    self?.resolve(token, pathOnly ? (lines.first?.split(separator: "\t").first.map(String.init) ?? "") : lines.joined(separator: "\n"))
+                }, cancel: { [weak self] m in self?.mediaPick = nil; self?.fail(token, m) })
+            mediaPick = coord
+            var cfg = PHPickerConfiguration()
+            cfg.filter = kind == "image" ? .images : (kind == "video" ? .videos : .any(of: [.images, .videos]))
+            cfg.selectionLimit = max(0, limit)
+            if #available(iOS 15.0, *) { cfg.selection = .ordered }
+            let pk = PHPickerViewController(configuration: cfg); pk.delegate = coord
+            present(pk, animated: true)
+        case "mediapicker.info":
+            if let line = chuksMediaInfo(fsURL(args)) { resolve(token, line) } else { fail(token, "not an image or video: \(args)") }
         case "camera.photo":
             if !UIImagePickerController.isSourceTypeAvailable(.camera) { fail(token, "camera unavailable"); break }
             let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
@@ -2912,16 +3937,43 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let pk = UIImagePickerController(); pk.sourceType = .camera; pk.delegate = coord
             present(pk, animated: true)
         case "mediapicker.save":
-            let path = args.hasPrefix("file://") ? String(args.dropFirst(7)) : args
-            guard let img = UIImage(contentsOfFile: path) else { fail(token, "no such image"); break }
+            // An image or a video, by what the file is.
+            let url = fsURL(args)
+            let img = UIImage(contentsOfFile: url.path)
+            let isVideo = img == nil && chuksIsVideoFile(url)
+            guard img != nil || isVideo else { fail(token, "not an image or video: \(args)"); break }
+            // iOS kills an app that asks Photos without the usage text. Refuse with the
+            // fix instead of taking the app down at a line the developer never wrote.
+            guard Bundle.main.object(forInfoDictionaryKey: "NSPhotoLibraryAddUsageDescription") != nil else {
+                fail(token, "saving to the gallery needs the \"photosAdd\" permission in app.json"); break
+            }
             PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
                 guard status == .authorized || status == .limited else { DispatchQueue.main.async { self?.fail(token, "photos permission denied") }; return }
-                PHPhotoLibrary.shared().performChanges({ PHAssetChangeRequest.creationRequestForAsset(from: img) },
-                    completionHandler: { ok, err in DispatchQueue.main.async { ok ? self?.resolve(token, "ok") : self?.fail(token, err?.localizedDescription ?? "save failed") } })
+                PHPhotoLibrary.shared().performChanges({
+                    if let img = img { PHAssetChangeRequest.creationRequestForAsset(from: img) }
+                    else { PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url) }
+                }, completionHandler: { ok, err in DispatchQueue.main.async { ok ? self?.resolve(token, "ok") : self?.fail(token, err?.localizedDescription ?? "save failed") } })
             }
+        case "camera.available": resolve(token, UIImagePickerController.isSourceTypeAvailable(.camera) ? "1" : "0")
+        case "camera.video":
+            if !UIImagePickerController.isSourceTypeAvailable(.camera) { fail(token, "camera unavailable"); break }
+            let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
+                                         cancel: { [weak self] m in self?.mediaCoord = nil; self?.fail(token, m) })
+            mediaCoord = coord
+            let pk = UIImagePickerController(); pk.sourceType = .camera; pk.delegate = coord
+            pk.mediaTypes = [UTType.movie.identifier]
+            pk.videoQuality = a.s("quality") == "low" ? .typeMedium : .typeHigh
+            let cap = a.num("maxSeconds") ?? 0
+            if cap > 0 { pk.videoMaximumDuration = cap }
+            present(pk, animated: true)
         case "camera.capturePreview":
             guard let ctrl = cameraController else { fail(token, "no CameraView on screen"); break }
             ctrl.capture(ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
+        case "camera.flash": cameraController?.setFlash(args)
+        case "camera.zoom": if let z = a.num() { cameraController?.setZoom(z) }
+        case "camera.zoomRange": resolve(token, cameraController?.zoomRange() ?? "1,1")
+        case "camera.focus": cameraController?.focus(x: a.num("x") ?? 0.5, y: a.num("y") ?? 0.5)
+        case "camera.hasFlash": resolve(token, cameraController?.hasFlash() == true ? "1" : "0")
         case "ble.state":
             ensureBle(); ble!.stateToken = token; ble!.emitState()
             streamTeardown[token] = { [weak self] in self?.ble?.stateToken = nil }
@@ -2948,6 +4000,40 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             ensureNfc(); nfc!.write(args, token)
         case "biometrics.available":
             resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
+        // The two halves of "available", asked separately. LAContext answers both
+        // through one call and its error code: notAvailable is no sensor,
+        // notEnrolled is a sensor with nothing on it, lockout is enrolled but
+        // temporarily refused (still hardware, still enrolled).
+        case "biometrics.hardware":
+            var e: NSError?
+            let ok = LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &e)
+            let has = ok || (e.map { LAError.Code(rawValue: $0.code) != .biometryNotAvailable } ?? false)
+            resolve(token, has ? "1" : "0")
+        case "biometrics.enrolled":
+            var e: NSError?
+            let ok = LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &e)
+            let enrolled = ok || (e.map { LAError.Code(rawValue: $0.code) == .biometryLockout } ?? false)
+            resolve(token, enrolled ? "1" : "0")
+        case "biometrics.types":
+            // biometryType is only populated after canEvaluatePolicy has run.
+            let ctx = LAContext()
+            _ = ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
+            switch ctx.biometryType {
+            case .faceID:  resolve(token, "face")
+            case .touchID: resolve(token, "fingerprint")
+            default:       resolve(token, "")
+            }
+        case "biometrics.level":
+            // iOS has no weak biometric: Face ID and Touch ID are both strong. Below
+            // that is the passcode, and below that nothing.
+            let ctx = LAContext()
+            if ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) {
+                resolve(token, "strong")
+            } else if ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: nil) {
+                resolve(token, "secret")
+            } else {
+                resolve(token, "none")
+            }
         case "biometrics.authenticate":
             let ctx = LAContext()
             var perr: NSError?
@@ -2962,77 +4048,313 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)
         case "permission.request": permRequest(args, token)
+        // ---- files -----------------------------------------------------------
+        // A relative path lives under the documents directory; "/..." and "file://..."
+        // are taken as given (a picked photo, a recording, a download). Every error
+        // reaches the app as a message, never as a silent no-op.
         case "fs.write":
-            // The content arrives as an ordinary field: the wire packs arguments, so a
-            // multi-line body needs no encoding of its own any more.
-            try? a.s("content").write(to: appFile(a.s("name")), atomically: true, encoding: .utf8)
+            guard let url = fsTarget(token, a.s("name")) else { break }
+            do { try fsMkParent(url); try a.s("content").write(to: url, atomically: true, encoding: .utf8); resolve(token, "") }
+            catch { fail(token, "cannot write \(a.s("name")): \(error.localizedDescription)") }
+        case "fs.writeB64":
+            guard let url = fsTarget(token, a.s("name")) else { break }
+            guard let bytes = Data(base64Encoded: a.s("content"), options: .ignoreUnknownCharacters) else { fail(token, "content is not base64"); break }
+            do { try fsMkParent(url); try bytes.write(to: url, options: .atomic); resolve(token, "") }
+            catch { fail(token, "cannot write \(a.s("name")): \(error.localizedDescription)") }
         case "fs.read":
-            if let s = try? String(contentsOf: appFile(args), encoding: .utf8) { resolve(token, s) }
+            if let s = try? String(contentsOf: fsURL(args), encoding: .utf8) { resolve(token, s) }
+            else { fail(token, "no such file: \(args)") }
+        case "fs.readB64":
+            if let d = try? Data(contentsOf: fsURL(args)) { resolve(token, d.base64EncodedString()) }
             else { fail(token, "no such file: \(args)") }
         case "fs.list":
-            let names = (try? FileManager.default.contentsOfDirectory(atPath: appDir().path)) ?? []
-            resolve(token, names.joined(separator: "\n"))
-        case "fs.delete": try? FileManager.default.removeItem(at: appFile(args))
+            let dir = fsURL(args)
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { fail(token, "no such directory: \(args)"); break }
+            var isDir: ObjCBool = false
+            let rows = names.sorted().map { n -> String in
+                FileManager.default.fileExists(atPath: dir.appendingPathComponent(n).path, isDirectory: &isDir)
+                return chuksWireEsc(isDir.boolValue ? n + "/" : n)
+            }
+            resolve(token, rows.joined(separator: "\n"))
+        case "fs.delete":
+            // removeItem is recursive for a directory. Nothing to delete is not an error.
+            guard let url = fsTarget(token, args) else { break }
+            if FileManager.default.fileExists(atPath: url.path) {
+                do { try FileManager.default.removeItem(at: url); resolve(token, "") }
+                catch { fail(token, "cannot delete \(args): \(error.localizedDescription)") }
+            } else { resolve(token, "") }
+        case "fs.exists":
+            resolve(token, FileManager.default.fileExists(atPath: fsURL(args).path) ? "1" : "0")
+        case "fs.info":
+            var isDir: ObjCBool = false
+            let path = fsURL(args).path
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { resolve(token, "none,0,0"); break }
+            let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+            let size = isDir.boolValue ? 0 : ((attrs[.size] as? NSNumber)?.int64Value ?? 0)
+            let mod = Int64(((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0) * 1000)
+            resolve(token, "\(isDir.boolValue ? "dir" : "file"),\(size),\(mod)")
+        case "fs.mkdir":
+            guard let url = fsTarget(token, args) else { break }
+            do { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true); resolve(token, "") }
+            catch { fail(token, "cannot create \(args): \(error.localizedDescription)") }
+        case "fs.copy", "fs.move":
+            // File to file, off the main thread: a copy of a video takes as long as it
+            // takes and the screen must not wait for it.
+            guard let src = fsTarget(token, a.s("src")), let dst = fsTarget(token, a.s("dst")) else { break }
+            let isMove = cap == "fs.move"
+            DispatchQueue.global(qos: .utility).async {
+                var msg = ""
+                do {
+                    try self.fsMkParent(dst)
+                    if FileManager.default.fileExists(atPath: dst.path) { try FileManager.default.removeItem(at: dst) }
+                    if isMove { try FileManager.default.moveItem(at: src, to: dst) } else { try FileManager.default.copyItem(at: src, to: dst) }
+                } catch { msg = "cannot \(isMove ? "move" : "copy") \(a.s("src")): \(error.localizedDescription)" }
+                DispatchQueue.main.async { if msg.isEmpty { self.resolve(token, "") } else { self.fail(token, msg) } }
+            }
+        case "fs.download":
+            // URLSession streams to a temporary file; the bytes never sit in memory and
+            // never cross the bridge. The app hears "path,bytes" or one message.
+            guard let url = URL(string: a.s("url")), url.scheme != nil else { fail(token, "not a URL: \(a.s("url"))"); break }
+            guard let dst = fsTarget(token, a.s("dst")) else { break }
+            let shown = a.s("dst")
+            let task = URLSession.shared.downloadTask(with: url) { tmp, resp, err in
+                var msg = "", bytes: Int64 = 0
+                if let err = err { msg = err.localizedDescription }
+                else if let code = (resp as? HTTPURLResponse)?.statusCode, code >= 400 { msg = "HTTP \(code)" }
+                else if let tmp = tmp {
+                    do {
+                        try self.fsMkParent(dst)
+                        if FileManager.default.fileExists(atPath: dst.path) { try FileManager.default.removeItem(at: dst) }
+                        try FileManager.default.moveItem(at: tmp, to: dst)
+                        bytes = ((try? FileManager.default.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                    } catch { msg = "cannot write \(shown): \(error.localizedDescription)" }
+                }
+                DispatchQueue.main.async { if msg.isEmpty { self.resolve(token, "\(dst.path),\(bytes)") } else { self.fail(token, "download failed: \(msg)") } }
+            }
+            task.resume()
+        case "fs.diskSpace":
+            let vals = try? appDir().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
+            let free = vals?.volumeAvailableCapacityForImportantUsage ?? 0
+            let total = Int64(vals?.volumeTotalCapacity ?? 0)
+            resolve(token, "\(free),\(total)")
+        case "fs.dir":
+            switch args {
+            case "cache": resolve(token, FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].path)
+            case "temp": resolve(token, FileManager.default.temporaryDirectory.path)
+            default: resolve(token, appDir().path)
+            }
         case "secure.set":
-            keychainSet(a.s("key"), a.s("value"))
+            keychainSet(a.s("key"), a.s("value"), protected: false)
+        case "secure.setProtected":
+            // The write is what creates the access control; it does not itself prompt on
+            // iOS (adding an item is allowed), but a later get() does. Off the main
+            // thread because SecItemAdd can block.
+            let k = a.s("key"), v = a.s("value")
+            DispatchQueue.global(qos: .userInitiated).async {
+                let ok = keychainSet(k, v, protected: true)
+                DispatchQueue.main.async { if ok { self.resolve(token, "") } else { self.fail(token, "no biometrics enrolled") } }
+            }
         case "secure.get":
-            if let v = keychainGet(args) { resolve(token, v) } else { fail(token, "no such key: \(args)") }
+            // A protected item makes SecItemCopyMatching show Face ID / Touch ID, which
+            // blocks, so every read runs off the main thread.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let r = keychainGet(args)
+                DispatchQueue.main.async {
+                    switch r {
+                    case .value(let v): self.resolve(token, v)
+                    case .missing: self.fail(token, "no such key: \(args)")
+                    case .denied(let m): self.fail(token, m)
+                    }
+                }
+            }
+        case "secure.has": resolve(token, keychainHas(args) ? "1" : "0")
+        case "secure.keys": resolve(token, keychainKeys().map { chuksWireEsc($0) }.joined(separator: "\n"))
         case "secure.delete": keychainDelete(args)
-        case "notif.notify":
+        case "secure.deleteAll": for k in keychainKeys() { keychainDelete(k) }
+        case "secure.available":
+            let ctx = LAContext()
+            resolve(token, ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
+        case "notif.notify", "notif.schedule":
             let content = UNMutableNotificationContent()
             content.title = a.s("title"); content.body = a.s("body")
             content.sound = .default
-            UNUserNotificationCenter.current().add(UNNotificationRequest(
-                identifier: UUID().uuidString, content: content,
-                trigger: UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)))
-        case "audio.play":
-            let src: URL? = args.hasPrefix("file://") ? URL(fileURLWithPath: String(args.dropFirst(7)))   // a recording / downloaded file
-                                                      : bundledAssetURL(args)   // a bundled asset
-            if let url = src {
-                try? AVAudioSession.sharedInstance().setCategory(.playback)
-                try? AVAudioSession.sharedInstance().setActive(true)
-                audioPlayer?.pause()                 // stop any previous track: no overlapping players
-                let p = AVPlayer(url: url); audioPlayer = p; p.play()
+            content.userInfo = ["data": a.s("data")]
+            let id = a.s("id").isEmpty ? UUID().uuidString : a.s("id")
+            var trigger: UNNotificationTrigger? = nil
+            if cap == "notif.schedule" {
+                let inSeconds = a.num("inSeconds") ?? 0
+                let atMs = a.num("atMs") ?? 0
+                if atMs > 0 {
+                    // A calendar trigger for an absolute time. Second precision is all
+                    // the OS offers; a date already past fires at once.
+                    let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second],
+                                                                from: Date(timeIntervalSince1970: atMs / 1000))
+                    trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+                } else {
+                    // The interval trigger refuses 0; a non-positive delay means "now".
+                    trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(1, inSeconds), repeats: false)
+                }
             }
-        case "audio.pause": audioPlayer?.pause()
-        case "audio.resume": audioPlayer?.play()
-        case "audio.stop": audioPlayer?.pause(); audioPlayer?.seek(to: .zero)
-        case "audio.position":
-            let cur = audioPlayer.map { CMTimeGetSeconds($0.currentTime()) } ?? 0
-            let dur = audioPlayer?.currentItem?.duration.seconds ?? 0
-            resolve(token, "\(cur.isFinite ? Int(cur*1000) : 0)/\(dur.isFinite ? Int(dur*1000) : 0)")
+            // The same id replaces the earlier request, pending or delivered, which is
+            // how a notification updates in place.
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: trigger))
+        case "notif.cancel":
+            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [args])
+        case "notif.cancelAll":
+            UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+        case "notif.dismiss":
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [args])
+        case "notif.dismissAll":
+            UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        case "notif.scheduled":
+            UNUserNotificationCenter.current().getPendingNotificationRequests { [weak self] reqs in
+                let lines = reqs.map { "\(chuksWireEsc($0.identifier))\t\(chuksWireEsc($0.content.title))\t\(chuksNotifFireAt($0))" }
+                DispatchQueue.main.async { self?.resolve(token, lines.joined(separator: "\n")) }
+            }
+        case "notif.setBadge":
+            let n = Int(a.num() ?? 0)
+            if #available(iOS 16.0, *) { UNUserNotificationCenter.current().setBadgeCount(n) }
+            else { UIApplication.shared.applicationIconBadgeNumber = n }
+        case "notif.badge":
+            resolve(token, String(UIApplication.shared.applicationIconBadgeNumber))
+        case "notif.onResponse":
+            // Every subscriber hears every tap; the delegate has one hook, which fans
+            // out over the token set. The launch tap, if any, goes to the first one.
+            notifTokens.insert(token)
+            notifDelegate.onResponse = { [weak self] p in for t in self?.notifTokens ?? [] { self?.resolve(t, p) } }
+            streamTeardown[token] = { [weak self] in
+                self?.notifTokens.remove(token)
+                if self?.notifTokens.isEmpty == true { notifDelegate.onResponse = nil }
+            }
+            if let p = notifDelegate.pending { notifDelegate.pending = nil; resolve(token, p) }
+        case "notif.channel":
+            break   // Android's concept; iOS has no channels
+        case "audio.mode":
+            // How this app's sound sits with everyone else's. Set before the first player.
+            let session = AVAudioSession.sharedInstance()
+            switch args {
+            case "ambient": try? session.setCategory(.ambient, options: [.mixWithOthers])
+            case "duck":    try? session.setCategory(.playback, options: [.duckOthers])
+            default:        try? session.setCategory(.playback)
+            }
+            try? session.setActive(true)
+        case "audio.create":
+            let id = a.s("id"), src = a.s("src")
+            if audioPlayers.count >= CardsVC.audioCap {
+                // Answer through the status the watcher will read, not a crash.
+                let msg = "too many players (\(CardsVC.audioCap)); release() the ones you are done with"
+                for t in audioWatchers[id] ?? [] { resolve(t, "error,0,0,1,1,0,\(msg)") }
+                os_log("%{public}@", log: chuksLog, type: .error, "Audio: " + msg)
+                break
+            }
+            let url: URL?
+            if src.hasPrefix("file://") { url = URL(fileURLWithPath: String(src.dropFirst(7))) }
+            else if src.hasPrefix("http://") || src.hasPrefix("https://") { url = URL(string: src) }
+            else { url = bundledAssetURL(src) }
+            guard let u = url else {
+                for t in audioWatchers[id] ?? [] { resolve(t, "error,0,0,1,1,0,\"\(src)\" is not a file, a URL, or a bundled asset") }
+                break
+            }
+            if audioInterruptionObs.isEmpty { installAudioInterruptionHandling() }
+            if AVAudioSession.sharedInstance().category == .soloAmbient {
+                // The default category never activates; give playback a real one so
+                // the silent switch does not silence a player nobody asked to be silent.
+                try? AVAudioSession.sharedInstance().setCategory(.playback)
+            }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            audioPlayers[id]?.release()
+            let p = ChuksAudioPlayer(id: id, url: u)
+            p.emit = { [weak self] st in for t in self?.audioWatchers[id] ?? [] { self?.resolve(t, st) } }
+            audioPlayers[id] = p
+        case "audio.play":    audioPlayers[a.s("id")]?.play()
+        case "audio.pause":   audioPlayers[a.s("id")]?.pause()
+        case "audio.stop":    audioPlayers[a.s("id")]?.stop()
+        case "audio.seek":    audioPlayers[a.s("id")]?.seek(ms: Int64(a.num("ms") ?? 0))
+        case "audio.volume":  audioPlayers[a.s("id")]?.setVolume(Float(a.num("v") ?? 1))
+        case "audio.rate":    audioPlayers[a.s("id")]?.setRate(Float(a.num("r") ?? 1))
+        case "audio.loop":    audioPlayers[a.s("id")]?.loop = a.bool("on")
+        case "audio.status":
+            resolve(token, audioPlayers[a.s("id")]?.status() ?? "error,0,0,1,1,0,no such player (released, or never created)")
+        case "audio.watch":
+            let id = a.s("id")
+            audioWatchers[id, default: []].insert(token)
+            streamTeardown[token] = { [weak self] in self?.audioWatchers[id]?.remove(token) }
+            if let p = audioPlayers[id] { resolve(token, p.status()) }
+        case "audio.release":
+            let id = a.s("id")
+            audioPlayers[id]?.release()
+            audioPlayers[id] = nil
+            audioWatchers[id] = nil
+        // ---- recorder ----------------------------------------------------------------
+        // AVAudioRecorder with metering. The session is playAndRecord WITH
+        // defaultToSpeaker: without it, everything the app plays after a recording
+        // goes to the earpiece, which is the classic trap. A phone call pauses the
+        // recorder (interruption began) and the status says so; the app resumes.
         case "recorder.start":
-            guard AVAudioSession.sharedInstance().recordPermission == .granted else { fail(token, "microphone permission denied"); break }
-            let url = appDir().appendingPathComponent("rec-\(UUID().uuidString).m4a")
-            let settings: [String: Any] = [AVFormatIDKey: Int(kAudioFormatMPEG4AAC), AVSampleRateKey: 44100,
-                                           AVNumberOfChannelsKey: 1, AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue]
-            do {
-                try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default)
-                try AVAudioSession.sharedInstance().setActive(true)
-                let r = try AVAudioRecorder(url: url, settings: settings)
-                r.isMeteringEnabled = true; r.record()
-                audioRecorder = r; recURL = url
-            } catch { fail(token, "record failed: \(error.localizedDescription)") }
+            withMicPermission(token) {
+                if self.audioRecorder != nil { self.fail(token, "already recording"); return }
+                let url = self.appDir().appendingPathComponent("rec-\(UUID().uuidString).m4a")
+                let (rate, bitrate): (Int, Int) = args == "low" ? (22050, 32000) : (args == "high" ? (48000, 192000) : (44100, 96000))
+                let settings: [String: Any] = [AVFormatIDKey: Int(kAudioFormatMPEG4AAC), AVSampleRateKey: rate, AVNumberOfChannelsKey: 1,
+                                               AVEncoderBitRateKey: bitrate, AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
+                do {
+                    try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+                    try AVAudioSession.sharedInstance().setActive(true)
+                    let r = try AVAudioRecorder(url: url, settings: settings)
+                    r.isMeteringEnabled = true
+                    guard r.record() else { self.fail(token, "record failed: the input is busy"); return }
+                    self.audioRecorder = r; self.recURL = url; self.recPaused = false
+                    if self.audioInterruptionObs.isEmpty { self.installAudioInterruptionHandling() }
+                    self.startRecorderTicker()
+                    self.resolve(token, "")
+                } catch { self.fail(token, "record failed: \(error.localizedDescription)") }
+            }
+        case "recorder.pause":
+            if let r = audioRecorder, r.isRecording { r.pause(); recPaused = true; pushRecorderStatus() }
+        case "recorder.resume":
+            if let r = audioRecorder, recPaused { r.record(); recPaused = false; pushRecorderStatus() }
         case "recorder.stop":
             guard let r = audioRecorder, let url = recURL else { fail(token, "not recording"); break }
-            r.stop(); audioRecorder = nil
-            try? AVAudioSession.sharedInstance().setActive(false)
+            r.stop(); audioRecorder = nil; recPaused = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            pushRecorderStatus()
             resolve(token, "file://" + url.path)
+        case "recorder.cancel":
+            if let r = audioRecorder { r.stop(); r.deleteRecording() }
+            audioRecorder = nil; recPaused = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            pushRecorderStatus()
+        case "recorder.status": resolve(token, recorderStatus())
+        case "recorder.watch":
+            recorderWatchers.insert(token)
+            streamTeardown[token] = { [weak self] in self?.recorderWatchers.remove(token) }
+            resolve(token, recorderStatus())
         case "recorder.levels":
             let t = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
-                guard let r = self?.audioRecorder else { return }
-                r.updateMeters()
-                let lin = pow(10, r.averagePower(forChannel: 0) / 20)   // dB (-160..0) -> linear 0..1
-                self?.resolve(token, String(format: "%.3f", max(0, min(1, lin))))
+                guard let self = self else { return }
+                self.resolve(token, String(format: "%.3f", self.recorderLevel()))
             }
             activeStreams[token] = t
-        case "tts.speak":
+        // ---- text-to-speech: see ChuksSpeech ---------------------------------------
+        case "tts.speak", "tts.say":
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)
-            if speech.isSpeaking { speech.stopSpeaking(at: .immediate) }
-            speech.speak(AVSpeechUtterance(string: args))
-        case "tts.stop": speech.stopSpeaking(at: .immediate)
-        case "tts.isSpeaking": resolve(token, speech.isSpeaking ? "1" : "0")
+            speech.speak(a, waiter: cap == "tts.say" ? token : nil)
+        case "tts.stop": speech.stopAll()
+        case "tts.pause": speech.pause()
+        case "tts.resume": speech.resume()
+        case "tts.isSpeaking": resolve(token, speech.synth.isSpeaking && !speech.synth.isPaused ? "1" : "0")
+        case "tts.status": resolve(token, speech.status())
+        case "tts.voices":
+            let rows = AVSpeechSynthesisVoice.speechVoices().map { v -> String in
+                let q: String
+                switch v.quality { case .premium: q = "premium"; case .enhanced: q = "enhanced"; default: q = "default" }
+                return "\(v.identifier)\t\(chuksWireEsc(v.name))\t\(v.language)\t\(q)"
+            }
+            resolve(token, rows.joined(separator: "\n"))
+        case "tts.watch":
+            speech.watchers.insert(token)
+            streamTeardown[token] = { [weak self] in self?.speech.watchers.remove(token) }
         // The framework noticed something the app probably did not mean. Logged
         // natively because the engine's own println reaches neither the device console
         // nor idevicesyslog.
@@ -3067,8 +4389,39 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // longer matches, which is why this only has to ask for a layout. Next runloop
             // turn, so the trait set just above has actually propagated.
             DispatchQueue.main.async { [weak self] in self?.relayout() }
+        // ---- clipboard ---------------------------------------------------------------
+        // has* answers from the pasteboard's item types and shows no banner; reading
+        // .string or .image is what iOS announces to the user.
         case "clipboard.set": UIPasteboard.general.string = args
         case "clipboard.get": resolve(token, UIPasteboard.general.string ?? "")
+        case "clipboard.setUrl":
+            if let u = URL(string: args) { UIPasteboard.general.items = [[UTType.url.identifier: u, UTType.utf8PlainText.identifier: args]] }
+            else { UIPasteboard.general.string = args }
+        case "clipboard.setImage":
+            guard let img = UIImage(contentsOfFile: fsURL(args).path) else { fail(token, "not an image: \(args)"); break }
+            UIPasteboard.general.image = img
+            resolve(token, "")
+        case "clipboard.getImage":
+            guard let img = UIPasteboard.general.image, let data = img.jpegData(compressionQuality: 0.92) else { resolve(token, ""); break }
+            let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("clipboard-\(UIPasteboard.general.changeCount).jpg")
+            do { try data.write(to: url); resolve(token, "file://" + url.path) }
+            catch { fail(token, "cannot write the image: \(error.localizedDescription)") }
+        case "clipboard.has":
+            resolve(token, chuksClipboardKinds().split(separator: ",").contains(Substring(args)) ? "1" : "0")
+        case "clipboard.clear": UIPasteboard.general.items = []
+        case "clipboard.watch":
+            // changedNotification fires for changes while the app is active; a change made
+            // in another app shows as a new changeCount when this one comes back.
+            var seen = UIPasteboard.general.changeCount
+            let report: () -> Void = { [weak self] in
+                let n = UIPasteboard.general.changeCount
+                if n == seen { return }
+                seen = n
+                self?.resolve(token, chuksClipboardKinds())
+            }
+            let o1 = NotificationCenter.default.addObserver(forName: UIPasteboard.changedNotification, object: nil, queue: .main) { _ in report() }
+            let o2 = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in report() }
+            streamTeardown[token] = { NotificationCenter.default.removeObserver(o1); NotificationCenter.default.removeObserver(o2) }
         case "linking.open":
             if let u = URL(string: args) { UIApplication.shared.open(u) }
         case "linking.canOpen":
@@ -3080,7 +4433,50 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "haptics.vibrate": if let ms = a.int() { hapticBuzz(ms) }
         case "haptics.pattern": hapticPattern(args)
         case "torch.set": setTorch(args == "1")
-        case "brightness.set": if let v = a.num() { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
+        // ---- brightness ------------------------------------------------------------
+        // iOS has one brightness, and a change an app makes outlives it until the
+        // device locks. The app's level is scoped here: the user's level is saved at
+        // the first set and put back when the app goes to the background or calls
+        // restore, and the app's level comes back with the app.
+        //
+        // A write to UIScreen.brightness is applied asynchronously: the getter keeps
+        // answering the old value for a few hundred milliseconds (measured on an
+        // iPhone 12 Pro, iOS 18). So get answers the level the app asked for while one
+        // is set, and setSystem resolves once the screen reports the new value.
+        case "brightness.set":
+            if let v = a.num() {
+                if appBrightness == nil { userBrightness = UIScreen.main.brightness; installBrightnessScoping() }
+                appBrightness = CGFloat(max(0, min(1, v)))
+                UIScreen.main.brightness = appBrightness!
+            }
+        case "brightness.get": resolve(token, String(format: "%.3f", Double(appBrightness ?? UIScreen.main.brightness)))
+        case "brightness.restore":
+            if let u = userBrightness { UIScreen.main.brightness = u }
+            appBrightness = nil; userBrightness = nil
+        case "brightness.system": resolve(token, String(format: "%.3f", Double(userBrightness ?? UIScreen.main.brightness)))
+        case "brightness.setSystem":
+            // The system level IS the screen's level here. Setting it while the app's
+            // level is scoped changes what restore puts back.
+            if let v = a.num() {
+                let lv = CGFloat(max(0, min(1, v)))
+                if appBrightness != nil { userBrightness = lv; resolve(token, ""); break }
+                UIScreen.main.brightness = lv
+                brightnessSettle(lv, tries: 20) { [weak self] in
+                    self?.resolve(token, "")
+                    for t in self?.brightnessWatchers ?? [] { self?.resolve(t, String(format: "%.3f", Double(lv))) }
+                }
+            }
+        case "brightness.canSetSystem": resolve(token, "1")
+        case "brightness.requestSystemAccess": break
+        case "brightness.mode": resolve(token, "manual")   // iOS does not expose auto-brightness to apps
+        case "brightness.watch":
+            // The notification covers changes made outside the app (the slider, auto
+            // brightness); the app's own system writes are reported by setSystem.
+            brightnessWatchers.insert(token)
+            let o = NotificationCenter.default.addObserver(forName: UIScreen.brightnessDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.resolve(token, String(format: "%.3f", Double(UIScreen.main.brightness)))
+            }
+            streamTeardown[token] = { [weak self] in NotificationCenter.default.removeObserver(o); self?.brightnessWatchers.remove(token) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
         case "orientation.watch":
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -3150,6 +4546,42 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         } catch { fireHaptic("medium") }
     }
 
+    // A phone call or Siri pauses every player and, when the OS says it is over and
+    // asks us to, resumes the ones that were playing. Headphones being unplugged
+    // pauses and does not resume, because that is what the user expects.
+    private func installAudioInterruptionHandling() {
+        let nc = NotificationCenter.default
+        audioInterruptionObs.append(nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self = self,
+                  let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            switch type {
+            case .began:
+                for p in self.audioPlayers.values {
+                    p.wasPlayingBeforeInterruption = p.state == "playing"
+                    if p.wasPlayingBeforeInterruption { p.pause() }
+                }
+                // A call takes the input: the recording pauses and says so. It does not
+                // resume by itself, since the app may want to end it there.
+                if let r = self.audioRecorder, r.isRecording { r.pause(); self.recPaused = true; self.pushRecorderStatus() }
+            case .ended:
+                let opts = AVAudioSession.InterruptionOptions(rawValue: n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+                if opts.contains(.shouldResume) {
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    for p in self.audioPlayers.values where p.wasPlayingBeforeInterruption { p.play() }
+                }
+                for p in self.audioPlayers.values { p.wasPlayingBeforeInterruption = false }
+            @unknown default: break
+            }
+        })
+        audioInterruptionObs.append(nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] n in
+            guard let raw = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
+            guard let self = self else { return }
+            for p in self.audioPlayers.values { p.pause() }
+        })
+    }
+
     private func setTorch(_ on: Bool) {
         guard let dev = AVCaptureDevice.default(for: .video), dev.hasTorch else { return }
         try? dev.lockForConfiguration()
@@ -3177,7 +4609,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Show the OS dialog once and report the outcome (all async).
     private func permRequest(_ kind: String, _ token: String) {
         switch kind {
-        case "camera": AVCaptureDevice.requestAccess(for: .video) { g in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } }
+        case "camera": AVCaptureDevice.requestAccess(for: .video) { g in DispatchQueue.main.async { if g { self.cameraController?.reopen() }; self.resolve(token, g ? "granted" : "denied") } }
         case "microphone": AVCaptureDevice.requestAccess(for: .audio) { g in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } }
         case "photos": PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in DispatchQueue.main.async { self.resolve(token, phAuthStr(s)) } }
         case "notifications":
@@ -3197,7 +4629,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     // File system (Tier B): the app's private Documents directory.
     private func appDir() -> URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
-    private func appFile(_ name: String) -> URL { appDir().appendingPathComponent(name) }
+    /// The URL a FileSystem path names: absolute and file:// as given, anything else
+    /// under the documents directory.
+    private func fsURL(_ path: String) -> URL {
+        if path.hasPrefix("file://") { return URL(fileURLWithPath: String(path.dropFirst(7))) }
+        if path.hasPrefix("/") { return URL(fileURLWithPath: path) }
+        return appDir().appendingPathComponent(path)
+    }
+    /// fsURL for an operation that writes, moves or deletes: an empty path would name
+    /// the documents directory itself, and no app means that. Fails the token instead.
+    private func fsTarget(_ token: String, _ path: String) -> URL? {
+        if path.isEmpty || path == "/" || path == "file://" { fail(token, "path is empty"); return nil }
+        return fsURL(path)
+    }
+    private func fsMkParent(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    }
 
     private func presentShare(_ items: [Any]) {
         let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)

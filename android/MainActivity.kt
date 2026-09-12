@@ -360,6 +360,8 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             if ((bo - t) != (ob - ot) || (r - l) != (or2 - ol)) { relayout(); pushViewport() }
         }
         intent?.data?.let { lastUrl = it.toString() }   // deep link that launched the app
+        ChuksNotif.deliverTap(intent)                   // a notification tap that launched the app
+        ChuksNotif.rearmAll(this)                       // alarms do not survive a reboot; the store does
 
         // DEV hot reload: assets/chuks-dev.txt (written by a DEV=1 build) points at the
         // running dev server. Present => fetch the UI over HTTP instead of the JNI engine.
@@ -1042,7 +1044,9 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // Deliver a native capability result back to the engine and apply the re-render.
     // Public because a package's module answers through the same channel the framework's
     // own capabilities do (ChuksModuleHost).
+    // Token "0" is a call without a callback: nothing is waiting, so nothing to render.
     override fun resolve(token: String, payload: String) {
+        if (token == "0") return
         applyStream(engResolve(token, payload)); relayout()
     }
     // Report a capability failure back to the engine (fires the request's onErr).
@@ -1075,7 +1079,24 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     override fun requestPermission(token: String, permissions: Array<String>) {
         val code = ++permSeq
         pendingPerms[code] = token
-        requestPermissions(permissions, code)
+        enqueuePermissionRequest(permissions, code)
+    }
+    // Android answers an in-flight requestPermissions with an EMPTY result the moment a
+    // second one is made, which reads as "denied" for a prompt the user never saw. So
+    // requests go one at a time: the next is made when the current one is answered. A
+    // request for something the first dialog already granted is answered by the system
+    // without a dialog, so the queue drains at the speed of the user's taps.
+    private val permQueue = ArrayDeque<Pair<Array<String>, Int>>()
+    private var permInFlight = false
+    private fun enqueuePermissionRequest(permissions: Array<String>, code: Int) {
+        permQueue.addLast(Pair(permissions, code))
+        pumpPermissionQueue()
+    }
+    private fun pumpPermissionQueue() {
+        if (permInFlight) return
+        val next = permQueue.removeFirstOrNull() ?: return
+        permInFlight = true
+        requestPermissions(next.first, next.second)
     }
 
     // Capabilities installed packages provide, consulted for any command the framework's
@@ -1092,8 +1113,26 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val streamTeardown = mutableMapOf<String, () -> Unit>()
     private val appStateTokens = mutableSetOf<String>()   // tokens watching foreground/background
     private val orientationTokens = mutableSetOf<String>()   // tokens watching device orientation
-    private fun currentOrientation(): String =
-        if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait"
+    // "coarse,edge", where edge is where the TOP OF THE DEVICE points. Display
+    // rotation is counter-clockwise from the natural orientation, so ROTATION_90 has
+    // the top pointing left, and the coarse word comes from the configuration, which
+    // is what the layout actually follows (a tablet's natural orientation may be
+    // landscape, where rotation alone would give the wrong coarse answer).
+    private fun currentOrientation(): String {
+        val coarse = if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait"
+        val rotation = if (android.os.Build.VERSION.SDK_INT >= 30) display?.rotation ?: 0
+                       else @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation
+        val edge = when (rotation) {
+            android.view.Surface.ROTATION_90  -> "left"
+            android.view.Surface.ROTATION_180 -> "down"
+            android.view.Surface.ROTATION_270 -> "right"
+            else                              -> "up"
+        }
+        // A phone's natural orientation is portrait, so up/down pair with portrait and
+        // left/right with landscape. On a natural-landscape device they cross; report
+        // what the device is doing rather than a pair that cannot happen.
+        return "$coarse,$edge"
+    }
 
     // Execute a native capability requested via an `X|` command (F3). Fire-and-forget
     // commands (token "0") just perform the side effect; async reads call resolve().
@@ -1183,7 +1222,16 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 }
                 // registerReceiver returns the current sticky battery Intent -> emit now.
                 val sticky = registerReceiver(receiver, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                streamTeardown[token] = { try { unregisterReceiver(receiver) } catch (e: Exception) {} }
+                // Battery Saver toggling is a battery fact too. Its broadcast carries no
+                // battery extras, so re-read the sticky intent for the rest of the payload.
+                val saver = object : android.content.BroadcastReceiver() {
+                    override fun onReceive(c: Context?, i: Intent?) { batterySticky()?.let { emitBattery(token, it) } }
+                }
+                registerReceiver(saver, android.content.IntentFilter(android.os.PowerManager.ACTION_POWER_SAVE_MODE_CHANGED))
+                streamTeardown[token] = {
+                    try { unregisterReceiver(receiver) } catch (e: Exception) {}
+                    try { unregisterReceiver(saver) } catch (e: Exception) {}
+                }
                 sticky?.let { emitBattery(token, it) }
             }
             "appstate.watch" -> {
@@ -1195,52 +1243,53 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
                 val cb = object : android.net.ConnectivityManager.NetworkCallback() {
                     override fun onAvailable(n: android.net.Network) { emitNetwork(token, cm) }
-                    override fun onLost(n: android.net.Network) { runOnUiThread { resolve(token, "none") } }
+                    override fun onLost(n: android.net.Network) { runOnUiThread { resolve(token, "none,0") } }
                     override fun onCapabilitiesChanged(n: android.net.Network, caps: android.net.NetworkCapabilities) { emitNetwork(token, cm) }
                 }
                 cm.registerDefaultNetworkCallback(cb)
                 streamTeardown[token] = { try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) {} }
                 emitNetwork(token, cm)
             }
-            "location.once" -> {
-                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+            // ---- location: see ChuksGeo.kt ----------------------------------------
+            "location.once" -> withLocationPerm(token) {
                 val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-                val provider = bestLocationProvider(lm)
-                if (provider == null) { fail(token, "location unavailable"); return }
+                val provider = ChuksGeo.provider(lm, args)
+                if (provider == null) { fail(token, "location unavailable"); return@withLocationPerm }
                 try {
-                    val last = lm.getLastKnownLocation(provider)
-                    if (last != null) { resolve(token, locFixStr(last)) }
-                    else {
-                        // No cached fix: take one live update, then release the listener.
-                        val listener = object : android.location.LocationListener {
-                            override fun onLocationChanged(l: android.location.Location) { resolve(token, locFixStr(l)); lm.removeUpdates(this) }
-                            override fun onProviderDisabled(p: String) {}
-                            override fun onProviderEnabled(p: String) {}
-                            @Deprecated("kept for older API levels") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
-                        }
-                        lm.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
-                    }
+                    ChuksGeo.current(lm, provider, args) { l -> if (l != null) resolve(token, ChuksGeo.fixString(l)) else fail(token, "location unavailable") }
                 } catch (e: SecurityException) { fail(token, "location permission denied") }
             }
-            "location.watch" -> {
-                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+            "location.lastKnown" -> {
+                if (!hasLocationPerm()) { resolve(token, ""); return }
                 val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-                val provider = bestLocationProvider(lm)
-                if (provider == null) { fail(token, "location unavailable"); return }
+                val l = ChuksGeo.lastKnown(lm, (a.num("maxAge") ?: 0.0).toLong(), (a.num("maxAcc") ?: 0.0).toFloat())
+                resolve(token, if (l != null) ChuksGeo.fixString(l) else "")
+            }
+            "location.enabled" -> resolve(token, if (ChuksGeo.enabled(getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager)) "1" else "0")
+            "location.heading" -> {
+                val h = ChuksGeo.Heading(this) { s -> resolve(token, s) }
+                val err = h.start(getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager)
+                if (err != null) { fail(token, err); return }
+                streamTeardown[token] = { h.stop() }
+            }
+            "location.geocode" -> ChuksGeo.geocode(this, args, { runOnUiThread(it) }) { rows, msg -> if (msg == null) resolve(token, rows) else fail(token, msg) }
+            "location.reverseGeocode" -> ChuksGeo.reverseGeocode(this, a.num("lat") ?: 0.0, a.num("lng") ?: 0.0, { runOnUiThread(it) }) { rows, msg -> if (msg == null) resolve(token, rows) else fail(token, msg) }
+            "location.watch" -> withLocationPerm(token) {
+                val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+                val provider = ChuksGeo.provider(lm, a.s("acc"))
+                if (provider == null) { fail(token, "location unavailable"); return@withLocationPerm }
                 val listener = object : android.location.LocationListener {
-                    override fun onLocationChanged(l: android.location.Location) { resolve(token, locFixStr(l)) }
+                    override fun onLocationChanged(l: android.location.Location) { resolve(token, ChuksGeo.fixString(l)) }
                     override fun onProviderDisabled(p: String) {}
                     override fun onProviderEnabled(p: String) {}
                     @Deprecated("kept for older API levels") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
                 }
                 try {
-                    lm.getLastKnownLocation(provider)?.let { resolve(token, locFixStr(it)) }   // immediate value
-                    lm.requestLocationUpdates(provider, 1000L, 0f, listener, Looper.getMainLooper())
+                    ChuksGeo.requestUpdates(lm, provider, a.s("acc"), (a.num("dist") ?: 0.0).toFloat(), (a.num("interval") ?: 1000.0).toLong(), listener)
                     streamTeardown[token] = { try { lm.removeUpdates(listener) } catch (e: Exception) {} }
                 } catch (e: SecurityException) { fail(token, "location permission denied") }
             }
-            "location.watchBackground" -> {
-                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+            "location.watchBackground" -> withLocationPerm(token) {
                 // A foreground service started while the app is on screen keeps the
                 // "while in use" grant with the screen off, so this needs no separate
                 // ACCESS_BACKGROUND_LOCATION prompt.
@@ -1251,12 +1300,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val svc = Intent(this, ChuksLocationService::class.java)
                 svc.putExtra("title", title)
                 svc.putExtra("body", body)
+                svc.putExtra("acc", a.s("acc")); svc.putExtra("dist", (a.num("dist") ?: 0.0).toFloat()); svc.putExtra("interval", (a.num("interval") ?: 1000.0).toLong())
                 try {
                     startForegroundService(svc)
                 } catch (e: Throwable) {
                     ChuksLocation.deliver = null
                     fail(token, "background location unavailable: " + (e.message ?: e.toString()))
-                    return
+                    return@withLocationPerm
                 }
                 streamTeardown[token] = {
                     ChuksLocation.deliver = null
@@ -1303,70 +1353,113 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val pi = packageManager.getPackageInfo(packageName, 0)
                 resolve(token, pi.firstInstallTime.toString())
             }
-            "contacts.list" -> {
-                if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) { fail(token, "contacts permission denied"); return }
-                try {
-                    // id -> [name, phones, emails]; merge phone + email rows by contact id
-                    val map = LinkedHashMap<String, Array<Any>>()
-                    fun entry(id: String, name: String) = map.getOrPut(id) { arrayOf(name, linkedSetOf<String>(), linkedSetOf<String>()) }
-                    contentResolver.query(android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                        arrayOf(android.provider.ContactsContract.CommonDataKinds.Phone.CONTACT_ID, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY, android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER),
-                        null, null, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY)?.use { c ->
-                        while (c.moveToNext()) {
-                            val id = c.getString(0) ?: continue
-                            @Suppress("UNCHECKED_CAST") (entry(id, c.getString(1) ?: "")[1] as LinkedHashSet<String>).add(c.getString(2) ?: "")
-                        }
-                    }
-                    contentResolver.query(android.provider.ContactsContract.CommonDataKinds.Email.CONTENT_URI,
-                        arrayOf(android.provider.ContactsContract.CommonDataKinds.Email.CONTACT_ID, android.provider.ContactsContract.Contacts.DISPLAY_NAME_PRIMARY, android.provider.ContactsContract.CommonDataKinds.Email.ADDRESS),
-                        null, null, null)?.use { c ->
-                        while (c.moveToNext()) {
-                            val id = c.getString(0) ?: continue
-                            @Suppress("UNCHECKED_CAST") (entry(id, c.getString(1) ?: "")[2] as LinkedHashSet<String>).add(c.getString(2) ?: "")
-                        }
-                    }
-                    val out = map.values.joinToString("\n") { r ->
-                        @Suppress("UNCHECKED_CAST")
-                        "${r[0]}\t${(r[1] as Set<String>).joinToString(";")}\t${(r[2] as Set<String>).joinToString(";")}"
-                    }
-                    resolve(token, out)
-                } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            // ---- contacts: see ChuksContacts.kt --------------------------------
+            "contacts.pick" -> {
+                // No permission: the picker's answer carries a grant for what was chosen.
+                // A phone or email pick answers ONE data row, readable through that
+                // grant; a whole-card pick grants the card, whose phones and emails
+                // need READ_CONTACTS to read (the card's own name does not).
+                val code = ++mediaSeq
+                pendingContactPick[code] = Pair(token, args)
+                val type = when (args) {
+                    "phone" -> android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_TYPE
+                    "email" -> android.provider.ContactsContract.CommonDataKinds.Email.CONTENT_TYPE
+                    else -> android.provider.ContactsContract.Contacts.CONTENT_TYPE
+                }
+                startActivityForResult(Intent(Intent.ACTION_PICK).setType(type), code)
             }
-            "calendar.upcoming" -> {
-                if (checkSelfPermission(Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
-                try {
-                    val days = a.num()?.toLong() ?: return
-                    val now = System.currentTimeMillis()
-                    val sb = StringBuilder()
-                    contentResolver.query(CalendarContract.Events.CONTENT_URI, arrayOf(CalendarContract.Events.TITLE, CalendarContract.Events.DTSTART, CalendarContract.Events.DTEND),
-                        "${CalendarContract.Events.DTSTART} >= ? AND ${CalendarContract.Events.DTSTART} <= ?", arrayOf(now.toString(), (now + days * 86400000L).toString()),
-                        "${CalendarContract.Events.DTSTART} ASC")?.use { c ->
-                        while (c.moveToNext()) sb.append(c.getString(0) ?: "").append('\t').append(c.getLong(1)).append('\t').append(c.getLong(2)).append('\n')
-                    }
-                    resolve(token, sb.toString().trimEnd('\n'))
-                } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            "contacts.list", "contacts.search" -> withContactsPerm(token, false) {
+                val q = if (cap == "contacts.search") args else ""
+                Thread {
+                    val out = try { ChuksContacts.list(this, q) } catch (e: Exception) { null }
+                    runOnUiThread { if (out != null) resolve(token, out) else fail(token, "read failed") }
+                }.start()
             }
-            "calendar.create" -> {
-                if (checkSelfPermission(Manifest.permission.WRITE_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
+            "contacts.get" -> withContactsPerm(token, false) {
+                val l = try { ChuksContacts.get(this, args) } catch (e: Exception) { null }
+                if (l != null) resolve(token, l) else fail(token, "no such contact: $args")
+            }
+            "contacts.add" -> withContactsPerm(token, true) {
+                try { resolve(token, ChuksContacts.add(this, a.s("name"), a.s("phones"), a.s("emails"))) }
+                catch (e: Exception) { fail(token, "cannot add contact: ${e.message}") }
+            }
+            "contacts.update" -> withContactsPerm(token, true) {
+                try { if (ChuksContacts.update(this, a.s("id"), a.s("name"), a.s("phones"), a.s("emails"))) resolve(token, "") else fail(token, "no such contact: ${a.s("id")}") }
+                catch (e: Exception) { fail(token, "cannot update contact: ${e.message}") }
+            }
+            "contacts.delete" -> withContactsPerm(token, true) {
+                try { if (ChuksContacts.delete(this, args)) resolve(token, "") else fail(token, "no such contact: $args") }
+                catch (e: Exception) { fail(token, "cannot delete contact: ${e.message}") }
+            }
+            "contacts.photo" -> withContactsPerm(token, false) {
+                val p = try { ChuksContacts.photo(this, args) } catch (e: Exception) { null }
+                if (p != null) resolve(token, p) else fail(token, "no such contact: $args")
+            }
+            "contacts.watch" -> withContactsPerm(token, false) {
+                val w = ChuksContacts.Watch(this) { resolve(token, "") }
+                w.start()
+                streamTeardown[token] = { w.stop() }
+            }
+            // ---- calendar: see ChuksCalendar.kt --------------------------------
+            "calendar.upcoming" -> withCalendarPerm(token) {
+                val days = a.num()?.toLong() ?: 0L
+                val now = System.currentTimeMillis()
+                try { resolve(token, ChuksCalendar.events(this, now, now + days * 86400000L, "")) } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            }
+            "calendar.events" -> withCalendarPerm(token) {
+                try { resolve(token, ChuksCalendar.events(this, (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(), a.s("cal"))) }
+                catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            }
+            "calendar.get" -> withCalendarPerm(token) {
+                val l = try { ChuksCalendar.get(this, args) } catch (e: Exception) { null }
+                if (l != null) resolve(token, l) else fail(token, "no such event: $args")
+            }
+            "calendar.calendars" -> withCalendarPerm(token) {
+                try { resolve(token, ChuksCalendar.calendars(this)) } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            }
+            "calendar.create" -> withCalendarPerm(token) {
+                val startMin = a.num("startInMin")?.toLong() ?: 0L
+                val durMin = a.num("durationMin")?.toLong() ?: 0L
+                val calId = ChuksCalendar.defaultCalendar(this)
+                if (calId < 0) { fail(token, "no writable calendar"); return@withCalendarPerm }
+                val now = System.currentTimeMillis()
+                try { resolve(token, ChuksCalendar.add(this, calId, a.s("title"), now + startMin * 60000L, now + (startMin + durMin) * 60000L, "", "", false, -1).toString()) }
+                catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+            }
+            "calendar.add" -> withCalendarPerm(token) {
+                val calId = if (a.s("cal").isEmpty()) ChuksCalendar.defaultCalendar(this) else (a.s("cal").toLongOrNull() ?: -2L)
+                if (calId == -1L) { fail(token, "no writable calendar"); return@withCalendarPerm }
+                val w = if (calId < 0) null else ChuksCalendar.writable(this, calId)
+                if (w == null) { fail(token, "no such calendar: ${a.s("cal")}"); return@withCalendarPerm }
+                if (!w) { fail(token, "calendar is read-only: ${a.s("cal")}"); return@withCalendarPerm }
                 try {
-                    val startMin = a.num("startInMin")?.toLong() ?: return
-                    val durMin = a.num("durationMin")?.toLong() ?: return
-                    var calId = -1L
-                    contentResolver.query(CalendarContract.Calendars.CONTENT_URI, arrayOf(CalendarContract.Calendars._ID),
-                        "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ?", arrayOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR.toString()), null)?.use { c ->
-                        if (c.moveToFirst()) calId = c.getLong(0)
-                    }
-                    if (calId < 0) { fail(token, "no writable calendar"); return }
-                    val now = System.currentTimeMillis()
-                    val values = android.content.ContentValues().apply {
-                        put(CalendarContract.Events.CALENDAR_ID, calId); put(CalendarContract.Events.TITLE, a.s("title"))
-                        put(CalendarContract.Events.DTSTART, now + startMin * 60000L); put(CalendarContract.Events.DTEND, now + (startMin + durMin) * 60000L)
-                        put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
-                    }
-                    val uri = contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
-                    if (uri == null) { fail(token, "insert failed"); return }
-                    resolve(token, uri.lastPathSegment ?: "ok")
+                    resolve(token, ChuksCalendar.add(this, calId, a.s("title"), (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(),
+                        a.s("location"), a.s("notes"), a.bool("allDay"), (a.num("alarm") ?: -1.0).toLong()).toString())
                 } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+            }
+            "calendar.update" -> withCalendarPerm(token) {
+                try {
+                    val ok = ChuksCalendar.update(this, a.s("id"), a.s("title"), (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(),
+                        a.s("location"), a.s("notes"), a.bool("allDay"), (a.num("alarm") ?: -1.0).toLong())
+                    if (ok) resolve(token, "") else fail(token, "no such event: ${a.s("id")}")
+                } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+            }
+            "calendar.delete" -> withCalendarPerm(token) {
+                try { if (ChuksCalendar.delete(this, args)) resolve(token, "") else fail(token, "no such event: $args") }
+                catch (e: Exception) { fail(token, "delete failed: ${e.message}") }
+            }
+            "calendar.compose" -> {
+                // No permission. The Calendar app answers no result, so the app hears
+                // "" when the form closes, whatever the user did in it.
+                val code = ++mediaSeq
+                pendingCompose[code] = token
+                try { startActivityForResult(ChuksCalendar.composeIntent(a.s("title"), (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(), a.s("location"), a.s("notes")), code) }
+                catch (e: Exception) { pendingCompose.remove(code); fail(token, "no calendar app: ${e.message}") }
+            }
+            "calendar.watch" -> withCalendarPerm(token) {
+                val w = ChuksCalendar.Watch(this) { resolve(token, "") }
+                w.start()
+                streamTeardown[token] = { w.stop() }
             }
             "linking.onurl" -> {
                 urlTokens.add(token)
@@ -1386,6 +1479,18 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 try { startActivityForResult(Intent.createChooser(intent, "Pick image"), code) }
                 catch (e: Exception) { pendingMedia.remove(code); fail(token, "no picker available") }
             }
+            // ---- the library picker with choices: see ChuksMedia.kt --------------
+            "mediapicker.video", "mediapicker.pick" -> {
+                val video = cap == "mediapicker.video"
+                val code = ++mediaSeq
+                pendingPick[code] = PickReq(token, if (video) 0.9 else (a.num("quality") ?: 0.9), if (video) 0 else (a.int("maxSize") ?: 0), video)
+                try { startActivityForResult(ChuksMedia.pickIntent(if (video) "video" else a.s("kind"), if (video) 1 else (a.int("limit") ?: 1)), code) }
+                catch (e: Exception) { pendingPick.remove(code); fail(token, "no picker available") }
+            }
+            "mediapicker.info" -> {
+                val l = ChuksMedia.info(ChuksFiles.resolve(this, args))
+                if (l != null) resolve(token, l) else fail(token, "not an image or video: $args")
+            }
             "camera.photo" -> {
                 val code = ++mediaSeq
                 val values = android.content.ContentValues().apply {
@@ -1402,6 +1507,32 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 try { startActivityForResult(intent, code) }
                 catch (e: Exception) { pendingMedia.remove(code); fail(token, "no camera app") }
             }
+            "camera.available" -> resolve(token, if (packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) "1" else "0")
+            "camera.video" -> {
+                val code = ++mediaSeq
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Video.Media.DISPLAY_NAME, "chuks-$code.mp4")
+                    put(android.provider.MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                }
+                val outUri = contentResolver.insert(android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                if (outUri == null) { fail(token, "cannot create output"); return }
+                pendingMedia[code] = Pair(token, outUri)
+                pendingVideo.add(code)
+                val intent = Intent(android.provider.MediaStore.ACTION_VIDEO_CAPTURE).apply {
+                    putExtra(android.provider.MediaStore.EXTRA_OUTPUT, outUri)
+                    putExtra(android.provider.MediaStore.EXTRA_VIDEO_QUALITY, if (a.s("quality") == "low") 0 else 1)
+                    val cap = a.int("maxSeconds") ?: 0
+                    if (cap > 0) putExtra(android.provider.MediaStore.EXTRA_DURATION_LIMIT, cap)
+                    addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                try { startActivityForResult(intent, code) }
+                catch (e: Exception) { pendingMedia.remove(code); pendingVideo.remove(code); fail(token, "no camera app") }
+            }
+            "camera.flash" -> cameraController?.setFlash(args)
+            "camera.zoom" -> a.num()?.let { cameraController?.setZoom(it.toFloat()) }
+            "camera.zoomRange" -> resolve(token, cameraController?.zoomRange() ?: "1.0,1.0")
+            "camera.focus" -> cameraController?.focusAt((a.num("x") ?: 0.5).toFloat(), (a.num("y") ?: 0.5).toFloat())
+            "camera.hasFlash" -> resolve(token, if (cameraController?.hasFlash() == true) "1" else "0")
             "camera.capturePreview" -> {
                 val ctrl = cameraController
                 if (ctrl == null) { fail(token, "no CameraView on screen"); return }
@@ -1438,26 +1569,54 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             "nfc.read" -> ensureNfc().read(token) { m -> fail(token, m) }
             "nfc.write" -> ensureNfc().write(args, token) { m -> fail(token, m) }
             "mediapicker.save" -> {
-                val path = if (args.startsWith("file://")) args.substring(7) else args
-                val f = java.io.File(path)
-                if (!f.exists()) { fail(token, "no such image"); return }
-                try {
-                    val values = android.content.ContentValues().apply {
-                        put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "chuks-${mediaSeq++}.jpg")
-                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                        if (android.os.Build.VERSION.SDK_INT >= 29) put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures")
-                    }
-                    val uri = contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                    if (uri == null) { fail(token, "cannot save"); return }
-                    contentResolver.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
-                    resolve(token, "ok")
-                } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+                // An image or a video, by what the file is; see ChuksMedia.save.
+                val f = ChuksFiles.resolve(this, args)
+                if (!f.isFile) { fail(token, "no such file: $args"); return }
+                val err = ChuksMedia.save(this, f)
+                if (err == null) resolve(token, "ok") else fail(token, err)
             }
-            "biometrics.available" -> {
-                if (android.os.Build.VERSION.SDK_INT < 29) { resolve(token, "0"); return }
-                val bm = getSystemService(android.hardware.biometrics.BiometricManager::class.java)
-                val ok = bm != null && bm.canAuthenticate() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS
-                resolve(token, if (ok) "1" else "0")
+            "biometrics.available" ->
+                resolve(token, if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS) "1" else "0")
+            // The two halves of "available". canAuthenticate() answers both through its
+            // result code: ERROR_NO_HARDWARE is no sensor; ERROR_NONE_ENROLLED is a
+            // sensor with nothing on it; SUCCESS is both. Anything else (unavailable
+            // right now, an update needed) still counts as hardware present.
+            "biometrics.hardware" ->
+                resolve(token, if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE) "0" else "1")
+            "biometrics.enrolled" ->
+                resolve(token, if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS) "1" else "0")
+            "biometrics.types" -> {
+                // Android does not say which biometric is enrolled, only which the device
+                // can do, which is what a button label needs anyway.
+                val pm = packageManager
+                val kinds = ArrayList<String>()
+                if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_FACE)) kinds.add("face")
+                if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_FINGERPRINT)) kinds.add("fingerprint")
+                if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_IRIS)) kinds.add("iris")
+                resolve(token, kinds.joinToString(","))
+            }
+            "biometrics.level" -> {
+                // Strongest thing enrolled. Class 3 (STRONG) is a fingerprint or 3D face;
+                // class 2 (WEAK) a 2D face unlock; DEVICE_CREDENTIAL a PIN, pattern or
+                // password. Asked strongest first, so the answer is the best available.
+                val ok = android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS
+                if (android.os.Build.VERSION.SDK_INT < 30) {
+                    // API 29 has only the un-classed canAuthenticate(): success is "strong" by
+                    // the era's definition, and a secure keyguard is "secret".
+                    val km = getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
+                    resolve(token, when {
+                        bioCode() == ok -> "strong"
+                        km.isDeviceSecure -> "secret"
+                        else -> "none"
+                    })
+                    return
+                }
+                resolve(token, when {
+                    bioCode(android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG) == ok -> "strong"
+                    bioCode(android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK) == ok -> "weak"
+                    bioCode(android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL) == ok -> "secret"
+                    else -> "none"
+                })
             }
             "biometrics.authenticate" -> authenticateBiometric(token, args)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
@@ -1476,97 +1635,148 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     val code = ++permSeq
                     pendingPerms[code] = token       // resolved in onRequestPermissionsResult
                     // calendar needs both read + write; the rest are a single permission
-                    requestPermissions(if (args == "calendar") arrayOf(p, Manifest.permission.WRITE_CALENDAR) else arrayOf(p), code)
+                    enqueuePermissionRequest(when (args) {
+                        "calendar" -> arrayOf(p, Manifest.permission.WRITE_CALENDAR)
+                        "contacts" -> arrayOf(p, Manifest.permission.WRITE_CONTACTS)
+                        else -> arrayOf(p)
+                    }, code)
                 }
             }
-            "fs.write" -> {
-                // The content arrives as an ordinary field: the wire packs arguments,
-                // so a multi-line body needs no encoding of its own any more.
-                java.io.File(filesDir, a.s("name")).writeText(a.s("content"))
-            }
+            // ---- files: see ChuksFiles.kt. A null message is success. ----------
+            "fs.write" -> ChuksFiles.write(this, a.s("name"), a.s("content")).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "fs.writeB64" -> ChuksFiles.writeB64(this, a.s("name"), a.s("content")).let { if (it == null) resolve(token, "") else fail(token, it) }
             "fs.read" -> {
-                val f = java.io.File(filesDir, args)
-                if (f.exists()) resolve(token, f.readText()) else fail(token, "no such file: $args")
+                val f = ChuksFiles.resolve(this, args)
+                if (f.isFile) resolve(token, f.readText()) else fail(token, "no such file: $args")
             }
-            "fs.list" -> resolve(token, (filesDir.listFiles()?.map { it.name } ?: emptyList()).joinToString("\n"))
-            "fs.delete" -> java.io.File(filesDir, args).delete()
-            "secure.set" -> {
-                secureSet(a.s("key"), a.s("value"))
+            "fs.readB64" -> ChuksFiles.readB64(this, args).let { if (it != null) resolve(token, it) else fail(token, "no such file: $args") }
+            "fs.list" -> ChuksFiles.list(this, args).let { if (it != null) resolve(token, it) else fail(token, "no such directory: $args") }
+            "fs.delete" -> ChuksFiles.delete(this, args).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "fs.exists" -> resolve(token, if (ChuksFiles.resolve(this, args).exists()) "1" else "0")
+            "fs.info" -> resolve(token, ChuksFiles.info(this, args))
+            "fs.mkdir" -> ChuksFiles.mkdir(this, args).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "fs.copy", "fs.move" -> ChuksFiles.transfer(this, a.s("src"), a.s("dst"), cap == "fs.move", { runOnUiThread(it) }) { msg ->
+                if (msg == null) resolve(token, "") else fail(token, msg)
             }
-            "secure.get" -> { val v = secureGet(args); if (v != null) resolve(token, v) else fail(token, "no such key: $args") }
-            "secure.delete" -> securePrefs().edit().remove(args).apply()
+            "fs.download" -> ChuksFiles.download(this, a.s("url"), a.s("dst"), { runOnUiThread(it) }) { result, msg ->
+                if (msg == null) resolve(token, result) else fail(token, msg)
+            }
+            "fs.diskSpace" -> resolve(token, ChuksFiles.diskSpace(this))
+            "fs.dir" -> resolve(token, ChuksFiles.dir(this, args))
+            // ---- secure storage: see ChuksSecure.kt ----------------------------
+            "secure.set" -> secure.setPlain(a.s("key"), a.s("value"))
+            "secure.setProtected" -> secure.setProtected(a.s("key"), a.s("value"), "", { resolve(token, "") }, { m -> fail(token, m) })
+            "secure.get" -> secure.get(args, "", { v -> resolve(token, v) }, { fail(token, "no such key: $args") }, { m -> fail(token, m) })
+            "secure.has" -> resolve(token, if (secure.has(args)) "1" else "0")
+            "secure.keys" -> resolve(token, secure.keys().joinToString("\n"))
+            "secure.delete" -> secure.delete(args)
+            "secure.deleteAll" -> secure.deleteAll()
+            "secure.available" -> resolve(token, if (secure.availableBool()) "1" else "0")
+            // ---- Local notifications: see ChuksNotifications.kt ----
             "notif.notify" -> {
-
-                val title = a.s("title")
-                val body = a.s("body")
-                notify(title, body)
+                val id = a.s("id").ifEmpty { "chuks-" + (notifId++) }
+                ChuksNotif.post(this, id, a.s("title"), a.s("body"), a.s("data"), a.s("channel"))
             }
-            "audio.play" -> {
-                audioMp?.release(); audioMp = null
-                val mp = MediaPlayer()
-                try {
-                    if (args.startsWith("file://")) {
-                        mp.setDataSource(args.substring(7))   // a recording / downloaded file
-                    } else {
-                        val afd = assets.openFd(args)         // a bundled asset
-                        mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length); afd.close()
-                    }
-                    mp.setAudioAttributes(
-                        android.media.AudioAttributes.Builder()
-                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build())
-                    mp.prepare(); mp.start()   // synchronous prepare: the asset is a local file
-                    audioMp = mp
-                } catch (e: Exception) { mp.release() }   // bad asset / bad state: leave nothing playing
+            "notif.schedule" -> {
+                val atMs = a.num("atMs")?.toLong() ?: 0L
+                val inSec = a.num("inSeconds")?.toLong() ?: 0L
+                val fireAt = if (atMs > 0) atMs else System.currentTimeMillis() + inSec * 1000
+                ChuksNotif.schedule(this, a.s("id"), a.s("title"), a.s("body"), fireAt, a.s("data"), a.s("channel"))
             }
-            "audio.pause" -> audioMp?.let { if (it.isPlaying) it.pause() }
-            "audio.resume" -> audioMp?.start()
-            "audio.stop" -> audioMp?.let { if (it.isPlaying) it.pause(); it.seekTo(0) }
-            "audio.position" -> {
-                val mp = audioMp
-                resolve(token, "${mp?.currentPosition ?: 0}/${mp?.duration ?: 0}")
+            "notif.cancel" -> ChuksNotif.cancel(this, args)
+            "notif.cancelAll" -> ChuksNotif.cancelAll(this)
+            "notif.dismiss" -> ChuksNotif.dismiss(this, args)
+            "notif.dismissAll" -> ChuksNotif.dismissAll(this)
+            "notif.scheduled" -> resolve(token, ChuksNotif.scheduled(this))
+            "notif.setBadge" -> ChuksNotif.setBadge(this, a.int() ?: 0)
+            "notif.badge" -> resolve(token, ChuksNotif.badge(this).toString())
+            "notif.channel" -> ChuksNotif.ensureChannel(this, a.s("id"), a.s("name"), a.s("importance"))
+            "notif.onResponse" -> {
+                notifTokens.add(token)
+                ChuksNotif.onResponse = { p -> runOnUiThread { notifTokens.toList().forEach { resolve(it, p) } } }
+                streamTeardown[token] = {
+                    notifTokens.remove(token)
+                    if (notifTokens.isEmpty()) ChuksNotif.onResponse = null
+                }
+                // The tap that launched the app, if any, goes to the first subscriber.
+                ChuksNotif.pending?.let {
+                    android.util.Log.i("Chuks", "notif.onResponse: delivering the launch tap to the first subscriber")
+                    ChuksNotif.pending = null; resolve(token, it)
+                }
             }
-            "recorder.start" -> {
-                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) { fail(token, "microphone permission denied"); return }
-                try {
-                    val f = java.io.File(filesDir, "rec-${System.nanoTime()}.m4a")
-                    @Suppress("DEPRECATION")
-                    val mr = if (android.os.Build.VERSION.SDK_INT >= 31) android.media.MediaRecorder(this) else android.media.MediaRecorder()
-                    mr.setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-                    mr.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
-                    mr.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
-                    mr.setOutputFile(f.absolutePath)
-                    mr.prepare(); mr.start()
-                    mediaRecorder = mr; recPath = f.absolutePath
-                } catch (e: Exception) { fail(token, "record failed: ${e.message}") }
+            // ---- Audio: see ChuksAudio.kt ----
+            "audio.mode" -> ChuksAudio.mode = args
+            "audio.create" -> {
+                val id = a.s("id"); val src = a.s("src")
+                if (ChuksAudio.players.size >= ChuksAudio.CAP) {
+                    val msg = "too many players (${ChuksAudio.CAP}); release() the ones you are done with"
+                    audioWatchers[id]?.forEach { resolve(it, "error,0,0,1,1,0,$msg") }
+                    android.util.Log.w("Chuks", "Audio: $msg")
+                    return
+                }
+                ChuksAudio.listen(this)
+                ChuksAudio.players.remove(id)?.release()
+                val p = ChuksAudioPlayer(id) { st -> runOnUiThread { audioWatchers[id]?.toList()?.forEach { resolve(it, st) } } }
+                ChuksAudio.players[id] = p
+                p.load(this, src)
             }
+            "audio.play" -> { ChuksAudio.requestFocus(this); ChuksAudio.players[a.s("id")]?.play() }
+            "audio.pause" -> ChuksAudio.players[a.s("id")]?.pause()
+            "audio.stop" -> ChuksAudio.players[a.s("id")]?.stop()
+            "audio.seek" -> ChuksAudio.players[a.s("id")]?.seek(a.int("ms") ?: 0)
+            "audio.volume" -> ChuksAudio.players[a.s("id")]?.setVolume((a.num("v") ?: 1.0).toFloat())
+            "audio.rate" -> ChuksAudio.players[a.s("id")]?.setRate((a.num("r") ?: 1.0).toFloat())
+            "audio.loop" -> ChuksAudio.players[a.s("id")]?.setLoop(a.bool("on"))
+            "audio.status" -> resolve(token, ChuksAudio.players[a.s("id")]?.status() ?: "error,0,0,1,1,0,no such player (released, or never created)")
+            "audio.watch" -> {
+                val id = a.s("id")
+                audioWatchers.getOrPut(id) { HashSet() }.add(token)
+                streamTeardown[token] = { audioWatchers[id]?.remove(token) }
+                ChuksAudio.players[id]?.let { resolve(token, it.status()) }
+            }
+            "audio.release" -> {
+                val id = a.s("id")
+                ChuksAudio.players.remove(id)?.release()
+                audioWatchers.remove(id)
+            }
+            // ---- recorder: see ChuksRecorder.kt ---------------------------------
+            "recorder.start" -> withMicPerm(token) {
+                val err = recorder.start(args)
+                if (err == null) resolve(token, "") else fail(token, err)
+            }
+            "recorder.pause" -> recorder.pause()
+            "recorder.resume" -> recorder.resume()
             "recorder.stop" -> {
-                val mr = mediaRecorder ?: run { fail(token, "not recording"); return }
-                try { mr.stop() } catch (e: Exception) {}
-                mr.release(); mediaRecorder = null
-                resolve(token, "file://" + (recPath ?: ""))
+                val p = recorder.stop()
+                if (p == null) fail(token, "not recording") else if (p.isEmpty()) fail(token, "nothing was recorded") else resolve(token, "file://$p")
+            }
+            "recorder.cancel" -> recorder.cancel()
+            "recorder.status" -> resolve(token, recorder.status())
+            "recorder.watch" -> {
+                recorder.watchers.add(token)
+                streamTeardown[token] = { recorder.watchers.remove(token) }
+                resolve(token, recorder.status())
             }
             "recorder.levels" -> {
                 val r = object : Runnable {
                     override fun run() {
-                        mediaRecorder?.let {
-                            val amp = try { it.maxAmplitude } catch (e: Exception) { 0 }
-                            resolve(token, String.format("%.3f", (amp.toDouble() / 32767.0).coerceIn(0.0, 1.0)))
-                        }
+                        resolve(token, String.format(java.util.Locale.US, "%.3f", recorder.level()))
                         if (activeStreams.containsKey(token)) streamHandler.postDelayed(this, 80)
                     }
                 }
                 activeStreams[token] = r
                 streamHandler.postDelayed(r, 80)
             }
-            "tts.speak" -> {
-                val text = args
-                ensureTts()
-                if (ttsReady) speakNow(text) else pendingSpeak = text   // speak once the engine finishes init
-            }
-            "tts.stop" -> tts?.stop()
-            "tts.isSpeaking" -> resolve(token, if (tts?.isSpeaking == true) "1" else "0")
+            // ---- text-to-speech: see ChuksSpeech.kt ----------------------------
+            "tts.speak", "tts.say" -> speech.speak(a.s("id"), a.s("text"), a.s("lang"), (a.num("rate") ?: 1.0).toFloat(), (a.num("pitch") ?: 1.0).toFloat(),
+                (a.num("volume") ?: 1.0).toFloat(), a.s("voice"), a.bool("queue"), if (cap == "tts.say") token else null)
+            "tts.stop" -> speech.stop()
+            "tts.pause" -> speech.pause()
+            "tts.resume" -> speech.resume()
+            "tts.isSpeaking" -> resolve(token, if (speech.isSpeaking()) "1" else "0")
+            "tts.status" -> resolve(token, speech.status())
+            "tts.voices" -> speech.whenReady { resolve(token, speech.voices()) }
+            "tts.watch" -> { ttsWatchers.add(token); streamTeardown[token] = { ttsWatchers.remove(token) } }
             // The framework noticed something the app probably did not mean. Logged
             // natively because the engine's own println reaches nothing on Android.
             "dev.warn" -> android.util.Log.w("Chuks", args)
@@ -1575,10 +1785,33 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             // is recorded rather than applied; it exists so the capability answers on
             // both platforms instead of failing on one.
             "appearance.set" -> appAppearance = args
+            // ---- clipboard: see ChuksClipboard.kt ------------------------------
             "clipboard.set" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
             "clipboard.get" -> {
                 val t = clipboard().primaryClip?.let { if (it.itemCount > 0) it.getItemAt(0).coerceToText(this).toString() else "" } ?: ""
                 resolve(token, t)
+            }
+            "clipboard.setUrl" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
+            "clipboard.setImage" -> ChuksClipboard.setImage(this, clipboard(), args).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "clipboard.getImage" -> {
+                val r = try { ChuksClipboard.getImage(this, clipboard()) } catch (e: Exception) { fail(token, "cannot read the image: ${e.message}"); return }
+                resolve(token, r)
+            }
+            "clipboard.has" -> resolve(token, if (ChuksClipboard.kinds(this, clipboard()).split(",").contains(args)) "1" else "0")
+            "clipboard.clear" -> ChuksClipboard.clear(clipboard())
+            "clipboard.watch" -> {
+                val cm = clipboard()
+                // Recent Android delivers the listener twice for one setPrimaryClip; the
+                // description's timestamp tells the two apart, so one change is one event.
+                var seen = -1L
+                val l = ClipboardManager.OnPrimaryClipChangedListener {
+                    val ts = if (android.os.Build.VERSION.SDK_INT >= 26) (cm.primaryClipDescription?.timestamp ?: 0L) else System.currentTimeMillis()
+                    if (ts == seen) return@OnPrimaryClipChangedListener
+                    seen = ts
+                    resolve(token, ChuksClipboard.kinds(this, cm))
+                }
+                cm.addPrimaryClipChangedListener(l)
+                streamTeardown[token] = { cm.removePrimaryClipChangedListener(l) }
             }
             "linking.open" -> try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(args))) } catch (_: Exception) {}
             "linking.canOpen" -> {
@@ -1593,8 +1826,43 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             "haptics.vibrate" -> a.num()?.let { hapticVibrate(it.toLong()) }
             "haptics.pattern" -> hapticPattern(args)
             "torch.set" -> setTorch(args == "1")
+            // ---- brightness ------------------------------------------------------
+            // The window's brightness is the app's: it applies while the window is in
+            // front and the system's setting comes back when it is not. The system's
+            // own value is a Settings.System row, written only with WRITE_SETTINGS,
+            // which is a grant the user gives in Settings rather than a prompt.
             "brightness.set" -> a.num()?.let {
                 val lp = window.attributes; lp.screenBrightness = it.toFloat().coerceIn(0f, 1f); window.attributes = lp
+            }
+            "brightness.get" -> {
+                val o = window.attributes.screenBrightness
+                resolve(token, brightnessStr(if (o >= 0f) o.toDouble() else systemBrightness()))
+            }
+            "brightness.restore" -> { val lp = window.attributes; lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE; window.attributes = lp }
+            "brightness.system" -> resolve(token, brightnessStr(systemBrightness()))
+            "brightness.setSystem" -> {
+                val v = a.num() ?: return
+                if (!android.provider.Settings.System.canWrite(this)) { fail(token, "system brightness needs the Modify system settings grant: Brightness.requestSystemAccess() opens where the user gives it"); return }
+                try {
+                    android.provider.Settings.System.putInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+                    android.provider.Settings.System.putInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, (v.coerceIn(0.0, 1.0) * 255).toInt())
+                    resolve(token, "")
+                } catch (e: Exception) { fail(token, "cannot set system brightness: ${e.message}") }
+            }
+            "brightness.canSetSystem" -> resolve(token, if (android.provider.Settings.System.canWrite(this)) "1" else "0")
+            "brightness.requestSystemAccess" -> try {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
+            } catch (e: Exception) {}
+            "brightness.mode" -> {
+                val m = try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE) } catch (e: Exception) { 0 }
+                resolve(token, if (m == android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC) "auto" else "manual")
+            }
+            "brightness.watch" -> {
+                val obs = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
+                    override fun onChange(self: Boolean) { resolve(token, brightnessStr(systemBrightness())) }
+                }
+                contentResolver.registerContentObserver(android.provider.Settings.System.getUriFor(android.provider.Settings.System.SCREEN_BRIGHTNESS), false, obs)
+                streamTeardown[token] = { contentResolver.unregisterContentObserver(obs) }
             }
             "brightness.keepAwake" ->
                 if (args == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -1632,6 +1900,42 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             "bg.cancelAll" -> cancelAllChuksJobs(this)
             "bg.status" -> resolve(token, chuksJobStatus(this, args))
 
+            // ---- One-shot reads of live OS state --------------------------
+            // The value the matching watch() would fire right now. Before these, reading
+            // one value meant opening a stream and cancelling it, which is a teardown to
+            // forget.
+            "battery.current" -> {
+                val i = batterySticky()
+                if (i == null) fail(token, "battery state unavailable on this device")
+                else resolve(token, batteryPayload(i))
+            }
+            "battery.available" -> {
+                val i = batterySticky()
+                val lvl = i?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+                resolve(token, if (lvl >= 0) "1" else "0")
+            }
+            "appstate.current" -> resolve(token, if (appForeground) "active" else "background")
+            "network.current" -> {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                resolve(token, networkState(cm))
+            }
+            "orientation.current" -> resolve(token, currentOrientation())
+
+            // ---- Availability ----------------------------------------------
+            // "Does this device have the hardware", asked before a feature is offered
+            // rather than discovered from a stream that never fires.
+            "torch.available" -> resolve(token,
+                if (packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_CAMERA_FLASH)) "1" else "0")
+            "motion.available" -> resolve(token, if (sensorAvailable(args)) "1" else "0")
+            "recorder.available" -> resolve(token,
+                if (packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_MICROPHONE)) "1" else "0")
+            "tts.available" -> speech.whenReady { resolve(token, if (speech.hasVoice()) "1" else "0") }
+            "ble.available" -> {
+                val hasLe = packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_BLUETOOTH_LE)
+                val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+                resolve(token, if (hasLe && mgr?.adapter != null) "1" else "0")
+            }
+
             "orientation.lock" -> requestedOrientation = when (args) {
                 "portrait"  -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 "landscape" -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -1652,7 +1956,11 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
     // Permission (F2): map a Chuks kind to an Android permission string, and hold the
     // request token until the async onRequestPermissionsResult callback fires.
-    private var permSeq = 0
+    // Request codes start from the clock, not 0: a process killed with a dialog up has
+    // its result delivered to the NEXT process, and a counter restarting at 0 would
+    // match it to a fresh request and report a denial the user never made. Codes must
+    // fit in 16 bits; permissions take the low range, activity results the high one.
+    private var permSeq = (android.os.SystemClock.uptimeMillis() % 8000).toInt()
     private val pendingPerms = mutableMapOf<Int, String>()   // requestCode -> engine token
     private fun permString(kind: String): String? = when (kind) {
         "camera" -> Manifest.permission.CAMERA
@@ -1668,35 +1976,97 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     }
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(code, permissions, grantResults)
-        val token = pendingPerms.remove(code) ?: return
-        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-        resolve(token, if (granted) "granted" else "denied")
+        permInFlight = false
+        val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        // A CameraView mounted before the app had the permission stayed dark: open it now.
+        if (granted && permissions.contains(Manifest.permission.CAMERA)) cameraController?.reopen()
+        pendingPermActions.remove(code)?.let { it(granted) } ?: pendingPerms.remove(code)?.let { resolve(it, if (granted) "granted" else "denied") }
+        pumpPermissionQueue()
+    }
+    // A capability that needs a permission it does not have yet asks for it and carries
+    // on when the answer comes, the way iOS's CLLocationManager does: a location read
+    // made before the app asked is the prompt, not a failure. A denial fails the token.
+    private val pendingPermActions = mutableMapOf<Int, (Boolean) -> Unit>()
+    private fun withContactsPerm(token: String, write: Boolean, run: () -> Unit) {
+        val need = if (write) arrayOf(Manifest.permission.READ_CONTACTS, Manifest.permission.WRITE_CONTACTS) else arrayOf(Manifest.permission.READ_CONTACTS)
+        if (need.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "contacts permission denied") }
+        enqueuePermissionRequest(need, code)
+    }
+    private fun withCalendarPerm(token: String, run: () -> Unit) {
+        val need = arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR)
+        if (need.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "calendar permission denied") }
+        enqueuePermissionRequest(need, code)
+    }
+    private fun withLocationPerm(token: String, run: () -> Unit) {
+        if (hasLocationPerm()) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "location permission denied") }
+        enqueuePermissionRequest(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), code)
     }
 
     // Deep links (F3): the URL that launched (or re-opened) the app, delivered to any
     // linking.onurl subscribers. lastUrl is held so a subscriber that registers after launch
     // still gets it.
     private var lastUrl: String? = null
+    private val notifTokens = HashSet<String>()      // Notifications.onResponse subscribers
     private val urlTokens = mutableSetOf<String>()
     override fun onNewIntent(newIntent: Intent) {
         super.onNewIntent(newIntent)
         setIntent(newIntent)
         newIntent.data?.toString()?.let { url -> lastUrl = url; runOnUiThread { urlTokens.forEach { resolve(it, url) } } }
+        ChuksNotif.deliverTap(newIntent)
     }
 
     // Media picker + camera (F3): each launch holds (engine token, camera output uri | null)
     // under its request code; the result is copied into app files and answered as "file://".
-    private var mediaSeq = 9000
+    private var mediaSeq = 9000 + (android.os.SystemClock.uptimeMillis() % 8000).toInt()
     private val pendingMedia = mutableMapOf<Int, Pair<String, android.net.Uri?>>()
+    private val pendingContactPick = mutableMapOf<Int, Pair<String, String>>()
+    private val pendingCompose = mutableMapOf<Int, String>()
+    private val pendingVideo = HashSet<Int>()   // camera.video requests among pendingMedia
+    private class PickReq(val token: String, val quality: Double, val maxSize: Int, val pathOnly: Boolean)
+    private val pendingPick = mutableMapOf<Int, PickReq>()
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        pendingCompose.remove(requestCode)?.let { token -> resolve(token, ""); return }
+        pendingContactPick.remove(requestCode)?.let { (token, kind) ->
+            val uri = data?.data
+            if (resultCode != RESULT_OK || uri == null) { fail(token, "canceled"); return }
+            val canRead = checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+            val line = try {
+                when (kind) {
+                    "phone", "email" -> ChuksContacts.pickedRow(this, uri, kind)
+                    else -> if (canRead) ChuksContacts.get(this, uri.lastPathSegment ?: "") else ChuksContacts.picked(this, uri)
+                }
+            } catch (e: Exception) { null }
+            if (line != null) resolve(token, line) else fail(token, "cannot read the picked contact")
+            return
+        }
+        pendingPick.remove(requestCode)?.let { req ->
+            if (resultCode != RESULT_OK) { fail(req.token, "canceled"); return }
+            val uris = ChuksMedia.picked(data)
+            if (uris.isEmpty()) { fail(req.token, "canceled"); return }
+            Thread {
+                val lines = uris.mapNotNull { u -> try { ChuksMedia.ingest(this, u, req.quality, req.maxSize) } catch (e: Exception) { android.util.Log.w("Chuks", "mediapicker: cannot bring in $u", e); null } }.map { "file://$it" }
+                runOnUiThread {
+                    if (lines.isEmpty()) fail(req.token, "no media")
+                    else resolve(req.token, if (req.pathOnly) lines[0].split("\t")[0] else lines.joinToString("\n"))
+                }
+            }.start()
+            return
+        }
         val entry = pendingMedia.remove(requestCode) ?: return
         val (token, outUri) = entry
         if (resultCode != RESULT_OK) { fail(token, "canceled"); return }
         val src = outUri ?: data?.data
         if (src == null) { fail(token, "no image"); return }
+        val isVideo = pendingVideo.remove(requestCode)
         try {
-            val dest = java.io.File(filesDir, "picked-$requestCode.jpg")
+            val dest = java.io.File(filesDir, if (isVideo) "cam_$requestCode.mp4" else "picked-$requestCode.jpg")
             contentResolver.openInputStream(src)?.use { input -> dest.outputStream().use { input.copyTo(it) } }
             resolve(token, "file://" + dest.absolutePath)
         } catch (e: Exception) { fail(token, "copy failed: ${e.message}") }
@@ -1707,15 +2077,6 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private fun hasLocationPerm(): Boolean =
         checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
         checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-    private fun bestLocationProvider(lm: android.location.LocationManager): String? = when {
-        lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) -> android.location.LocationManager.GPS_PROVIDER
-        lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER) -> android.location.LocationManager.NETWORK_PROVIDER
-        else -> null
-    }
-    // "lat,lng,accuracy,altitude,speed,heading" — matches the iOS payload shape.
-    private fun locFixStr(l: android.location.Location): String =
-        "${l.latitude},${l.longitude},${l.accuracy},${l.altitude},${l.speed},${l.bearing}"
-
     // Motion (F3): stream a sensor's first three axes as "x,y,z" at ~20Hz until cancelled.
     private fun startSensor(token: String, type: Int) {
         val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
@@ -1815,8 +2176,32 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // Biometrics (F3): the framework BiometricPrompt (API 28+, no androidx dependency).
     // onAuthenticationSucceeded -> "success"; a cancel/lockout/error -> fail(); a single
     // non-match (onAuthenticationFailed) leaves the prompt open for a retry.
+    // BiometricManager.canAuthenticate() throws SecurityException when the manifest
+    // lacks USE_BIOMETRIC, which is what happens when app.json declares no "faceId".
+    // A capability query must never take the app down: without the permission the
+    // answer is "no hardware", and the reason is logged once so the developer sees it.
+    private var bioWarned = false
+    private fun bioCode(authenticators: Int = -1): Int {
+        val none = android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE
+        if (android.os.Build.VERSION.SDK_INT < 29) return none
+        val bm = getSystemService(android.hardware.biometrics.BiometricManager::class.java) ?: return none
+        return try {
+            if (authenticators >= 0 && android.os.Build.VERSION.SDK_INT >= 30) bm.canAuthenticate(authenticators)
+            else @Suppress("DEPRECATION") bm.canAuthenticate()
+        } catch (e: SecurityException) {
+            if (!bioWarned) {
+                bioWarned = true
+                android.util.Log.w("Chuks", "Biometrics: USE_BIOMETRIC is not declared. Add \"faceId\" to permissions in app.json; until then every biometrics query answers unavailable.")
+            }
+            none
+        }
+    }
+
     private fun authenticateBiometric(token: String, reason: String) {
         if (android.os.Build.VERSION.SDK_INT < 28) { fail(token, "biometrics unavailable"); return }
+        if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE) {
+            fail(token, "biometrics unavailable (no sensor, or \"faceId\" is not declared in app.json)"); return
+        }
         val prompt = android.hardware.biometrics.BiometricPrompt.Builder(this)
             .setTitle("Authenticate")
             .setSubtitle(if (reason.isEmpty()) "Confirm your identity" else reason)
@@ -1834,88 +2219,96 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             })
     }
 
-    // Secure storage (Tier B): values are AES-GCM encrypted with an AndroidKeyStore
-    // key (never leaves the secure hardware) and the ciphertext kept in a private
-    // SharedPreferences. iv is prepended to the ciphertext, the whole blob base64'd.
-    private fun secureKey(): javax.crypto.SecretKey {
-        val ks = java.security.KeyStore.getInstance("AndroidKeyStore"); ks.load(null)
-        (ks.getEntry("chuks_secure", null) as? java.security.KeyStore.SecretKeyEntry)?.let { return it.secretKey }
-        val kg = javax.crypto.KeyGenerator.getInstance(android.security.keystore.KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
-        kg.init(android.security.keystore.KeyGenParameterSpec.Builder("chuks_secure",
-                android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT)
-            .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE).build())
-        return kg.generateKey()
-    }
-    private fun securePrefs() = getSharedPreferences("chuks_secure", Context.MODE_PRIVATE)
-    private fun secureSet(key: String, value: String) {
-        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding"); c.init(javax.crypto.Cipher.ENCRYPT_MODE, secureKey())
-        val iv = c.iv; val ct = c.doFinal(value.toByteArray())
-        val blob = iv + ct
-        securePrefs().edit().putString(key, android.util.Base64.encodeToString(blob, android.util.Base64.DEFAULT)).apply()
-    }
-    private fun secureGet(key: String): String? {
-        val enc = securePrefs().getString(key, null) ?: return null
-        val blob = android.util.Base64.decode(enc, android.util.Base64.DEFAULT)
-        val iv = blob.copyOfRange(0, 12); val ct = blob.copyOfRange(12, blob.size)
-        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-        c.init(javax.crypto.Cipher.DECRYPT_MODE, secureKey(), javax.crypto.spec.GCMParameterSpec(128, iv))
-        return String(c.doFinal(ct))
-    }
+    private val secure by lazy { ChuksSecure(this) }
+
 
 
     private var notifId = 1
-    private var audioMp: MediaPlayer? = null   // single-track audio playback (Tier B)
-    private var mediaRecorder: android.media.MediaRecorder? = null   // mic recording (Tier C)
-    private var recPath: String? = null
-
-    // Text-to-speech (Tier B). The engine inits asynchronously; a speak() that
-    // arrives before onInit is stashed in pendingSpeak and flushed once ready.
-    private var tts: android.speech.tts.TextToSpeech? = null
-    private var ttsReady = false
-    private var pendingSpeak: String? = null
-    private fun ensureTts() {
-        if (tts != null) return
-        tts = android.speech.tts.TextToSpeech(this) { status ->
-            ttsReady = status == android.speech.tts.TextToSpeech.SUCCESS
-            if (ttsReady) {
-                tts?.setLanguage(java.util.Locale.US)
-                // Route speech through the media/speaker path (same as Audio playback),
-                // else the engine default can land on a track that isn't audible.
-                tts?.setAudioAttributes(
-                    android.media.AudioAttributes.Builder()
-                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build())
-                pendingSpeak?.let { speakNow(it); pendingSpeak = null }
-            }
-        }
+    private val audioWatchers = HashMap<String, HashSet<String>>()   // AudioPlayer id -> watch tokens
+    private val recorder: ChuksRecorder by lazy { ChuksRecorder(this) { s -> for (t in recorder.watchers.toList()) resolve(t, s) } }
+    private fun withMicPerm(token: String, run: () -> Unit) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "microphone permission denied") }
+        enqueuePermissionRequest(arrayOf(Manifest.permission.RECORD_AUDIO), code)
     }
-    private fun speakNow(text: String) {
-        tts?.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, "chuks")
+
+    // Text-to-speech: see ChuksSpeech.kt. Watchers get every event; a tts.say token
+    // is settled when its own utterance ends.
+    private val ttsWatchers = HashSet<String>()
+    private val speech by lazy {
+        ChuksSpeech(this, { ev -> for (t in ttsWatchers.toList()) resolve(t, ev) }, { tok, err -> if (err == null) resolve(tok, "") else fail(tok, err) })
     }
 
     // ---- Real streams: battery / app-state / network ----
     private var appForeground = true
-    private fun emitBattery(token: String, i: Intent) {
+    // The battery reading, in one place, so watch() and current() cannot drift apart.
+    private fun batteryPayload(i: Intent): String {
         val level = i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
         val pct = if (level >= 0 && scale > 0) level * 100 / scale else -1
         val status = i.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
         val charging = if (status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
                            status == android.os.BatteryManager.BATTERY_STATUS_FULL) 1 else 0
-        runOnUiThread { resolve(token, "$pct,$charging") }
-    }
-    private fun emitNetwork(token: String, cm: android.net.ConnectivityManager) {
-        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
-        val s = when {
-            caps == null -> "none"
-            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-            else -> "other"
+        // The state the intent already carried, no longer collapsed into the 1/0.
+        val state = when (status) {
+            android.os.BatteryManager.BATTERY_STATUS_CHARGING     -> "charging"
+            android.os.BatteryManager.BATTERY_STATUS_FULL         -> "full"
+            android.os.BatteryManager.BATTERY_STATUS_DISCHARGING  -> "unplugged"
+            android.os.BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "not-charging"
+            else                                                  -> "unknown"
         }
+        val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        val low = if (pm?.isPowerSaveMode == true) 1 else 0
+        return "$pct,$charging,$state,$low"
+    }
+    private fun emitBattery(token: String, i: Intent) {
+        val s = batteryPayload(i)
         runOnUiThread { resolve(token, s) }
     }
+    // ACTION_BATTERY_CHANGED is sticky: registering a null receiver returns the last
+    // broadcast synchronously, which is the current state with no subscription to undo.
+    private fun batterySticky(): Intent? =
+        registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+    // The transport, in one place, for watch() and current() alike.
+    private fun networkState(cm: android.net.ConnectivityManager): String {
+        // "transport,reachable". Reachable is the system's own validation of the
+        // network: it probes for real, so a captive portal fails it. VPN is checked
+        // first because a tunnel also reports the transport it rides on.
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return "none,0"
+        val transport = when {
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)       -> "vpn"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)      -> "wifi"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)  -> "cellular"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)  -> "ethernet"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_BLUETOOTH) -> "bluetooth"
+            else -> "other"
+        }
+        val reachable = if (caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)) 1 else 0
+        return "$transport,$reachable"
+    }
+    private fun emitNetwork(token: String, cm: android.net.ConnectivityManager) {
+        val s = networkState(cm)
+        runOnUiThread { resolve(token, s) }
+    }
+
+    // Whether ONE named motion sensor exists here, for Motion.available(). An unknown
+    // name is "no" rather than a crash, so a typo shows up as a feature that never
+    // appears instead of taking the app down.
+    private fun sensorAvailable(name: String): Boolean {
+        val type = when (name) {
+            "accelerometer" -> android.hardware.Sensor.TYPE_ACCELEROMETER
+            "gyroscope"     -> android.hardware.Sensor.TYPE_GYROSCOPE
+            "magnetometer"  -> android.hardware.Sensor.TYPE_MAGNETIC_FIELD
+            "proximity"     -> android.hardware.Sensor.TYPE_PROXIMITY
+            "light"         -> android.hardware.Sensor.TYPE_LIGHT
+            "barometer"     -> android.hardware.Sensor.TYPE_PRESSURE
+            else -> return false
+        }
+        val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+        return sm.getDefaultSensor(type) != null
+    }
+
     override fun onResume() {
         super.onResume(); appForeground = true
         appStateTokens.toList().forEach { resolve(it, "active") }
@@ -1927,22 +2320,15 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         // later kills a backgrounded process.
         persistState()
     }
-    private fun notify(title: String, body: String) {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = android.app.NotificationChannel("chuks", "Chuks", android.app.NotificationManager.IMPORTANCE_DEFAULT)
-            nm.createNotificationChannel(chan)
-        }
-        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                    android.app.Notification.Builder(this, "chuks")
-                else @Suppress("DEPRECATION") android.app.Notification.Builder(this)
-        val n = b.setContentTitle(title).setContentText(body)
-                 .setSmallIcon(android.R.drawable.ic_dialog_info)
-                 .setAutoCancel(true).build()
-        nm.notify(notifId++, n)
-    }
-
     private fun clipboard() = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    // The system setting as 0.0..1.0. Stored as 0..255 (some devices 0..4095, which
+    // the framework maps; the setting itself is 0..255 on every device we target).
+    // Three decimals, as iOS answers, so a level reads the same on both.
+    private fun brightnessStr(v: Double) = String.format(java.util.Locale.US, "%.3f", v)
+    private fun systemBrightness(): Double {
+        val v = try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) } catch (e: Exception) { 128 }
+        return (v / 255.0).coerceIn(0.0, 1.0)
+    }
 
     private fun fireHaptic(style: String) {
         val v = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
@@ -3237,6 +3623,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         private val bgH = Handler(bg.looper)
         private var onCapOk: ((String) -> Unit)? = null
         private var onCapErr: ((String) -> Unit)? = null
+        // The live request, re-issued whenever a control changes it (trap: a Camera2
+        // setting is a field on the repeating request, not a device property).
+        private var previewReq: CaptureRequest.Builder? = null
+        private var chars: CameraCharacteristics? = null
+        private var flash = "off"          // off | on | auto at capture; torch = light on
+        private var zoomRatio = 1f
+        private var afRegion: android.hardware.camera2.params.MeteringRectangle? = null
 
         init {
             texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -3248,6 +3641,9 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             if (texture.isAvailable) open()
         }
 
+        /** After a permission grant: the view is there, the device is not. */
+        fun reopen() { if (device == null && texture.isAvailable) open() }
+
         fun setFacing(f: String) {
             val want = if (f == "front") "front" else "back"
             if (want == facing) return
@@ -3257,10 +3653,14 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
         private fun pickCamera(): String? {
             val want = if (facing == "front") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
-            for (id in camMgr.cameraIdList) {
-                if (camMgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == want) return id
-            }
-            return camMgr.cameraIdList.firstOrNull()
+            // A device can list several cameras of one facing: the main one, plus
+            // ultra-wide, tele, and logical wrappers, some with no flash and no zoom.
+            // Manufacturers number the main back camera 0 and the main front 1, so among
+            // the wanted facing prefer the lowest-numbered id, which is the main lens.
+            // (An emulator can list a limited "10" before the full "0".)
+            val matches = camMgr.cameraIdList.filter { camMgr.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want }
+            val best = matches.minByOrNull { it.toIntOrNull() ?: Int.MAX_VALUE }
+            return best ?: camMgr.cameraIdList.firstOrNull()
         }
 
         @SuppressLint("MissingPermission")
@@ -3282,6 +3682,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             val cam = device ?: return
             val st = texture.surfaceTexture ?: return
             val chars = camMgr.getCameraCharacteristics(camId ?: return)
+            this.chars = chars
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val previewSize = map?.getOutputSizes(SurfaceTexture::class.java)?.maxByOrNull { it.width.toLong() * it.height } ?: Size(1280, 720)
@@ -3296,11 +3697,81 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     override fun onConfigured(s: CameraCaptureSession) {
                         session = s
                         req.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        previewReq = req
+                        applyControls(req)
                         try { s.setRepeatingRequest(req.build(), null, bgH) } catch (e: Exception) {}
                     }
                     override fun onConfigureFailed(s: CameraCaptureSession) {}
                 }, bgH)
             } catch (e: Exception) {}
+        }
+
+        // ---- controls -----------------------------------------------------------
+        private fun applyControls(req: CaptureRequest.Builder) {
+            val c = chars
+            if (c != null) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    req.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
+                } else {
+                    // Below 30 zoom is a crop of the active array, centred.
+                    val rect = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    if (rect != null) {
+                        val w = (rect.width() / zoomRatio).toInt(); val h = (rect.height() / zoomRatio).toInt()
+                        val l = rect.centerX() - w / 2; val t = rect.centerY() - h / 2
+                        req.set(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(l, t, l + w, t + h))
+                    }
+                }
+            }
+            val hasFlash = c?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            if (hasFlash) {
+                if (flash == "torch") { req.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON); req.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH) }
+                else { req.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF); req.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON) }
+            }
+            afRegion?.let { r ->
+                req.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(r))
+                req.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(r))
+            }
+        }
+        private fun reissue() {
+            val s = session ?: return; val req = previewReq ?: return
+            applyControls(req)
+            try { s.setRepeatingRequest(req.build(), null, bgH) } catch (e: Exception) {}
+        }
+        fun hasFlash(): Boolean = chars?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        fun setFlash(mode: String) { flash = mode; bgH.post { reissue() } }
+        fun zoomRange(): String {
+            val c = chars ?: return "1.0,1.0"
+            val max = if (Build.VERSION.SDK_INT >= 30) (c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper ?: 1f)
+                      else (c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f)
+            val min = if (Build.VERSION.SDK_INT >= 30) (c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower ?: 1f) else 1f
+            return String.format(java.util.Locale.US, "%.1f,%.1f", min, max)
+        }
+        fun setZoom(factor: Float) {
+            val r = zoomRange().split(","); val lo = r[0].toFloat(); val hi = r[1].toFloat()
+            zoomRatio = factor.coerceIn(lo, hi)
+            bgH.post { reissue() }
+        }
+        fun focusAt(x: Float, y: Float) {
+            // The view's fraction to a metering rectangle on the sensor, which is
+            // rotated by the sensor orientation relative to the view.
+            val c = chars ?: return
+            val arr = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+            if ((c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) < 1) return
+            val (sx, sy) = when (sensorOrientation) { 90 -> y to 1f - x; 180 -> 1f - x to 1f - y; 270 -> 1f - y to x; else -> x to y }
+            val size = (minOf(arr.width(), arr.height()) / 10)
+            val cx = (arr.left + sx * arr.width()).toInt(); val cy = (arr.top + sy * arr.height()).toInt()
+            val rect = android.graphics.Rect((cx - size / 2).coerceIn(arr.left, arr.right - size), (cy - size / 2).coerceIn(arr.top, arr.bottom - size), 0, 0)
+            rect.right = rect.left + size; rect.bottom = rect.top + size
+            afRegion = android.hardware.camera2.params.MeteringRectangle(rect, android.hardware.camera2.params.MeteringRectangle.METERING_WEIGHT_MAX - 1)
+            bgH.post {
+                val s = session ?: return@post; val req = previewReq ?: return@post
+                applyControls(req)
+                req.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                req.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                try { s.capture(req.build(), null, bgH) } catch (e: Exception) {}
+                req.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                try { s.setRepeatingRequest(req.build(), null, bgH) } catch (e: Exception) {}
+            }
         }
 
         fun capture(ok: (String) -> Unit, err: (String) -> Unit) {
@@ -3342,6 +3813,15 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 req.addTarget(rd.surface)
                 req.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                applyControls(req)
+                // The flash at capture: the AE mode carries it on Camera2.
+                if (hasFlash() && flash != "torch") {
+                    req.set(CaptureRequest.CONTROL_AE_MODE, when (flash) {
+                        "on" -> CameraMetadata.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                        "auto" -> CameraMetadata.CONTROL_AE_MODE_ON_AUTO_FLASH
+                        else -> CameraMetadata.CONTROL_AE_MODE_ON
+                    })
+                }
                 s.capture(req.build(), null, bgH)
             } catch (e: Exception) { runOnUiThread { err(e.message ?: "capture failed") } }
         }

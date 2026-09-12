@@ -918,7 +918,7 @@ dataType ImageProps {
  * bytes asynchronously and shows them; give it a size (`w`/`h`) and optional
  * `radius`. `resize`: "cover" (fill, crop, the default), "contain" (fit), "center".
  * (For a local SF Symbol icon use `Icon`/`name` instead.) The URL rides the text
- * channel, so it may not contain a newline or "|".
+ * channel, which escapes newlines and rejoins pipes, so any URL is safe.
  *
  * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color),
  *   `tintColor`, `blurRadius`, `spinner`, and `filter`, a GPU photo-filter preset
@@ -968,8 +968,8 @@ dataType WebViewProps { ViewProps; url: string? }
 /**
  * A native web view (WKWebView on iOS, android.webkit.WebView on Android) that
  * loads a URL. Give it a size (`w`/`h`) or let it `grow` to fill, plus optional
- * `radius`. The URL rides the text channel, so it may not contain a newline or
- * "|" (fine for normal URLs). (Inline HTML can be added later via encoding.)
+ * `radius`. The URL rides the text channel, which escapes newlines and rejoins pipes,
+ * so any URL is safe. (Inline HTML can be added later via encoding.)
  *
  * Props: `url`, `w`, `h`, `grow`, `radius`, `bg`.
  *
@@ -1125,36 +1125,64 @@ export function TextInput(p: TextInputProps): Node {
     n.onBlur = p["onBlur"]
     applyEventsV(n, p); return n
 }
-dataType SafeAreaViewProps { ViewProps; edges: string? }
+export dataType SafeAreaViewProps { ViewProps; edges: string? }
 /**
- * Insets its children clear of the device safe area (notch/status bar, home
- * indicator). Composed from the host-reported insets, so it's cross-platform and
- * needs no host code. Use it for EDGE-TO-EDGE content: a full-bleed screen, or an
- * overlay/modal that spans the whole window. (Regular screens are already inset by
- * the app root, so a SafeAreaView there is a no-op.)
+ * A `Column` that keeps its children inside the safe area: below the notch and the
+ * status bar, above the home indicator, clear of a landscape notch on either side.
  *
- * Props: `edges` ("top,bottom" default; "all" | "top" | "bottom" | any combination),
- * plus any layout/style prop.
+ * Every `ViewProps` field works as it does on `Column`, and padding ADDS to the inset:
+ * `pt: 14` is fourteen points below the safe edge, `pad: 14` is fourteen inside it on
+ * every side. `edges` picks which sides count: `"all"` (the default), or any of
+ * `"top"`, `"bottom"`, `"left"`, `"right"` joined with commas; `edges: "top"` for a
+ * screen whose bottom a tab bar owns.
+ *
+ * It fills the available space by default, so a `Scroll` inside it has a height to size
+ * into; `grow: 0` makes it content-sized, for a bottom bar or a sheet. Where it sits
+ * decides how a scrolling screen behaves, and both are right somewhere:
  *
  * ```chuks
- * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
+ * // content scrolls UNDER the notch and status bar, the way Settings and Mail do
+ * Scroll({ dir: "col", grow: 1, bg: tk("bg") }, [
+ *     SafeAreaView({ pad: 14, gap: 18 }, kids),
+ * ])
+ * // content is clipped at the safe edge; the band under the notch stays empty
+ * SafeAreaView({ bg: tk("bg") }, [
+ *     Scroll({ dir: "col", grow: 1 }, kids),
+ * ])
  * ```
+ *
+ * Inside a tab whose header has already cleared the top, `safeTop()` is 0 and this adds
+ * nothing there, so one screen lays out correctly pushed full-screen or inside a tab.
+ * `safeTop()` and its siblings stay available for what a container cannot express: a
+ * floating bar's gap, a header measuring itself.
  */
 export function SafeAreaView(first: SafeAreaViewProps | []Kid, kids: []Kid = []): Node {
-    if (typeof(first) == "array") { return SafeAreaView({}, first) }   // content-only (default edges)
-    const p: SafeAreaViewProps = first
-    const edges: string = pvS(p, "edges", "top,bottom")
+    var p: any = {}
+    var c: []Kid = kids
+    if (typeof(first) == "array") { const arr: []Kid = first; c = arr } else { p = first }
+    const edges: string = p["edges"] != null ? string(p["edges"]) : "all"
     const all: bool = edges.contains("all")
-    var out: []Node = []
-    if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
-    const inner: []Node = flatKids(kids)
-    for (var i: int = 0; i < inner.length; i = i + 1) { out.push(inner[i]) }
-    if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
-    // Fill the available space by default (a screen-level wrapper), so a grow child
-    // like a Scroll has a bounded height to size into on the Yoga hosts (UIKit/Android).
-    // Overridable with grow:0 for a content-sized safe inset (e.g. a bottom bar).
-    const s: Style = new Style(); s.dir = "col"; s.grow = 1; applyLayoutV(s, p)
-    return mkView(s, out)
+    // The inset joins whatever padding was asked for on that side. Per-side beats the
+    // axis beats `pad`, the same precedence Style itself applies, so `pad: 14` with a
+    // `pt: 0` is fourteen everywhere but the top.
+    var q: map[string]any = {}
+    const keys: []string = p.keys()
+    var i: int = 0
+    while (i < keys.length) { q[keys[i]] = p[keys[i]]; i = i + 1 }
+    q["pt"] = safeSide(p, "pt", "py") + ((all || edges.contains("top")) ? safeTop() : 0)
+    q["pb"] = safeSide(p, "pb", "py") + ((all || edges.contains("bottom")) ? safeBottom() : 0)
+    q["pl"] = safeSide(p, "pl", "px") + ((all || edges.contains("left")) ? safeLeft() : 0)
+    q["pr"] = safeSide(p, "pr", "px") + ((all || edges.contains("right")) ? safeRight() : 0)
+    const s: Style = new Style(); s.dir = "col"; s.grow = 1
+    applyLayoutV(s, q)
+    const n: Node = mkView(s, flatKids(c)); applyEventsV(n, q); return n
+}
+// The padding a caller asked for on one side, before the inset is added.
+function safeSide(p: any, side: string, axis: string): int {
+    if (p[side] != null) { return int(p[side]) }
+    if (p[axis] != null) { return int(p[axis]) }
+    if (p["pad"] != null) { return int(p["pad"]) }
+    return 0
 }
 dataType LinearGradientProps {
     ViewProps;
@@ -1232,7 +1260,6 @@ export function Blur(p: BlurProps, kids: []Kid = []): Node {
 }
 
 // A fixed-height empty row (a safe-area spacer).
-function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
 
 dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
@@ -1453,14 +1480,15 @@ dataType AlertProps {
  *  - Simple confirm: `confirmText` is the primary button; a non-empty `cancelText`
  *    adds a cancel button; `destructive: true` reddens the confirm button.
  *    `onConfirm` / `onCancel` fire on tap.
- *  - Multi-button: pass `buttons` as a pipe-separated string ("Save|Discard|Cancel").
+ *  - Multi-button: pass `buttons` as a TAB-separated string ("Save\tDiscard\tCancel"),
+ *    so a label may itself contain a "|".
  *    Prefix a label with `!` for a destructive (red) button or `~` for a cancel-style
  *    button. `onButton` fires with the tapped index (as a string; parse with int()).
  *  - Prompt: `prompt: true` adds a text field (`placeholder`, `promptValue` seed the
  *    it); on confirm, `onSubmit` fires with the entered text.
  *
  * Props: `visible` (bool), `title`, `message`, `confirmText` ("OK"), `cancelText`
- * ("" = single-button), `destructive` (bool), `buttons` (pipe string), `prompt` (bool),
+ * ("" = single-button), `destructive` (bool), `buttons` (tab-separated string), `prompt` (bool),
  * `placeholder`, `promptValue`, `onConfirm` (() -> void), `onCancel` (() -> void),
  * `onButton` ((string) -> void), `onSubmit` ((string) -> void).
  *
@@ -1481,15 +1509,18 @@ export function Alert(p: AlertProps): Node {
     const promptValue: string = pvS(p, "promptValue", "")
     const buttonsProp: string = pvS(p, "buttons", "")
     // Build the button list in tap-index order. The user API takes `buttons` as a
-    // pipe-separated string; internally each button is its own trailing TAB field (the
-    // mutation protocol splits ops on '|', so a '|' in the text truncates it). Multi-
-    // button: index -> onButton. Simple: [~cancel, confirm] or [confirm], so index
-    // 0/last map to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
+    // TAB-separated string, and internally each button is its own trailing tab field.
+    // It used to be pipe-separated, on the belief that a pipe in the mutation stream
+    // truncates the op; it does not (the hosts rejoin everything after the last fixed
+    // field), but a pipe in a LABEL did split one button into two. A tab cannot appear
+    // in a button label typed into a dialog, which a pipe can. Multi-button:
+    // index -> onButton. Simple: [~cancel, confirm] or [confirm], so index 0/last map
+    // to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
     var buttonList: []string = []
     var confirmIdx: int = -1
     var cancelIdx: int = -1
     if (buttonsProp != "") {
-        buttonList = buttonsProp.split("|")
+        buttonList = buttonsProp.split("\t")
     } else {
         const confirm: string = pvS(p, "confirmText", "OK")
         const cancel: string = pvS(p, "cancelText", "")
@@ -1497,8 +1528,8 @@ export function Alert(p: AlertProps): Node {
         if (cancel != "") { buttonList = ["~" + cancel, confirmLabel]; cancelIdx = 0; confirmIdx = 1 }
         else { buttonList = [confirmLabel]; confirmIdx = 0 }
     }
-    var joined: string = title + "\t" + message + "\t" + (isPrompt ? "1" : "0") + "\t" + placeholder + "\t" + promptValue
-    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + buttonList[bi] }
+    var joined: string = packField(title) + "\t" + packField(message) + "\t" + (isPrompt ? "1" : "0") + "\t" + packField(placeholder) + "\t" + packField(promptValue)
+    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + packField(buttonList[bi]) }
     const n: Node = mkAlert(s, joined)
     // The host reports the tapped button INDEX ("0","1",...), plus "\t<text>" for a
     // prompt. routeAlert (top-level, so its locals don't sit inside the captured
@@ -1607,7 +1638,7 @@ export function Select(p: SelectProps, options: []string): Node {
     s.fg = pvS(p, "color", "111318")
     s.radius = pvI(p, "radius", 10)
     applyLayoutV(s, p)
-    const n: Node = mkSelect(s, options.join("\t"))   // options in the text channel
+    const n: Node = mkSelect(s, packList(options))   // options in the text channel
     applyEventsV(n, p)                                // onChange(index) fires on pick
     return n
 }
@@ -1702,7 +1733,7 @@ export function Menu(p: MenuProps, items: []string): Node {
     s.radius = pvI(p, "radius", 10)
     applyLayoutV(s, p)
     const label: string = pvS(p, "label", "Menu")
-    const n: Node = mkMenu(s, label + "\t" + items.join("\t"))   // parts[0]=label, rest=items
+    const n: Node = mkMenu(s, packField(label) + "\t" + packList(items))   // parts[0]=label, rest=items
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
@@ -1721,7 +1752,7 @@ export function Menu(p: MenuProps, items: []string): Node {
 export function ContextMenu(p: ViewProps, items: []string, kids: []Kid): Node {
     const s: Style = new Style()
     applyLayoutV(s, p)
-    const n: Node = mkContextMenu(s, items.join("\t"), flatKids(kids))     // items in the text channel
+    const n: Node = mkContextMenu(s, packList(items), flatKids(kids))     // items in the text channel
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
@@ -2147,8 +2178,11 @@ export class Component extends Node {
 // app did not write, a chat message, a server field, a contact's name, could carry
 // "\nR|app" and remove the root view. Escaped here, unescaped by both hosts.
 //
-// The pipe needs no escape: the host rejoins everything after the third one, which is
-// why a label may contain "|" and always could.
+// The pipe needs no escape, and this is a property of the parser rather than luck:
+// free text is always the LAST field of an op, and both hosts read it by rejoining
+// everything after the fixed fields (P, V, IF, X). A label, a controlled value, a URL
+// and a capability's JSON arguments may all contain "|". Verified on device, not
+// assumed: a label "a|b|c" renders whole, and "\nR|app" does not remove the root.
 function escText(s: string): string {
     var out: string = ""
     var i: int = 0
@@ -2161,6 +2195,34 @@ function escText(s: string): string {
         else { out = out + c }
     }
     return out
+}
+
+// A field of a TAB-packed text payload (Alert, Select, Menu, ContextMenu). Those pack
+// several strings into one node's text and the host splits them on a tab, and escText
+// does not escape tabs, so a tab inside a label used to shift every field after it: an
+// alert's message became its placeholder. A real tab is written as the two characters
+// "\" and "t", which survives the text channel (escText doubles the backslash, the
+// host halves it again) and cannot split. It shows as \t in the label, which is a
+// visible oddity rather than a scrambled dialog. Tabs cannot be typed on either
+// keyboard, but they arrive by paste and from server data.
+function packField(s: string): string {
+    if (!s.contains("\t")) { return s }
+    var out: string = ""
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        out = out + (c == "\t" ? "\\t" : c)
+        i = i + 1
+    }
+    return out
+}
+
+// Pack a list of strings into one tab-separated field, each protected (see packField).
+function packList(items: []string): string {
+    var out: []string = []
+    var i: int = 0
+    while (i < items.length) { out.push(packField(items[i])); i = i + 1 }
+    return out.join("\t")
 }
 
 export class Reconciler {

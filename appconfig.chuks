@@ -562,7 +562,7 @@ var HAS_BG_TASKS: bool = false
 // service needs permissions no ordinary location read does.
 var HAS_BG_LOCATION: bool = false
 
-const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "bluetooth", "nfc", "activity", "bodySensors", "health"]
+const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "exactAlarms", "systemBrightness", "bluetooth", "nfc", "activity", "bodySensors", "health"]
 
 // permission kind -> iOS Info.plist usage-description key(s)
 function iosKeysFor(kind: string): []string {
@@ -626,10 +626,18 @@ function androidPermsFor(kind: string): []string {
     if (kind == "microphone") { return ["RECORD_AUDIO"] }
     if (kind == "location") { return ["ACCESS_FINE_LOCATION"] }
     if (kind == "photos") { return ["READ_MEDIA_IMAGES"] }
-    if (kind == "contacts") { return ["READ_CONTACTS"] }
+    // Android splits the address book into a read and a write permission; one kind
+    // covers both so Contacts.add works wherever Contacts.list does.
+    if (kind == "contacts") { return ["READ_CONTACTS", "WRITE_CONTACTS"] }
     if (kind == "calendar") { return ["READ_CALENDAR", "WRITE_CALENDAR"] }
     if (kind == "faceId") { return ["USE_BIOMETRIC"] }
-    if (kind == "notifications") { return ["POST_NOTIFICATIONS"] }
+    // RECEIVE_BOOT_COMPLETED is what lets a scheduled notification survive a reboot.
+    if (kind == "notifications") { return ["POST_NOTIFICATIONS", "RECEIVE_BOOT_COMPLETED"] }
+    // Exact alarms are a separate, user-visible permission from Android 12. Without
+    // it a scheduled notification is inexact and Doze may hold it for minutes.
+    if (kind == "exactAlarms") { return ["SCHEDULE_EXACT_ALARM"] }
+    // Brightness.setSystem: a special grant the user gives in Settings, not a prompt.
+    if (kind == "systemBrightness") { return ["WRITE_SETTINGS"] }
     if (kind == "bluetooth") { return ["BLUETOOTH_SCAN", "BLUETOOTH_CONNECT"] }
     if (kind == "nfc") { return ["NFC"] }
     if (kind == "activity") { return ["ACTIVITY_RECOGNITION"] }   // step counter, API 29+
