@@ -32,7 +32,7 @@ import android.provider.CalendarContract
 import java.util.TimeZone
 
 object ChuksCalendar {
-    private fun clean(s: String?) = (s ?: "").replace('\t', ' ').replace('\n', ' ')
+    private fun clean(s: String?) = ChuksWire.esc(s)   // escapes the separators; see ChuksWire.kt
 
     private val INST_PROJ = arrayOf(CalendarContract.Instances.TITLE, CalendarContract.Instances.BEGIN, CalendarContract.Instances.END,
         CalendarContract.Instances.EVENT_ID, CalendarContract.Instances.CALENDAR_ID, CalendarContract.Instances.EVENT_LOCATION,

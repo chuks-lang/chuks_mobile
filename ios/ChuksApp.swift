@@ -1076,15 +1076,39 @@ func chuksClipboardKinds() -> String {
 // One event is "title\tstartMs\tendMs\tid\tcalendarId\tlocation\tnotes\tallDay" on both
 // platforms. The id is eventIdentifier, which store.event(withIdentifier:) takes; an
 // occurrence of a repeating event carries the same id as every other.
-func chuksTabClean(_ s: String) -> String { s.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }
+// A field of a capability payload. Records are joined by a newline and fields by a
+// tab, and a value can contain either: a filename may hold a newline, a contact may
+// be saved with a tab in the name. Escaping them keeps the record and field COUNT
+// right (three files list as three rows, not four) and keeps the value recoverable,
+// where the old clean() replaced them with spaces and lost what was there.
+// Undone by wireFields() in core/native.chuks.
+func chuksWireEsc(_ s: String, listItem: Bool = false) -> String {
+    if !s.contains("\\") && !s.contains("\t") && !s.contains("\n") && !s.contains("\r") && !(listItem && s.contains(";")) { return s }
+    var out = ""
+    for c in s {
+        switch c {
+        case "\\": out += "\\\\"
+        case "\t": out += "\\t"
+        case "\n": out += "\\n"
+        case "\r": out += "\\r"
+        // Only for an item of a ";"-joined list (a contact's phones and emails): a
+        // number holding a semicolon would otherwise become two numbers. Escaped a step
+        // further than a plain field, and undone by wireList rather than wireFields, so
+        // the semicolon survives the field split and dies at the list split.
+        case ";" where listItem: out += "\\;"
+        default: out.append(c)
+        }
+    }
+    return out
+}
 func chuksHex(_ c: CGColor) -> String {
     guard let comps = c.converted(to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil)?.components, comps.count >= 3 else { return "000000" }
     return String(format: "%02X%02X%02X", Int(comps[0] * 255), Int(comps[1] * 255), Int(comps[2] * 255))
 }
 func chuksEventLine(_ e: EKEvent) -> String {
     let ms: (Date?) -> Int64 = { d in Int64((d?.timeIntervalSince1970 ?? 0) * 1000) }
-    return [chuksTabClean(e.title ?? ""), "\(ms(e.startDate))", "\(ms(e.endDate))", e.eventIdentifier ?? "", e.calendar?.calendarIdentifier ?? "",
-            chuksTabClean(e.location ?? ""), chuksTabClean(e.notes ?? ""), e.isAllDay ? "1" : "0"].joined(separator: "\t")
+    return [chuksWireEsc(e.title ?? ""), "\(ms(e.startDate))", "\(ms(e.endDate))", e.eventIdentifier ?? "", e.calendar?.calendarIdentifier ?? "",
+            chuksWireEsc(e.location ?? ""), chuksWireEsc(e.notes ?? ""), e.isAllDay ? "1" : "0"].joined(separator: "\t")
 }
 // The fields add, update and compose share. An alarm of -1 (or none) clears alarms.
 func chuksFillEvent(_ ev: EKEvent, _ a: ChuksArgs) {
@@ -1123,9 +1147,10 @@ func chuksContactsAuthorized() -> Bool {
 func chuksContactLine(_ c: CNContact) -> String {
     var name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
     if name.isEmpty, c.isKeyAvailable(CNContactOrganizationNameKey) { name = c.organizationName }
-    let clean: (String) -> String = { $0.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: ";", with: ",") }
-    let phones = c.isKeyAvailable(CNContactPhoneNumbersKey) ? c.phoneNumbers.map { clean($0.value.stringValue) }.joined(separator: ";") : ""
-    let emails = c.isKeyAvailable(CNContactEmailAddressesKey) ? c.emailAddresses.map { clean(String($0.value)) }.joined(separator: ";") : ""
+    let clean: (String) -> String = { chuksWireEsc($0) }
+    let item: (String) -> String = { chuksWireEsc($0, listItem: true) }
+    let phones = c.isKeyAvailable(CNContactPhoneNumbersKey) ? c.phoneNumbers.map { item($0.value.stringValue) }.joined(separator: ";") : ""
+    let emails = c.isKeyAvailable(CNContactEmailAddressesKey) ? c.emailAddresses.map { item(String($0.value)) }.joined(separator: ";") : ""
     return "\(clean(name))\t\(phones)\t\(emails)\t\(c.identifier)"
 }
 // The app gives one name; the first word is the given name and the rest the family
@@ -1145,7 +1170,7 @@ final class ChuksContactPropertyPick: NSObject, CNContactPickerDelegate {
     func contactPicker(_ picker: CNContactPickerViewController, didSelect p: CNContactProperty) {
         let c = p.contact
         let name = "\(c.givenName) \(c.familyName)".trimmingCharacters(in: .whitespaces)
-        let clean: (String) -> String = { $0.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: ";", with: ",") }
+        let clean: (String) -> String = { chuksWireEsc($0) }
         if let n = p.value as? CNPhoneNumber { onPick("\(clean(name))\t\(clean(n.stringValue))\t\t\(c.identifier)") }
         else { onPick("\(clean(name))\t\t\(clean(String(describing: p.value ?? "")))\t\(c.identifier)") }
     }
@@ -1331,7 +1356,7 @@ final class ChuksMediaPick: NSObject, PHPickerViewControllerDelegate {
                     let dst = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                         .appendingPathComponent("picked-\(UUID().uuidString).\(url.pathExtension.isEmpty ? "mov" : url.pathExtension)")
                     try? FileManager.default.removeItem(at: dst)
-                    if (try? FileManager.default.copyItem(at: url, to: dst)) != nil { lines[i] = chuksMediaInfo(dst).map { dst.path + "\t" + $0 } }
+                    if (try? FileManager.default.copyItem(at: url, to: dst)) != nil { lines[i] = chuksMediaInfo(dst).map { chuksWireEsc(dst.path) + "\t" + $0 } }
                 }
             } else if prov.canLoadObject(ofClass: UIImage.self) {
                 prov.loadObject(ofClass: UIImage.self) { obj, _ in
@@ -1339,7 +1364,7 @@ final class ChuksMediaPick: NSObject, PHPickerViewControllerDelegate {
                     guard let img = obj as? UIImage else { return }
                     if let p = chuksSaveImage(chuksScaleImage(img, maxSize: self.maxSize), quality: self.quality) {
                         let u = URL(fileURLWithPath: p)
-                        lines[i] = chuksMediaInfo(u).map { u.path + "\t" + $0 }
+                        lines[i] = chuksMediaInfo(u).map { chuksWireEsc(u.path) + "\t" + $0 }
                     }
                 }
             } else { group.leave() }
@@ -1715,6 +1740,31 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var stageMaxCall: CFTimeInterval = 0     // the engine round trip alone
     var stageMaxApply: CFTimeInterval = 0    // applying the mutation stream to views
     var stageMaxBytes = 0                    // largest mutation stream in a frame
+    var stageParseSink = 0                   // keeps parseOnly from being optimized away
+    var stageMaxOps = 0                      // most ops (lines) in one crossing: the granularity
+    var stageSumOps = 0                      // total ops over the phase, for an average
+    var stageCrossings = 0                   // crossings that carried at least one op
+    var stageMaxParse: CFTimeInterval = 0    // parse alone (PARSE_PROBE=1): split + dispatch, no view work
+    // A parse-only pass over the same stream, to separate the protocol's cost from the
+    // view mutations that follow it. Behind an env var because it does the work twice and
+    // would make the frame numbers of an ordinary run pessimistic.
+    static let parseProbe = ProcessInfo.processInfo.environment["PARSE_PROBE"] == "1"
+    private func parseOnly(_ stream: String) {
+        var sink = 0
+        for raw in stream.split(separator: "\n") {
+            let f = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            guard let op = f.first else { continue }
+            // The same work the real switch does before it touches a view: the op lookup
+            // and the field reads, including the rejoin for the text-carrying ops.
+            switch op {
+            case "P", "V", "IF", "X": if f.count >= 3 { sink += f[2...].joined(separator: "|").utf8.count }
+            case "C", "S", "T", "LS": if f.count >= 3 { sink += f[1].utf8.count + f[2].utf8.count }
+            case "I": if f.count >= 4 { sink += (Int(f[3]) ?? 0) }
+            default: if f.count >= 2 { sink += f[1].utf8.count }
+            }
+        }
+        stageParseSink += sink
+    }
     var stageMaxTickWork: CFTimeInterval = 0 // worst synchronous work inside one tick
     var stageWorstInterval: CFTimeInterval = 0
     var stageWorkOnWorst: CFTimeInterval = 0 // our work on the frame that took longest
@@ -2267,6 +2317,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         perfFrames = 0; perfJanky = 0; perfMaxFrame = 0; perfSumTime = 0; perfMaxPlayers = 0
         stageMaxEngine = 0; stageMaxLayout = 0; stageMaxIdle = 0; stageFrames = 0
         stageMaxCall = 0; stageMaxApply = 0; stageMaxBytes = 0
+        stageMaxOps = 0; stageSumOps = 0; stageCrossings = 0; stageMaxParse = 0
         stageMaxTickWork = 0; stageWorstInterval = 0; stageWorkOnWorst = 0; stageMaxCommit = 0
     }
     @objc func perfTick() {
@@ -2324,6 +2375,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             + String(format: " | stages: engine %.1f ms, apply %.1f ms, layout %.1f ms, idle %.1f ms, bytes %d, mutating %d",
                      stageMaxCall * 1000, stageMaxApply * 1000, stageMaxLayout * 1000, stageMaxIdle * 1000,
                      stageMaxBytes, stageFrames)
+            + String(format: " | wire: ops/crossing max %d avg %.1f over %d crossings, parse %.3f ms",
+                     stageMaxOps, Double(stageSumOps) / Double(max(1, stageCrossings)), stageCrossings, stageMaxParse * 1000)
             + String(format: " | worst frame %.1f ms of which OUR work %.1f ms; worst work %.1f ms; worst commit+render %.1f ms",
                      stageWorstInterval * 1000, stageWorkOnWorst * 1000, stageMaxTickWork * 1000, stageMaxCommit * 1000)
         print(msg); NSLog(msg); perfLog.append(msg)
@@ -3036,6 +3089,21 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func apply(_ stream: String) {
+        // Every engine -> host crossing lands here, whatever produced it: a render, a
+        // scroll re-window, a tap's re-render, a capability result. Counted here rather
+        // than in one caller so "ops per crossing" means what it says.
+        if BENCHMARK_MODE && !stream.isEmpty {
+            let ops = stream.split(separator: "\n").count
+            if ops > stageMaxOps { stageMaxOps = ops }
+            stageSumOps += ops; stageCrossings += 1
+            if stream.utf8.count > stageMaxBytes { stageMaxBytes = stream.utf8.count }
+            if CardsVC.parseProbe {
+                let p0 = CACurrentMediaTime()
+                parseOnly(stream)
+                let p = CACurrentMediaTime() - p0
+                if p > stageMaxParse { stageMaxParse = p }
+            }
+        }
         for raw in stream.split(separator: "\n") {
             let f = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
             guard let op = f.first else { continue }
@@ -3483,9 +3551,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if let err = err { self?.fail(token, "geocoding failed: \(err.localizedDescription)"); return }
                 let rows = (marks ?? []).map { p -> String in
                     let street = [p.subThoroughfare, p.thoroughfare].compactMap { $0 }.joined(separator: " ")
-                    return [p.name ?? "", street, p.locality ?? "", p.administrativeArea ?? "", p.postalCode ?? "", p.country ?? "", p.isoCountryCode ?? ""]
-                        .map { $0.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }
-                        .joined(separator: "\t")
+                    let fields: [String] = [p.name ?? "", street, p.locality ?? "", p.administrativeArea ?? "",
+                                            p.postalCode ?? "", p.country ?? "", p.isoCountryCode ?? ""]
+                    return fields.map { chuksWireEsc($0) }.joined(separator: "\t")
                 }
                 self?.resolve(token, rows.joined(separator: "\n"))
             }
@@ -3735,7 +3803,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             withCalendarAccess(token) { store in
                 let lines = store.calendars(for: .event).map { c -> String in
                     let hex = c.cgColor.map { chuksHex($0) } ?? "000000"
-                    return "\(c.calendarIdentifier)\t\(chuksTabClean(c.title))\t\(c.allowsContentModifications ? "1" : "0")\t\(hex)"
+                    return "\(c.calendarIdentifier)\t\(chuksWireEsc(c.title))\t\(c.allowsContentModifications ? "1" : "0")\t\(hex)"
                 }
                 self.resolve(token, lines.joined(separator: "\n"))
             }
@@ -4005,7 +4073,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             var isDir: ObjCBool = false
             let rows = names.sorted().map { n -> String in
                 FileManager.default.fileExists(atPath: dir.appendingPathComponent(n).path, isDirectory: &isDir)
-                return isDir.boolValue ? n + "/" : n
+                return chuksWireEsc(isDir.boolValue ? n + "/" : n)
             }
             resolve(token, rows.joined(separator: "\n"))
         case "fs.delete":
@@ -4100,7 +4168,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 }
             }
         case "secure.has": resolve(token, keychainHas(args) ? "1" : "0")
-        case "secure.keys": resolve(token, keychainKeys().joined(separator: "\n"))
+        case "secure.keys": resolve(token, keychainKeys().map { chuksWireEsc($0) }.joined(separator: "\n"))
         case "secure.delete": keychainDelete(args)
         case "secure.deleteAll": for k in keychainKeys() { keychainDelete(k) }
         case "secure.available":
@@ -4140,7 +4208,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             UNUserNotificationCenter.current().removeAllDeliveredNotifications()
         case "notif.scheduled":
             UNUserNotificationCenter.current().getPendingNotificationRequests { [weak self] reqs in
-                let lines = reqs.map { "\($0.identifier)\t\($0.content.title)\t\(chuksNotifFireAt($0))" }
+                let lines = reqs.map { "\(chuksWireEsc($0.identifier))\t\(chuksWireEsc($0.content.title))\t\(chuksNotifFireAt($0))" }
                 DispatchQueue.main.async { self?.resolve(token, lines.joined(separator: "\n")) }
             }
         case "notif.setBadge":
@@ -4281,7 +4349,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let rows = AVSpeechSynthesisVoice.speechVoices().map { v -> String in
                 let q: String
                 switch v.quality { case .premium: q = "premium"; case .enhanced: q = "enhanced"; default: q = "default" }
-                return "\(v.identifier)\t\(chuksTabClean(v.name))\t\(v.language)\t\(q)"
+                return "\(v.identifier)\t\(chuksWireEsc(v.name))\t\(v.language)\t\(q)"
             }
             resolve(token, rows.joined(separator: "\n"))
         case "tts.watch":

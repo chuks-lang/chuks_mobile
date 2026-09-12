@@ -61,7 +61,7 @@ object ChuksFiles {
     fun list(ctx: Context, dir: String): String? {
         val d = resolve(ctx, dir)
         val names = d.listFiles() ?: return null
-        return names.sortedBy { it.name }.joinToString("\n") { if (it.isDirectory) it.name + "/" else it.name }
+        return names.sortedBy { it.name }.joinToString("\n") { ChuksWire.esc(if (it.isDirectory) it.name + "/" else it.name) }
     }
 
     fun delete(ctx: Context, path: String): String? {

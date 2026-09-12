@@ -146,7 +146,7 @@ object ChuksNotif {
             rows.add(Triple(rec.optLong("atMs"), id, rec.optString("title")))
         }
         rows.sortBy { it.first }
-        return rows.joinToString("\n") { "${it.second}\t${it.third}\t${it.first}" }
+        return rows.joinToString("\n") { "${ChuksWire.esc(it.second)}\t${ChuksWire.esc(it.third)}\t${it.first}" }
     }
 
     /** Fire one stored request now: post it and forget it. Called by the receiver. */

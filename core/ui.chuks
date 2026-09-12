@@ -918,7 +918,7 @@ dataType ImageProps {
  * bytes asynchronously and shows them; give it a size (`w`/`h`) and optional
  * `radius`. `resize`: "cover" (fill, crop, the default), "contain" (fit), "center".
  * (For a local SF Symbol icon use `Icon`/`name` instead.) The URL rides the text
- * channel, so it may not contain a newline or "|".
+ * channel, which escapes newlines and rejoins pipes, so any URL is safe.
  *
  * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color),
  *   `tintColor`, `blurRadius`, `spinner`, and `filter`, a GPU photo-filter preset
@@ -968,8 +968,8 @@ dataType WebViewProps { ViewProps; url: string? }
 /**
  * A native web view (WKWebView on iOS, android.webkit.WebView on Android) that
  * loads a URL. Give it a size (`w`/`h`) or let it `grow` to fill, plus optional
- * `radius`. The URL rides the text channel, so it may not contain a newline or
- * "|" (fine for normal URLs). (Inline HTML can be added later via encoding.)
+ * `radius`. The URL rides the text channel, which escapes newlines and rejoins pipes,
+ * so any URL is safe. (Inline HTML can be added later via encoding.)
  *
  * Props: `url`, `w`, `h`, `grow`, `radius`, `bg`.
  *
@@ -1480,14 +1480,15 @@ dataType AlertProps {
  *  - Simple confirm: `confirmText` is the primary button; a non-empty `cancelText`
  *    adds a cancel button; `destructive: true` reddens the confirm button.
  *    `onConfirm` / `onCancel` fire on tap.
- *  - Multi-button: pass `buttons` as a pipe-separated string ("Save|Discard|Cancel").
+ *  - Multi-button: pass `buttons` as a TAB-separated string ("Save\tDiscard\tCancel"),
+ *    so a label may itself contain a "|".
  *    Prefix a label with `!` for a destructive (red) button or `~` for a cancel-style
  *    button. `onButton` fires with the tapped index (as a string; parse with int()).
  *  - Prompt: `prompt: true` adds a text field (`placeholder`, `promptValue` seed the
  *    it); on confirm, `onSubmit` fires with the entered text.
  *
  * Props: `visible` (bool), `title`, `message`, `confirmText` ("OK"), `cancelText`
- * ("" = single-button), `destructive` (bool), `buttons` (pipe string), `prompt` (bool),
+ * ("" = single-button), `destructive` (bool), `buttons` (tab-separated string), `prompt` (bool),
  * `placeholder`, `promptValue`, `onConfirm` (() -> void), `onCancel` (() -> void),
  * `onButton` ((string) -> void), `onSubmit` ((string) -> void).
  *
@@ -1508,15 +1509,18 @@ export function Alert(p: AlertProps): Node {
     const promptValue: string = pvS(p, "promptValue", "")
     const buttonsProp: string = pvS(p, "buttons", "")
     // Build the button list in tap-index order. The user API takes `buttons` as a
-    // pipe-separated string; internally each button is its own trailing TAB field (the
-    // mutation protocol splits ops on '|', so a '|' in the text truncates it). Multi-
-    // button: index -> onButton. Simple: [~cancel, confirm] or [confirm], so index
-    // 0/last map to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
+    // TAB-separated string, and internally each button is its own trailing tab field.
+    // It used to be pipe-separated, on the belief that a pipe in the mutation stream
+    // truncates the op; it does not (the hosts rejoin everything after the last fixed
+    // field), but a pipe in a LABEL did split one button into two. A tab cannot appear
+    // in a button label typed into a dialog, which a pipe can. Multi-button:
+    // index -> onButton. Simple: [~cancel, confirm] or [confirm], so index 0/last map
+    // to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
     var buttonList: []string = []
     var confirmIdx: int = -1
     var cancelIdx: int = -1
     if (buttonsProp != "") {
-        buttonList = buttonsProp.split("|")
+        buttonList = buttonsProp.split("\t")
     } else {
         const confirm: string = pvS(p, "confirmText", "OK")
         const cancel: string = pvS(p, "cancelText", "")
@@ -1524,8 +1528,8 @@ export function Alert(p: AlertProps): Node {
         if (cancel != "") { buttonList = ["~" + cancel, confirmLabel]; cancelIdx = 0; confirmIdx = 1 }
         else { buttonList = [confirmLabel]; confirmIdx = 0 }
     }
-    var joined: string = title + "\t" + message + "\t" + (isPrompt ? "1" : "0") + "\t" + placeholder + "\t" + promptValue
-    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + buttonList[bi] }
+    var joined: string = packField(title) + "\t" + packField(message) + "\t" + (isPrompt ? "1" : "0") + "\t" + packField(placeholder) + "\t" + packField(promptValue)
+    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + packField(buttonList[bi]) }
     const n: Node = mkAlert(s, joined)
     // The host reports the tapped button INDEX ("0","1",...), plus "\t<text>" for a
     // prompt. routeAlert (top-level, so its locals don't sit inside the captured
@@ -1634,7 +1638,7 @@ export function Select(p: SelectProps, options: []string): Node {
     s.fg = pvS(p, "color", "111318")
     s.radius = pvI(p, "radius", 10)
     applyLayoutV(s, p)
-    const n: Node = mkSelect(s, options.join("\t"))   // options in the text channel
+    const n: Node = mkSelect(s, packList(options))   // options in the text channel
     applyEventsV(n, p)                                // onChange(index) fires on pick
     return n
 }
@@ -1729,7 +1733,7 @@ export function Menu(p: MenuProps, items: []string): Node {
     s.radius = pvI(p, "radius", 10)
     applyLayoutV(s, p)
     const label: string = pvS(p, "label", "Menu")
-    const n: Node = mkMenu(s, label + "\t" + items.join("\t"))   // parts[0]=label, rest=items
+    const n: Node = mkMenu(s, packField(label) + "\t" + packList(items))   // parts[0]=label, rest=items
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
@@ -1748,7 +1752,7 @@ export function Menu(p: MenuProps, items: []string): Node {
 export function ContextMenu(p: ViewProps, items: []string, kids: []Kid): Node {
     const s: Style = new Style()
     applyLayoutV(s, p)
-    const n: Node = mkContextMenu(s, items.join("\t"), flatKids(kids))     // items in the text channel
+    const n: Node = mkContextMenu(s, packList(items), flatKids(kids))     // items in the text channel
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
@@ -2174,8 +2178,11 @@ export class Component extends Node {
 // app did not write, a chat message, a server field, a contact's name, could carry
 // "\nR|app" and remove the root view. Escaped here, unescaped by both hosts.
 //
-// The pipe needs no escape: the host rejoins everything after the third one, which is
-// why a label may contain "|" and always could.
+// The pipe needs no escape, and this is a property of the parser rather than luck:
+// free text is always the LAST field of an op, and both hosts read it by rejoining
+// everything after the fixed fields (P, V, IF, X). A label, a controlled value, a URL
+// and a capability's JSON arguments may all contain "|". Verified on device, not
+// assumed: a label "a|b|c" renders whole, and "\nR|app" does not remove the root.
 function escText(s: string): string {
     var out: string = ""
     var i: int = 0
@@ -2188,6 +2195,34 @@ function escText(s: string): string {
         else { out = out + c }
     }
     return out
+}
+
+// A field of a TAB-packed text payload (Alert, Select, Menu, ContextMenu). Those pack
+// several strings into one node's text and the host splits them on a tab, and escText
+// does not escape tabs, so a tab inside a label used to shift every field after it: an
+// alert's message became its placeholder. A real tab is written as the two characters
+// "\" and "t", which survives the text channel (escText doubles the backslash, the
+// host halves it again) and cannot split. It shows as \t in the label, which is a
+// visible oddity rather than a scrambled dialog. Tabs cannot be typed on either
+// keyboard, but they arrive by paste and from server data.
+function packField(s: string): string {
+    if (!s.contains("\t")) { return s }
+    var out: string = ""
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        out = out + (c == "\t" ? "\\t" : c)
+        i = i + 1
+    }
+    return out
+}
+
+// Pack a list of strings into one tab-separated field, each protected (see packField).
+function packList(items: []string): string {
+    var out: []string = []
+    var i: int = 0
+    while (i < items.length) { out.push(packField(items[i])); i = i + 1 }
+    return out.join("\t")
 }
 
 export class Reconciler {

@@ -77,7 +77,7 @@ object ChuksMedia {
             bmp.recycle()
             dst
         }
-        return info(f)?.let { f.absolutePath + "\t" + it }
+        return info(f)?.let { ChuksWire.esc(f.absolutePath) + "\t" + it }
     }
 
     // Trap 3: bounds first, a power-of-two sample near the target, then the exact scale

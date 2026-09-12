@@ -83,7 +83,7 @@ class ChuksSecure(private val activity: Activity) {
     }
 
     fun has(k: String) = prefs.contains(k)
-    fun keys(): List<String> = prefs.all.keys.sorted()
+    fun keys(): List<String> = prefs.all.keys.sorted().map { ChuksWire.esc(it) }
     fun delete(k: String) = prefs.edit().remove(k).apply()
     fun deleteAll() = prefs.edit().clear().apply()
 

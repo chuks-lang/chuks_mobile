@@ -22,6 +22,75 @@ const CAP_QUICK_MS: int = 10000
 const CAP_HARDWARE_MS: int = 60000
 const CAP_PROMPT_MS: int = 300000
 
+// ---- Reading a capability payload -------------------------------------------
+// A capability that answers several things joins records with a newline and the
+// fields of a record with a tab. A value inside a field may itself contain either
+// (a filename with a newline in it is legal on both platforms; a contact can be
+// saved with a tab in the name), so the hosts ESCAPE those characters in every
+// field they emit: a backslash becomes "\\", a tab "\t", a newline "\n", a
+// carriage return "\r". Only real separators survive as raw characters.
+//
+// One field can hold a list of its own: a contact's phones and emails are joined by
+// ";". Those items are escaped a step further ("\;"), and wireList splits them, so a
+// phone number containing a semicolon does not become two phones.
+//
+// That means a plain split already gives the right NUMBER of rows and fields, which
+// is what used to go wrong: three files whose names held a newline listed as four.
+// These two helpers also undo the escaping, so a value comes back exactly as the OS
+// gave it:
+//
+//   const rows: []string = wireRows(await FileSystem.listAsync())
+//   const cols: []string = wireFields(rows[0])
+//   const phones: []string = wireList(cols[1])      // a contact's phone numbers
+export function wireRows(payload: string): []string {
+    if (payload == "") { return [] }
+    return payload.split("\n")
+}
+/**
+ * The fields of one record, each given back as the OS had it. A "\;" is left as it is,
+ * because ";" separates the items INSIDE a field (a contact's several phones) and must
+ * survive one level longer: split such a field with wireList.
+ */
+export function wireFields(row: string): []string {
+    const raw: []string = row.split("\t")
+    var out: []string = []
+    var i: int = 0
+    while (i < raw.length) { out.push(unescKeepSemi(raw[i])); i = i + 1 }
+    return out
+}
+/** The items of a ";"-joined field (a contact's phones or emails), each given back whole. */
+export function wireList(field: string): []string {
+    if (field == "") { return [] }
+    const raw: []string = field.split(";")
+    var out: []string = []
+    var i: int = 0
+    while (i < raw.length) { out.push(wireUnesc(raw[i])); i = i + 1 }
+    return out
+}
+/** Undo the host's field escaping, including "\;". One left-to-right scan: a
+ *  search-and-replace would corrupt a value that legitimately ends in a backslash. */
+export function wireUnesc(s: string): string { return unesc(s, true) }
+function unescKeepSemi(s: string): string { return unesc(s, false) }
+function unesc(s: string, semi: bool): string {
+    if (!s.contains("\\")) { return s }
+    var out: string = ""
+    var i: int = 0
+    while (i < s.length) {
+        const c: string = s.slice(i, i + 1)
+        if (c == "\\" && i + 1 < s.length) {
+            const n: string = s.slice(i + 1, i + 2)
+            if (n == "t") { out = out + "\t"; i = i + 2; continue }
+            if (n == "n") { out = out + "\n"; i = i + 2; continue }
+            if (n == "r") { out = out + "\r"; i = i + 2; continue }
+            if (n == "\\") { out = out + "\\"; i = i + 2; continue }
+            if (n == ";" && semi) { out = out + ";"; i = i + 2; continue }
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
 // The system pasteboard. set() copies text and returns at once; get() reads it, and is
 // async because the OS defers a pasteboard read. iOS shows the user a banner when an
 // app READS the pasteboard, so read on an explicit action rather than on mount; has()

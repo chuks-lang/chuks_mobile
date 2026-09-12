@@ -37,8 +37,10 @@ import java.io.File
 
 object ChuksContacts {
     private class Row(var name: String) { val phones = LinkedHashSet<String>(); val emails = LinkedHashSet<String>() }
-    private fun clean(s: String?) = (s ?: "").replace('\t', ' ').replace('\n', ' ').replace(';', ',')
+    private fun clean(s: String?) = ChuksWire.esc(s)   // escapes the separators; see ChuksWire.kt
     private fun line(id: String, r: Row) = "${clean(r.name)}\t${r.phones.joinToString(";")}\t${r.emails.joinToString(";")}\t$id"
+    // Phones and emails are collected already escaped as list items (see item()).
+    private fun item(s: String?) = ChuksWire.escItem(s)
 
     private val PROJ = arrayOf(ContactsContract.Data.CONTACT_ID, ContactsContract.Data.DISPLAY_NAME_PRIMARY,
                                ContactsContract.Data.MIMETYPE, ContactsContract.Data.DATA1)
@@ -54,8 +56,8 @@ object ChuksContacts {
                 val r = out.getOrPut(id) { Row(c.getString(1) ?: "") }
                 val v = c.getString(3) ?: continue
                 when (c.getString(2)) {
-                    CommonDataKinds.Phone.CONTENT_ITEM_TYPE -> r.phones.add(clean(v))
-                    CommonDataKinds.Email.CONTENT_ITEM_TYPE -> r.emails.add(clean(v))
+                    CommonDataKinds.Phone.CONTENT_ITEM_TYPE -> r.phones.add(item(v))
+                    CommonDataKinds.Email.CONTENT_ITEM_TYPE -> r.emails.add(item(v))
                 }
             }
         }
@@ -110,8 +112,8 @@ object ChuksContacts {
                 while (c.moveToNext()) {
                     val v = c.getString(1) ?: continue
                     when (c.getString(0)) {
-                        CommonDataKinds.Phone.CONTENT_ITEM_TYPE -> r.phones.add(clean(v))
-                        CommonDataKinds.Email.CONTENT_ITEM_TYPE -> r.emails.add(clean(v))
+                        CommonDataKinds.Phone.CONTENT_ITEM_TYPE -> r.phones.add(item(v))
+                        CommonDataKinds.Email.CONTENT_ITEM_TYPE -> r.emails.add(item(v))
                     }
                 }
             }
@@ -129,7 +131,7 @@ object ChuksContacts {
             if (!c.moveToFirst()) return null
             fun col(vararg names: String): String { for (n in names) { val i = c.getColumnIndex(n); if (i >= 0 && !c.isNull(i)) return c.getString(i) ?: "" }; return "" }
             val name = clean(col(ContactsContract.Data.DISPLAY_NAME_PRIMARY, ContactsContract.Data.DISPLAY_NAME, "display_name_alt"))
-            val v = clean(col(valCol, ContactsContract.Data.DATA1))
+            val v = item(col(valCol, ContactsContract.Data.DATA1))
             val id = col(ContactsContract.Data.CONTACT_ID)
             return if (kind == "phone") "$name\t$v\t\t$id" else "$name\t\t$v\t$id"
         }

@@ -179,7 +179,7 @@ object ChuksGeo {
 
     // ---- the geocoder (trap 5) -----------------------------------------------
 
-    private fun clean(s: String?) = (s ?: "").replace('\t', ' ').replace('\n', ' ')
+    private fun clean(s: String?) = ChuksWire.esc(s)   // escapes the separators; see ChuksWire.kt
 
     /** `done(rows, error)` on the main thread: rows are "lat,lng" lines. */
     fun geocode(ctx: Context, address: String, post: (Runnable) -> Unit, done: (String, String?) -> Unit) {

@@ -159,7 +159,7 @@ class ChuksSpeech(private val ctx: Context, private val emit: (String) -> Unit, 
         val vs: Set<Voice> = try { t.voices ?: emptySet() } catch (e: Exception) { emptySet() }
         return vs.sortedBy { it.name }.joinToString("\n") { v ->
             val q = when { v.quality >= Voice.QUALITY_VERY_HIGH -> "premium"; v.quality >= Voice.QUALITY_HIGH -> "enhanced"; else -> "default" }
-            "${v.name}\t${v.name.replace('\t', ' ')}\t${v.locale.toLanguageTag()}\t$q"
+            "${ChuksWire.esc(v.name)}\t${ChuksWire.esc(v.name)}\t${v.locale.toLanguageTag()}\t$q"
         }
     }
 }
