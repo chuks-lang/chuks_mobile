@@ -143,10 +143,64 @@ export class Torch {
 }
 
 // ---- Screen brightness ------------------------------------------------------
-// level is 0.0..1.0. keepAwake() toggles the idle timer (keep the screen on).
+// Levels are 0.0..1.0. set() is the APP's brightness: it applies while the app is in
+// front and the screen goes back to the user's own setting when the app leaves, on
+// both platforms (Android scopes it to the window; iOS has one brightness, so the host
+// saves the user's level at the first set() and puts it back on the way out). The
+// system setting is a separate axis: system() reads it, and setSystem() changes it for
+// good, which on Android needs the "Modify system settings" grant the user gives in
+// Settings, opened by requestSystemAccess().
 export class Brightness {
+    /** The app's brightness while it is in front. */
     public static set(level: float): void { emitNativeCommand("brightness.set", level, null) }
+    /** The brightness the screen has right now, the app's if set, else the system's. */
+    public static get(onResult: (float)=> void): void {
+        emitNativeCommand("brightness.get", "", function(s: string): void { onResult(float(s)) })
+    }
+    /** Gives the screen back to the system's setting; what set() did is undone. */
+    public static restore(): void { emitNativeCommand("brightness.restore", "", null) }
+    /** The system's own setting, 0.0..1.0, whatever the app has set. */
+    public static system(onResult: (float)=> void): void {
+        emitNativeCommand("brightness.system", "", function(s: string): void { onResult(float(s)) })
+    }
+    /**
+     * Changes the system's setting, which outlives the app. On Android this needs the
+     * "Modify system settings" grant; without it onError says so, and
+     * requestSystemAccess() opens where the user gives it.
+     */
+    public static setSystem(level: float, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("brightness.setSystem", level, function(_: string): void { onOk() }, onError)
+    }
+    /** Whether setSystem() would be allowed right now. Always true on iOS. */
+    public static canSetSystem(onResult: (bool)=> void): void {
+        emitNativeCommand("brightness.canSetSystem", "", function(s: string): void { onResult(s == "1") })
+    }
+    /** Opens the Settings page where the user grants system access (Android). Does nothing on iOS. */
+    public static requestSystemAccess(): void { emitNativeCommand("brightness.requestSystemAccess", "", null) }
+    /** Whether the system is adjusting brightness itself ("auto") or holding the user's level ("manual"). */
+    public static mode(onResult: (string)=> void): void { emitNativeCommand("brightness.mode", "", onResult) }
     public static keepAwake(on: bool): void { emitNativeCommand("brightness.keepAwake", on, null) }
+    /** The system brightness as it changes, 0.0..1.0: the user's slider, auto-brightness in daylight. */
+    public static watch(onChange: (float)=> void): NativeSub {
+        return emitNativeStream("brightness.watch", "", function(s: string): void { onChange(float(s)) }, null)
+    }
+
+    /** The current brightness, awaited. */
+    public static async getAsync(): Task<float> { return float(await awaitCommand("brightness.get", "", false, CAP_QUICK_MS)) }
+    /** The system setting, awaited. */
+    public static async systemAsync(): Task<float> { return float(await awaitCommand("brightness.system", "", false, CAP_QUICK_MS)) }
+    /** Change the system setting, awaited. Throws without the grant. */
+    public static async setSystemAsync(level: float): Task<void> {
+        await awaitCommand("brightness.setSystem", level, true, CAP_QUICK_MS)
+        return
+    }
+    /** Whether setSystem() is allowed, awaited. */
+    public static async canSetSystemAsync(): Task<bool> {
+        const s: string = await awaitCommand("brightness.canSetSystem", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** "auto" or "manual", awaited. */
+    public static async modeAsync(): Task<string> { return await awaitCommand("brightness.mode", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Orientation ------------------------------------------------------------

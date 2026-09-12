@@ -1795,8 +1795,43 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             "haptics.vibrate" -> a.num()?.let { hapticVibrate(it.toLong()) }
             "haptics.pattern" -> hapticPattern(args)
             "torch.set" -> setTorch(args == "1")
+            // ---- brightness ------------------------------------------------------
+            // The window's brightness is the app's: it applies while the window is in
+            // front and the system's setting comes back when it is not. The system's
+            // own value is a Settings.System row, written only with WRITE_SETTINGS,
+            // which is a grant the user gives in Settings rather than a prompt.
             "brightness.set" -> a.num()?.let {
                 val lp = window.attributes; lp.screenBrightness = it.toFloat().coerceIn(0f, 1f); window.attributes = lp
+            }
+            "brightness.get" -> {
+                val o = window.attributes.screenBrightness
+                resolve(token, brightnessStr(if (o >= 0f) o.toDouble() else systemBrightness()))
+            }
+            "brightness.restore" -> { val lp = window.attributes; lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE; window.attributes = lp }
+            "brightness.system" -> resolve(token, brightnessStr(systemBrightness()))
+            "brightness.setSystem" -> {
+                val v = a.num() ?: return
+                if (!android.provider.Settings.System.canWrite(this)) { fail(token, "system brightness needs the Modify system settings grant: Brightness.requestSystemAccess() opens where the user gives it"); return }
+                try {
+                    android.provider.Settings.System.putInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+                    android.provider.Settings.System.putInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS, (v.coerceIn(0.0, 1.0) * 255).toInt())
+                    resolve(token, "")
+                } catch (e: Exception) { fail(token, "cannot set system brightness: ${e.message}") }
+            }
+            "brightness.canSetSystem" -> resolve(token, if (android.provider.Settings.System.canWrite(this)) "1" else "0")
+            "brightness.requestSystemAccess" -> try {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
+            } catch (e: Exception) {}
+            "brightness.mode" -> {
+                val m = try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE) } catch (e: Exception) { 0 }
+                resolve(token, if (m == android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC) "auto" else "manual")
+            }
+            "brightness.watch" -> {
+                val obs = object : android.database.ContentObserver(Handler(Looper.getMainLooper())) {
+                    override fun onChange(self: Boolean) { resolve(token, brightnessStr(systemBrightness())) }
+                }
+                contentResolver.registerContentObserver(android.provider.Settings.System.getUriFor(android.provider.Settings.System.SCREEN_BRIGHTNESS), false, obs)
+                streamTeardown[token] = { contentResolver.unregisterContentObserver(obs) }
             }
             "brightness.keepAwake" ->
                 if (args == "1") window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -2303,6 +2338,14 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         persistState()
     }
     private fun clipboard() = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    // The system setting as 0.0..1.0. Stored as 0..255 (some devices 0..4095, which
+    // the framework maps; the setting itself is 0..255 on every device we target).
+    // Three decimals, as iOS answers, so a level reads the same on both.
+    private fun brightnessStr(v: Double) = String.format(java.util.Locale.US, "%.3f", v)
+    private fun systemBrightness(): Double {
+        val v = try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) } catch (e: Exception) { 128 }
+        return (v / 255.0).coerceIn(0.0, 1.0)
+    }
 
     private fun fireHaptic(style: String) {
         val v = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return

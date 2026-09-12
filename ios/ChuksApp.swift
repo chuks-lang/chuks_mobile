@@ -2920,6 +2920,31 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var locHeadings: [String: LocHeading] = [:]   // live compass streams, keyed by token
     var contactPickers: [String: NSObject] = [:]   // picker delegates alive while presented
     var calendarEditors: [String: ChuksEventEditDelegate] = [:]   // system add-event forms alive while presented
+    var brightnessWatchers = Set<String>()
+    var appBrightness: CGFloat? = nil      // the level set() asked for, nil when the app has not set one
+    // Wait for the asynchronous brightness write to land, polling the getter; give up
+    // (and carry on) after `tries` x 50 ms so a device that never reports it does not hang a token.
+    private func brightnessSettle(_ target: CGFloat, tries: Int, _ done: @escaping () -> Void) {
+        if abs(UIScreen.main.brightness - target) < 0.005 || tries <= 0 { done(); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.brightnessSettle(target, tries: tries - 1, done) }
+    }
+    var userBrightness: CGFloat? = nil     // the user's level before the first set(), put back on the way out
+    private var brightnessScoped = false
+    private func installBrightnessScoping() {
+        if brightnessScoped { return }
+        brightnessScoped = true
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.appBrightness != nil, let u = self.userBrightness else { return }
+            UIScreen.main.brightness = u
+        }
+        NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, let b = self.appBrightness else { return }
+            // The user may have moved the slider while away: that is the new level to
+            // put back later.
+            self.userBrightness = UIScreen.main.brightness
+            UIScreen.main.brightness = b
+        }
+    }
     var calendarStores: [String: EKEventStore] = [:]   // one store per calendar.watch, kept so EKEventStoreChanged is posted
     // Calendar access, asked for on first use the way iOS's own apps do. The store is
     // handed to the work once access is there; a refusal fails the token.
@@ -3948,7 +3973,50 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "haptics.vibrate": if let ms = a.int() { hapticBuzz(ms) }
         case "haptics.pattern": hapticPattern(args)
         case "torch.set": setTorch(args == "1")
-        case "brightness.set": if let v = a.num() { UIScreen.main.brightness = CGFloat(max(0, min(1, v))) }
+        // ---- brightness ------------------------------------------------------------
+        // iOS has one brightness, and a change an app makes outlives it until the
+        // device locks. The app's level is scoped here: the user's level is saved at
+        // the first set and put back when the app goes to the background or calls
+        // restore, and the app's level comes back with the app.
+        //
+        // A write to UIScreen.brightness is applied asynchronously: the getter keeps
+        // answering the old value for a few hundred milliseconds (measured on an
+        // iPhone 12 Pro, iOS 18). So get answers the level the app asked for while one
+        // is set, and setSystem resolves once the screen reports the new value.
+        case "brightness.set":
+            if let v = a.num() {
+                if appBrightness == nil { userBrightness = UIScreen.main.brightness; installBrightnessScoping() }
+                appBrightness = CGFloat(max(0, min(1, v)))
+                UIScreen.main.brightness = appBrightness!
+            }
+        case "brightness.get": resolve(token, String(format: "%.3f", Double(appBrightness ?? UIScreen.main.brightness)))
+        case "brightness.restore":
+            if let u = userBrightness { UIScreen.main.brightness = u }
+            appBrightness = nil; userBrightness = nil
+        case "brightness.system": resolve(token, String(format: "%.3f", Double(userBrightness ?? UIScreen.main.brightness)))
+        case "brightness.setSystem":
+            // The system level IS the screen's level here. Setting it while the app's
+            // level is scoped changes what restore puts back.
+            if let v = a.num() {
+                let lv = CGFloat(max(0, min(1, v)))
+                if appBrightness != nil { userBrightness = lv; resolve(token, ""); break }
+                UIScreen.main.brightness = lv
+                brightnessSettle(lv, tries: 20) { [weak self] in
+                    self?.resolve(token, "")
+                    for t in self?.brightnessWatchers ?? [] { self?.resolve(t, String(format: "%.3f", Double(lv))) }
+                }
+            }
+        case "brightness.canSetSystem": resolve(token, "1")
+        case "brightness.requestSystemAccess": break
+        case "brightness.mode": resolve(token, "manual")   // iOS does not expose auto-brightness to apps
+        case "brightness.watch":
+            // The notification covers changes made outside the app (the slider, auto
+            // brightness); the app's own system writes are reported by setSystem.
+            brightnessWatchers.insert(token)
+            let o = NotificationCenter.default.addObserver(forName: UIScreen.brightnessDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.resolve(token, String(format: "%.3f", Double(UIScreen.main.brightness)))
+            }
+            streamTeardown[token] = { [weak self] in NotificationCenter.default.removeObserver(o); self?.brightnessWatchers.remove(token) }
         case "brightness.keepAwake": UIApplication.shared.isIdleTimerDisabled = (args == "1")
         case "orientation.watch":
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()

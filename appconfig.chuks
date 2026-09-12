@@ -562,7 +562,7 @@ var HAS_BG_TASKS: bool = false
 // service needs permissions no ordinary location read does.
 var HAS_BG_LOCATION: bool = false
 
-const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "exactAlarms", "bluetooth", "nfc", "activity", "bodySensors", "health"]
+const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "exactAlarms", "systemBrightness", "bluetooth", "nfc", "activity", "bodySensors", "health"]
 
 // permission kind -> iOS Info.plist usage-description key(s)
 function iosKeysFor(kind: string): []string {
@@ -636,6 +636,8 @@ function androidPermsFor(kind: string): []string {
     // Exact alarms are a separate, user-visible permission from Android 12. Without
     // it a scheduled notification is inexact and Doze may hold it for minutes.
     if (kind == "exactAlarms") { return ["SCHEDULE_EXACT_ALARM"] }
+    // Brightness.setSystem: a special grant the user gives in Settings, not a prompt.
+    if (kind == "systemBrightness") { return ["WRITE_SETTINGS"] }
     if (kind == "bluetooth") { return ["BLUETOOTH_SCAN", "BLUETOOTH_CONNECT"] }
     if (kind == "nfc") { return ["NFC"] }
     if (kind == "activity") { return ["ACTIVITY_RECOGNITION"] }   // step counter, API 29+
