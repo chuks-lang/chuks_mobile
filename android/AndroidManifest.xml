@@ -38,5 +38,12 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+        <!-- Files handed to other apps (the clipboard, the share sheet) go through this
+             provider, which serves one cache directory by content URI. The authority is
+             the app id, filled by the build, so two Chuks apps can be installed together. -->
+        <provider android:name=".ChuksFileProvider"
+                  android:authorities="__APP_ID__.files"
+                  android:exported="false"
+                  android:grantUriPermissions="true" />
     </application>
 </manifest>

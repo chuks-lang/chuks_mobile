@@ -1754,10 +1754,33 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             // is recorded rather than applied; it exists so the capability answers on
             // both platforms instead of failing on one.
             "appearance.set" -> appAppearance = args
+            // ---- clipboard: see ChuksClipboard.kt ------------------------------
             "clipboard.set" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
             "clipboard.get" -> {
                 val t = clipboard().primaryClip?.let { if (it.itemCount > 0) it.getItemAt(0).coerceToText(this).toString() else "" } ?: ""
                 resolve(token, t)
+            }
+            "clipboard.setUrl" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
+            "clipboard.setImage" -> ChuksClipboard.setImage(this, clipboard(), args).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "clipboard.getImage" -> {
+                val r = try { ChuksClipboard.getImage(this, clipboard()) } catch (e: Exception) { fail(token, "cannot read the image: ${e.message}"); return }
+                resolve(token, r)
+            }
+            "clipboard.has" -> resolve(token, if (ChuksClipboard.kinds(this, clipboard()).split(",").contains(args)) "1" else "0")
+            "clipboard.clear" -> ChuksClipboard.clear(clipboard())
+            "clipboard.watch" -> {
+                val cm = clipboard()
+                // Recent Android delivers the listener twice for one setPrimaryClip; the
+                // description's timestamp tells the two apart, so one change is one event.
+                var seen = -1L
+                val l = ClipboardManager.OnPrimaryClipChangedListener {
+                    val ts = if (android.os.Build.VERSION.SDK_INT >= 26) (cm.primaryClipDescription?.timestamp ?: 0L) else System.currentTimeMillis()
+                    if (ts == seen) return@OnPrimaryClipChangedListener
+                    seen = ts
+                    resolve(token, ChuksClipboard.kinds(this, cm))
+                }
+                cm.addPrimaryClipChangedListener(l)
+                streamTeardown[token] = { cm.removePrimaryClipChangedListener(l) }
             }
             "linking.open" -> try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(args))) } catch (_: Exception) {}
             "linking.canOpen" -> {

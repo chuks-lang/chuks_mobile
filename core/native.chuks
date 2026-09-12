@@ -24,13 +24,59 @@ const CAP_PROMPT_MS: int = 300000
 
 // The system pasteboard. set() copies text and returns at once; get() reads it, and is
 // async because the OS defers a pasteboard read. iOS shows the user a banner when an
-// app reads the pasteboard, so read on an explicit action rather than on mount.
+// app READS the pasteboard, so read on an explicit action rather than on mount; has()
+// asks what is there without reading it and shows nothing, which is how a Paste button
+// knows whether to be enabled.
 export class Clipboard {
     public static set(text: string): void { emitNativeCommand("clipboard.set", text, null) }
     public static get(onResult: (string)=> void): void { emitNativeCommand("clipboard.get", "", onResult) }
+    /**
+     * Copies a URL so that apps that take URLs (a browser, a mail client) see one, and
+     * apps that take text see its text.
+     */
+    public static setUrl(url: string): void { emitNativeCommand("clipboard.setUrl", url, null) }
+    /** Copies an image from a file: a "file://" path, an absolute one, or one under the app's documents. */
+    public static setImage(path: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("clipboard.setImage", path, function(_: string): void { onOk() }, onError)
+    }
+    /**
+     * The image on the clipboard as a "file://" path to a JPEG in the app's cache, or ""
+     * when there is none. Feed it to an Image.
+     */
+    public static getImage(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("clipboard.getImage", "", onResult, onError)
+    }
+    /**
+     * Whether the clipboard holds a `kind`: "text", "url" or "image". Answered from the
+     * clipboard's description, without reading it: no banner on iOS, nothing pasted.
+     */
+    public static has(kind: string, onResult: (bool)=> void): void {
+        emitNativeCommand("clipboard.has", kind, function(s: string): void { onResult(s == "1") })
+    }
+    public static clear(): void { emitNativeCommand("clipboard.clear", "", null) }
+    /**
+     * Fires when the clipboard changes while the app is in front, with the kinds now on
+     * it as a comma-separated string ("text,url", "image", or "" when empty). What is
+     * copied while the app is in the background arrives as one event when it returns.
+     */
+    public static watch(onChange: (string)=> void): NativeSub {
+        return emitNativeStream("clipboard.watch", "", onChange, null)
+    }
 
     /** The clipboard's text, awaited. Await it inside an async function, not in a handler. */
     public static async getAsync(): Task<string> { return await awaitCommand("clipboard.get", "", false, CAP_QUICK_MS) }
+    /** The clipboard's image as a file path, awaited; "" when there is none. */
+    public static async getImageAsync(): Task<string> { return await awaitCommand("clipboard.getImage", "", true, CAP_QUICK_MS) }
+    /** Copy an image, awaited. Throws when the file is not an image. */
+    public static async setImageAsync(path: string): Task<void> {
+        await awaitCommand("clipboard.setImage", path, true, CAP_QUICK_MS)
+        return
+    }
+    /** Whether the clipboard holds a kind, awaited. */
+    public static async hasAsync(kind: string): Task<bool> {
+        const s: string = await awaitCommand("clipboard.has", kind, false, CAP_QUICK_MS)
+        return s == "1"
+    }
 }
 
 // ---- Linking ----------------------------------------------------------------

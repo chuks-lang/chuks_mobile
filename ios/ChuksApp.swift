@@ -58,6 +58,7 @@ import Contacts
 import ContactsUI
 import EventKit
 import EventKitUI
+import UniformTypeIdentifiers
 import LocalAuthentication
 import Security
 import Network
@@ -940,6 +941,19 @@ final class LocHeading: NSObject, CLLocationManagerDelegate {
         if (e as? CLError)?.code == .locationUnknown { return }
         onErr(e.localizedDescription)
     }
+}
+
+// ---- clipboard -----------------------------------------------------------------
+// The kinds on the pasteboard, "text,url,image" in that order, read from its types
+// alone (no banner). A URL copied from a browser has a URL type; a URL typed as text
+// is text only, as on Android where a text that parses as http(s) counts as a URL.
+func chuksClipboardKinds() -> String {
+    let p = UIPasteboard.general
+    var kinds: [String] = []
+    if p.hasStrings { kinds.append("text") }
+    if p.hasURLs { kinds.append("url") }
+    if p.hasImages { kinds.append("image") }
+    return kinds.joined(separator: ",")
 }
 
 // ---- calendar ------------------------------------------------------------------
@@ -3890,8 +3904,39 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // longer matches, which is why this only has to ask for a layout. Next runloop
             // turn, so the trait set just above has actually propagated.
             DispatchQueue.main.async { [weak self] in self?.relayout() }
+        // ---- clipboard ---------------------------------------------------------------
+        // has* answers from the pasteboard's item types and shows no banner; reading
+        // .string or .image is what iOS announces to the user.
         case "clipboard.set": UIPasteboard.general.string = args
         case "clipboard.get": resolve(token, UIPasteboard.general.string ?? "")
+        case "clipboard.setUrl":
+            if let u = URL(string: args) { UIPasteboard.general.items = [[UTType.url.identifier: u, UTType.utf8PlainText.identifier: args]] }
+            else { UIPasteboard.general.string = args }
+        case "clipboard.setImage":
+            guard let img = UIImage(contentsOfFile: fsURL(args).path) else { fail(token, "not an image: \(args)"); break }
+            UIPasteboard.general.image = img
+            resolve(token, "")
+        case "clipboard.getImage":
+            guard let img = UIPasteboard.general.image, let data = img.jpegData(compressionQuality: 0.92) else { resolve(token, ""); break }
+            let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("clipboard-\(UIPasteboard.general.changeCount).jpg")
+            do { try data.write(to: url); resolve(token, "file://" + url.path) }
+            catch { fail(token, "cannot write the image: \(error.localizedDescription)") }
+        case "clipboard.has":
+            resolve(token, chuksClipboardKinds().split(separator: ",").contains(Substring(args)) ? "1" : "0")
+        case "clipboard.clear": UIPasteboard.general.items = []
+        case "clipboard.watch":
+            // changedNotification fires for changes while the app is active; a change made
+            // in another app shows as a new changeCount when this one comes back.
+            var seen = UIPasteboard.general.changeCount
+            let report: () -> Void = { [weak self] in
+                let n = UIPasteboard.general.changeCount
+                if n == seen { return }
+                seen = n
+                self?.resolve(token, chuksClipboardKinds())
+            }
+            let o1 = NotificationCenter.default.addObserver(forName: UIPasteboard.changedNotification, object: nil, queue: .main) { _ in report() }
+            let o2 = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in report() }
+            streamTeardown[token] = { NotificationCenter.default.removeObserver(o1); NotificationCenter.default.removeObserver(o2) }
         case "linking.open":
             if let u = URL(string: args) { UIApplication.shared.open(u) }
         case "linking.canOpen":

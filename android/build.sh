@@ -168,6 +168,8 @@ SPV
         echo "   launch assets compiled"
     fi
 fi
+# The file provider's authority must be unique per installed app: the app id.
+sed -i '' "s#__APP_ID__#$APPID#g" "$OUT/AndroidManifest.xml"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
     $RESZIP --rename-manifest-package "$APPID" \
     --min-sdk-version 24 --target-sdk-version 34
