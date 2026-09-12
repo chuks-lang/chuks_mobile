@@ -1079,7 +1079,24 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     override fun requestPermission(token: String, permissions: Array<String>) {
         val code = ++permSeq
         pendingPerms[code] = token
-        requestPermissions(permissions, code)
+        enqueuePermissionRequest(permissions, code)
+    }
+    // Android answers an in-flight requestPermissions with an EMPTY result the moment a
+    // second one is made, which reads as "denied" for a prompt the user never saw. So
+    // requests go one at a time: the next is made when the current one is answered. A
+    // request for something the first dialog already granted is answered by the system
+    // without a dialog, so the queue drains at the speed of the user's taps.
+    private val permQueue = ArrayDeque<Pair<Array<String>, Int>>()
+    private var permInFlight = false
+    private fun enqueuePermissionRequest(permissions: Array<String>, code: Int) {
+        permQueue.addLast(Pair(permissions, code))
+        pumpPermissionQueue()
+    }
+    private fun pumpPermissionQueue() {
+        if (permInFlight) return
+        val next = permQueue.removeFirstOrNull() ?: return
+        permInFlight = true
+        requestPermissions(next.first, next.second)
     }
 
     // Capabilities installed packages provide, consulted for any command the framework's
@@ -1233,45 +1250,46 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 streamTeardown[token] = { try { cm.unregisterNetworkCallback(cb) } catch (e: Exception) {} }
                 emitNetwork(token, cm)
             }
-            "location.once" -> {
-                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+            // ---- location: see ChuksGeo.kt ----------------------------------------
+            "location.once" -> withLocationPerm(token) {
                 val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-                val provider = bestLocationProvider(lm)
-                if (provider == null) { fail(token, "location unavailable"); return }
+                val provider = ChuksGeo.provider(lm, args)
+                if (provider == null) { fail(token, "location unavailable"); return@withLocationPerm }
                 try {
-                    val last = lm.getLastKnownLocation(provider)
-                    if (last != null) { resolve(token, locFixStr(last)) }
-                    else {
-                        // No cached fix: take one live update, then release the listener.
-                        val listener = object : android.location.LocationListener {
-                            override fun onLocationChanged(l: android.location.Location) { resolve(token, locFixStr(l)); lm.removeUpdates(this) }
-                            override fun onProviderDisabled(p: String) {}
-                            override fun onProviderEnabled(p: String) {}
-                            @Deprecated("kept for older API levels") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
-                        }
-                        lm.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
-                    }
+                    ChuksGeo.current(lm, provider, args) { l -> if (l != null) resolve(token, ChuksGeo.fixString(l)) else fail(token, "location unavailable") }
                 } catch (e: SecurityException) { fail(token, "location permission denied") }
             }
-            "location.watch" -> {
-                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+            "location.lastKnown" -> {
+                if (!hasLocationPerm()) { resolve(token, ""); return }
                 val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-                val provider = bestLocationProvider(lm)
-                if (provider == null) { fail(token, "location unavailable"); return }
+                val l = ChuksGeo.lastKnown(lm, (a.num("maxAge") ?: 0.0).toLong(), (a.num("maxAcc") ?: 0.0).toFloat())
+                resolve(token, if (l != null) ChuksGeo.fixString(l) else "")
+            }
+            "location.enabled" -> resolve(token, if (ChuksGeo.enabled(getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager)) "1" else "0")
+            "location.heading" -> {
+                val h = ChuksGeo.Heading(this) { s -> resolve(token, s) }
+                val err = h.start(getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager)
+                if (err != null) { fail(token, err); return }
+                streamTeardown[token] = { h.stop() }
+            }
+            "location.geocode" -> ChuksGeo.geocode(this, args, { runOnUiThread(it) }) { rows, msg -> if (msg == null) resolve(token, rows) else fail(token, msg) }
+            "location.reverseGeocode" -> ChuksGeo.reverseGeocode(this, a.num("lat") ?: 0.0, a.num("lng") ?: 0.0, { runOnUiThread(it) }) { rows, msg -> if (msg == null) resolve(token, rows) else fail(token, msg) }
+            "location.watch" -> withLocationPerm(token) {
+                val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+                val provider = ChuksGeo.provider(lm, a.s("acc"))
+                if (provider == null) { fail(token, "location unavailable"); return@withLocationPerm }
                 val listener = object : android.location.LocationListener {
-                    override fun onLocationChanged(l: android.location.Location) { resolve(token, locFixStr(l)) }
+                    override fun onLocationChanged(l: android.location.Location) { resolve(token, ChuksGeo.fixString(l)) }
                     override fun onProviderDisabled(p: String) {}
                     override fun onProviderEnabled(p: String) {}
                     @Deprecated("kept for older API levels") override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {}
                 }
                 try {
-                    lm.getLastKnownLocation(provider)?.let { resolve(token, locFixStr(it)) }   // immediate value
-                    lm.requestLocationUpdates(provider, 1000L, 0f, listener, Looper.getMainLooper())
+                    ChuksGeo.requestUpdates(lm, provider, a.s("acc"), (a.num("dist") ?: 0.0).toFloat(), (a.num("interval") ?: 1000.0).toLong(), listener)
                     streamTeardown[token] = { try { lm.removeUpdates(listener) } catch (e: Exception) {} }
                 } catch (e: SecurityException) { fail(token, "location permission denied") }
             }
-            "location.watchBackground" -> {
-                if (!hasLocationPerm()) { fail(token, "location permission denied"); return }
+            "location.watchBackground" -> withLocationPerm(token) {
                 // A foreground service started while the app is on screen keeps the
                 // "while in use" grant with the screen off, so this needs no separate
                 // ACCESS_BACKGROUND_LOCATION prompt.
@@ -1282,12 +1300,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val svc = Intent(this, ChuksLocationService::class.java)
                 svc.putExtra("title", title)
                 svc.putExtra("body", body)
+                svc.putExtra("acc", a.s("acc")); svc.putExtra("dist", (a.num("dist") ?: 0.0).toFloat()); svc.putExtra("interval", (a.num("interval") ?: 1000.0).toLong())
                 try {
                     startForegroundService(svc)
                 } catch (e: Throwable) {
                     ChuksLocation.deliver = null
                     fail(token, "background location unavailable: " + (e.message ?: e.toString()))
-                    return
+                    return@withLocationPerm
                 }
                 streamTeardown[token] = {
                     ChuksLocation.deliver = null
@@ -1544,7 +1563,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     val code = ++permSeq
                     pendingPerms[code] = token       // resolved in onRequestPermissionsResult
                     // calendar needs both read + write; the rest are a single permission
-                    requestPermissions(if (args == "calendar") arrayOf(p, Manifest.permission.WRITE_CALENDAR) else arrayOf(p), code)
+                    enqueuePermissionRequest(if (args == "calendar") arrayOf(p, Manifest.permission.WRITE_CALENDAR) else arrayOf(p), code)
                 }
             }
             // ---- files: see ChuksFiles.kt. A null message is success. ----------
@@ -1823,9 +1842,20 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     }
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(code, permissions, grantResults)
-        val token = pendingPerms.remove(code) ?: return
+        permInFlight = false
         val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-        resolve(token, if (granted) "granted" else "denied")
+        pendingPermActions.remove(code)?.let { it(granted) } ?: pendingPerms.remove(code)?.let { resolve(it, if (granted) "granted" else "denied") }
+        pumpPermissionQueue()
+    }
+    // A capability that needs a permission it does not have yet asks for it and carries
+    // on when the answer comes, the way iOS's CLLocationManager does: a location read
+    // made before the app asked is the prompt, not a failure. A denial fails the token.
+    private val pendingPermActions = mutableMapOf<Int, (Boolean) -> Unit>()
+    private fun withLocationPerm(token: String, run: () -> Unit) {
+        if (hasLocationPerm()) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "location permission denied") }
+        enqueuePermissionRequest(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), code)
     }
 
     // Deep links (F3): the URL that launched (or re-opened) the app, delivered to any
@@ -1864,15 +1894,6 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private fun hasLocationPerm(): Boolean =
         checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
         checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-    private fun bestLocationProvider(lm: android.location.LocationManager): String? = when {
-        lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) -> android.location.LocationManager.GPS_PROVIDER
-        lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER) -> android.location.LocationManager.NETWORK_PROVIDER
-        else -> null
-    }
-    // "lat,lng,accuracy,altitude,speed,heading" — matches the iOS payload shape.
-    private fun locFixStr(l: android.location.Location): String =
-        "${l.latitude},${l.longitude},${l.accuracy},${l.altitude},${l.speed},${l.bearing}"
-
     // Motion (F3): stream a sensor's first three axes as "x,y,z" at ~20Hz until cancelled.
     private fun startSensor(token: String, type: Int) {
         val sm = getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager

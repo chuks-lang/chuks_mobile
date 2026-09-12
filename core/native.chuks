@@ -148,20 +148,47 @@ export dataType TrackingNotice {
     body: string,       // Android notification text, e.g. "Tap to return"
 }
 
-// Where the device is, from CoreLocation (iOS) / LocationManager (Android). once() reads
-// a single fix; watch() streams them while the app is on screen; watchBackground() keeps
-// streaming when it is not, and takes the TrackingNotice the user is shown while it runs.
-// Needs the "location" permission. A background stream is the one capability a user will
-// notice in their battery settings, so cancel it the moment the work is done.
+// Where the device is, from CoreLocation (iOS) / LocationManager (Android).
+//
+// A fix is "lat,lng,accuracyM,altitudeM,speedMps,headingDeg,timestampMs". Accuracy is
+// the radius in metres the true position is within; speed and heading are -1 when the
+// platform has no estimate (standing still, first fix).
+//
+// Every read takes an accuracy, and the accuracy is the cost: "lowest" (about 3 km,
+// cell towers, nearly free), "low" (about 1 km), "balanced" (about 100 m, the right
+// default for "which city am I in" and a map's first paint), "high" (about 10 m, GPS),
+// "highest" (the best the hardware can do), "navigation" (highest plus the extra
+// sensor work turn-by-turn needs; plugged-in use). A watch also takes a distance
+// filter, in metres, below which a move is not reported, and a minimum interval.
+//
+// once() reads a single fix; lastKnown() answers instantly from the OS cache, or empty;
+// watch() streams while the app is on screen; watchBackground() keeps streaming when it
+// is not, and takes the TrackingNotice the user is shown while it runs. Needs the
+// "location" permission. A background stream is the one capability a user will notice
+// in their battery settings, so cancel it the moment the work is done.
 export class Location {
-    public static once(onResult: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("location.once", "", onResult, onError)
+    public static once(onResult: (string)=> void, onError: (string)=> void, accuracy: string = "balanced"): void {
+        emitNativeCommandE("location.once", accuracy, onResult, onError)
+    }
+    // The OS's cached fix, instantly and for free, or "" when there is none or it is
+    // older than `maxAgeMs` or coarser than `maxAccuracyM` (0 for either means any).
+    // The right first paint for a map: draw this, then refine with once() or watch().
+    public static lastKnown(onResult: (string)=> void, maxAgeMs: int = 0, maxAccuracyM: float = 0): void {
+        emitNativeCommand("location.lastKnown", { maxAge: maxAgeMs, maxAcc: maxAccuracyM }, onResult)
+    }
+    // Whether location services are on at all, device-wide. Off means every read fails
+    // whatever the app's permission says; the fix is the user turning them on in Settings.
+    public static enabled(onResult: (bool)=> void): void {
+        emitNativeCommand("location.enabled", "", function(s: string): void { onResult(s == "1") })
     }
     /**
      * Location updates while your app is on screen. Stops when the app is backgrounded.
+     * `distanceM` is the move below which nothing is reported; `intervalMs` the fastest
+     * the platform is asked to deliver.
      */
-    public static watch(onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
-        return emitNativeStream("location.watch", "", onUpdate, onError)
+    public static watch(onUpdate: (string)=> void, onError: (string)=> void,
+                        accuracy: string = "navigation", distanceM: float = 0, intervalMs: int = 1000): NativeSub {
+        return emitNativeStream("location.watch", { acc: accuracy, dist: distanceM, interval: intervalMs }, onUpdate, onError)
     }
     /**
      * Location updates that keep arriving with the screen off and the phone pocketed.
@@ -184,12 +211,58 @@ export class Location {
      * sub.cancel()
      * ```
      */
-    public static watchBackground(notice: TrackingNotice, onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
-        return emitNativeStream("location.watchBackground", { title: notice.title, body: notice.body }, onUpdate, onError)
+    public static watchBackground(notice: TrackingNotice, onUpdate: (string)=> void, onError: (string)=> void,
+                                  accuracy: string = "navigation", distanceM: float = 0, intervalMs: int = 1000): NativeSub {
+        return emitNativeStream("location.watchBackground",
+            { title: notice.title, body: notice.body, acc: accuracy, dist: distanceM, interval: intervalMs }, onUpdate, onError)
+    }
+    /**
+     * The compass: "trueHeadingDeg,magneticHeadingDeg,accuracy", a few times a second as
+     * the device turns. True heading is -1 until a location fix lets the platform correct
+     * for magnetic declination. Accuracy is 3 (high), 2, 1 or 0 (uncalibrated: wave the
+     * phone in a figure of eight). Fails where there is no magnetometer.
+     */
+    public static watchHeading(onUpdate: (string)=> void, onError: (string)=> void): NativeSub {
+        return emitNativeStream("location.heading", "", onUpdate, onError)
+    }
+    /**
+     * An address to coordinates: one "lat,lng" per line, best match first, empty when
+     * nothing matched. Goes to the platform's geocoding service, so it needs the network
+     * and is rate limited: geocode what the user typed, not every row of a list.
+     */
+    public static geocode(address: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("location.geocode", address, onResult, onError)
+    }
+    /**
+     * Coordinates to an address: one match per line, each
+     * "name\tstreet\tcity\tregion\tpostalCode\tcountry\tisoCountryCode", fields empty
+     * where the platform has nothing. Same service and limits as geocode().
+     */
+    public static reverseGeocode(lat: float, lng: float, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("location.reverseGeocode", { lat: lat, lng: lng }, onResult, onError)
     }
 
     /** One fix, awaited. Throws the host's message if location is off or denied. */
-    public static async onceAsync(): Task<string> { return await awaitCommand("location.once", "", true, CAP_HARDWARE_MS) }
+    public static async onceAsync(accuracy: string = "balanced"): Task<string> {
+        return await awaitCommand("location.once", accuracy, true, CAP_HARDWARE_MS)
+    }
+    /** The cached fix, awaited; "" when there is none that qualifies. */
+    public static async lastKnownAsync(maxAgeMs: int = 0, maxAccuracyM: float = 0): Task<string> {
+        return await awaitCommand("location.lastKnown", { maxAge: maxAgeMs, maxAcc: maxAccuracyM }, false, CAP_QUICK_MS)
+    }
+    /** Whether location services are on, awaited. */
+    public static async enabledAsync(): Task<bool> {
+        const s: string = await awaitCommand("location.enabled", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** Address to coordinates, awaited. Throws when the service is unreachable. */
+    public static async geocodeAsync(address: string): Task<string> {
+        return await awaitCommand("location.geocode", address, true, CAP_HARDWARE_MS)
+    }
+    /** Coordinates to an address, awaited. Throws when the service is unreachable. */
+    public static async reverseGeocodeAsync(lat: float, lng: float): Task<string> {
+        return await awaitCommand("location.reverseGeocode", { lat: lat, lng: lng }, true, CAP_HARDWARE_MS)
+    }
 }
 
 // ---- Media picker + camera --------------------------------------------------

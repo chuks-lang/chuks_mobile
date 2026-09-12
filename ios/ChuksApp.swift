@@ -877,6 +877,69 @@ func unAuthStr(_ s: UNAuthorizationStatus) -> String {
     switch s { case .authorized, .provisional, .ephemeral: return "granted"; case .denied: return "denied"; default: return "undetermined" }
 }
 
+// "lat,lng,accuracyM,altitudeM,speedMps,headingDeg,timestampMs": the one fix shape both
+// platforms produce, for once, lastKnown, watch and watchBackground alike.
+func chuksFixString(_ l: CLLocation) -> String {
+    let c = l.coordinate
+    return "\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course),\(Int64(l.timestamp.timeIntervalSince1970 * 1000))"
+}
+// The app's accuracy names, mapped the way expo-location maps them, so the same word
+// costs the same battery on both platforms. Unknown names answer nil and the caller
+// keeps its default.
+func chuksLocAccuracy(_ name: String) -> CLLocationAccuracy? {
+    switch name {
+    case "lowest": return kCLLocationAccuracyThreeKilometers
+    case "low": return kCLLocationAccuracyKilometer
+    case "balanced": return kCLLocationAccuracyHundredMeters
+    case "high": return kCLLocationAccuracyNearestTenMeters
+    case "highest": return kCLLocationAccuracyBest
+    case "navigation": return kCLLocationAccuracyBestForNavigation
+    default: return nil
+    }
+}
+// CLHeading's accuracy is degrees of error (negative: invalid); Android's is a 0..3
+// sensor grade. Both platforms answer the grade, cut the way expo-location cuts it.
+func chuksHeadingGrade(_ degrees: CLLocationDirection) -> Int {
+    if degrees > 50 || degrees < 0 { return 0 }
+    if degrees > 35 { return 1 }
+    if degrees > 20 { return 2 }
+    return 3
+}
+
+// The compass. A CLLocationManager of its own so the heading filter and the location
+// manager's accuracy never fight; trueHeading needs a location fix, so the manager is
+// also started for location at the cheapest class, or trueHeading stays -1.
+final class LocHeading: NSObject, CLLocationManagerDelegate {
+    private let mgr = CLLocationManager()
+    private let onHeading: (String) -> Void
+    private let onErr: (String) -> Void
+    init(onHeading: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
+        self.onHeading = onHeading; self.onErr = onErr
+        super.init(); mgr.delegate = self
+        mgr.headingFilter = 1   // degrees; below this a turn is not reported
+        mgr.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+    }
+    func start() {
+        guard CLLocationManager.headingAvailable() else { onErr("no compass on this device"); return }
+        mgr.startUpdatingHeading()
+        if mgr.authorizationStatus == .authorizedWhenInUse || mgr.authorizationStatus == .authorizedAlways { mgr.startUpdatingLocation() }
+    }
+    func stop() { mgr.stopUpdatingHeading(); mgr.stopUpdatingLocation() }
+    // Permission granted after the watch began: start the location feed now, so
+    // trueHeading stops being -1 from here on.
+    func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+        if m.authorizationStatus == .authorizedWhenInUse || m.authorizationStatus == .authorizedAlways { m.startUpdatingLocation() }
+    }
+    func locationManager(_ m: CLLocationManager, didUpdateHeading h: CLHeading) {
+        onHeading("\(h.trueHeading),\(h.magneticHeading),\(chuksHeadingGrade(h.headingAccuracy))")
+    }
+    func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {}
+    func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
+        if (e as? CLError)?.code == .locationUnknown { return }
+        onErr(e.localizedDescription)
+    }
+}
+
 // Location permission needs a CLLocationManager delegate (result via callback).
 final class LocPerm: NSObject, CLLocationManagerDelegate {
     private let mgr = CLLocationManager()
@@ -903,7 +966,8 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     private let onFix: (String) -> Void
     private let onErr: (String) -> Void
     private var pending = false   // waiting on the authorization decision to begin
-    init(once: Bool, background: Bool = false, onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
+    init(once: Bool, background: Bool = false, accuracy: String = "", distance: Double = 0,
+         onFix: @escaping (String) -> Void, onErr: @escaping (String) -> Void) {
         self.once = once; self.onFix = onFix; self.onErr = onErr
         super.init(); mgr.delegate = self
         if background {
@@ -930,7 +994,11 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
         // tunes its filtering for a person on foot, and auto-pause OFF (iOS otherwise
         // stops updates when it decides you have stopped, silently losing the middle of
         // a walk). `once` callers get a single fix, so they keep the cheaper class.
-        mgr.desiredAccuracy = once ? kCLLocationAccuracyBest : kCLLocationAccuracyBestForNavigation
+        // The accuracy names are the app's; the empty default keeps what each kind of
+        // read has always had. The distance filter is what makes a watch quiet while the
+        // user sits still: kCLDistanceFilterNone (0) reports every fix.
+        mgr.desiredAccuracy = chuksLocAccuracy(accuracy) ?? (once ? kCLLocationAccuracyHundredMeters : kCLLocationAccuracyBestForNavigation)
+        mgr.distanceFilter = distance > 0 ? distance : kCLDistanceFilterNone
         if !once {
             mgr.activityType = .fitness
             mgr.pausesLocationUpdatesAutomatically = false
@@ -967,7 +1035,7 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
             if l.horizontalAccuracy < 0 { continue }
             if now.timeIntervalSince(l.timestamp) > 5 { continue }
             let c = l.coordinate
-            onFix("\(c.latitude),\(c.longitude),\(l.horizontalAccuracy),\(l.altitude),\(l.speed),\(l.course)")
+            onFix(chuksFixString(l))
             delivered = true
         }
         if once && delivered { m.stopUpdatingLocation() }
@@ -2746,6 +2814,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var streamTeardown: [String: () -> Void] = [:]   // real OS streams: unregister closure, run on __cancel__
     var orientationTokens = Set<String>()   // orientation.watch tokens, so a lock can re-emit the new value
     var locFixes: [String: LocFix] = [:]    // live Location managers, keyed by token (once + watch)
+    var locHeadings: [String: LocHeading] = [:]   // live compass streams, keyed by token
     let motion = CMMotionManager()          // one shared motion manager; sensors fan out to token sets
     var accelTokens = Set<String>()
     var gyroTokens = Set<String>()
@@ -2949,10 +3018,52 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             resolve(token, "1")
             #endif
         case "location.once":
-            let fix = LocFix(once: true,
+            let fix = LocFix(once: true, accuracy: args,
                 onFix: { [weak self] s in self?.resolve(token, s); self?.locFixes[token] = nil },
                 onErr: { [weak self] m in self?.fail(token, m); self?.locFixes[token] = nil })
             locFixes[token] = fix; fix.start()
+        case "location.lastKnown":
+            // The manager's cached fix costs nothing and needs no start. A fix older
+            // than maxAge or coarser than maxAcc is not an answer; neither is one from
+            // before permission was granted (there is none then).
+            let maxAge = a.num("maxAge") ?? 0, maxAcc = a.num("maxAcc") ?? 0
+            if let l = CLLocationManager().location, l.horizontalAccuracy >= 0,
+               maxAge <= 0 || Date().timeIntervalSince(l.timestamp) * 1000 <= maxAge,
+               maxAcc <= 0 || l.horizontalAccuracy <= maxAcc {
+                resolve(token, chuksFixString(l))
+            } else { resolve(token, "") }
+        case "location.enabled":
+            // locationServicesEnabled() reads a system setting; iOS logs a UI-hang warning
+            // when it is called on the main thread, so it is asked off it.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let on = CLLocationManager.locationServicesEnabled()
+                DispatchQueue.main.async { self.resolve(token, on ? "1" : "0") }
+            }
+        case "location.heading":
+            let h = LocHeading(onHeading: { [weak self] s in self?.resolve(token, s) },
+                               onErr: { [weak self] m in self?.fail(token, m) })
+            locHeadings[token] = h
+            streamTeardown[token] = { [weak self] in self?.locHeadings[token]?.stop(); self?.locHeadings[token] = nil }
+            h.start()
+        case "location.geocode":
+            CLGeocoder().geocodeAddressString(args) { [weak self] marks, err in
+                if let err = err as? CLError, err.code == .geocodeFoundNoResult || err.code == .geocodeFoundPartialResult { self?.resolve(token, ""); return }
+                if let err = err { self?.fail(token, "geocoding failed: \(err.localizedDescription)"); return }
+                let rows = (marks ?? []).compactMap { $0.location }.map { "\($0.coordinate.latitude),\($0.coordinate.longitude)" }
+                self?.resolve(token, rows.joined(separator: "\n"))
+            }
+        case "location.reverseGeocode":
+            CLGeocoder().reverseGeocodeLocation(CLLocation(latitude: a.num("lat") ?? 0, longitude: a.num("lng") ?? 0)) { [weak self] marks, err in
+                if let err = err as? CLError, err.code == .geocodeFoundNoResult || err.code == .geocodeFoundPartialResult { self?.resolve(token, ""); return }
+                if let err = err { self?.fail(token, "geocoding failed: \(err.localizedDescription)"); return }
+                let rows = (marks ?? []).map { p -> String in
+                    let street = [p.subThoroughfare, p.thoroughfare].compactMap { $0 }.joined(separator: " ")
+                    return [p.name ?? "", street, p.locality ?? "", p.administrativeArea ?? "", p.postalCode ?? "", p.country ?? "", p.isoCountryCode ?? ""]
+                        .map { $0.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }
+                        .joined(separator: "\t")
+                }
+                self?.resolve(token, rows.joined(separator: "\n"))
+            }
         case "location.watch", "location.watchBackground":
             let bg = (cap == "location.watchBackground")
             // The notification text in args is Android's business: iOS shows its own blue
@@ -2964,7 +3075,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 fail(token, "background location needs \"location\" in UIBackgroundModes: add \"backgroundLocation\": true to app.json")
                 break
             }
-            let fix = LocFix(once: false, background: bg,
+            let fix = LocFix(once: false, background: bg, accuracy: a.s("acc"), distance: a.num("dist") ?? 0,
                 onFix: { [weak self] s in self?.resolve(token, s) },
                 onErr: { [weak self] m in self?.fail(token, m) })
             locFixes[token] = fix
