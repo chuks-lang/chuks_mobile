@@ -637,15 +637,35 @@ func chuksBatteryNow() -> String {
     let d = UIDevice.current
     let lvl = d.batteryLevel < 0 ? -1 : Int((d.batteryLevel * 100).rounded())
     let chg = (d.batteryState == .charging || d.batteryState == .full) ? 1 : 0
-    return "\(lvl),\(chg)"
+    // The state UIKit already reports, no longer collapsed into the 1/0 above. iOS
+    // has no "plugged in but not charging" state of its own; Android does.
+    let state: String
+    switch d.batteryState {
+    case .unplugged: state = "unplugged"
+    case .charging:  state = "charging"
+    case .full:      state = "full"
+    default:         state = "unknown"
+    }
+    let low = ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0
+    return "\(lvl),\(chg),\(state),\(low)"
 }
 
 // The transport a network path is on, for watch() and current() alike.
 func chuksPathString(_ path: NWPath) -> String {
-    if path.status != .satisfied { return "none" }
-    if path.usesInterfaceType(.wifi) { return "wifi" }
-    if path.usesInterfaceType(.cellular) { return "cellular" }
-    return "other"
+    // "transport,reachable". Reachable is whether the path is satisfied, which is
+    // the most iOS offers without sending a probe; Android's half validates the
+    // network for real. A tunnel shows up as an interface of type .other whose name
+    // is utun/ipsec/ppp, so that is how a VPN is told apart from "other".
+    let reachable = path.status == .satisfied ? 1 : 0
+    if path.status != .satisfied { return "none,0" }
+    if path.usesInterfaceType(.wifi) { return "wifi,\(reachable)" }
+    if path.usesInterfaceType(.cellular) { return "cellular,\(reachable)" }
+    if path.usesInterfaceType(.wiredEthernet) { return "ethernet,\(reachable)" }
+    let tunnel = path.availableInterfaces.contains { i in
+        i.name.hasPrefix("utun") || i.name.hasPrefix("ipsec") || i.name.hasPrefix("ppp")
+    }
+    if tunnel { return "vpn,\(reachable)" }
+    return "other,\(reachable)"
 }
 
 // Whether ONE named motion sensor exists here. Asked by Motion.available() before a
@@ -672,9 +692,18 @@ func chuksSensorAvailable(_ name: String, _ motion: CMMotionManager) -> Bool {
 // Orientation capability helpers: the current interface orientation as a string, and a
 // lock through the mask the AppDelegate reports to UIKit.
 var chuksOrientationMask: UIInterfaceOrientationMask = .all
+// "coarse,edge", where edge is where the TOP OF THE DEVICE points. UIKit's interface
+// orientations name the landscapes by where the home button is, which is the opposite
+// edge, so .landscapeLeft (home button on the left) has the top pointing RIGHT. The
+// Chuks word is defined by the device so the two platforms can agree on it.
 func currentOrientationString() -> String {
     let io = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.interfaceOrientation
-    return (io?.isLandscape ?? false) ? "landscape" : "portrait"
+    switch io {
+    case .portraitUpsideDown: return "portrait,down"
+    case .landscapeLeft:      return "landscape,right"
+    case .landscapeRight:     return "landscape,left"
+    default:                  return "portrait,up"
+    }
 }
 func applyOrientationLock(_ mode: String) {
     switch mode {
@@ -2698,7 +2727,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let emit = { [weak self] in self?.resolve(token, chuksBatteryNow()) }
             let o1 = NotificationCenter.default.addObserver(forName: UIDevice.batteryLevelDidChangeNotification, object: nil, queue: .main) { _ in emit() }
             let o2 = NotificationCenter.default.addObserver(forName: UIDevice.batteryStateDidChangeNotification, object: nil, queue: .main) { _ in emit() }
-            streamTeardown[token] = { NotificationCenter.default.removeObserver(o1); NotificationCenter.default.removeObserver(o2) }
+            // Low Power Mode is a battery fact too, and it changes on its own schedule.
+            let o3 = NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { _ in emit() }
+            streamTeardown[token] = { for o in [o1, o2, o3] { NotificationCenter.default.removeObserver(o) } }
             emit()
         case "appstate.watch":
             let emit: (String) -> Void = { [weak self] s in self?.resolve(token, s) }
@@ -3038,6 +3069,40 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             ensureNfc(); nfc!.write(args, token)
         case "biometrics.available":
             resolve(token, LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
+        // The two halves of "available", asked separately. LAContext answers both
+        // through one call and its error code: notAvailable is no sensor,
+        // notEnrolled is a sensor with nothing on it, lockout is enrolled but
+        // temporarily refused (still hardware, still enrolled).
+        case "biometrics.hardware":
+            var e: NSError?
+            let ok = LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &e)
+            let has = ok || (e.map { LAError.Code(rawValue: $0.code) != .biometryNotAvailable } ?? false)
+            resolve(token, has ? "1" : "0")
+        case "biometrics.enrolled":
+            var e: NSError?
+            let ok = LAContext().canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &e)
+            let enrolled = ok || (e.map { LAError.Code(rawValue: $0.code) == .biometryLockout } ?? false)
+            resolve(token, enrolled ? "1" : "0")
+        case "biometrics.types":
+            // biometryType is only populated after canEvaluatePolicy has run.
+            let ctx = LAContext()
+            _ = ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
+            switch ctx.biometryType {
+            case .faceID:  resolve(token, "face")
+            case .touchID: resolve(token, "fingerprint")
+            default:       resolve(token, "")
+            }
+        case "biometrics.level":
+            // iOS has no weak biometric: Face ID and Touch ID are both strong. Below
+            // that is the passcode, and below that nothing.
+            let ctx = LAContext()
+            if ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) {
+                resolve(token, "strong")
+            } else if ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: nil) {
+                resolve(token, "secret")
+            } else {
+                resolve(token, "none")
+            }
         case "biometrics.authenticate":
             let ctx = LAContext()
             var perr: NSError?

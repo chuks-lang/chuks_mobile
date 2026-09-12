@@ -105,9 +105,20 @@ export class Brightness {
 
 // ---- Orientation ------------------------------------------------------------
 // The device orientation, as a stream, plus a lock. watch() fires the current value
-// immediately ("portrait" | "landscape"), then on every rotation, until its NativeSub
-// is cancelled. lockTo(mode) pins the UI to "portrait" | "landscape", or "auto" to follow
-// the device again. (`lock` is a Chuks keyword, hence `lockTo`.)
+// immediately, then on every rotation, until its NativeSub is cancelled. The payload
+// is "coarse,edge":
+//
+//     "portrait,up"   "portrait,down"   "landscape,left"   "landscape,right"
+//
+// The first field is the answer to "which way is the layout"; the second says where
+// the TOP of the device is pointing, which is what decides how a captured photo has to
+// be rotated and which side a notch is on. "left" means the top of the device points
+// left. That definition is the same on both platforms, whatever names each OS uses
+// internally (iOS's interface and device orientations name the two landscapes in
+// opposite ways, so the word is defined by the device, not borrowed from either).
+//
+// lockTo(mode) pins the UI to "portrait" | "landscape", or "auto" to follow the device
+// again. (`lock` is a Chuks keyword, hence `lockTo`.)
 export class Orientation {
     public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("orientation.watch", "", onChange, null) }
     // The value watch() would fire right now, read once.
@@ -402,9 +413,29 @@ export class DeviceInfo {
 // cancel, fail, or biometrics are unavailable. `reason` is the prompt subtitle (iOS shows
 // it under the Face ID sheet; Android as the subtitle).
 export class Biometrics {
+    // Usable right now: there is a sensor AND something is enrolled on it. The two
+    // halves are also answered separately below, because they call for different
+    // messages to the user: "this phone cannot" versus "set it up in Settings".
     public static available(onResult: (bool)=> void): void {
         emitNativeCommand("biometrics.available", "", function(s: string): void { onResult(s == "1") })
     }
+    // Whether the device has a biometric sensor at all, enrolled or not.
+    public static hardware(onResult: (bool)=> void): void {
+        emitNativeCommand("biometrics.hardware", "", function(s: string): void { onResult(s == "1") })
+    }
+    // Whether the user has enrolled a face or finger on it.
+    public static enrolled(onResult: (bool)=> void): void {
+        emitNativeCommand("biometrics.enrolled", "", function(s: string): void { onResult(s == "1") })
+    }
+    // Which kinds the hardware supports, comma-separated from "face", "fingerprint",
+    // "iris"; empty when there is none. So a button can say "Use Face ID" rather than
+    // "Use biometrics".
+    public static types(onResult: (string)=> void): void { emitNativeCommand("biometrics.types", "", onResult) }
+    // How strong what is enrolled is: "none" (nothing), "secret" (a passcode or
+    // pattern, no biometric), "weak" (a 2D face unlock), "strong" (fingerprint or a
+    // 3D face). An app guarding money can refuse "weak". iOS never answers "weak":
+    // Face ID and Touch ID are both strong.
+    public static level(onResult: (string)=> void): void { emitNativeCommand("biometrics.level", "", onResult) }
     public static authenticate(reason: string, onOk: ()=> void, onError: (string)=> void): void {
         emitNativeCommandE("biometrics.authenticate", reason, function(_: string): void { onOk() }, onError)
     }
@@ -414,6 +445,20 @@ export class Biometrics {
         const s: string = await awaitCommand("biometrics.available", "", false, CAP_QUICK_MS)
         return s == "1"
     }
+    /** Whether there is a biometric sensor, awaited. */
+    public static async hardwareAsync(): Task<bool> {
+        const s: string = await awaitCommand("biometrics.hardware", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** Whether something is enrolled on it, awaited. */
+    public static async enrolledAsync(): Task<bool> {
+        const s: string = await awaitCommand("biometrics.enrolled", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** The supported kinds, "face,fingerprint,iris" or a subset, awaited. */
+    public static async typesAsync(): Task<string> { return await awaitCommand("biometrics.types", "", false, CAP_QUICK_MS) }
+    /** "none" | "secret" | "weak" | "strong", awaited. */
+    public static async levelAsync(): Task<string> { return await awaitCommand("biometrics.level", "", false, CAP_QUICK_MS) }
     /** Prompt for biometric authentication, awaited. Returns on success, throws on cancel or failure. */
     public static async authenticateAsync(reason: string): Task<void> {
         await awaitCommand("biometrics.authenticate", reason, true, CAP_PROMPT_MS)
@@ -465,8 +510,11 @@ export class Motion {
 // watch() streams a LIVE cumulative count since the stream started; query() reads a
 // past window (iOS only — Android has no on-device history without Health Connect).
 export class Pedometer {
-    // "true"/"false": is a hardware step counter present on this device.
-    public static available(onResult: (string)=> void): void { emitNativeCommand("pedometer.available", "", onResult) }
+    // Whether a hardware step counter is present on this device. A bool, like every
+    // other availability check; it answered the STRING "true"/"false" until v0.2.0.
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("pedometer.available", "", function(s: string): void { onResult(s == "true" || s == "1") })
+    }
     // Live stream. onData payload (comma-separated, since the watch started):
     //   "steps,distanceMeters,paceSecPerMeter,cadenceStepsPerSec,floorsUp,floorsDown"
     // Fields the platform can't provide are 0 (Android: floors always 0; distance/pace
@@ -478,8 +526,11 @@ export class Pedometer {
     // to watch() (no on-device history without Health Connect).
     public static query(secondsAgo: int, onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("pedometer.query", secondsAgo, onResult, onError) }
 
-    /** "true"/"false": is there a hardware step counter, awaited. */
-    public static async availableAsync(): Task<string> { return await awaitCommand("pedometer.available", "", false, CAP_QUICK_MS) }
+    /** Whether there is a hardware step counter, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("pedometer.available", "", false, CAP_QUICK_MS)
+        return s == "true" || s == "1"
+    }
     /** Steps and distance over the last `secondsAgo` seconds, awaited. iOS only; throws on Android. */
     public static async queryAsync(secondsAgo: int): Task<string> { return await awaitCommand("pedometer.query", secondsAgo, true, CAP_QUICK_MS) }
 }
@@ -832,11 +883,20 @@ export class Tts {
 // once, with the same payload. Opening a stream and cancelling it after one tick is how
 // you used to read a single value, and that is a stream whose teardown you can forget.
 
-// The charge level and whether the device is plugged in. current() and watch() answer
-// from the same reading in the host, so the two can never disagree. available() is false
-// on the iOS Simulator, which reports a fixed placeholder rather than a real battery.
+// The charge level, whether the device is plugged in, what the battery is doing, and
+// whether the OS is in low-power mode. current() and watch() answer from the same
+// reading in the host, so the two can never disagree. available() is false on the iOS
+// Simulator, which reports a fixed placeholder rather than a real battery.
 export class Battery {
-    // onChange gets "level,charging", e.g. "87,1" (level 0..100, charging 1/0).
+    // The payload is "level,charging,state,lowPower", e.g. "87,1,charging,0":
+    //   level     0..100, or -1 when the platform cannot say (the iOS Simulator)
+    //   charging  1 or 0, kept for code that read it before the two fields after it
+    //   state     "unknown" | "unplugged" | "charging" | "full" | "not-charging"
+    //             not-charging is Android's word for plugged in but not taking charge
+    //             (thermal throttling, a charge limit); iOS reports it as charging
+    //   lowPower  1 while the OS is in Low Power Mode / Battery Saver, else 0. The one
+    //             battery fact that should change what an app does: stop polling,
+    //             drop video quality, stop animating.
     // Comma, not "|": "|" is the mutation-wire field delimiter and is unsafe in a payload.
     public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("battery.watch", "", onChange, null) }
     // The same payload, read once.
@@ -847,7 +907,7 @@ export class Battery {
         emitNativeCommand("battery.available", "", function(s: string): void { onResult(s == "1") })
     }
 
-    /** "level,charging" right now, awaited. */
+    /** "level,charging,state,lowPower" right now, awaited. */
     public static async currentAsync(): Task<string> { return await awaitCommand("battery.current", "", false, CAP_QUICK_MS) }
     /** Whether this device reports a real battery, awaited. */
     public static async availableAsync(): Task<bool> {
@@ -869,16 +929,21 @@ export class AppState {
     public static async currentAsync(): Task<string> { return await awaitCommand("appstate.current", "", false, CAP_QUICK_MS) }
 }
 
-// Which transport the device is on. Reachability is not connectivity: "wifi" means the
-// device has a wifi transport, not that your server is reachable through it. Treat a
-// failed request as the authority and this as a hint.
+// Which transport the device is on, and whether the internet is reachable over it.
+// The payload is "transport,reachable", e.g. "wifi,1":
+//   transport  "wifi" | "cellular" | "ethernet" | "vpn" | "bluetooth" | "none" |
+//              "other" | "unknown"
+//   reachable  1 when the OS believes the internet is reachable over that transport,
+//              else 0. On Android this is the system's own validation of the network
+//              (a captive portal fails it); on iOS it is whether the path is
+//              satisfied, which is the most the platform offers without a probe.
+// Reachable still is not "my server is up": a failed request stays the authority.
 export class Network {
-    // onChange gets "wifi" | "cellular" | "none" | "other".
     public static watch(onChange: (string)=> void): NativeSub { return emitNativeStream("network.watch", "", onChange, null) }
     // Which transport the device is on right now, read once.
     public static current(onResult: (string)=> void): void { emitNativeCommand("network.current", "", onResult) }
 
-    /** "wifi" | "cellular" | "none" | "other" right now, awaited. */
+    /** "transport,reachable" right now, awaited. */
     public static async currentAsync(): Task<string> { return await awaitCommand("network.current", "", false, CAP_QUICK_MS) }
 }
 

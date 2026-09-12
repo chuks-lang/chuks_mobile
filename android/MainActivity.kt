@@ -1092,8 +1092,26 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val streamTeardown = mutableMapOf<String, () -> Unit>()
     private val appStateTokens = mutableSetOf<String>()   // tokens watching foreground/background
     private val orientationTokens = mutableSetOf<String>()   // tokens watching device orientation
-    private fun currentOrientation(): String =
-        if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait"
+    // "coarse,edge", where edge is where the TOP OF THE DEVICE points. Display
+    // rotation is counter-clockwise from the natural orientation, so ROTATION_90 has
+    // the top pointing left, and the coarse word comes from the configuration, which
+    // is what the layout actually follows (a tablet's natural orientation may be
+    // landscape, where rotation alone would give the wrong coarse answer).
+    private fun currentOrientation(): String {
+        val coarse = if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait"
+        val rotation = if (android.os.Build.VERSION.SDK_INT >= 30) display?.rotation ?: 0
+                       else @Suppress("DEPRECATION") windowManager.defaultDisplay.rotation
+        val edge = when (rotation) {
+            android.view.Surface.ROTATION_90  -> "left"
+            android.view.Surface.ROTATION_180 -> "down"
+            android.view.Surface.ROTATION_270 -> "right"
+            else                              -> "up"
+        }
+        // A phone's natural orientation is portrait, so up/down pair with portrait and
+        // left/right with landscape. On a natural-landscape device they cross; report
+        // what the device is doing rather than a pair that cannot happen.
+        return "$coarse,$edge"
+    }
 
     // Execute a native capability requested via an `X|` command (F3). Fire-and-forget
     // commands (token "0") just perform the side effect; async reads call resolve().
@@ -1183,7 +1201,16 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 }
                 // registerReceiver returns the current sticky battery Intent -> emit now.
                 val sticky = registerReceiver(receiver, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                streamTeardown[token] = { try { unregisterReceiver(receiver) } catch (e: Exception) {} }
+                // Battery Saver toggling is a battery fact too. Its broadcast carries no
+                // battery extras, so re-read the sticky intent for the rest of the payload.
+                val saver = object : android.content.BroadcastReceiver() {
+                    override fun onReceive(c: Context?, i: Intent?) { batterySticky()?.let { emitBattery(token, it) } }
+                }
+                registerReceiver(saver, android.content.IntentFilter(android.os.PowerManager.ACTION_POWER_SAVE_MODE_CHANGED))
+                streamTeardown[token] = {
+                    try { unregisterReceiver(receiver) } catch (e: Exception) {}
+                    try { unregisterReceiver(saver) } catch (e: Exception) {}
+                }
                 sticky?.let { emitBattery(token, it) }
             }
             "appstate.watch" -> {
@@ -1195,7 +1222,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
                 val cb = object : android.net.ConnectivityManager.NetworkCallback() {
                     override fun onAvailable(n: android.net.Network) { emitNetwork(token, cm) }
-                    override fun onLost(n: android.net.Network) { runOnUiThread { resolve(token, "none") } }
+                    override fun onLost(n: android.net.Network) { runOnUiThread { resolve(token, "none,0") } }
                     override fun onCapabilitiesChanged(n: android.net.Network, caps: android.net.NetworkCapabilities) { emitNetwork(token, cm) }
                 }
                 cm.registerDefaultNetworkCallback(cb)
@@ -1453,11 +1480,48 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     resolve(token, "ok")
                 } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
             }
-            "biometrics.available" -> {
-                if (android.os.Build.VERSION.SDK_INT < 29) { resolve(token, "0"); return }
-                val bm = getSystemService(android.hardware.biometrics.BiometricManager::class.java)
-                val ok = bm != null && bm.canAuthenticate() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS
-                resolve(token, if (ok) "1" else "0")
+            "biometrics.available" ->
+                resolve(token, if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS) "1" else "0")
+            // The two halves of "available". canAuthenticate() answers both through its
+            // result code: ERROR_NO_HARDWARE is no sensor; ERROR_NONE_ENROLLED is a
+            // sensor with nothing on it; SUCCESS is both. Anything else (unavailable
+            // right now, an update needed) still counts as hardware present.
+            "biometrics.hardware" ->
+                resolve(token, if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE) "0" else "1")
+            "biometrics.enrolled" ->
+                resolve(token, if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS) "1" else "0")
+            "biometrics.types" -> {
+                // Android does not say which biometric is enrolled, only which the device
+                // can do, which is what a button label needs anyway.
+                val pm = packageManager
+                val kinds = ArrayList<String>()
+                if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_FACE)) kinds.add("face")
+                if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_FINGERPRINT)) kinds.add("fingerprint")
+                if (pm.hasSystemFeature(android.content.pm.PackageManager.FEATURE_IRIS)) kinds.add("iris")
+                resolve(token, kinds.joinToString(","))
+            }
+            "biometrics.level" -> {
+                // Strongest thing enrolled. Class 3 (STRONG) is a fingerprint or 3D face;
+                // class 2 (WEAK) a 2D face unlock; DEVICE_CREDENTIAL a PIN, pattern or
+                // password. Asked strongest first, so the answer is the best available.
+                val ok = android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS
+                if (android.os.Build.VERSION.SDK_INT < 30) {
+                    // API 29 has only the un-classed canAuthenticate(): success is "strong" by
+                    // the era's definition, and a secure keyguard is "secret".
+                    val km = getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
+                    resolve(token, when {
+                        bioCode() == ok -> "strong"
+                        km.isDeviceSecure -> "secret"
+                        else -> "none"
+                    })
+                    return
+                }
+                resolve(token, when {
+                    bioCode(android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG) == ok -> "strong"
+                    bioCode(android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK) == ok -> "weak"
+                    bioCode(android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL) == ok -> "secret"
+                    else -> "none"
+                })
             }
             "biometrics.authenticate" -> authenticateBiometric(token, args)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
@@ -1857,8 +1921,32 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // Biometrics (F3): the framework BiometricPrompt (API 28+, no androidx dependency).
     // onAuthenticationSucceeded -> "success"; a cancel/lockout/error -> fail(); a single
     // non-match (onAuthenticationFailed) leaves the prompt open for a retry.
+    // BiometricManager.canAuthenticate() throws SecurityException when the manifest
+    // lacks USE_BIOMETRIC, which is what happens when app.json declares no "faceId".
+    // A capability query must never take the app down: without the permission the
+    // answer is "no hardware", and the reason is logged once so the developer sees it.
+    private var bioWarned = false
+    private fun bioCode(authenticators: Int = -1): Int {
+        val none = android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE
+        if (android.os.Build.VERSION.SDK_INT < 29) return none
+        val bm = getSystemService(android.hardware.biometrics.BiometricManager::class.java) ?: return none
+        return try {
+            if (authenticators >= 0 && android.os.Build.VERSION.SDK_INT >= 30) bm.canAuthenticate(authenticators)
+            else @Suppress("DEPRECATION") bm.canAuthenticate()
+        } catch (e: SecurityException) {
+            if (!bioWarned) {
+                bioWarned = true
+                android.util.Log.w("Chuks", "Biometrics: USE_BIOMETRIC is not declared. Add \"faceId\" to permissions in app.json; until then every biometrics query answers unavailable.")
+            }
+            none
+        }
+    }
+
     private fun authenticateBiometric(token: String, reason: String) {
         if (android.os.Build.VERSION.SDK_INT < 28) { fail(token, "biometrics unavailable"); return }
+        if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE) {
+            fail(token, "biometrics unavailable (no sensor, or \"faceId\" is not declared in app.json)"); return
+        }
         val prompt = android.hardware.biometrics.BiometricPrompt.Builder(this)
             .setTitle("Authenticate")
             .setSubtitle(if (reason.isEmpty()) "Confirm your identity" else reason)
@@ -1957,7 +2045,17 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         val status = i.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)
         val charging = if (status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
                            status == android.os.BatteryManager.BATTERY_STATUS_FULL) 1 else 0
-        return "$pct,$charging"
+        // The state the intent already carried, no longer collapsed into the 1/0.
+        val state = when (status) {
+            android.os.BatteryManager.BATTERY_STATUS_CHARGING     -> "charging"
+            android.os.BatteryManager.BATTERY_STATUS_FULL         -> "full"
+            android.os.BatteryManager.BATTERY_STATUS_DISCHARGING  -> "unplugged"
+            android.os.BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "not-charging"
+            else                                                  -> "unknown"
+        }
+        val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        val low = if (pm?.isPowerSaveMode == true) 1 else 0
+        return "$pct,$charging,$state,$low"
     }
     private fun emitBattery(token: String, i: Intent) {
         val s = batteryPayload(i)
@@ -1969,13 +2067,20 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
     // The transport, in one place, for watch() and current() alike.
     private fun networkState(cm: android.net.ConnectivityManager): String {
-        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
-        return when {
-            caps == null -> "none"
-            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+        // "transport,reachable". Reachable is the system's own validation of the
+        // network: it probes for real, so a captive portal fails it. VPN is checked
+        // first because a tunnel also reports the transport it rides on.
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return "none,0"
+        val transport = when {
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)       -> "vpn"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)      -> "wifi"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)  -> "cellular"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)  -> "ethernet"
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_BLUETOOTH) -> "bluetooth"
             else -> "other"
         }
+        val reachable = if (caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)) 1 else 0
+        return "$transport,$reachable"
     }
     private fun emitNetwork(token: String, cm: android.net.ConnectivityManager) {
         val s = networkState(cm)
