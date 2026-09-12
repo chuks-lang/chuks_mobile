@@ -57,6 +57,7 @@ import CoreHaptics
 import Contacts
 import ContactsUI
 import EventKit
+import EventKitUI
 import LocalAuthentication
 import Security
 import Network
@@ -938,6 +939,40 @@ final class LocHeading: NSObject, CLLocationManagerDelegate {
     func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
         if (e as? CLError)?.code == .locationUnknown { return }
         onErr(e.localizedDescription)
+    }
+}
+
+// ---- calendar ------------------------------------------------------------------
+// One event is "title\tstartMs\tendMs\tid\tcalendarId\tlocation\tnotes\tallDay" on both
+// platforms. The id is eventIdentifier, which store.event(withIdentifier:) takes; an
+// occurrence of a repeating event carries the same id as every other.
+func chuksTabClean(_ s: String) -> String { s.replacingOccurrences(of: "\t", with: " ").replacingOccurrences(of: "\n", with: " ") }
+func chuksHex(_ c: CGColor) -> String {
+    guard let comps = c.converted(to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil)?.components, comps.count >= 3 else { return "000000" }
+    return String(format: "%02X%02X%02X", Int(comps[0] * 255), Int(comps[1] * 255), Int(comps[2] * 255))
+}
+func chuksEventLine(_ e: EKEvent) -> String {
+    let ms: (Date?) -> Int64 = { d in Int64((d?.timeIntervalSince1970 ?? 0) * 1000) }
+    return [chuksTabClean(e.title ?? ""), "\(ms(e.startDate))", "\(ms(e.endDate))", e.eventIdentifier ?? "", e.calendar?.calendarIdentifier ?? "",
+            chuksTabClean(e.location ?? ""), chuksTabClean(e.notes ?? ""), e.isAllDay ? "1" : "0"].joined(separator: "\t")
+}
+// The fields add, update and compose share. An alarm of -1 (or none) clears alarms.
+func chuksFillEvent(_ ev: EKEvent, _ a: ChuksArgs) {
+    ev.title = a.s("title")
+    ev.startDate = Date(timeIntervalSince1970: (a.num("start") ?? 0) / 1000)
+    ev.endDate = Date(timeIntervalSince1970: (a.num("end") ?? 0) / 1000)
+    ev.location = a.s("location").isEmpty ? nil : a.s("location")
+    ev.notes = a.s("notes").isEmpty ? nil : a.s("notes")
+    ev.isAllDay = a.bool("allDay")
+    let alarm = a.num("alarm") ?? -1
+    ev.alarms = alarm >= 0 ? [EKAlarm(relativeOffset: -alarm * 60)] : nil
+}
+final class ChuksEventEditDelegate: NSObject, EKEventEditViewDelegate {
+    private let onDone: (String?) -> Void
+    init(onDone: @escaping (String?) -> Void) { self.onDone = onDone }
+    func eventEditViewController(_ controller: EKEventEditViewController, didCompleteWith action: EKEventEditViewAction) {
+        controller.dismiss(animated: true)
+        onDone(action == .saved ? (controller.event?.eventIdentifier ?? "") : nil)
     }
 }
 
@@ -2870,6 +2905,20 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var locFixes: [String: LocFix] = [:]    // live Location managers, keyed by token (once + watch)
     var locHeadings: [String: LocHeading] = [:]   // live compass streams, keyed by token
     var contactPickers: [String: NSObject] = [:]   // picker delegates alive while presented
+    var calendarEditors: [String: ChuksEventEditDelegate] = [:]   // system add-event forms alive while presented
+    var calendarStores: [String: EKEventStore] = [:]   // one store per calendar.watch, kept so EKEventStoreChanged is posted
+    // Calendar access, asked for on first use the way iOS's own apps do. The store is
+    // handed to the work once access is there; a refusal fails the token.
+    private func withCalendarAccess(_ token: String, _ work: @escaping (EKEventStore) -> Void) {
+        let store = EKEventStore()
+        let s = EKEventStore.authorizationStatus(for: .event)
+        var ok = s == .authorized
+        if #available(iOS 17.0, *) { ok = ok || s == .fullAccess }
+        if ok { work(store); return }
+        if s == .denied || s == .restricted { fail(token, "calendar permission denied"); return }
+        let done: (Bool, Error?) -> Void = { g, _ in DispatchQueue.main.async { if g { work(store) } else { self.fail(token, "calendar permission denied") } } }
+        if #available(iOS 17.0, *) { store.requestFullAccessToEvents(completion: done) } else { store.requestAccess(to: .event, completion: done) }
+    }
     let motion = CMMotionManager()          // one shared motion manager; sensors fan out to token sets
     var accelTokens = Set<String>()
     var gyroTokens = Set<String>()
@@ -3333,24 +3382,98 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // One notification for any change, coalesced by the OS. Needs nothing.
             let obs = NotificationCenter.default.addObserver(forName: .CNContactStoreDidChange, object: nil, queue: .main) { [weak self] _ in self?.resolve(token, "") }
             streamTeardown[token] = { NotificationCenter.default.removeObserver(obs) }
+        // ---- calendar: see ChuksCalendar helpers below ----------------------------
+        // Reads and writes prompt when the app has not asked yet (withCalendarAccess),
+        // the way a location read does. compose needs no access at all.
         case "calendar.upcoming":
             guard let days = a.num() else { break }
-            let store = EKEventStore()
-            let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
-            let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map {
-                "\($0.title ?? "")\t\(Int($0.startDate.timeIntervalSince1970 * 1000))\t\(Int($0.endDate.timeIntervalSince1970 * 1000))"
+            withCalendarAccess(token) { store in
+                let pred = store.predicateForEvents(withStart: Date(), end: Date(timeIntervalSinceNow: days * 86400), calendars: nil)
+                let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map(chuksEventLine)
+                self.resolve(token, lines.joined(separator: "\n"))
             }
-            resolve(token, lines.joined(separator: "\n"))
+        case "calendar.events":
+            let from = Date(timeIntervalSince1970: (a.num("start") ?? 0) / 1000), to = Date(timeIntervalSince1970: (a.num("end") ?? 0) / 1000)
+            let calId = a.s("cal")
+            withCalendarAccess(token) { store in
+                var cals: [EKCalendar]? = nil
+                if !calId.isEmpty {
+                    guard let c = store.calendar(withIdentifier: calId) else { self.fail(token, "no such calendar: \(calId)"); return }
+                    cals = [c]
+                }
+                let pred = store.predicateForEvents(withStart: from, end: to, calendars: cals)
+                let lines = store.events(matching: pred).sorted { $0.startDate < $1.startDate }.map(chuksEventLine)
+                self.resolve(token, lines.joined(separator: "\n"))
+            }
+        case "calendar.get":
+            withCalendarAccess(token) { store in
+                if let ev = store.event(withIdentifier: args) { self.resolve(token, chuksEventLine(ev)) }
+                else { self.fail(token, "no such event: \(args)") }
+            }
+        case "calendar.calendars":
+            withCalendarAccess(token) { store in
+                let lines = store.calendars(for: .event).map { c -> String in
+                    let hex = c.cgColor.map { chuksHex($0) } ?? "000000"
+                    return "\(c.calendarIdentifier)\t\(chuksTabClean(c.title))\t\(c.allowsContentModifications ? "1" : "0")\t\(hex)"
+                }
+                self.resolve(token, lines.joined(separator: "\n"))
+            }
         case "calendar.create":
             guard let startMin = a.num("startInMin"), let durMin = a.num("durationMin") else { break }
+            withCalendarAccess(token) { store in
+                guard let cal = store.defaultCalendarForNewEvents else { self.fail(token, "no writable calendar"); return }
+                let ev = EKEvent(eventStore: store)
+                ev.title = a.s("title"); ev.calendar = cal
+                ev.startDate = Date(timeIntervalSinceNow: startMin * 60)
+                ev.endDate = Date(timeIntervalSinceNow: startMin * 60 + durMin * 60)
+                do { try store.save(ev, span: .thisEvent); self.resolve(token, ev.eventIdentifier ?? "ok") }
+                catch { self.fail(token, "save failed: \(error.localizedDescription)") }
+            }
+        case "calendar.add":
+            withCalendarAccess(token) { store in
+                let calId = a.s("cal")
+                let cal: EKCalendar? = calId.isEmpty ? store.defaultCalendarForNewEvents : store.calendar(withIdentifier: calId)
+                guard let cal = cal else { self.fail(token, calId.isEmpty ? "no writable calendar" : "no such calendar: \(calId)"); return }
+                guard cal.allowsContentModifications else { self.fail(token, "calendar is read-only: \(cal.title)"); return }
+                let ev = EKEvent(eventStore: store)
+                ev.calendar = cal
+                chuksFillEvent(ev, a)
+                do { try store.save(ev, span: .thisEvent); self.resolve(token, ev.eventIdentifier ?? "ok") }
+                catch { self.fail(token, "save failed: \(error.localizedDescription)") }
+            }
+        case "calendar.update":
+            withCalendarAccess(token) { store in
+                guard let ev = store.event(withIdentifier: a.s("id")) else { self.fail(token, "no such event: \(a.s("id"))"); return }
+                chuksFillEvent(ev, a)
+                do { try store.save(ev, span: .futureEvents); self.resolve(token, "") }
+                catch { self.fail(token, "save failed: \(error.localizedDescription)") }
+            }
+        case "calendar.delete":
+            withCalendarAccess(token) { store in
+                guard let ev = store.event(withIdentifier: args) else { self.fail(token, "no such event: \(args)"); return }
+                do { try store.remove(ev, span: .futureEvents); self.resolve(token, "") }
+                catch { self.fail(token, "delete failed: \(error.localizedDescription)") }
+            }
+        case "calendar.compose":
+            // The system form. Since iOS 17 it needs no calendar access: the user is
+            // the one saving, and the app is told the id. Before 17 it prompted itself.
             let store = EKEventStore()
-            guard let cal = store.defaultCalendarForNewEvents else { fail(token, "no writable calendar"); break }
             let ev = EKEvent(eventStore: store)
-            ev.title = a.s("title"); ev.calendar = cal
-            ev.startDate = Date(timeIntervalSinceNow: startMin * 60)
-            ev.endDate = Date(timeIntervalSinceNow: startMin * 60 + durMin * 60)
-            do { try store.save(ev, span: .thisEvent); resolve(token, ev.eventIdentifier ?? "ok") }
-            catch { fail(token, "save failed: \(error.localizedDescription)") }
+            chuksFillEvent(ev, a)
+            let vc = EKEventEditViewController()
+            vc.eventStore = store; vc.event = ev
+            let d = ChuksEventEditDelegate(onDone: { [weak self] id in
+                if let id = id { self?.resolve(token, id) } else { self?.fail(token, "canceled") }
+                self?.calendarEditors[token] = nil
+            })
+            vc.editViewDelegate = d
+            calendarEditors[token] = d
+            self.present(vc, animated: true)
+        case "calendar.watch":
+            let obs = NotificationCenter.default.addObserver(forName: .EKEventStoreChanged, object: nil, queue: .main) { [weak self] _ in self?.resolve(token, "") }
+            let store = EKEventStore()   // a store must exist for the notification to be posted to this process
+            calendarStores[token] = store
+            streamTeardown[token] = { [weak self] in NotificationCenter.default.removeObserver(obs); self?.calendarStores[token] = nil }
         case "linking.opensettings":
             if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
         case "bg.define":

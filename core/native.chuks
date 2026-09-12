@@ -403,25 +403,109 @@ export class Nfc {
 }
 
 // ---- Calendar ---------------------------------------------------------------
-// Read upcoming events and create new ones. Needs the "calendar" permission (request it
-// via Permission.request("calendar") first). upcoming() answers one event per line, each
-// three TAB-separated fields: title, startMs, endMs (Unix epoch ms). createEvent() adds an
-// event `startInMin` minutes from now lasting `durationMin` minutes, into the device's
-// default calendar; onOk fires with the created id. Denied permission / no writable
-// calendar goes to onError.
+// The device calendars. An event is one line of TAB-separated fields:
+// "title\tstartMs\tendMs\tid\tcalendarId\tlocation\tnotes\tallDay", times in Unix epoch
+// milliseconds and stored to the whole second (both platforms; a calendar has no use
+// for less), allDay "1" or "0". A repeating event appears once per occurrence in a
+// range read, each with the same id.
+//
+// compose() opens the OS's own add-event form and needs NO permission: the user sees
+// what is being added and saves it, or not. Everything else needs the "calendar"
+// permission; a call made before the app has asked is the prompt.
 export class Calendar {
+    /** Events in the next `days` days, one per line, soonest first. */
     public static upcoming(days: int, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("calendar.upcoming", days, onResult, onError)
     }
+    /** Events between two times, soonest first; one calendar when `calendarId` is given. */
+    public static events(fromMs: int, toMs: int, onResult: (string)=> void, onError: (string)=> void, calendarId: string = ""): void {
+        emitNativeCommandE("calendar.events", { start: fromMs, end: toMs, cal: calendarId }, onResult, onError)
+    }
+    /** One event by id. Fails with "no such event" when it is gone. */
+    public static get(id: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("calendar.get", id, onResult, onError)
+    }
+    /**
+     * The calendars on the device, one per line: "id\ttitle\twritable\tcolor", writable
+     * "1" or "0", color as RRGGBB. The user's phone may have several, some read-only
+     * (a subscribed holidays calendar); add() into one that is not writable fails.
+     */
+    public static calendars(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("calendar.calendars", "", onResult, onError)
+    }
+    /** Adds an event `startInMin` minutes from now into the default calendar. onOk gets its id. */
     public static createEvent(title: string, startInMin: int, durationMin: int, onOk: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("calendar.create", { title: title, startInMin: startInMin, durationMin: durationMin }, onOk, onError)
+    }
+    /**
+     * Adds an event at exact times. onResult gets its id. `calendarId` empty means the
+     * default calendar; `alarmMin` is minutes before the start to alert, -1 for none.
+     */
+    public static add(title: string, startMs: int, endMs: int, onResult: (string)=> void, onError: (string)=> void,
+                      location: string = "", notes: string = "", calendarId: string = "", allDay: bool = false, alarmMin: int = -1): void {
+        emitNativeCommandE("calendar.add", { title: title, start: startMs, end: endMs, location: location, notes: notes,
+                                             cal: calendarId, allDay: allDay, alarm: alarmMin }, onResult, onError)
+    }
+    /** Replaces an event's title, times, location, notes, all-day flag and alarm. A repeating event is changed for every occurrence. */
+    public static update(id: string, title: string, startMs: int, endMs: int, onOk: ()=> void, onError: (string)=> void,
+                         location: string = "", notes: string = "", allDay: bool = false, alarmMin: int = -1): void {
+        emitNativeCommandE("calendar.update", { id: id, title: title, start: startMs, end: endMs, location: location, notes: notes,
+                                                allDay: allDay, alarm: alarmMin }, function(_: string): void { onOk() }, onError)
+    }
+    /** Removes an event, every occurrence of a repeating one. */
+    public static delete(id: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("calendar.delete", id, function(_: string): void { onOk() }, onError)
+    }
+    /**
+     * The OS's own add-event form, filled in and shown to the user, who saves it or
+     * does not. No permission. onResult gets the saved event's id on iOS and "" on
+     * Android, which does not report what the form did; onError gets "canceled" on
+     * iOS when the user backs out.
+     */
+    public static compose(title: string, startMs: int, endMs: int, onResult: (string)=> void, onError: (string)=> void,
+                          location: string = "", notes: string = ""): void {
+        emitNativeCommandE("calendar.compose", { title: title, start: startMs, end: endMs, location: location, notes: notes, allDay: false, alarm: -1 }, onResult, onError)
+    }
+    /** Fires (with "") when any calendar changes: an event added elsewhere, a sync, an edit made here. */
+    public static watch(onChange: (string)=> void): NativeSub {
+        return emitNativeStream("calendar.watch", "", onChange, null)
     }
 
     /** Upcoming events for the next `days` days, awaited. */
     public static async upcomingAsync(days: int): Task<string> { return await awaitCommand("calendar.upcoming", days, true, CAP_PROMPT_MS) }
+    /** Events in a range, awaited. */
+    public static async eventsAsync(fromMs: int, toMs: int, calendarId: string = ""): Task<string> {
+        return await awaitCommand("calendar.events", { start: fromMs, end: toMs, cal: calendarId }, true, CAP_PROMPT_MS)
+    }
+    /** One event, awaited. Throws when it is gone. */
+    public static async getAsync(id: string): Task<string> { return await awaitCommand("calendar.get", id, true, CAP_PROMPT_MS) }
+    /** The calendars, awaited. */
+    public static async calendarsAsync(): Task<string> { return await awaitCommand("calendar.calendars", "", true, CAP_PROMPT_MS) }
     /** Create an event, awaited. Answers the new event's id. */
     public static async createEventAsync(title: string, startInMin: int, durationMin: int): Task<string> {
         return await awaitCommand("calendar.create", { title: title, startInMin: startInMin, durationMin: durationMin }, true, CAP_PROMPT_MS)
+    }
+    /** Add at exact times, awaited. Answers the id. */
+    public static async addAsync(title: string, startMs: int, endMs: int, location: string = "", notes: string = "",
+                                 calendarId: string = "", allDay: bool = false, alarmMin: int = -1): Task<string> {
+        return await awaitCommand("calendar.add", { title: title, start: startMs, end: endMs, location: location, notes: notes,
+                                                    cal: calendarId, allDay: allDay, alarm: alarmMin }, true, CAP_PROMPT_MS)
+    }
+    /** Update, awaited. Throws on failure. */
+    public static async updateAsync(id: string, title: string, startMs: int, endMs: int, location: string = "", notes: string = "",
+                                    allDay: bool = false, alarmMin: int = -1): Task<void> {
+        await awaitCommand("calendar.update", { id: id, title: title, start: startMs, end: endMs, location: location, notes: notes,
+                                                allDay: allDay, alarm: alarmMin }, true, CAP_PROMPT_MS)
+        return
+    }
+    /** Delete, awaited. Throws on failure. */
+    public static async deleteAsync(id: string): Task<void> {
+        await awaitCommand("calendar.delete", id, true, CAP_PROMPT_MS)
+        return
+    }
+    /** The system form, awaited. Answers the id (iOS) or "" (Android); throws "canceled" on iOS. */
+    public static async composeAsync(title: string, startMs: int, endMs: int, location: string = "", notes: string = ""): Task<string> {
+        return await awaitCommand("calendar.compose", { title: title, start: startMs, end: endMs, location: location, notes: notes, allDay: false, alarm: -1 }, true, CAP_PROMPT_MS)
     }
 }
 

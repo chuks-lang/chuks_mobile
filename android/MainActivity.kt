@@ -1400,41 +1400,66 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 w.start()
                 streamTeardown[token] = { w.stop() }
             }
-            "calendar.upcoming" -> {
-                if (checkSelfPermission(Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
-                try {
-                    val days = a.num()?.toLong() ?: return
-                    val now = System.currentTimeMillis()
-                    val sb = StringBuilder()
-                    contentResolver.query(CalendarContract.Events.CONTENT_URI, arrayOf(CalendarContract.Events.TITLE, CalendarContract.Events.DTSTART, CalendarContract.Events.DTEND),
-                        "${CalendarContract.Events.DTSTART} >= ? AND ${CalendarContract.Events.DTSTART} <= ?", arrayOf(now.toString(), (now + days * 86400000L).toString()),
-                        "${CalendarContract.Events.DTSTART} ASC")?.use { c ->
-                        while (c.moveToNext()) sb.append(c.getString(0) ?: "").append('\t').append(c.getLong(1)).append('\t').append(c.getLong(2)).append('\n')
-                    }
-                    resolve(token, sb.toString().trimEnd('\n'))
-                } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            // ---- calendar: see ChuksCalendar.kt --------------------------------
+            "calendar.upcoming" -> withCalendarPerm(token) {
+                val days = a.num()?.toLong() ?: 0L
+                val now = System.currentTimeMillis()
+                try { resolve(token, ChuksCalendar.events(this, now, now + days * 86400000L, "")) } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
             }
-            "calendar.create" -> {
-                if (checkSelfPermission(Manifest.permission.WRITE_CALENDAR) != PackageManager.PERMISSION_GRANTED) { fail(token, "calendar permission denied"); return }
+            "calendar.events" -> withCalendarPerm(token) {
+                try { resolve(token, ChuksCalendar.events(this, (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(), a.s("cal"))) }
+                catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            }
+            "calendar.get" -> withCalendarPerm(token) {
+                val l = try { ChuksCalendar.get(this, args) } catch (e: Exception) { null }
+                if (l != null) resolve(token, l) else fail(token, "no such event: $args")
+            }
+            "calendar.calendars" -> withCalendarPerm(token) {
+                try { resolve(token, ChuksCalendar.calendars(this)) } catch (e: Exception) { fail(token, "read failed: ${e.message}") }
+            }
+            "calendar.create" -> withCalendarPerm(token) {
+                val startMin = a.num("startInMin")?.toLong() ?: 0L
+                val durMin = a.num("durationMin")?.toLong() ?: 0L
+                val calId = ChuksCalendar.defaultCalendar(this)
+                if (calId < 0) { fail(token, "no writable calendar"); return@withCalendarPerm }
+                val now = System.currentTimeMillis()
+                try { resolve(token, ChuksCalendar.add(this, calId, a.s("title"), now + startMin * 60000L, now + (startMin + durMin) * 60000L, "", "", false, -1).toString()) }
+                catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+            }
+            "calendar.add" -> withCalendarPerm(token) {
+                val calId = if (a.s("cal").isEmpty()) ChuksCalendar.defaultCalendar(this) else (a.s("cal").toLongOrNull() ?: -2L)
+                if (calId == -1L) { fail(token, "no writable calendar"); return@withCalendarPerm }
+                val w = if (calId < 0) null else ChuksCalendar.writable(this, calId)
+                if (w == null) { fail(token, "no such calendar: ${a.s("cal")}"); return@withCalendarPerm }
+                if (!w) { fail(token, "calendar is read-only: ${a.s("cal")}"); return@withCalendarPerm }
                 try {
-                    val startMin = a.num("startInMin")?.toLong() ?: return
-                    val durMin = a.num("durationMin")?.toLong() ?: return
-                    var calId = -1L
-                    contentResolver.query(CalendarContract.Calendars.CONTENT_URI, arrayOf(CalendarContract.Calendars._ID),
-                        "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ?", arrayOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR.toString()), null)?.use { c ->
-                        if (c.moveToFirst()) calId = c.getLong(0)
-                    }
-                    if (calId < 0) { fail(token, "no writable calendar"); return }
-                    val now = System.currentTimeMillis()
-                    val values = android.content.ContentValues().apply {
-                        put(CalendarContract.Events.CALENDAR_ID, calId); put(CalendarContract.Events.TITLE, a.s("title"))
-                        put(CalendarContract.Events.DTSTART, now + startMin * 60000L); put(CalendarContract.Events.DTEND, now + (startMin + durMin) * 60000L)
-                        put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
-                    }
-                    val uri = contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
-                    if (uri == null) { fail(token, "insert failed"); return }
-                    resolve(token, uri.lastPathSegment ?: "ok")
+                    resolve(token, ChuksCalendar.add(this, calId, a.s("title"), (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(),
+                        a.s("location"), a.s("notes"), a.bool("allDay"), (a.num("alarm") ?: -1.0).toLong()).toString())
                 } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+            }
+            "calendar.update" -> withCalendarPerm(token) {
+                try {
+                    val ok = ChuksCalendar.update(this, a.s("id"), a.s("title"), (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(),
+                        a.s("location"), a.s("notes"), a.bool("allDay"), (a.num("alarm") ?: -1.0).toLong())
+                    if (ok) resolve(token, "") else fail(token, "no such event: ${a.s("id")}")
+                } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+            }
+            "calendar.delete" -> withCalendarPerm(token) {
+                try { if (ChuksCalendar.delete(this, args)) resolve(token, "") else fail(token, "no such event: $args") }
+                catch (e: Exception) { fail(token, "delete failed: ${e.message}") }
+            }
+            "calendar.compose" -> {
+                // No permission. The Calendar app answers no result, so the app hears
+                // "" when the form closes, whatever the user did in it.
+                val code = ++mediaSeq
+                pendingCompose[code] = token
+                try { startActivityForResult(ChuksCalendar.composeIntent(a.s("title"), (a.num("start") ?: 0.0).toLong(), (a.num("end") ?: 0.0).toLong(), a.s("location"), a.s("notes")), code) }
+                catch (e: Exception) { pendingCompose.remove(code); fail(token, "no calendar app: ${e.message}") }
+            }
+            "calendar.watch" -> withCalendarPerm(token) {
+                val w = ChuksCalendar.Watch(this) { resolve(token, "") }
+                w.start()
+                streamTeardown[token] = { w.stop() }
             }
             "linking.onurl" -> {
                 urlTokens.add(token)
@@ -1848,7 +1873,11 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
     // Permission (F2): map a Chuks kind to an Android permission string, and hold the
     // request token until the async onRequestPermissionsResult callback fires.
-    private var permSeq = 0
+    // Request codes start from the clock, not 0: a process killed with a dialog up has
+    // its result delivered to the NEXT process, and a counter restarting at 0 would
+    // match it to a fresh request and report a denial the user never made. Codes must
+    // fit in 16 bits; permissions take the low range, activity results the high one.
+    private var permSeq = (android.os.SystemClock.uptimeMillis() % 8000).toInt()
     private val pendingPerms = mutableMapOf<Int, String>()   // requestCode -> engine token
     private fun permString(kind: String): String? = when (kind) {
         "camera" -> Manifest.permission.CAMERA
@@ -1880,6 +1909,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "contacts permission denied") }
         enqueuePermissionRequest(need, code)
     }
+    private fun withCalendarPerm(token: String, run: () -> Unit) {
+        val need = arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR)
+        if (need.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "calendar permission denied") }
+        enqueuePermissionRequest(need, code)
+    }
     private fun withLocationPerm(token: String, run: () -> Unit) {
         if (hasLocationPerm()) { run(); return }
         val code = ++permSeq
@@ -1902,11 +1938,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
     // Media picker + camera (F3): each launch holds (engine token, camera output uri | null)
     // under its request code; the result is copied into app files and answered as "file://".
-    private var mediaSeq = 9000
+    private var mediaSeq = 9000 + (android.os.SystemClock.uptimeMillis() % 8000).toInt()
     private val pendingMedia = mutableMapOf<Int, Pair<String, android.net.Uri?>>()
     private val pendingContactPick = mutableMapOf<Int, Pair<String, String>>()
+    private val pendingCompose = mutableMapOf<Int, String>()
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        pendingCompose.remove(requestCode)?.let { token -> resolve(token, ""); return }
         pendingContactPick.remove(requestCode)?.let { (token, kind) ->
             val uri = data?.data
             if (resultCode != RESULT_OK || uri == null) { fail(token, "canceled"); return }
