@@ -1663,11 +1663,15 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             }
             "fs.diskSpace" -> resolve(token, ChuksFiles.diskSpace(this))
             "fs.dir" -> resolve(token, ChuksFiles.dir(this, args))
-            "secure.set" -> {
-                secureSet(a.s("key"), a.s("value"))
-            }
-            "secure.get" -> { val v = secureGet(args); if (v != null) resolve(token, v) else fail(token, "no such key: $args") }
-            "secure.delete" -> securePrefs().edit().remove(args).apply()
+            // ---- secure storage: see ChuksSecure.kt ----------------------------
+            "secure.set" -> secure.setPlain(a.s("key"), a.s("value"))
+            "secure.setProtected" -> secure.setProtected(a.s("key"), a.s("value"), "", { resolve(token, "") }, { m -> fail(token, m) })
+            "secure.get" -> secure.get(args, "", { v -> resolve(token, v) }, { fail(token, "no such key: $args") }, { m -> fail(token, m) })
+            "secure.has" -> resolve(token, if (secure.has(args)) "1" else "0")
+            "secure.keys" -> resolve(token, secure.keys().joinToString("\n"))
+            "secure.delete" -> secure.delete(args)
+            "secure.deleteAll" -> secure.deleteAll()
+            "secure.available" -> resolve(token, if (secure.availableBool()) "1" else "0")
             // ---- Local notifications: see ChuksNotifications.kt ----
             "notif.notify" -> {
                 val id = a.s("id").ifEmpty { "chuks-" + (notifId++) }
@@ -2215,34 +2219,8 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             })
     }
 
-    // Secure storage (Tier B): values are AES-GCM encrypted with an AndroidKeyStore
-    // key (never leaves the secure hardware) and the ciphertext kept in a private
-    // SharedPreferences. iv is prepended to the ciphertext, the whole blob base64'd.
-    private fun secureKey(): javax.crypto.SecretKey {
-        val ks = java.security.KeyStore.getInstance("AndroidKeyStore"); ks.load(null)
-        (ks.getEntry("chuks_secure", null) as? java.security.KeyStore.SecretKeyEntry)?.let { return it.secretKey }
-        val kg = javax.crypto.KeyGenerator.getInstance(android.security.keystore.KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
-        kg.init(android.security.keystore.KeyGenParameterSpec.Builder("chuks_secure",
-                android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT)
-            .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE).build())
-        return kg.generateKey()
-    }
-    private fun securePrefs() = getSharedPreferences("chuks_secure", Context.MODE_PRIVATE)
-    private fun secureSet(key: String, value: String) {
-        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding"); c.init(javax.crypto.Cipher.ENCRYPT_MODE, secureKey())
-        val iv = c.iv; val ct = c.doFinal(value.toByteArray())
-        val blob = iv + ct
-        securePrefs().edit().putString(key, android.util.Base64.encodeToString(blob, android.util.Base64.DEFAULT)).apply()
-    }
-    private fun secureGet(key: String): String? {
-        val enc = securePrefs().getString(key, null) ?: return null
-        val blob = android.util.Base64.decode(enc, android.util.Base64.DEFAULT)
-        val iv = blob.copyOfRange(0, 12); val ct = blob.copyOfRange(12, blob.size)
-        val c = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-        c.init(javax.crypto.Cipher.DECRYPT_MODE, secureKey(), javax.crypto.spec.GCMParameterSpec(128, iv))
-        return String(c.doFinal(ct))
-    }
+    private val secure by lazy { ChuksSecure(this) }
+
 
 
     private var notifId = 1

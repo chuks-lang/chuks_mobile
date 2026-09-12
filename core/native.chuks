@@ -1257,21 +1257,61 @@ export class FileSystem {
     public static async dirAsync(kind: string): Task<string> { return await awaitCommand("fs.dir", kind, false, CAP_QUICK_MS) }
 }
 
-// ---- Secure storage (Tier B) ------------------------------------------------
+// ---- Secure storage ---------------------------------------------------------
 // Encrypted key/value backed by the OS keystore (iOS Keychain, Android Keystore
-// AES-GCM) — for tokens, secrets, small sensitive values. get() of a missing key
-// goes to onError. Not for large blobs; use FileSystem for those.
+// AES-GCM), for tokens, secrets, small sensitive values. Not for large blobs; use
+// FileSystem. A value stored with setProtected() is bound to the user's biometrics
+// (or device passcode): reading it, and replacing it, shows the OS prompt, and it is
+// unreadable if the biometrics are removed or changed. A plain set() reads back with
+// no prompt. get() handles both, prompting only when the value is protected.
 export class SecureStore {
     public static set(key: string, value: string): void {
         emitNativeCommand("secure.set", { key: key, value: value }, null)
     }
+    /**
+     * Stores a value behind the biometric gate. The write shows the OS prompt (Face ID,
+     * Touch ID, fingerprint, or the device passcode); onOk fires once it is stored,
+     * onError if the user cancels or there is no biometric set up. available() first.
+     */
+    public static setProtected(key: string, value: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("secure.setProtected", { key: key, value: value }, function(_: string): void { onOk() }, onError)
+    }
     public static get(key: string, onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("secure.get", key, onResult, onError)
     }
+    /** Whether a key is stored. Never prompts, even for a protected value. */
+    public static has(key: string, onResult: (bool)=> void): void {
+        emitNativeCommand("secure.has", key, function(s: string): void { onResult(s == "1") })
+    }
+    /** The stored keys, one per line. Never prompts. */
+    public static keys(onResult: (string)=> void): void { emitNativeCommand("secure.keys", "", onResult) }
     public static delete(key: string): void { emitNativeCommand("secure.delete", key, null) }
+    /** Removes everything this app stored. */
+    public static deleteAll(): void { emitNativeCommand("secure.deleteAll", "", null) }
+    /** Whether the biometric gate can be used: a sensor is present and something is enrolled. */
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("secure.available", "", function(s: string): void { onResult(s == "1") })
+    }
 
-    /** A stored secret, awaited. Throws if the key is not there. */
-    public static async getAsync(key: string): Task<string> { return await awaitCommand("secure.get", key, true, CAP_QUICK_MS) }
+    /** A stored secret, awaited. A protected value prompts. Throws if the key is not there. */
+    public static async getAsync(key: string): Task<string> { return await awaitCommand("secure.get", key, true, CAP_PROMPT_MS) }
+    /** Store behind the biometric gate, awaited. Throws if cancelled. */
+    public static async setProtectedAsync(key: string, value: string): Task<void> {
+        await awaitCommand("secure.setProtected", { key: key, value: value }, true, CAP_PROMPT_MS)
+        return
+    }
+    /** Whether a key is stored, awaited. */
+    public static async hasAsync(key: string): Task<bool> {
+        const s: string = await awaitCommand("secure.has", key, false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** The stored keys, awaited. */
+    public static async keysAsync(): Task<string> { return await awaitCommand("secure.keys", "", false, CAP_QUICK_MS) }
+    /** Whether the biometric gate is usable, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("secure.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
 }
 
 // ---- Local notifications ----------------------------------------------------

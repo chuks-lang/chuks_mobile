@@ -1386,21 +1386,61 @@ func chuksMediaInfo(_ url: URL) -> String? {
 }
 
 // Secure storage (Tier B): Keychain-backed key/value.
-func keychainSet(_ key: String, _ value: String) {
-    let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key]
+// The read of a keychain item has three ends: the value, no such key, or the user
+// declining the biometric prompt. They are different to the caller (a denial is not
+// "no session"), so get answers which.
+enum KeychainResult { case value(String); case missing; case denied(String) }
+
+// A service name scopes the items to this app's own store, so keys() lists ours alone.
+private let chuksKeychainService = "chuks.securestore"
+
+@discardableResult
+func keychainSet(_ key: String, _ value: String, protected: Bool) -> Bool {
+    let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                               kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key]
     SecItemDelete(base as CFDictionary)
     var add = base; add[kSecValueData as String] = value.data(using: .utf8)!
-    SecItemAdd(add as CFDictionary, nil)
+    if protected {
+        // biometryCurrentSet: the item dies if the enrolled biometrics change, which is
+        // the strong guarantee; .or(.devicePasscode) lets a user with a passcode but no
+        // biometrics still store and read. userPresence is the umbrella of the two.
+        guard let ac = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly, .userPresence, nil) else { return false }
+        add[kSecAttrAccessControl as String] = ac
+    } else {
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    }
+    return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
 }
-func keychainGet(_ key: String) -> String? {
-    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key,
+func keychainGet(_ key: String) -> KeychainResult {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                            kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key,
                             kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
     var out: AnyObject?
-    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
-    return String(data: d, encoding: .utf8)
+    let status = SecItemCopyMatching(q as CFDictionary, &out)
+    if status == errSecSuccess, let d = out as? Data, let s = String(data: d, encoding: .utf8) { return .value(s) }
+    if status == errSecItemNotFound { return .missing }
+    if status == errSecUserCanceled || status == errSecAuthFailed { return .denied("authentication canceled") }
+    return .denied("cannot read \(key): OSStatus \(status)")
+}
+// Existence without the value: no data returned, so a protected item does not prompt.
+func keychainHas(_ key: String) -> Bool {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                            kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key,
+                            kSecReturnData as String: false, kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
+    let status = SecItemCopyMatching(q as CFDictionary, nil)
+    return status == errSecSuccess || status == errSecInteractionNotAllowed   // the latter: it exists but is protected
+}
+func keychainKeys() -> [String] {
+    let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                            kSecAttrService as String: chuksKeychainService, kSecMatchLimit as String: kSecMatchLimitAll,
+                            kSecReturnAttributes as String: true, kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
+    var out: AnyObject?
+    guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let items = out as? [[String: Any]] else { return [] }
+    return items.compactMap { $0[kSecAttrAccount as String] as? String }.sorted()
 }
 func keychainDelete(_ key: String) {
-    SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key] as CFDictionary)
+    SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                   kSecAttrService as String: chuksKeychainService, kSecAttrAccount as String: key] as CFDictionary)
 }
 
 // ── Audio player ─────────────────────────────────────────────────────────────
@@ -4036,10 +4076,36 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             default: resolve(token, appDir().path)
             }
         case "secure.set":
-            keychainSet(a.s("key"), a.s("value"))
+            keychainSet(a.s("key"), a.s("value"), protected: false)
+        case "secure.setProtected":
+            // The write is what creates the access control; it does not itself prompt on
+            // iOS (adding an item is allowed), but a later get() does. Off the main
+            // thread because SecItemAdd can block.
+            let k = a.s("key"), v = a.s("value")
+            DispatchQueue.global(qos: .userInitiated).async {
+                let ok = keychainSet(k, v, protected: true)
+                DispatchQueue.main.async { if ok { self.resolve(token, "") } else { self.fail(token, "no biometrics enrolled") } }
+            }
         case "secure.get":
-            if let v = keychainGet(args) { resolve(token, v) } else { fail(token, "no such key: \(args)") }
+            // A protected item makes SecItemCopyMatching show Face ID / Touch ID, which
+            // blocks, so every read runs off the main thread.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let r = keychainGet(args)
+                DispatchQueue.main.async {
+                    switch r {
+                    case .value(let v): self.resolve(token, v)
+                    case .missing: self.fail(token, "no such key: \(args)")
+                    case .denied(let m): self.fail(token, m)
+                    }
+                }
+            }
+        case "secure.has": resolve(token, keychainHas(args) ? "1" : "0")
+        case "secure.keys": resolve(token, keychainKeys().joined(separator: "\n"))
         case "secure.delete": keychainDelete(args)
+        case "secure.deleteAll": for k in keychainKeys() { keychainDelete(k) }
+        case "secure.available":
+            let ctx = LAContext()
+            resolve(token, ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil) ? "1" : "0")
         case "notif.notify", "notif.schedule":
             let content = UNMutableNotificationContent()
             content.title = a.s("title"); content.body = a.s("body")
