@@ -166,7 +166,7 @@ fun chuksUnescapeText(s: String): String {
     return out.toString()
 }
 
-class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
+class MainActivity : Activity(), ChuksModuleHost {
     private val views = HashMap<String, View>()
     private val ynodes = HashMap<String, Long>()
     // Incremental apply: relayout() reassigns a view's LayoutParams (which triggers a child
@@ -1110,6 +1110,12 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // run on __cancel__ so the receiver/callback is unregistered.
     // Live package-supplied views, by node id.
     private val packageViews = HashMap<String, ChuksNativeView>()
+    private val packageViewHosts = HashMap<String, ViewBinding>()
+    /** One package view's host object; see ChuksViewHost. */
+    inner class ViewBinding(private val id: String) : ChuksViewHost {
+        override val activity: Activity get() = this@MainActivity
+        override fun emit(name: String, value: String) { hostInput("$id:$name", value) }
+    }
     private val streamTeardown = mutableMapOf<String, () -> Unit>()
     private val appStateTokens = mutableSetOf<String>()   // tokens watching foreground/background
     private val orientationTokens = mutableSetOf<String>()   // tokens watching device orientation
@@ -2622,7 +2628,11 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             else -> {
                 val factory = ChuksPackageModules.views()[kind]
                 if (factory != null) {
-                    val pv = factory(this)
+                    // One binding per view, carrying the node id, so emit() reaches this
+                    // node's handlers and not another instance's.
+                    val binding = ViewBinding(id)
+                    val pv = factory(binding)
+                    packageViewHosts[id] = binding
                     packageViews[id] = pv
                     pv.view
                 } else FrameLayout(this)
@@ -4154,6 +4164,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         // core/ui.chuks), so keep this a map miss rather than the O(views) sweep below.
         if (!views.containsKey(id) && !ynodes.containsKey(id)) return
         packageViews.remove(id)?.destroy()
+        packageViewHosts.remove(id)
         views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
         ynodes[id]?.let { textNodes.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."

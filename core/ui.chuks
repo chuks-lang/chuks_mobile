@@ -341,6 +341,11 @@ export class Node {
     var scrollTo: int
     // Image GPU op-chain (a JSON op list from effects.chain); the host runs it on the GPU.
     var opsChain: string
+    // A package view's own events, by name: "scan" -> the closure the app passed. The
+    // framework's events are fixed fields above because it knows them all; a package's
+    // are not knowable here, so they are a map. Each is registered under "<id>:<name>"
+    // and the host fires it by calling emit(name, value) on the view's host object.
+    var events: map[string]any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -349,6 +354,7 @@ export class Node {
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
         this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1; this.opsChain = ""
+        this.events = {}
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -1011,12 +1017,32 @@ dataType WebViewProps { ViewProps; url: string? }
  * The layout half of that type is listed rather than inherited because a dataType cannot
  * embed a type from another module yet, so `ViewProps` is out of reach from a package.
  *
- * Taps need no new mechanism: wrap it in a `Pressable` the way you would any other view.
+ * Events: pass a fifth argument, a map of name to closure, and the native side calls
+ * `emit("<name>", value)` on its view host to fire one. The names are yours; the
+ * framework does not need to know them.
+ *
+ * ```chuks
+ * export function Rating(p: RatingProps): Node {
+ *     return nativeView("kit.rating", { value: p.value ?? 0 }, p, [],
+ *                       { change: p.onChange })
+ * }
+ * ```
+ *
+ * A plain tap still needs no mechanism of its own: wrap the view in a `Pressable`.
  */
-export function nativeView(kind: string, props: any, layout: any, kids: []Kid): Node {
+export function nativeView(kind: string, props: any, layout: any, kids: []Kid, events: any = null): Node {
     const s: Style = new Style()
     applyLayoutV(s, layout)
-    return new Node(kind, s, json.stringify(props), flatKids(kids))
+    const n: Node = new Node(kind, s, json.stringify(props), flatKids(kids))
+    // The view's own events, by name. The native side calls emit("<name>", value) and
+    // the closure registered here runs, with the value it sent. Names are the package's
+    // to choose; nothing in the framework needs to know them.
+    if (events != null) {
+        const names: []string = events.keys()
+        var i: int = 0
+        while (i < names.length) { n.events[names[i]] = events[names[i]]; i = i + 1 }
+    }
+    return n
 }
 
 export function WebView(p: WebViewProps): Node {
@@ -2515,6 +2541,12 @@ export class Reconciler {
         if (n.onLongPress != null) { this.handlers[id + ":longpress"] = n.onLongPress; this.emit("TL|" + id) }
         if (n.onPressIn != null) { this.handlers[id + ":pressin"] = n.onPressIn; this.emit("TPI|" + id) }
         if (n.onPressOut != null) { this.handlers[id + ":pressout"] = n.onPressOut; this.emit("TPO|" + id) }
+        // A package view's named events. No op is emitted: the host tags an event
+        // "<id>:<name>" by the same convention, and a name the app did not register
+        // simply finds no handler and does nothing.
+        const evNames: []string = n.events.keys()
+        var ei: int = 0
+        while (ei < evNames.length) { this.handlers[id + ":" + evNames[ei]] = n.events[evNames[ei]]; ei = ei + 1 }
         if (n.onLoad != null) { this.handlers[id + ":load"] = n.onLoad; this.emit("ML|" + id) }
         if (n.onError != null) { this.handlers[id + ":error"] = n.onError; this.emit("ME|" + id) }
         if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
@@ -2645,6 +2677,18 @@ export class Reconciler {
         this.rebindOrDrop(id + ":progress", next.onProgress)
         this.rebindOrDrop(id + ":slidedone", next.onSlideDone)
         this.rebindOrDrop(id + ":scroll", next.onScroll)
+        // A package view's named events, rebound the same way: the new closure captures
+        // this render's state, and a name the node no longer carries is dropped so a
+        // recycled cell cannot fire the previous row's handler.
+        const nextEv: []string = next.events.keys()
+        var ri: int = 0
+        while (ri < nextEv.length) { this.handlers[id + ":" + nextEv[ri]] = next.events[nextEv[ri]]; ri = ri + 1 }
+        const prevEv: []string = p.events.keys()
+        var di: int = 0
+        while (di < prevEv.length) {
+            if (next.events[prevEv[di]] == null) { this.rebindOrDrop(id + ":" + prevEv[di], null) }
+            di = di + 1
+        }
         // scrollTo: imperatively scroll when the target changes (reuses the List LS op).
         if (next.scrollTo >= 0 && next.scrollTo != this.scrollToPos.getOr(id, -1)) {
             this.scrollToPos[id] = next.scrollTo

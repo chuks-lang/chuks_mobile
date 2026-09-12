@@ -1662,7 +1662,19 @@ func chuksWakeThunk() {
     }
 }
 
-final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost, ChuksViewHost {
+
+/// One package view's host object. Bound to the node id at creation, so `emit` fires
+/// that node's handler: two instances of the same kind on one screen report separately,
+/// which the framework's own singleton pattern (one `cameraController`) cannot express.
+final class ChuksViewBinding: ChuksViewHost {
+    private unowned let vc: CardsVC
+    private let id: String
+    init(vc: CardsVC, id: String) { self.vc = vc; self.id = id }
+    var presenter: UIViewController { vc }
+    func emit(_ name: String, _ value: String) { vc.fireValue("\(id):\(name)", value) }
+}
+
+final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost {
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
@@ -3284,6 +3296,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return m
     }()
     var packageViews: [String: ChuksNativeView] = [:]
+    var packageViewHosts: [String: ChuksViewBinding] = [:]
 
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
     var urlTokens = Set<String>()             // linking.onurl subscribers
@@ -4978,7 +4991,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             // do we look: an unknown kind is otherwise a plain container, exactly as
             // before, so an app with no view packages pays one dictionary miss.
             if let t = packageViewTypes[kind] {
-                let pv = t.init(host: self)
+                // One binding per view, carrying the node id, so emit() reaches this
+                // node's handlers and not another instance's. Held by the host: a view
+                // is not required to keep the reference it was handed.
+                let binding = ChuksViewBinding(vc: self, id: id)
+                let pv = t.init(host: binding)
+                packageViewHosts[id] = binding
                 packageViews[id] = pv
                 v = pv.view
             } else {
@@ -5663,6 +5681,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // and must stay a dictionary miss -- never the O(views) prefix sweep below.
         if views[id] == nil && ynodes[id] == nil { return }
         if let pv = packageViews.removeValue(forKey: id) { pv.destroy() }
+        packageViewHosts[id] = nil
         if let v = views[id] {
             for g in v.gestureRecognizers ?? [] {
                 if let t = g as? UITapGestureRecognizer { taps[t] = nil }

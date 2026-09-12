@@ -141,10 +141,17 @@ public extension ChuksNativeView {
     func destroy() {}
 }
 
-/// What a view is handed. Deliberately small: a view draws, it does not answer requests.
+/// What a view is handed. Deliberately small: a view draws, reports what the user did,
+/// and does not answer requests. One of these per view, bound to the node that owns it,
+/// so a view never has to know its own id.
 public protocol ChuksViewHost: AnyObject {
     /// The view controller to present from, for a view that opens something.
     var presenter: UIViewController { get }
+    /// Tell Chuks the user did something. `name` is the event the app registered on the
+    /// component ("change", "scan", "regionChange"); `value` is handed to that closure.
+    /// A name nothing is listening for costs a dictionary miss and does nothing, so a
+    /// view may report freely without knowing what the app subscribed to.
+    func emit(_ name: String, _ value: String)
 }
 
 /// One package's native capability. `namespace` is the part before the dot in every

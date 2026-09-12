@@ -421,6 +421,24 @@ function mobileSymmetryStr(projdir: string): string {
         const name: string = strOr(pkg["name"], "(unnamed package)")
         const ios: []string = implementedCaps(pkg, "ios", ns)
         const android: []string = implementedCaps(pkg, "android", ns)
+        // What the package's own Chuks asks for, against what anything answers. A view
+        // kind is answered by the view registry rather than by a native branch, so it
+        // counts as handled when it is declared.
+        //
+        // This runs BEFORE the one-platform skip below. A package whose Android half is
+        // only a view implements no capability NAME at all, so the comparison below reads
+        // it as having no Android half and skips the package entirely: the first package
+        // that shipped a view was checked by nothing.
+        const emitted: []string = chuksEmitted(pkg, ns)
+        var e: int = 0
+        while (e < emitted.length) {
+            const name2: string = emitted[e]
+            e = e + 1
+            if (contains(ios, name2) || contains(android, name2)) { continue }
+            if (isViewKind(m, name2)) { continue }
+            out = out + "gap\t" + name + "\t" + ns + "." + name2 + "\tthe package's Chuks emits this, but no native source handles it and no view declares it\n"
+        }
+
         // A package that ships only one platform's sources is a different thing from
         // one whose two halves disagree, and saying "everything is missing on Android"
         // for an iOS-only package would be noise.
@@ -447,19 +465,6 @@ function mobileSymmetryStr(projdir: string): string {
                 out = out + "gap\t" + name + "\t" + ns + "." + c + "\timplemented in Swift, missing from the Kotlin\n"
             }
         }
-        // What the package's own Chuks asks for, against what anything answers. A view
-        // kind is answered by the view registry rather than by a native branch, so it
-        // counts as handled when it is declared.
-        const emitted: []string = chuksEmitted(pkg, ns)
-        var e: int = 0
-        while (e < emitted.length) {
-            const name2: string = emitted[e]
-            e = e + 1
-            if (contains(ios, name2) || contains(android, name2)) { continue }
-            if (isViewKind(m, name2)) { continue }
-            out = out + "gap\t" + name + "\t" + ns + "." + name2 + "\tthe package's Chuks emits this, but no native source handles it and no view declares it\n"
-        }
-
         var k: int = 0
         while (k < android.length) {
             const c2: string = android[k]
@@ -508,6 +513,82 @@ function mobileModulesStr(projdir: string, platform: string): string {
 // The kind an app writes is namespace-qualified ("health.ring"), so two packages can
 // both call a view "chart" without colliding. Only packages that ship sources for THIS
 // platform are listed, for the same reason modules are.
+// The kind an app writes for a package view.
+//
+// The key in "views" is namespace-relative: "ring" under namespace "health" is the kind
+// "health.ring". A key that already carries the namespace is taken as written rather
+// than prefixed a second time, because "kit.kit.rating" is a kind nothing can ever
+// answer, and it fails in the quietest way the framework has: iOS keeps working, since
+// its class declares its own kind, while Android renders a blank space where the view
+// should be. viewSymmetryStr below catches every other spelling mistake.
+function viewKind(ns: string, name: string): string {
+    if (name == ns) { return ns }
+    if (name.length > ns.length + 1 && name.slice(0, ns.length + 1) == ns + ".") { return name }
+    return ns + "." + name
+}
+
+// Every package view, checked against the other two places its identity is written.
+//
+// A view kind lives in three files at once: the package's chuks.json names it, the
+// package's Chuks passes it to nativeView, and the iOS class repeats it in
+// `static var kind`. Android takes it from the manifest alone. So a kind that disagrees
+// with the Swift class renders on one platform and renders nothing on the other, with
+// no build error and no runtime log.
+function viewSymmetryStr(projdir: string): string {
+    const pkgs: []any = packageManifests(projdir)
+    var out: string = ""
+    var i: int = 0
+    while (i < pkgs.length) {
+        const pkg: any = pkgs[i]
+        i = i + 1
+        const m: any = pkg["mobile"]
+        if (m == null) { continue }
+        const ns: string = strOr(m["namespace"], "")
+        const views: any = m["views"]
+        if (ns == "" || views == null) { continue }
+        const pname: string = strOr(pkg["name"], "(unnamed package)")
+        const swift: string = sourcesText(pkg, "ios")
+        const kotlin: string = sourcesText(pkg, "android")
+        const names: []string = views.keys()
+        var j: int = 0
+        while (j < names.length) {
+            const name: string = names[j]
+            j = j + 1
+            const cls: string = string(views[name])
+            if (cls == "") { continue }
+            const kind: string = viewKind(ns, name)
+            if (m["ios"] != null) {
+                if (swift.indexOf("class " + cls) < 0) {
+                    out = out + "gap\t" + pname + "\t" + kind + "\tno Swift source declares " + cls + "\n"
+                } else if (swift.indexOf("\"" + kind + "\"") < 0) {
+                    out = out + "gap\t" + pname + "\t" + kind + "\t" + cls + " does not declare this kind; its `static var kind` must return \"" + kind + "\"\n"
+                }
+            }
+            if (m["android"] != null && kotlin.indexOf("class " + cls) < 0) {
+                out = out + "gap\t" + pname + "\t" + kind + "\tno Kotlin source declares " + cls + "\n"
+            }
+        }
+    }
+    return out
+}
+
+// Every line of a package's sources for one platform, concatenated. Used to ask whether
+// a class is declared and whether it names the kind the manifest gives it.
+function sourcesText(pkg: any, platform: string): string {
+    const m: any = pkg["mobile"]
+    const plat: any = m[platform]
+    if (plat == null || plat["sources"] == null) { return "" }
+    const srcs: []any = plat["sources"]
+    var out: string = ""
+    var j: int = 0
+    while (j < srcs.length) {
+        const path: string = string(pkg["__dir"]) + "/" + string(srcs[j])
+        j = j + 1
+        if (fs.exists(path)) { out = out + fs.readFile(path) + "\n" }
+    }
+    return out
+}
+
 function mobileViewsStr(projdir: string, platform: string): string {
     const pkgs: []any = packageManifests(projdir)
     var out: string = ""
@@ -525,7 +606,7 @@ function mobileViewsStr(projdir: string, platform: string): string {
             const name: string = names[j]
             j = j + 1
             const cls: string = string(views[name])
-            if (cls != "") { out = out + ns + "." + name + "\t" + cls + "\n" }
+            if (cls != "") { out = out + viewKind(ns, name) + "\t" + cls + "\n" }
         }
     }
     return out
@@ -811,7 +892,7 @@ function main(): void {
     else if (field == "ios-entitlements") { print(iosEntitlementsStr(perms)) }
     else if (field == "android-perms") { print(androidPermsStr(perms)) }
     else if (field == "mobile-views") { print(mobileViewsStr(projdir, a[5])) }
-    else if (field == "mobile-symmetry") { print(coreSymmetryStr(a.length > 5 ? a[5] : "") + mobileSymmetryStr(projdir)) }
+    else if (field == "mobile-symmetry") { print(coreSymmetryStr(a.length > 5 ? a[5] : "") + mobileSymmetryStr(projdir) + viewSymmetryStr(projdir)) }
     else if (field == "android-schemes") { print(androidViewFilterStr(android)) }
     else if (field == "background-location") {
         // iOS needs "location" in UIBackgroundModes, and CRASHES rather than erroring if
