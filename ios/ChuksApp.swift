@@ -1214,8 +1214,8 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
 
 // Media picker + camera: copy the chosen/captured UIImage into the app's Documents and
 // return its path, so the "file://<path>" can feed an Image node.
-func chuksSaveImage(_ img: UIImage) -> String? {
-    guard let data = img.jpegData(compressionQuality: 0.9) else { return nil }
+func chuksSaveImage(_ img: UIImage, quality: Double = 0.9) -> String? {
+    guard let data = img.jpegData(compressionQuality: CGFloat(max(0.05, min(1, quality)))) else { return nil }
     let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("picked-\(UUID().uuidString).jpg")
     do { try data.write(to: url); return url.path } catch { return nil }
@@ -1239,6 +1239,90 @@ final class MediaCoordinator: NSObject, PHPickerViewControllerDelegate, UIImageP
         if let path = (info[.originalImage] as? UIImage).flatMap({ chuksSaveImage($0) }) { done("file://" + path) } else { cancel("no image") }
     }
     func imagePickerControllerDidCancel(_ p: UIImagePickerController) { p.dismiss(animated: true); cancel("canceled") }
+}
+
+// ---- the library picker with choices ----------------------------------------------
+// PHPicker for images, videos or both, several at once, in the order chosen. An image
+// comes in through UIImage (which also bakes in its orientation), scaled to maxSize on
+// the longer edge and written as a JPEG at the asked quality; a video is copied as it
+// is. The file URL PHPicker hands over for a video is valid only inside the closure
+// (it is a temporary export), so the copy happens there and not a line later. Every
+// item is described as "path\tkind\twidth\theight\tbytes\tdurationMs".
+final class ChuksMediaPick: NSObject, PHPickerViewControllerDelegate {
+    private let quality: Double
+    private let maxSize: Int
+    private let done: ([String]) -> Void
+    private let cancel: (String) -> Void
+    init(quality: Double, maxSize: Int, done: @escaping ([String]) -> Void, cancel: @escaping (String) -> Void) {
+        self.quality = quality; self.maxSize = maxSize; self.done = done; self.cancel = cancel
+    }
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        if results.isEmpty { cancel("canceled"); return }
+        var lines = [String?](repeating: nil, count: results.count)
+        let group = DispatchGroup()
+        for (i, r) in results.enumerated() {
+            let prov = r.itemProvider
+            group.enter()
+            if prov.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                prov.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                    defer { group.leave() }
+                    guard let url = url else { return }
+                    let dst = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent("picked-\(UUID().uuidString).\(url.pathExtension.isEmpty ? "mov" : url.pathExtension)")
+                    try? FileManager.default.removeItem(at: dst)
+                    if (try? FileManager.default.copyItem(at: url, to: dst)) != nil { lines[i] = chuksMediaInfo(dst).map { dst.path + "\t" + $0 } }
+                }
+            } else if prov.canLoadObject(ofClass: UIImage.self) {
+                prov.loadObject(ofClass: UIImage.self) { obj, _ in
+                    defer { group.leave() }
+                    guard let img = obj as? UIImage else { return }
+                    if let p = chuksSaveImage(chuksScaleImage(img, maxSize: self.maxSize), quality: self.quality) {
+                        let u = URL(fileURLWithPath: p)
+                        lines[i] = chuksMediaInfo(u).map { u.path + "\t" + $0 }
+                    }
+                }
+            } else { group.leave() }
+        }
+        group.notify(queue: .main) {
+            let out = lines.compactMap { $0 }.map { "file://" + $0 }
+            if out.isEmpty { self.cancel("no media") } else { self.done(out) }
+        }
+    }
+}
+func chuksScaleImage(_ img: UIImage, maxSize: Int) -> UIImage {
+    guard maxSize > 0 else { return img }
+    let w = img.size.width, h = img.size.height, longest = max(w, h)
+    guard longest > CGFloat(maxSize) else { return img }
+    let k = CGFloat(maxSize) / longest
+    let size = CGSize(width: (w * k).rounded(), height: (h * k).rounded())
+    let f = UIGraphicsImageRendererFormat.default(); f.scale = 1
+    return UIGraphicsImageRenderer(size: size, format: f).image { _ in img.draw(in: CGRect(origin: .zero, size: size)) }
+}
+func chuksIsVideoFile(_ url: URL) -> Bool {
+    guard let t = UTType(filenameExtension: url.pathExtension) else { return false }
+    return t.conforms(to: .movie) || t.conforms(to: .video)
+}
+/// "kind\twidth\theight\tbytes\tdurationMs", or nil for a file that is neither.
+func chuksMediaInfo(_ url: URL) -> String? {
+    let bytes = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value ?? 0
+    if !chuksIsVideoFile(url), let src = CGImageSourceCreateWithURL(url as CFURL, nil), let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+       let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int {
+        // EXIF orientation 5..8 means the pixels are stored rotated; report the displayed size.
+        let o = props[kCGImagePropertyOrientation] as? Int ?? 1
+        return o >= 5 ? "image\t\(h)\t\(w)\t\(bytes)\t0" : "image\t\(w)\t\(h)\t\(bytes)\t0"
+    }
+    if chuksIsVideoFile(url) {
+        let asset = AVURLAsset(url: url)
+        let ms = Int64(CMTimeGetSeconds(asset.duration) * 1000)
+        var w = 0, h = 0
+        if let track = asset.tracks(withMediaType: .video).first {
+            let s = track.naturalSize.applying(track.preferredTransform)
+            w = Int(abs(s.width)); h = Int(abs(s.height))
+        }
+        return "video\t\(w)\t\(h)\t\(bytes)\t\(ms)"
+    }
+    return nil
 }
 
 // Secure storage (Tier B): Keychain-backed key/value.
@@ -3053,6 +3137,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var nfc: NfcReader? = nil           // CoreNFC reader (lazy)
     var recURL: URL? = nil
     var recPaused = false
+    var mediaPick: ChuksMediaPick? = nil   // the library picker with choices, alive while presented
     var recorderWatchers = Set<String>()
     private var recorderTicker: Timer? = nil
     private func recorderLevel() -> Double {
@@ -3657,6 +3742,25 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             var cfg = PHPickerConfiguration(); cfg.filter = .images; cfg.selectionLimit = 1
             let pk = PHPickerViewController(configuration: cfg); pk.delegate = coord
             present(pk, animated: true)
+        // ---- the library picker with choices: see ChuksMediaPick ---------------------
+        case "mediapicker.video", "mediapicker.pick":
+            let kind = cap == "mediapicker.video" ? "video" : a.s("kind")
+            let limit = cap == "mediapicker.video" ? 1 : (a.int("limit") ?? 1)
+            let pathOnly = cap == "mediapicker.video"
+            let coord = ChuksMediaPick(quality: a.num("quality") ?? 0.9, maxSize: a.int("maxSize") ?? 0,
+                done: { [weak self] lines in
+                    self?.mediaPick = nil
+                    self?.resolve(token, pathOnly ? (lines.first?.split(separator: "\t").first.map(String.init) ?? "") : lines.joined(separator: "\n"))
+                }, cancel: { [weak self] m in self?.mediaPick = nil; self?.fail(token, m) })
+            mediaPick = coord
+            var cfg = PHPickerConfiguration()
+            cfg.filter = kind == "image" ? .images : (kind == "video" ? .videos : .any(of: [.images, .videos]))
+            cfg.selectionLimit = max(0, limit)
+            if #available(iOS 15.0, *) { cfg.selection = .ordered }
+            let pk = PHPickerViewController(configuration: cfg); pk.delegate = coord
+            present(pk, animated: true)
+        case "mediapicker.info":
+            if let line = chuksMediaInfo(fsURL(args)) { resolve(token, line) } else { fail(token, "not an image or video: \(args)") }
         case "camera.photo":
             if !UIImagePickerController.isSourceTypeAvailable(.camera) { fail(token, "camera unavailable"); break }
             let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
@@ -3665,12 +3769,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let pk = UIImagePickerController(); pk.sourceType = .camera; pk.delegate = coord
             present(pk, animated: true)
         case "mediapicker.save":
-            let path = args.hasPrefix("file://") ? String(args.dropFirst(7)) : args
-            guard let img = UIImage(contentsOfFile: path) else { fail(token, "no such image"); break }
+            // An image or a video, by what the file is.
+            let url = fsURL(args)
+            let img = UIImage(contentsOfFile: url.path)
+            let isVideo = img == nil && chuksIsVideoFile(url)
+            guard img != nil || isVideo else { fail(token, "not an image or video: \(args)"); break }
+            // iOS kills an app that asks Photos without the usage text. Refuse with the
+            // fix instead of taking the app down at a line the developer never wrote.
+            guard Bundle.main.object(forInfoDictionaryKey: "NSPhotoLibraryAddUsageDescription") != nil else {
+                fail(token, "saving to the gallery needs the \"photosAdd\" permission in app.json"); break
+            }
             PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
                 guard status == .authorized || status == .limited else { DispatchQueue.main.async { self?.fail(token, "photos permission denied") }; return }
-                PHPhotoLibrary.shared().performChanges({ PHAssetChangeRequest.creationRequestForAsset(from: img) },
-                    completionHandler: { ok, err in DispatchQueue.main.async { ok ? self?.resolve(token, "ok") : self?.fail(token, err?.localizedDescription ?? "save failed") } })
+                PHPhotoLibrary.shared().performChanges({
+                    if let img = img { PHAssetChangeRequest.creationRequestForAsset(from: img) }
+                    else { PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url) }
+                }, completionHandler: { ok, err in DispatchQueue.main.async { ok ? self?.resolve(token, "ok") : self?.fail(token, err?.localizedDescription ?? "save failed") } })
             }
         case "camera.capturePreview":
             guard let ctrl = cameraController else { fail(token, "no CameraView on screen"); break }

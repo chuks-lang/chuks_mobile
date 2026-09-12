@@ -1479,6 +1479,18 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 try { startActivityForResult(Intent.createChooser(intent, "Pick image"), code) }
                 catch (e: Exception) { pendingMedia.remove(code); fail(token, "no picker available") }
             }
+            // ---- the library picker with choices: see ChuksMedia.kt --------------
+            "mediapicker.video", "mediapicker.pick" -> {
+                val video = cap == "mediapicker.video"
+                val code = ++mediaSeq
+                pendingPick[code] = PickReq(token, if (video) 0.9 else (a.num("quality") ?: 0.9), if (video) 0 else (a.int("maxSize") ?: 0), video)
+                try { startActivityForResult(ChuksMedia.pickIntent(if (video) "video" else a.s("kind"), if (video) 1 else (a.int("limit") ?: 1)), code) }
+                catch (e: Exception) { pendingPick.remove(code); fail(token, "no picker available") }
+            }
+            "mediapicker.info" -> {
+                val l = ChuksMedia.info(ChuksFiles.resolve(this, args))
+                if (l != null) resolve(token, l) else fail(token, "not an image or video: $args")
+            }
             "camera.photo" -> {
                 val code = ++mediaSeq
                 val values = android.content.ContentValues().apply {
@@ -1531,20 +1543,11 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             "nfc.read" -> ensureNfc().read(token) { m -> fail(token, m) }
             "nfc.write" -> ensureNfc().write(args, token) { m -> fail(token, m) }
             "mediapicker.save" -> {
-                val path = if (args.startsWith("file://")) args.substring(7) else args
-                val f = java.io.File(path)
-                if (!f.exists()) { fail(token, "no such image"); return }
-                try {
-                    val values = android.content.ContentValues().apply {
-                        put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "chuks-${mediaSeq++}.jpg")
-                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                        if (android.os.Build.VERSION.SDK_INT >= 29) put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures")
-                    }
-                    val uri = contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                    if (uri == null) { fail(token, "cannot save"); return }
-                    contentResolver.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
-                    resolve(token, "ok")
-                } catch (e: Exception) { fail(token, "save failed: ${e.message}") }
+                // An image or a video, by what the file is; see ChuksMedia.save.
+                val f = ChuksFiles.resolve(this, args)
+                if (!f.isFile) { fail(token, "no such file: $args"); return }
+                val err = ChuksMedia.save(this, f)
+                if (err == null) resolve(token, "ok") else fail(token, err)
             }
             "biometrics.available" ->
                 resolve(token, if (bioCode() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS) "1" else "0")
@@ -1992,6 +1995,8 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val pendingMedia = mutableMapOf<Int, Pair<String, android.net.Uri?>>()
     private val pendingContactPick = mutableMapOf<Int, Pair<String, String>>()
     private val pendingCompose = mutableMapOf<Int, String>()
+    private class PickReq(val token: String, val quality: Double, val maxSize: Int, val pathOnly: Boolean)
+    private val pendingPick = mutableMapOf<Int, PickReq>()
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         pendingCompose.remove(requestCode)?.let { token -> resolve(token, ""); return }
@@ -2006,6 +2011,19 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 }
             } catch (e: Exception) { null }
             if (line != null) resolve(token, line) else fail(token, "cannot read the picked contact")
+            return
+        }
+        pendingPick.remove(requestCode)?.let { req ->
+            if (resultCode != RESULT_OK) { fail(req.token, "canceled"); return }
+            val uris = ChuksMedia.picked(data)
+            if (uris.isEmpty()) { fail(req.token, "canceled"); return }
+            Thread {
+                val lines = uris.mapNotNull { u -> try { ChuksMedia.ingest(this, u, req.quality, req.maxSize) } catch (e: Exception) { android.util.Log.w("Chuks", "mediapicker: cannot bring in $u", e); null } }.map { "file://$it" }
+                runOnUiThread {
+                    if (lines.isEmpty()) fail(req.token, "no media")
+                    else resolve(req.token, if (req.pathOnly) lines[0].split("\t")[0] else lines.joinToString("\n"))
+                }
+            }.start()
             return
         }
         val entry = pendingMedia.remove(requestCode) ?: return

@@ -377,17 +377,54 @@ export class MediaPicker {
     public static pickImage(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("mediapicker.image", "", onResult, onError)
     }
+    /** One video from the library, as a "file://" path. Cancel arrives as "canceled". */
+    public static pickVideo(onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("mediapicker.video", "", onResult, onError)
+    }
+    /**
+     * The library picker with choices. `kind` is "image", "video" or "any"; `limit`
+     * how many the user may choose (0 for no limit). onResult gets one line per item:
+     * "path\tkind\twidth\theight\tbytes\tdurationMs" (duration 0 for an image). A
+     * picked image is copied in as a JPEG at `quality` (0.0..1.0), scaled so its longer
+     * edge is at most `maxSize` pixels when that is above 0: a 12-megapixel photo is
+     * 5 MB and a screen needs a tenth of that. Videos are copied as they are.
+     */
+    public static pick(kind: string, onResult: (string)=> void, onError: (string)=> void,
+                       limit: int = 1, quality: float = 0.9, maxSize: int = 0): void {
+        emitNativeCommandE("mediapicker.pick", { kind: kind, limit: limit, quality: quality, maxSize: maxSize }, onResult, onError)
+    }
+    /** "kind\twidth\theight\tbytes\tdurationMs" for an image or video file the app has a path to. */
+    public static info(path: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("mediapicker.info", path, onResult, onError)
+    }
     // Save a "file://<path>" image (e.g. one from pickImage/takePhoto, or a downloaded file)
     // back to the OS photo gallery. onOk fires when written; onError on failure or a denied
     // add-photos permission (iOS). Android needs no permission on API 29+.
     public static saveImage(fileUri: string, onOk: ()=> void, onError: (string)=> void): void {
         emitNativeCommandE("mediapicker.save", fileUri, function(_: string): void { onOk() }, onError)
     }
+    /** Saves an image or a video to the gallery, by what the file is. */
+    public static save(fileUri: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("mediapicker.save", fileUri, function(_: string): void { onOk() }, onError)
+    }
 
     /** Pick one photo, awaited. Throws if the user cancels or the permission is denied. */
     public static async pickImageAsync(): Task<string> { return await awaitCommand("mediapicker.image", "", true, CAP_PROMPT_MS) }
+    /** Pick one video, awaited. Throws "canceled" when the user backs out. */
+    public static async pickVideoAsync(): Task<string> { return await awaitCommand("mediapicker.video", "", true, CAP_PROMPT_MS) }
+    /** The picker with choices, awaited. One line per item; throws "canceled". */
+    public static async pickAsync(kind: string, limit: int = 1, quality: float = 0.9, maxSize: int = 0): Task<string> {
+        return await awaitCommand("mediapicker.pick", { kind: kind, limit: limit, quality: quality, maxSize: maxSize }, true, CAP_PROMPT_MS)
+    }
+    /** A media file's kind, size and duration, awaited. */
+    public static async infoAsync(path: string): Task<string> { return await awaitCommand("mediapicker.info", path, true, CAP_QUICK_MS) }
     /** Save a "file://" image to the gallery, awaited. Throws on failure. */
     public static async saveImageAsync(fileUri: string): Task<void> {
+        await awaitCommand("mediapicker.save", fileUri, true, CAP_HARDWARE_MS)
+        return
+    }
+    /** Save an image or video to the gallery, awaited. */
+    public static async saveAsync(fileUri: string): Task<void> {
         await awaitCommand("mediapicker.save", fileUri, true, CAP_HARDWARE_MS)
         return
     }
