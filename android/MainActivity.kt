@@ -360,6 +360,8 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             if ((bo - t) != (ob - ot) || (r - l) != (or2 - ol)) { relayout(); pushViewport() }
         }
         intent?.data?.let { lastUrl = it.toString() }   // deep link that launched the app
+        ChuksNotif.deliverTap(intent)                   // a notification tap that launched the app
+        ChuksNotif.rearmAll(this)                       // alarms do not survive a reboot; the store does
 
         // DEV hot reload: assets/chuks-dev.txt (written by a DEV=1 build) points at the
         // running dev server. Present => fetch the UI over HTTP instead of the JNI engine.
@@ -1559,11 +1561,37 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             }
             "secure.get" -> { val v = secureGet(args); if (v != null) resolve(token, v) else fail(token, "no such key: $args") }
             "secure.delete" -> securePrefs().edit().remove(args).apply()
+            // ---- Local notifications: see ChuksNotifications.kt ----
             "notif.notify" -> {
-
-                val title = a.s("title")
-                val body = a.s("body")
-                notify(title, body)
+                val id = a.s("id").ifEmpty { "chuks-" + (notifId++) }
+                ChuksNotif.post(this, id, a.s("title"), a.s("body"), a.s("data"), a.s("channel"))
+            }
+            "notif.schedule" -> {
+                val atMs = a.num("atMs")?.toLong() ?: 0L
+                val inSec = a.num("inSeconds")?.toLong() ?: 0L
+                val fireAt = if (atMs > 0) atMs else System.currentTimeMillis() + inSec * 1000
+                ChuksNotif.schedule(this, a.s("id"), a.s("title"), a.s("body"), fireAt, a.s("data"), a.s("channel"))
+            }
+            "notif.cancel" -> ChuksNotif.cancel(this, args)
+            "notif.cancelAll" -> ChuksNotif.cancelAll(this)
+            "notif.dismiss" -> ChuksNotif.dismiss(this, args)
+            "notif.dismissAll" -> ChuksNotif.dismissAll(this)
+            "notif.scheduled" -> resolve(token, ChuksNotif.scheduled(this))
+            "notif.setBadge" -> ChuksNotif.setBadge(this, a.int() ?: 0)
+            "notif.badge" -> resolve(token, ChuksNotif.badge(this).toString())
+            "notif.channel" -> ChuksNotif.ensureChannel(this, a.s("id"), a.s("name"), a.s("importance"))
+            "notif.onResponse" -> {
+                notifTokens.add(token)
+                ChuksNotif.onResponse = { p -> runOnUiThread { notifTokens.toList().forEach { resolve(it, p) } } }
+                streamTeardown[token] = {
+                    notifTokens.remove(token)
+                    if (notifTokens.isEmpty()) ChuksNotif.onResponse = null
+                }
+                // The tap that launched the app, if any, goes to the first subscriber.
+                ChuksNotif.pending?.let {
+                    android.util.Log.i("Chuks", "notif.onResponse: delivering the launch tap to the first subscriber")
+                    ChuksNotif.pending = null; resolve(token, it)
+                }
             }
             "audio.play" -> {
                 audioMp?.release(); audioMp = null
@@ -1783,11 +1811,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // linking.onurl subscribers. lastUrl is held so a subscriber that registers after launch
     // still gets it.
     private var lastUrl: String? = null
+    private val notifTokens = HashSet<String>()      // Notifications.onResponse subscribers
     private val urlTokens = mutableSetOf<String>()
     override fun onNewIntent(newIntent: Intent) {
         super.onNewIntent(newIntent)
         setIntent(newIntent)
         newIntent.data?.toString()?.let { url -> lastUrl = url; runOnUiThread { urlTokens.forEach { resolve(it, url) } } }
+        ChuksNotif.deliverTap(newIntent)
     }
 
     // Media picker + camera (F3): each launch holds (engine token, camera output uri | null)
@@ -2126,21 +2156,6 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         // later kills a backgrounded process.
         persistState()
     }
-    private fun notify(title: String, body: String) {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = android.app.NotificationChannel("chuks", "Chuks", android.app.NotificationManager.IMPORTANCE_DEFAULT)
-            nm.createNotificationChannel(chan)
-        }
-        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                    android.app.Notification.Builder(this, "chuks")
-                else @Suppress("DEPRECATION") android.app.Notification.Builder(this)
-        val n = b.setContentTitle(title).setContentText(body)
-                 .setSmallIcon(android.R.drawable.ic_dialog_info)
-                 .setAutoCancel(true).build()
-        nm.notify(notifId++, n)
-    }
-
     private fun clipboard() = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
     private fun fireHaptic(style: String) {

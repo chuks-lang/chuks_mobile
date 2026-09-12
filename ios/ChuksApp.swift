@@ -533,6 +533,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     func application(_ a: UIApplication, didFinishLaunchingWithOptions o: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         chuksPipeStdioToLog()
+        // Before anything else. The notification delegate has to be in place before this
+        // method returns, or the tap that LAUNCHED the app is never delivered at all:
+        // iOS hands the launch response only to a delegate that already exists. It used
+        // to be set in viewDidLoad, which is too late for exactly that case.
+        UNUserNotificationCenter.current().delegate = notifDelegate
         let w = UIWindow(frame: UIScreen.main.bounds)
         let vc = CardsVC()
         if let url = o?[.url] as? URL { vc.lastURL = url.absoluteString }   // deep link that launched the app
@@ -1021,14 +1026,40 @@ func keychainDelete(_ key: String) {
 }
 
 // Show notifications even while the app is foregrounded (iOS otherwise suppresses
-// the banner for the active app).
+// the banner for the active app), and receive the tap.
+//
+// The tap that LAUNCHED the app arrives here before any Chuks code has run, let alone
+// subscribed. It is held in `pending` and handed to the first onResponse subscriber,
+// so a screen that subscribes on mount does not miss the reason it was opened. Same
+// shape as the launch URL in Linking.onURL.
 final class NotifDelegate: NSObject, UNUserNotificationCenterDelegate {
+    var onResponse: ((String) -> Void)?
+    var pending: String?
     func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
-        done([.banner, .sound])
+        // .list is what keeps a foreground-delivered notification in Notification
+        // Center after its banner goes. Without it the banner was the only trace, and
+        // a user who looked away for five seconds had nothing to tap.
+        done([.banner, .list, .sound])
+    }
+    func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        let id = r.notification.request.identifier
+        let data = r.notification.request.content.userInfo["data"] as? String ?? ""
+        let payload = id + "\t" + data
+        if let cb = onResponse { cb(payload) } else { pending = payload }
+        done()
     }
 }
 let notifDelegate = NotifDelegate()
+
+// A pending request's next fire time as epoch milliseconds, whichever trigger it has.
+func chuksNotifFireAt(_ req: UNNotificationRequest) -> Int64 {
+    var date: Date? = nil
+    if let t = req.trigger as? UNTimeIntervalNotificationTrigger { date = t.nextTriggerDate() }
+    else if let t = req.trigger as? UNCalendarNotificationTrigger { date = t.nextTriggerDate() }
+    return Int64((date?.timeIntervalSince1970 ?? 0) * 1000)
+}
 
 // ── Host wake ────────────────────────────────────────────────────────────────
 // The engine calls this (from a background goroutine, via the chuks_set_wake C
@@ -1435,7 +1466,6 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     override func viewDidLoad() {
         super.viewDidLoad()
         print("BENCHMARK CHUKS: booting…")
-        UNUserNotificationCenter.current().delegate = notifDelegate  // foreground banners
         view.backgroundColor = hexColor("0E1116")
         YGConfigSetPointScaleFactor(config, Float(UIScreen.main.scale))
 
@@ -2621,6 +2651,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
     var urlTokens = Set<String>()             // linking.onurl subscribers
+    var notifTokens = Set<String>()   // Notifications.onResponse subscribers
     var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
     // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
     func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
@@ -3133,13 +3164,61 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "secure.get":
             if let v = keychainGet(args) { resolve(token, v) } else { fail(token, "no such key: \(args)") }
         case "secure.delete": keychainDelete(args)
-        case "notif.notify":
+        case "notif.notify", "notif.schedule":
             let content = UNMutableNotificationContent()
             content.title = a.s("title"); content.body = a.s("body")
             content.sound = .default
-            UNUserNotificationCenter.current().add(UNNotificationRequest(
-                identifier: UUID().uuidString, content: content,
-                trigger: UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)))
+            content.userInfo = ["data": a.s("data")]
+            let id = a.s("id").isEmpty ? UUID().uuidString : a.s("id")
+            var trigger: UNNotificationTrigger? = nil
+            if cap == "notif.schedule" {
+                let inSeconds = a.num("inSeconds") ?? 0
+                let atMs = a.num("atMs") ?? 0
+                if atMs > 0 {
+                    // A calendar trigger for an absolute time. Second precision is all
+                    // the OS offers; a date already past fires at once.
+                    let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second],
+                                                                from: Date(timeIntervalSince1970: atMs / 1000))
+                    trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+                } else {
+                    // The interval trigger refuses 0; a non-positive delay means "now".
+                    trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(1, inSeconds), repeats: false)
+                }
+            }
+            // The same id replaces the earlier request, pending or delivered, which is
+            // how a notification updates in place.
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: trigger))
+        case "notif.cancel":
+            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [args])
+        case "notif.cancelAll":
+            UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+        case "notif.dismiss":
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [args])
+        case "notif.dismissAll":
+            UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        case "notif.scheduled":
+            UNUserNotificationCenter.current().getPendingNotificationRequests { [weak self] reqs in
+                let lines = reqs.map { "\($0.identifier)\t\($0.content.title)\t\(chuksNotifFireAt($0))" }
+                DispatchQueue.main.async { self?.resolve(token, lines.joined(separator: "\n")) }
+            }
+        case "notif.setBadge":
+            let n = Int(a.num() ?? 0)
+            if #available(iOS 16.0, *) { UNUserNotificationCenter.current().setBadgeCount(n) }
+            else { UIApplication.shared.applicationIconBadgeNumber = n }
+        case "notif.badge":
+            resolve(token, String(UIApplication.shared.applicationIconBadgeNumber))
+        case "notif.onResponse":
+            // Every subscriber hears every tap; the delegate has one hook, which fans
+            // out over the token set. The launch tap, if any, goes to the first one.
+            notifTokens.insert(token)
+            notifDelegate.onResponse = { [weak self] p in for t in self?.notifTokens ?? [] { self?.resolve(t, p) } }
+            streamTeardown[token] = { [weak self] in
+                self?.notifTokens.remove(token)
+                if self?.notifTokens.isEmpty == true { notifDelegate.onResponse = nil }
+            }
+            if let p = notifDelegate.pending { notifDelegate.pending = nil; resolve(token, p) }
+        case "notif.channel":
+            break   // Android's concept; iOS has no channels
         case "audio.play":
             let src: URL? = args.hasPrefix("file://") ? URL(fileURLWithPath: String(args.dropFirst(7)))   // a recording / downloaded file
                                                       : bundledAssetURL(args)   // a bundled asset

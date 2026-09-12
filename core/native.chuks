@@ -785,12 +785,71 @@ export class SecureStore {
     public static async getAsync(key: string): Task<string> { return await awaitCommand("secure.get", key, true, CAP_QUICK_MS) }
 }
 
-// ---- Local notifications (Tier B) -------------------------------------------
-// Post a local notification. Requires the "notifications" permission (see F2). Fires
-// shortly after the call and appears in the notification shade / as a banner.
+// ---- Local notifications ----------------------------------------------------
+// Local, meaning posted by this device. A push from a server is a package's job.
+// Needs the "notifications" permission; without it nothing appears and nothing fails,
+// so request it first.
+//
+// Every notification has an id you choose. The same id posted again replaces the
+// earlier one, which is how a progress notification updates in place, and the id is
+// what you cancel or dismiss by, and what comes back when the user taps it.
+//
+// `data` is a string of your own (JSON, usually) handed back untouched on tap. It
+// must not contain "|", which is the delimiter on the wire between host and engine.
+//
+// Scheduling is done by the OS, not by the app: a scheduled notification fires with
+// the app killed, and on Android survives a reboot. Timing is a floor. Android's Doze
+// can hold an inexact alarm for minutes; an app that declares the "exactAlarms"
+// permission and has been granted it gets an exact one. iOS keeps at most 64 pending
+// requests per app and drops the oldest beyond that.
+//
+// A tap opens the app and reaches onResponse, including the tap that LAUNCHED the app:
+// it is held until a subscriber appears, so a screen that subscribes on mount does
+// not miss it.
 export class Notifications {
-    public static notify(title: string, body: string): void {
-        emitNativeCommand("notif.notify", { title: title, body: body }, null)
+    // Show now. `id` and `data` are optional: an empty id gets a fresh one.
+    public static notify(title: string, body: string, id: string = "", data: string = "", channel: string = ""): void {
+        emitNativeCommand("notif.notify", { title: title, body: body, id: id, data: data, channel: channel }, null)
+    }
+    // Show in `inSeconds` seconds. Survives the app being killed.
+    public static schedule(id: string, title: string, body: string, inSeconds: int, data: string = "", channel: string = ""): void {
+        emitNativeCommand("notif.schedule", { id: id, title: title, body: body, inSeconds: inSeconds, atMs: 0, data: data, channel: channel }, null)
+    }
+    // Show at an absolute time, epoch milliseconds.
+    public static scheduleAt(id: string, title: string, body: string, atEpochMs: int, data: string = "", channel: string = ""): void {
+        emitNativeCommand("notif.schedule", { id: id, title: title, body: body, inSeconds: 0, atMs: atEpochMs, data: data, channel: channel }, null)
+    }
+    // Un-schedule one that has not fired yet.
+    public static cancel(id: string): void { emitNativeCommand("notif.cancel", id, null) }
+    public static cancelAll(): void { emitNativeCommand("notif.cancelAll", "", null) }
+    // Remove one that HAS fired from the shade.
+    public static dismiss(id: string): void { emitNativeCommand("notif.dismiss", id, null) }
+    public static dismissAll(): void { emitNativeCommand("notif.dismissAll", "", null) }
+    // Everything scheduled and not yet fired: one per line, "id\ttitle\tfireAtMs".
+    public static scheduled(onResult: (string)=> void): void { emitNativeCommand("notif.scheduled", "", onResult) }
+    // The number on the app icon. 0 clears it. iOS shows it always; on Android it is
+    // up to the launcher, and most modern ones show a dot rather than a number.
+    public static setBadge(count: int): void { emitNativeCommand("notif.setBadge", count, null) }
+    public static badge(onResult: (string)=> void): void { emitNativeCommand("notif.badge", "", onResult) }
+    // Fires "id\tdata" when the user taps a notification, until cancelled. The tap that
+    // launched the app is delivered to the first subscriber.
+    public static onResponse(onTap: (string)=> void): NativeSub { return emitNativeStream("notif.onResponse", "", onTap, null) }
+    // Android only, a no-op on iOS. Since Android 8 every notification belongs to a
+    // channel, and the channel, not the notification, decides importance and sound;
+    // the user can silence a channel in Settings. A notification that names no
+    // channel goes to a default one. `importance` is "low" (no sound, no peek),
+    // "default", or "high" (peeks over the current screen). A channel's importance is
+    // fixed once created; a new id is needed to change it.
+    public static channel(id: string, name: string, importance: string = "default"): void {
+        emitNativeCommand("notif.channel", { id: id, name: name, importance: importance }, null)
+    }
+
+    /** Everything scheduled and not yet fired, awaited. */
+    public static async scheduledAsync(): Task<string> { return await awaitCommand("notif.scheduled", "", false, CAP_QUICK_MS) }
+    /** The badge number, awaited. */
+    public static async badgeAsync(): Task<int> {
+        const s: string = await awaitCommand("notif.badge", "", false, CAP_QUICK_MS)
+        return int(s)
     }
 }
 

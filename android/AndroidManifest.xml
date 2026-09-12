@@ -29,5 +29,14 @@
         <service android:name=".ChuksLocationService"
                  android:foregroundServiceType="location"
                  android:exported="false" />
+        <!-- Scheduled notifications. The alarm fires into this receiver with no Activity
+             alive, and BOOT_COMPLETED re-arms the stored ones, since alarms do not
+             survive a reboot. Exported because the boot broadcast comes from the
+             system; the alarm intents are explicit and reach it regardless. -->
+        <receiver android:name=".ChuksNotifReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
