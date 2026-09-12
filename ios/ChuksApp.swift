@@ -2718,7 +2718,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     /// framework's own streams use, so `__cancel__` releases both alike.
     func onCancel(_ token: String, _ teardown: @escaping () -> Void) { streamTeardown[token] = teardown }
 
-    func resolve(_ token: String, _ payload: String) { if let s = eResolve(token, payload) { apply(s); relayout() } }
+    // Token "0" is a call without a callback: nothing is waiting, so nothing to render.
+    func resolve(_ token: String, _ payload: String) {
+        if token == "0" { return }
+        if let s = eResolve(token, payload) { apply(s); relayout() }
+    }
     // Report a capability failure back to the engine (fires the request's onErr).
     // Token "0" means the caller passed no callback, so the engine allocated nothing and
     // there is no closure anywhere to hand this to. The engine's own unhandled-failure
@@ -3260,17 +3264,101 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)
         case "permission.request": permRequest(args, token)
+        // ---- files -----------------------------------------------------------
+        // A relative path lives under the documents directory; "/..." and "file://..."
+        // are taken as given (a picked photo, a recording, a download). Every error
+        // reaches the app as a message, never as a silent no-op.
         case "fs.write":
-            // The content arrives as an ordinary field: the wire packs arguments, so a
-            // multi-line body needs no encoding of its own any more.
-            try? a.s("content").write(to: appFile(a.s("name")), atomically: true, encoding: .utf8)
+            guard let url = fsTarget(token, a.s("name")) else { break }
+            do { try fsMkParent(url); try a.s("content").write(to: url, atomically: true, encoding: .utf8); resolve(token, "") }
+            catch { fail(token, "cannot write \(a.s("name")): \(error.localizedDescription)") }
+        case "fs.writeB64":
+            guard let url = fsTarget(token, a.s("name")) else { break }
+            guard let bytes = Data(base64Encoded: a.s("content"), options: .ignoreUnknownCharacters) else { fail(token, "content is not base64"); break }
+            do { try fsMkParent(url); try bytes.write(to: url, options: .atomic); resolve(token, "") }
+            catch { fail(token, "cannot write \(a.s("name")): \(error.localizedDescription)") }
         case "fs.read":
-            if let s = try? String(contentsOf: appFile(args), encoding: .utf8) { resolve(token, s) }
+            if let s = try? String(contentsOf: fsURL(args), encoding: .utf8) { resolve(token, s) }
+            else { fail(token, "no such file: \(args)") }
+        case "fs.readB64":
+            if let d = try? Data(contentsOf: fsURL(args)) { resolve(token, d.base64EncodedString()) }
             else { fail(token, "no such file: \(args)") }
         case "fs.list":
-            let names = (try? FileManager.default.contentsOfDirectory(atPath: appDir().path)) ?? []
-            resolve(token, names.joined(separator: "\n"))
-        case "fs.delete": try? FileManager.default.removeItem(at: appFile(args))
+            let dir = fsURL(args)
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { fail(token, "no such directory: \(args)"); break }
+            var isDir: ObjCBool = false
+            let rows = names.sorted().map { n -> String in
+                FileManager.default.fileExists(atPath: dir.appendingPathComponent(n).path, isDirectory: &isDir)
+                return isDir.boolValue ? n + "/" : n
+            }
+            resolve(token, rows.joined(separator: "\n"))
+        case "fs.delete":
+            // removeItem is recursive for a directory. Nothing to delete is not an error.
+            guard let url = fsTarget(token, args) else { break }
+            if FileManager.default.fileExists(atPath: url.path) {
+                do { try FileManager.default.removeItem(at: url); resolve(token, "") }
+                catch { fail(token, "cannot delete \(args): \(error.localizedDescription)") }
+            } else { resolve(token, "") }
+        case "fs.exists":
+            resolve(token, FileManager.default.fileExists(atPath: fsURL(args).path) ? "1" : "0")
+        case "fs.info":
+            var isDir: ObjCBool = false
+            let path = fsURL(args).path
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { resolve(token, "none,0,0"); break }
+            let attrs = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+            let size = isDir.boolValue ? 0 : ((attrs[.size] as? NSNumber)?.int64Value ?? 0)
+            let mod = Int64(((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0) * 1000)
+            resolve(token, "\(isDir.boolValue ? "dir" : "file"),\(size),\(mod)")
+        case "fs.mkdir":
+            guard let url = fsTarget(token, args) else { break }
+            do { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true); resolve(token, "") }
+            catch { fail(token, "cannot create \(args): \(error.localizedDescription)") }
+        case "fs.copy", "fs.move":
+            // File to file, off the main thread: a copy of a video takes as long as it
+            // takes and the screen must not wait for it.
+            guard let src = fsTarget(token, a.s("src")), let dst = fsTarget(token, a.s("dst")) else { break }
+            let isMove = cap == "fs.move"
+            DispatchQueue.global(qos: .utility).async {
+                var msg = ""
+                do {
+                    try self.fsMkParent(dst)
+                    if FileManager.default.fileExists(atPath: dst.path) { try FileManager.default.removeItem(at: dst) }
+                    if isMove { try FileManager.default.moveItem(at: src, to: dst) } else { try FileManager.default.copyItem(at: src, to: dst) }
+                } catch { msg = "cannot \(isMove ? "move" : "copy") \(a.s("src")): \(error.localizedDescription)" }
+                DispatchQueue.main.async { if msg.isEmpty { self.resolve(token, "") } else { self.fail(token, msg) } }
+            }
+        case "fs.download":
+            // URLSession streams to a temporary file; the bytes never sit in memory and
+            // never cross the bridge. The app hears "path,bytes" or one message.
+            guard let url = URL(string: a.s("url")), url.scheme != nil else { fail(token, "not a URL: \(a.s("url"))"); break }
+            guard let dst = fsTarget(token, a.s("dst")) else { break }
+            let shown = a.s("dst")
+            let task = URLSession.shared.downloadTask(with: url) { tmp, resp, err in
+                var msg = "", bytes: Int64 = 0
+                if let err = err { msg = err.localizedDescription }
+                else if let code = (resp as? HTTPURLResponse)?.statusCode, code >= 400 { msg = "HTTP \(code)" }
+                else if let tmp = tmp {
+                    do {
+                        try self.fsMkParent(dst)
+                        if FileManager.default.fileExists(atPath: dst.path) { try FileManager.default.removeItem(at: dst) }
+                        try FileManager.default.moveItem(at: tmp, to: dst)
+                        bytes = ((try? FileManager.default.attributesOfItem(atPath: dst.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                    } catch { msg = "cannot write \(shown): \(error.localizedDescription)" }
+                }
+                DispatchQueue.main.async { if msg.isEmpty { self.resolve(token, "\(dst.path),\(bytes)") } else { self.fail(token, "download failed: \(msg)") } }
+            }
+            task.resume()
+        case "fs.diskSpace":
+            let vals = try? appDir().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
+            let free = vals?.volumeAvailableCapacityForImportantUsage ?? 0
+            let total = Int64(vals?.volumeTotalCapacity ?? 0)
+            resolve(token, "\(free),\(total)")
+        case "fs.dir":
+            switch args {
+            case "cache": resolve(token, FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].path)
+            case "temp": resolve(token, FileManager.default.temporaryDirectory.path)
+            default: resolve(token, appDir().path)
+            }
         case "secure.set":
             keychainSet(a.s("key"), a.s("value"))
         case "secure.get":
@@ -3616,7 +3704,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     // File system (Tier B): the app's private Documents directory.
     private func appDir() -> URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
-    private func appFile(_ name: String) -> URL { appDir().appendingPathComponent(name) }
+    /// The URL a FileSystem path names: absolute and file:// as given, anything else
+    /// under the documents directory.
+    private func fsURL(_ path: String) -> URL {
+        if path.hasPrefix("file://") { return URL(fileURLWithPath: String(path.dropFirst(7))) }
+        if path.hasPrefix("/") { return URL(fileURLWithPath: path) }
+        return appDir().appendingPathComponent(path)
+    }
+    /// fsURL for an operation that writes, moves or deletes: an empty path would name
+    /// the documents directory itself, and no app means that. Fails the token instead.
+    private func fsTarget(_ token: String, _ path: String) -> URL? {
+        if path.isEmpty || path == "/" || path == "file://" { fail(token, "path is empty"); return nil }
+        return fsURL(path)
+    }
+    private func fsMkParent(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    }
 
     private func presentShare(_ items: [Any]) {
         let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)

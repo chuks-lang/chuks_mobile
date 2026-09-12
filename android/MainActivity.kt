@@ -1044,7 +1044,9 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     // Deliver a native capability result back to the engine and apply the re-render.
     // Public because a package's module answers through the same channel the framework's
     // own capabilities do (ChuksModuleHost).
+    // Token "0" is a call without a callback: nothing is waiting, so nothing to render.
     override fun resolve(token: String, payload: String) {
+        if (token == "0") return
         applyStream(engResolve(token, payload)); relayout()
     }
     // Report a capability failure back to the engine (fires the request's onErr).
@@ -1545,17 +1547,27 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     requestPermissions(if (args == "calendar") arrayOf(p, Manifest.permission.WRITE_CALENDAR) else arrayOf(p), code)
                 }
             }
-            "fs.write" -> {
-                // The content arrives as an ordinary field: the wire packs arguments,
-                // so a multi-line body needs no encoding of its own any more.
-                java.io.File(filesDir, a.s("name")).writeText(a.s("content"))
-            }
+            // ---- files: see ChuksFiles.kt. A null message is success. ----------
+            "fs.write" -> ChuksFiles.write(this, a.s("name"), a.s("content")).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "fs.writeB64" -> ChuksFiles.writeB64(this, a.s("name"), a.s("content")).let { if (it == null) resolve(token, "") else fail(token, it) }
             "fs.read" -> {
-                val f = java.io.File(filesDir, args)
-                if (f.exists()) resolve(token, f.readText()) else fail(token, "no such file: $args")
+                val f = ChuksFiles.resolve(this, args)
+                if (f.isFile) resolve(token, f.readText()) else fail(token, "no such file: $args")
             }
-            "fs.list" -> resolve(token, (filesDir.listFiles()?.map { it.name } ?: emptyList()).joinToString("\n"))
-            "fs.delete" -> java.io.File(filesDir, args).delete()
+            "fs.readB64" -> ChuksFiles.readB64(this, args).let { if (it != null) resolve(token, it) else fail(token, "no such file: $args") }
+            "fs.list" -> ChuksFiles.list(this, args).let { if (it != null) resolve(token, it) else fail(token, "no such directory: $args") }
+            "fs.delete" -> ChuksFiles.delete(this, args).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "fs.exists" -> resolve(token, if (ChuksFiles.resolve(this, args).exists()) "1" else "0")
+            "fs.info" -> resolve(token, ChuksFiles.info(this, args))
+            "fs.mkdir" -> ChuksFiles.mkdir(this, args).let { if (it == null) resolve(token, "") else fail(token, it) }
+            "fs.copy", "fs.move" -> ChuksFiles.transfer(this, a.s("src"), a.s("dst"), cap == "fs.move", { runOnUiThread(it) }) { msg ->
+                if (msg == null) resolve(token, "") else fail(token, msg)
+            }
+            "fs.download" -> ChuksFiles.download(this, a.s("url"), a.s("dst"), { runOnUiThread(it) }) { result, msg ->
+                if (msg == null) resolve(token, result) else fail(token, msg)
+            }
+            "fs.diskSpace" -> resolve(token, ChuksFiles.diskSpace(this))
+            "fs.dir" -> resolve(token, ChuksFiles.dir(this, args))
             "secure.set" -> {
                 secureSet(a.s("key"), a.s("value"))
             }

@@ -745,27 +745,103 @@ export class Permission {
     public static async requestAsync(kind: string): Task<string> { return await awaitCommand("permission.request", kind, true, CAP_PROMPT_MS) }
 }
 
-// ---- File system (Tier B) ---------------------------------------------------
-// Read / write / list / delete files in the app's private document directory.
-// Content crosses as an ordinary argument: the wire packs arguments, so a multi-line
-// file body needs no encoding of its own. read() returns the content directly. A read
-// of a missing file goes to onError.
+// ---- File system ------------------------------------------------------------
+// Files in the app's own storage, and any file the app has a path to.
+//
+// A path is relative to the app's documents directory unless it starts with "/" or
+// "file://", in which case it is taken as given, which is how a picked photo, a
+// recording or a download is read. Relative paths may have directories in them:
+// "notes/2026/a.txt" works, and write() creates the directories on the way.
+//
+// Text crosses the bridge as text. Binary crosses as base64, which is fine for a
+// thumbnail or a small blob and wrong for a video: for anything large, move it with
+// copy(), move() and download(), which go file to file on the native side and never
+// cross the bridge at all.
+//
+// Storage is private to the app, backed up, kept across updates and removed on
+// uninstall. Secrets belong in SecureStore, not here.
 export class FileSystem {
-    public static write(name: string, content: string): void {
-        emitNativeCommand("fs.write", { name: name, content: content }, null)
+    // Writes text. Creates missing directories. Content crosses as an ordinary
+    // argument, so a multi-line body needs no encoding of its own.
+    public static write(path: string, content: string): void {
+        emitNativeCommand("fs.write", { name: path, content: content }, null)
     }
-    public static read(name: string, onResult: (string)=> void, onError: (string)=> void): void {
-        emitNativeCommandE("fs.read", name, onResult, onError)
+    // Writes bytes given as base64 (see std/buffer for producing it).
+    public static writeBase64(path: string, base64: string): void {
+        emitNativeCommand("fs.writeB64", { name: path, content: base64 }, null)
     }
-    public static list(onResult: (string)=> void): void {
-        emitNativeCommand("fs.list", "", onResult)
+    public static read(path: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("fs.read", path, onResult, onError)
     }
-    public static delete(name: string): void { emitNativeCommand("fs.delete", name, null) }
+    // Bytes, as base64.
+    public static readBase64(path: string, onResult: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("fs.readB64", path, onResult, onError)
+    }
+    // One entry per line, directories with a trailing "/". The documents directory
+    // when `dir` is empty.
+    public static list(onResult: (string)=> void, dir: string = ""): void {
+        emitNativeCommand("fs.list", dir, onResult)
+    }
+    // A file, or a directory and everything in it. Deleting what is not there is fine.
+    public static delete(path: string): void { emitNativeCommand("fs.delete", path, null) }
+    public static exists(path: string, onResult: (bool)=> void): void {
+        emitNativeCommand("fs.exists", path, function(s: string): void { onResult(s == "1") })
+    }
+    // "kind,sizeBytes,modifiedMs": kind is "file", "dir" or "none". A directory's size
+    // is 0, not the sum of its contents.
+    public static info(path: string, onResult: (string)=> void): void { emitNativeCommand("fs.info", path, onResult) }
+    public static mkdir(path: string): void { emitNativeCommand("fs.mkdir", path, null) }
+    // File to file on the native side; nothing crosses the bridge. Directories on the
+    // way to `dst` are created. An existing `dst` is replaced.
+    public static copy(src: string, dst: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("fs.copy", { src: src, dst: dst }, function(_: string): void { onOk() }, onError)
+    }
+    public static move(src: string, dst: string, onOk: ()=> void, onError: (string)=> void): void {
+        emitNativeCommandE("fs.move", { src: src, dst: dst }, function(_: string): void { onOk() }, onError)
+    }
+    // Fetches a URL straight to a file, streamed, so the size of the download is not
+    // the size of anything in memory. onOk gets the byte count.
+    public static download(url: string, dst: string, onOk: (string)=> void, onError: (string)=> void): void {
+        emitNativeCommandE("fs.download", { url: url, dst: dst }, onOk, onError)
+    }
+    // "freeBytes,totalBytes" for the volume the app's storage is on.
+    public static diskSpace(onResult: (string)=> void): void { emitNativeCommand("fs.diskSpace", "", onResult) }
+    // The absolute path of one of the app's directories, for handing to something
+    // that wants a real path: "documents" (backed up), "cache" (the OS may clear it),
+    // "temp" (gone by the next launch).
+    public static dir(kind: string, onResult: (string)=> void): void { emitNativeCommand("fs.dir", kind, onResult) }
 
-    /** A file's contents, awaited. Throws if it does not exist. */
-    public static async readAsync(name: string): Task<string> { return await awaitCommand("fs.read", name, true, CAP_QUICK_MS) }
-    /** The private directory's file names, newline-joined, awaited. */
-    public static async listAsync(): Task<string> { return await awaitCommand("fs.list", "", false, CAP_QUICK_MS) }
+    /** A file's text, awaited. Throws if it does not exist. */
+    public static async readAsync(path: string): Task<string> { return await awaitCommand("fs.read", path, true, CAP_QUICK_MS) }
+    /** A file's bytes as base64, awaited. Throws if it does not exist. */
+    public static async readBase64Async(path: string): Task<string> { return await awaitCommand("fs.readB64", path, true, CAP_QUICK_MS) }
+    /** A directory listing, awaited. */
+    public static async listAsync(dir: string = ""): Task<string> { return await awaitCommand("fs.list", dir, false, CAP_QUICK_MS) }
+    /** Whether the path exists, awaited. */
+    public static async existsAsync(path: string): Task<bool> {
+        const s: string = await awaitCommand("fs.exists", path, false, CAP_QUICK_MS)
+        return s == "1"
+    }
+    /** "kind,sizeBytes,modifiedMs", awaited. */
+    public static async infoAsync(path: string): Task<string> { return await awaitCommand("fs.info", path, false, CAP_QUICK_MS) }
+    /** Copy, awaited. Throws on failure. */
+    public static async copyAsync(src: string, dst: string): Task<void> {
+        await awaitCommand("fs.copy", { src: src, dst: dst }, true, CAP_HARDWARE_MS)
+        return
+    }
+    /** Move, awaited. Throws on failure. */
+    public static async moveAsync(src: string, dst: string): Task<void> {
+        await awaitCommand("fs.move", { src: src, dst: dst }, true, CAP_HARDWARE_MS)
+        return
+    }
+    /** Download, awaited. Answers the byte count; throws on failure. Allowed as long as a prompt, since a download is as slow as the network. */
+    public static async downloadAsync(url: string, dst: string): Task<string> {
+        return await awaitCommand("fs.download", { url: url, dst: dst }, true, CAP_PROMPT_MS)
+    }
+    /** "freeBytes,totalBytes", awaited. */
+    public static async diskSpaceAsync(): Task<string> { return await awaitCommand("fs.diskSpace", "", false, CAP_QUICK_MS) }
+    /** An app directory's absolute path, awaited. */
+    public static async dirAsync(kind: string): Task<string> { return await awaitCommand("fs.dir", kind, false, CAP_QUICK_MS) }
 }
 
 // ---- Secure storage (Tier B) ------------------------------------------------
