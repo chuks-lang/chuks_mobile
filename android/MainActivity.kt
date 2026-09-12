@@ -1706,33 +1706,28 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 ChuksAudio.players.remove(id)?.release()
                 audioWatchers.remove(id)
             }
-            "recorder.start" -> {
-                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) { fail(token, "microphone permission denied"); return }
-                try {
-                    val f = java.io.File(filesDir, "rec-${System.nanoTime()}.m4a")
-                    @Suppress("DEPRECATION")
-                    val mr = if (android.os.Build.VERSION.SDK_INT >= 31) android.media.MediaRecorder(this) else android.media.MediaRecorder()
-                    mr.setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-                    mr.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
-                    mr.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
-                    mr.setOutputFile(f.absolutePath)
-                    mr.prepare(); mr.start()
-                    mediaRecorder = mr; recPath = f.absolutePath
-                } catch (e: Exception) { fail(token, "record failed: ${e.message}") }
+            // ---- recorder: see ChuksRecorder.kt ---------------------------------
+            "recorder.start" -> withMicPerm(token) {
+                val err = recorder.start(args)
+                if (err == null) resolve(token, "") else fail(token, err)
             }
+            "recorder.pause" -> recorder.pause()
+            "recorder.resume" -> recorder.resume()
             "recorder.stop" -> {
-                val mr = mediaRecorder ?: run { fail(token, "not recording"); return }
-                try { mr.stop() } catch (e: Exception) {}
-                mr.release(); mediaRecorder = null
-                resolve(token, "file://" + (recPath ?: ""))
+                val p = recorder.stop()
+                if (p == null) fail(token, "not recording") else if (p.isEmpty()) fail(token, "nothing was recorded") else resolve(token, "file://$p")
+            }
+            "recorder.cancel" -> recorder.cancel()
+            "recorder.status" -> resolve(token, recorder.status())
+            "recorder.watch" -> {
+                recorder.watchers.add(token)
+                streamTeardown[token] = { recorder.watchers.remove(token) }
+                resolve(token, recorder.status())
             }
             "recorder.levels" -> {
                 val r = object : Runnable {
                     override fun run() {
-                        mediaRecorder?.let {
-                            val amp = try { it.maxAmplitude } catch (e: Exception) { 0 }
-                            resolve(token, String.format("%.3f", (amp.toDouble() / 32767.0).coerceIn(0.0, 1.0)))
-                        }
+                        resolve(token, String.format(java.util.Locale.US, "%.3f", recorder.level()))
                         if (activeStreams.containsKey(token)) streamHandler.postDelayed(this, 80)
                     }
                 }
@@ -2204,8 +2199,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
     private var notifId = 1
     private val audioWatchers = HashMap<String, HashSet<String>>()   // AudioPlayer id -> watch tokens
-    private var mediaRecorder: android.media.MediaRecorder? = null   // mic recording (Tier C)
-    private var recPath: String? = null
+    private val recorder: ChuksRecorder by lazy { ChuksRecorder(this) { s -> for (t in recorder.watchers.toList()) resolve(t, s) } }
+    private fun withMicPerm(token: String, run: () -> Unit) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { run(); return }
+        val code = ++permSeq
+        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "microphone permission denied") }
+        enqueuePermissionRequest(arrayOf(Manifest.permission.RECORD_AUDIO), code)
+    }
 
     // Text-to-speech: see ChuksSpeech.kt. Watchers get every event; a tts.say token
     // is settled when its own utterance ends.

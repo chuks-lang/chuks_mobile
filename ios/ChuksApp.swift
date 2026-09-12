@@ -3052,6 +3052,40 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var ble: BleManager? = nil          // CoreBluetooth central (lazy)
     var nfc: NfcReader? = nil           // CoreNFC reader (lazy)
     var recURL: URL? = nil
+    var recPaused = false
+    var recorderWatchers = Set<String>()
+    private var recorderTicker: Timer? = nil
+    private func recorderLevel() -> Double {
+        guard let r = audioRecorder, r.isRecording else { return 0 }
+        r.updateMeters()
+        return max(0, min(1, pow(10, Double(r.averagePower(forChannel: 0)) / 20)))   // dB (-160..0) -> linear 0..1
+    }
+    private func recorderStatus() -> String {
+        guard let r = audioRecorder else { return "idle,0,0.000" }
+        let state = recPaused ? "paused" : "recording"
+        return "\(state),\(Int(r.currentTime * 1000))," + String(format: "%.3f", recorderLevel())
+    }
+    private func pushRecorderStatus() {
+        let s = recorderStatus()
+        for t in recorderWatchers { resolve(t, s) }
+        if audioRecorder == nil { recorderTicker?.invalidate(); recorderTicker = nil }
+    }
+    private func startRecorderTicker() {
+        recorderTicker?.invalidate()
+        recorderTicker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.audioRecorder == nil { self.recorderTicker?.invalidate(); self.recorderTicker = nil; return }
+            if !self.recorderWatchers.isEmpty { self.pushRecorderStatus() }
+        }
+    }
+    // The microphone permission, asked for on first use; a refusal fails the token.
+    private func withMicPermission(_ token: String, _ work: @escaping () -> Void) {
+        switch AVAudioSession.sharedInstance().recordPermission {
+        case .granted: work()
+        case .denied: fail(token, "microphone permission denied")
+        default: AVAudioSession.sharedInstance().requestRecordPermission { ok in DispatchQueue.main.async { if ok { work() } else { self.fail(token, "microphone permission denied") } } }
+        }
+    }
     lazy var speech = ChuksSpeech(host: self)  // text-to-speech
     let pedometer = CMPedometer()       // step counter / distance / pace (Pedometer)
     let altimeter = CMAltimeter()       // barometer: pressure + relative altitude
@@ -3926,29 +3960,54 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             audioPlayers[id]?.release()
             audioPlayers[id] = nil
             audioWatchers[id] = nil
+        // ---- recorder ----------------------------------------------------------------
+        // AVAudioRecorder with metering. The session is playAndRecord WITH
+        // defaultToSpeaker: without it, everything the app plays after a recording
+        // goes to the earpiece, which is the classic trap. A phone call pauses the
+        // recorder (interruption began) and the status says so; the app resumes.
         case "recorder.start":
-            guard AVAudioSession.sharedInstance().recordPermission == .granted else { fail(token, "microphone permission denied"); break }
-            let url = appDir().appendingPathComponent("rec-\(UUID().uuidString).m4a")
-            let settings: [String: Any] = [AVFormatIDKey: Int(kAudioFormatMPEG4AAC), AVSampleRateKey: 44100,
-                                           AVNumberOfChannelsKey: 1, AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue]
-            do {
-                try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default)
-                try AVAudioSession.sharedInstance().setActive(true)
-                let r = try AVAudioRecorder(url: url, settings: settings)
-                r.isMeteringEnabled = true; r.record()
-                audioRecorder = r; recURL = url
-            } catch { fail(token, "record failed: \(error.localizedDescription)") }
+            withMicPermission(token) {
+                if self.audioRecorder != nil { self.fail(token, "already recording"); return }
+                let url = self.appDir().appendingPathComponent("rec-\(UUID().uuidString).m4a")
+                let (rate, bitrate): (Int, Int) = args == "low" ? (22050, 32000) : (args == "high" ? (48000, 192000) : (44100, 96000))
+                let settings: [String: Any] = [AVFormatIDKey: Int(kAudioFormatMPEG4AAC), AVSampleRateKey: rate, AVNumberOfChannelsKey: 1,
+                                               AVEncoderBitRateKey: bitrate, AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
+                do {
+                    try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+                    try AVAudioSession.sharedInstance().setActive(true)
+                    let r = try AVAudioRecorder(url: url, settings: settings)
+                    r.isMeteringEnabled = true
+                    guard r.record() else { self.fail(token, "record failed: the input is busy"); return }
+                    self.audioRecorder = r; self.recURL = url; self.recPaused = false
+                    if self.audioInterruptionObs.isEmpty { self.installAudioInterruptionHandling() }
+                    self.startRecorderTicker()
+                    self.resolve(token, "")
+                } catch { self.fail(token, "record failed: \(error.localizedDescription)") }
+            }
+        case "recorder.pause":
+            if let r = audioRecorder, r.isRecording { r.pause(); recPaused = true; pushRecorderStatus() }
+        case "recorder.resume":
+            if let r = audioRecorder, recPaused { r.record(); recPaused = false; pushRecorderStatus() }
         case "recorder.stop":
             guard let r = audioRecorder, let url = recURL else { fail(token, "not recording"); break }
-            r.stop(); audioRecorder = nil
-            try? AVAudioSession.sharedInstance().setActive(false)
+            r.stop(); audioRecorder = nil; recPaused = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            pushRecorderStatus()
             resolve(token, "file://" + url.path)
+        case "recorder.cancel":
+            if let r = audioRecorder { r.stop(); r.deleteRecording() }
+            audioRecorder = nil; recPaused = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            pushRecorderStatus()
+        case "recorder.status": resolve(token, recorderStatus())
+        case "recorder.watch":
+            recorderWatchers.insert(token)
+            streamTeardown[token] = { [weak self] in self?.recorderWatchers.remove(token) }
+            resolve(token, recorderStatus())
         case "recorder.levels":
             let t = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
-                guard let r = self?.audioRecorder else { return }
-                r.updateMeters()
-                let lin = pow(10, r.averagePower(forChannel: 0) / 20)   // dB (-160..0) -> linear 0..1
-                self?.resolve(token, String(format: "%.3f", max(0, min(1, lin))))
+                guard let self = self else { return }
+                self.resolve(token, String(format: "%.3f", self.recorderLevel()))
             }
             activeStreams[token] = t
         // ---- text-to-speech: see ChuksSpeech ---------------------------------------
@@ -4177,6 +4236,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     p.wasPlayingBeforeInterruption = p.state == "playing"
                     if p.wasPlayingBeforeInterruption { p.pause() }
                 }
+                // A call takes the input: the recording pauses and says so. It does not
+                // resume by itself, since the app may want to end it there.
+                if let r = self.audioRecorder, r.isRecording { r.pause(); self.recPaused = true; self.pushRecorderStatus() }
             case .ended:
                 let opts = AVAudioSession.InterruptionOptions(rawValue: n.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
                 if opts.contains(.shouldResume) {

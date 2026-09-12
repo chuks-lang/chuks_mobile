@@ -1358,20 +1358,33 @@ export class Audio {
         return audioPos(s)
     }
 }
-// ---- Microphone recording (Tier C) ------------------------------------------
-// Record audio from the mic to a file, with a live input-level stream for a VU meter.
-// start() begins recording (needs the "microphone" permission — request it via
-// Permission.request first; onError fires if it is denied or recording fails). stop()
-// finishes and answers (onResult) with a "file://<path>" to the recorded m4a, which you
-// can hand straight to Audio.play. levels() streams the current input level as "0".."1"
-// (normalized) while recording, ~12x/second, until its NativeSub is cancelled.
+// ---- Microphone recording ---------------------------------------------------
+// Record from the microphone to an AAC file (".m4a", mono), which Audio can play back
+// and FileSystem can move. Needs the "microphone" permission; a start() before the app
+// has asked is the prompt. Status is "state,durationMs,level": state "recording",
+// "paused" or "idle", duration the recorded time (pauses excluded), level the input
+// level 0.0..1.0 for a meter. A phone call pauses the recording and the status says
+// so; the app resumes when it wants to.
 export class Recorder {
-    public static start(onError: (string)=> void): void {
-        emitNativeCommandE("recorder.start", "", null, onError)
+    /** Starts a new recording. quality is "low" (voice memo, small), "medium" or "high" (music). */
+    public static start(onError: (string)=> void, quality: string = "medium"): void {
+        emitNativeCommandE("recorder.start", quality, null, onError)
     }
+    public static pause(): void { emitNativeCommand("recorder.pause", "", null) }
+    public static resume(): void { emitNativeCommand("recorder.resume", "", null) }
+    /** Finishes and answers a "file://" path to the recording. */
     public static stop(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("recorder.stop", "", onResult, onError)
     }
+    /** Stops and deletes the recording. */
+    public static cancel(): void { emitNativeCommand("recorder.cancel", "", null) }
+    /** "state,durationMs,level", once. */
+    public static status(onResult: (string)=> void): void { emitNativeCommand("recorder.status", "", onResult) }
+    /** The status a few times a second while recording or paused, and once when it stops. */
+    public static watch(onStatus: (string)=> void): NativeSub {
+        return emitNativeStream("recorder.watch", "", onStatus, null)
+    }
+    /** The input level alone, "0.000".."1.000", about 12 times a second while recording. */
     public static levels(onLevel: (string)=> void): NativeSub {
         return emitNativeStream("recorder.levels", "", onLevel, null)
     }
@@ -1386,8 +1399,15 @@ export class Recorder {
         const s: string = await awaitCommand("recorder.available", "", false, CAP_QUICK_MS)
         return s == "1"
     }
+    /** Start, awaited: resolves once recording, throws if denied or the input is busy. */
+    public static async startAsync(quality: string = "medium"): Task<void> {
+        await awaitCommand("recorder.start", quality, true, CAP_PROMPT_MS)
+        return
+    }
     /** Stop recording, awaited. Answers a "file://" path to the m4a. */
     public static async stopAsync(): Task<string> { return await awaitCommand("recorder.stop", "", true, CAP_QUICK_MS) }
+    /** "state,durationMs,level", awaited. */
+    public static async statusAsync(): Task<string> { return await awaitCommand("recorder.status", "", false, CAP_QUICK_MS) }
 }
 
 // ---- Text-to-speech ---------------------------------------------------------
