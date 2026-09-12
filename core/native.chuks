@@ -430,25 +430,68 @@ export class MediaPicker {
     }
 }
 
-// The camera. takePhoto() presents the system camera UI; capturePreview() takes a still
-// from a CameraView already on screen, with no system UI, which is the one to use for a
-// scanner or a custom shutter. Both copy the result into the app's private storage and
-// answer a "file://" path. Needs the "camera" permission, and there is no camera on
-// either simulator.
+// The camera. takePhoto() and takeVideo() present the system camera UI; capturePreview()
+// takes a still from a CameraView already on screen, with no system UI, which is the
+// one to use for a scanner or a custom shutter, and setFlash / setZoom / focusAt drive
+// that view. Everything copies its result into the app's private storage and answers a
+// "file://" path. Needs the "camera" permission, and there is no camera on the iOS
+// Simulator (the Android emulator has a virtual one).
 export class Camera {
+    /** Whether this device has a camera at all. False on both simulators. */
+    public static available(onResult: (bool)=> void): void {
+        emitNativeCommand("camera.available", "", function(s: string): void { onResult(s == "1") })
+    }
     public static takePhoto(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("camera.photo", "", onResult, onError)
+    }
+    /**
+     * The system camera, recording a video. Answers a "file://" path (MediaPicker.info
+     * describes it). `maxSeconds` caps the recording, 0 for no cap; quality "high" or
+     * "low" (the platform's own sizes). Needs "camera" and "microphone" on iOS; the
+     * Android camera app handles both itself.
+     */
+    public static takeVideo(onResult: (string)=> void, onError: (string)=> void, maxSeconds: int = 0, quality: string = "high"): void {
+        emitNativeCommandE("camera.video", { maxSeconds: maxSeconds, quality: quality }, onResult, onError)
     }
     // Capture a still from a live CameraView that is currently on screen. Resolves a
     // "file://<path>" JPEG you can pass to Image. Fails if no CameraView is mounted.
     public static capturePreview(onResult: (string)=> void, onError: (string)=> void): void {
         emitNativeCommandE("camera.capturePreview", "", onResult, onError)
     }
+    // ---- controls for a CameraView on screen ------------------------------------
+    /** "off", "on", "auto" for the flash at capture, or "torch" for the light on continuously. */
+    public static setFlash(mode: string): void { emitNativeCommand("camera.flash", mode, null) }
+    /** The zoom factor, 1.0 for none; clamped to zoomRange(). */
+    public static setZoom(factor: float): void { emitNativeCommand("camera.zoom", factor, null) }
+    /** "min,max" zoom factors the camera on screen supports. */
+    public static zoomRange(onResult: (string)=> void): void { emitNativeCommand("camera.zoomRange", "", onResult) }
+    /** Focus and expose on a point of the view, x and y as 0.0..1.0 fractions of its width and height. */
+    public static focusAt(x: float, y: float): void { emitNativeCommand("camera.focus", { x: x, y: y }, null) }
+    /** Whether the camera on screen has a flash. */
+    public static hasFlash(onResult: (bool)=> void): void {
+        emitNativeCommand("camera.hasFlash", "", function(s: string): void { onResult(s == "1") })
+    }
 
+    /** Whether there is a camera, awaited. */
+    public static async availableAsync(): Task<bool> {
+        const s: string = await awaitCommand("camera.available", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
     /** Take a photo, awaited. Throws if the user cancels or the permission is denied. */
     public static async takePhotoAsync(): Task<string> { return await awaitCommand("camera.photo", "", true, CAP_PROMPT_MS) }
+    /** Record a video with the system camera, awaited. Throws "canceled". */
+    public static async takeVideoAsync(maxSeconds: int = 0, quality: string = "high"): Task<string> {
+        return await awaitCommand("camera.video", { maxSeconds: maxSeconds, quality: quality }, true, CAP_PROMPT_MS)
+    }
     /** Capture a still from a mounted CameraView, awaited. */
     public static async capturePreviewAsync(): Task<string> { return await awaitCommand("camera.capturePreview", "", true, CAP_QUICK_MS) }
+    /** "min,max" zoom factors, awaited. */
+    public static async zoomRangeAsync(): Task<string> { return await awaitCommand("camera.zoomRange", "", false, CAP_QUICK_MS) }
+    /** Whether the camera on screen has a flash, awaited. */
+    public static async hasFlashAsync(): Task<bool> {
+        const s: string = await awaitCommand("camera.hasFlash", "", false, CAP_QUICK_MS)
+        return s == "1"
+    }
 }
 
 // ---- Bluetooth LE -----------------------------------------------------------

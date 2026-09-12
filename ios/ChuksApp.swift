@@ -419,13 +419,66 @@ final class CameraController: NSObject, AVCapturePhotoCaptureDelegate {
     }
 
     func stop() { q.async { [weak self] in if self?.session.isRunning == true { self?.session.stopRunning() } } }
+    /// After a permission grant: the view is there, the input could not be made before.
+    func reopen() { if session.inputs.isEmpty { let f = facing.isEmpty ? "back" : facing; facing = ""; configure(f) } }
+
+    // ---- controls -------------------------------------------------------------------
+    // Flash is a capture setting (off / on / auto); torch is the light kept on, which
+    // is a device setting. Zoom and focus are device settings too, and every device
+    // setting needs lockForConfiguration around it or it is ignored.
+    private var flashMode: AVCaptureDevice.FlashMode = .off
+    private var device: AVCaptureDevice? { (session.inputs.first as? AVCaptureDeviceInput)?.device }
+    private func configureDevice(_ f: (AVCaptureDevice) -> Void) {
+        guard let d = device, (try? d.lockForConfiguration()) != nil else { return }
+        f(d); d.unlockForConfiguration()
+    }
+    func hasFlash() -> Bool { device?.hasFlash ?? false }
+    func setFlash(_ mode: String) {
+        flashMode = mode == "on" ? .on : (mode == "auto" ? .auto : .off)
+        q.async { [weak self] in
+            self?.configureDevice { d in
+                guard d.hasTorch else { return }
+                d.torchMode = mode == "torch" && d.isTorchModeSupported(.on) ? .on : .off
+            }
+        }
+    }
+    func zoomRange() -> String {
+        guard let d = device else { return "1,1" }
+        // The upper bound the hardware reports can be 100x and is digital past a few;
+        // it is the platform's number and reported as such.
+        return String(format: "%.1f,%.1f", Double(d.minAvailableVideoZoomFactor), Double(d.maxAvailableVideoZoomFactor))
+    }
+    func setZoom(_ factor: Double) {
+        q.async { [weak self] in
+            self?.configureDevice { d in d.videoZoomFactor = CGFloat(max(Double(d.minAvailableVideoZoomFactor), min(Double(d.maxAvailableVideoZoomFactor), factor))) }
+        }
+    }
+    func focus(x: Double, y: Double) {
+        // The view's fraction to the device's point of interest, which is in the
+        // sensor's own orientation; the preview layer knows the conversion.
+        let layer = previewView.layer as? AVCaptureVideoPreviewLayer
+        let viewPoint = CGPoint(x: previewView.bounds.width * CGFloat(x), y: previewView.bounds.height * CGFloat(y))
+        let devPoint = layer?.captureDevicePointConverted(fromLayerPoint: viewPoint) ?? CGPoint(x: x, y: y)
+        q.async { [weak self] in
+            self?.configureDevice { d in
+                if d.isFocusPointOfInterestSupported && d.isFocusModeSupported(.autoFocus) { d.focusPointOfInterest = devPoint; d.focusMode = .autoFocus }
+                if d.isExposurePointOfInterestSupported && d.isExposureModeSupported(.autoExpose) { d.exposurePointOfInterest = devPoint; d.exposureMode = .autoExpose }
+                // Go back to continuous once this focus has landed, so the view stays
+                // sharp when the scene moves; the device does that when subject-area
+                // change monitoring is on.
+                d.isSubjectAreaChangeMonitoringEnabled = true
+            }
+        }
+    }
 
     func capture(ok: @escaping (String) -> Void, err: @escaping (String) -> Void) {
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { err("camera permission not granted"); return }
         onCapOk = ok; onCapErr = err
         q.async { [weak self] in
             guard let self = self, self.session.isRunning else { DispatchQueue.main.async { err("camera not running") }; return }
-            self.photoOut.capturePhoto(with: AVCapturePhotoSettings(), delegate: self)
+            let settings = AVCapturePhotoSettings()
+            if self.photoOut.supportedFlashModes.contains(self.flashMode) { settings.flashMode = self.flashMode }
+            self.photoOut.capturePhoto(with: settings, delegate: self)
         }
     }
 
@@ -1236,6 +1289,13 @@ final class MediaCoordinator: NSObject, PHPickerViewControllerDelegate, UIImageP
     }
     func imagePickerController(_ p: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
         p.dismiss(animated: true)
+        if let movie = info[.mediaURL] as? URL {
+            // The camera's temporary file: copied into the app's storage before iOS reclaims it.
+            let dst = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("cam_\(UUID().uuidString).\(movie.pathExtension.isEmpty ? "mov" : movie.pathExtension)")
+            if (try? FileManager.default.copyItem(at: movie, to: dst)) != nil { done("file://" + dst.path) } else { cancel("cannot keep the video") }
+            return
+        }
         if let path = (info[.originalImage] as? UIImage).flatMap({ chuksSaveImage($0) }) { done("file://" + path) } else { cancel("no image") }
     }
     func imagePickerControllerDidCancel(_ p: UIImagePickerController) { p.dismiss(animated: true); cancel("canceled") }
@@ -3786,9 +3846,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     else { PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url) }
                 }, completionHandler: { ok, err in DispatchQueue.main.async { ok ? self?.resolve(token, "ok") : self?.fail(token, err?.localizedDescription ?? "save failed") } })
             }
+        case "camera.available": resolve(token, UIImagePickerController.isSourceTypeAvailable(.camera) ? "1" : "0")
+        case "camera.video":
+            if !UIImagePickerController.isSourceTypeAvailable(.camera) { fail(token, "camera unavailable"); break }
+            let coord = MediaCoordinator(done: { [weak self] p in self?.mediaCoord = nil; self?.resolve(token, p) },
+                                         cancel: { [weak self] m in self?.mediaCoord = nil; self?.fail(token, m) })
+            mediaCoord = coord
+            let pk = UIImagePickerController(); pk.sourceType = .camera; pk.delegate = coord
+            pk.mediaTypes = [UTType.movie.identifier]
+            pk.videoQuality = a.s("quality") == "low" ? .typeMedium : .typeHigh
+            let cap = a.num("maxSeconds") ?? 0
+            if cap > 0 { pk.videoMaximumDuration = cap }
+            present(pk, animated: true)
         case "camera.capturePreview":
             guard let ctrl = cameraController else { fail(token, "no CameraView on screen"); break }
             ctrl.capture(ok: { [weak self] p in self?.resolve(token, p) }, err: { [weak self] m in self?.fail(token, m) })
+        case "camera.flash": cameraController?.setFlash(args)
+        case "camera.zoom": if let z = a.num() { cameraController?.setZoom(z) }
+        case "camera.zoomRange": resolve(token, cameraController?.zoomRange() ?? "1,1")
+        case "camera.focus": cameraController?.focus(x: a.num("x") ?? 0.5, y: a.num("y") ?? 0.5)
+        case "camera.hasFlash": resolve(token, cameraController?.hasFlash() == true ? "1" : "0")
         case "ble.state":
             ensureBle(); ble!.stateToken = token; ble!.emitState()
             streamTeardown[token] = { [weak self] in self?.ble?.stateToken = nil }
@@ -4398,7 +4475,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Show the OS dialog once and report the outcome (all async).
     private func permRequest(_ kind: String, _ token: String) {
         switch kind {
-        case "camera": AVCaptureDevice.requestAccess(for: .video) { g in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } }
+        case "camera": AVCaptureDevice.requestAccess(for: .video) { g in DispatchQueue.main.async { if g { self.cameraController?.reopen() }; self.resolve(token, g ? "granted" : "denied") } }
         case "microphone": AVCaptureDevice.requestAccess(for: .audio) { g in DispatchQueue.main.async { self.resolve(token, g ? "granted" : "denied") } }
         case "photos": PHPhotoLibrary.requestAuthorization(for: .readWrite) { s in DispatchQueue.main.async { self.resolve(token, phAuthStr(s)) } }
         case "notifications":

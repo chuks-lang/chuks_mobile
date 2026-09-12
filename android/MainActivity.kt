@@ -1507,6 +1507,32 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 try { startActivityForResult(intent, code) }
                 catch (e: Exception) { pendingMedia.remove(code); fail(token, "no camera app") }
             }
+            "camera.available" -> resolve(token, if (packageManager.hasSystemFeature(PackageManager.FEATURE_CAMERA_ANY)) "1" else "0")
+            "camera.video" -> {
+                val code = ++mediaSeq
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Video.Media.DISPLAY_NAME, "chuks-$code.mp4")
+                    put(android.provider.MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                }
+                val outUri = contentResolver.insert(android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                if (outUri == null) { fail(token, "cannot create output"); return }
+                pendingMedia[code] = Pair(token, outUri)
+                pendingVideo.add(code)
+                val intent = Intent(android.provider.MediaStore.ACTION_VIDEO_CAPTURE).apply {
+                    putExtra(android.provider.MediaStore.EXTRA_OUTPUT, outUri)
+                    putExtra(android.provider.MediaStore.EXTRA_VIDEO_QUALITY, if (a.s("quality") == "low") 0 else 1)
+                    val cap = a.int("maxSeconds") ?: 0
+                    if (cap > 0) putExtra(android.provider.MediaStore.EXTRA_DURATION_LIMIT, cap)
+                    addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                try { startActivityForResult(intent, code) }
+                catch (e: Exception) { pendingMedia.remove(code); pendingVideo.remove(code); fail(token, "no camera app") }
+            }
+            "camera.flash" -> cameraController?.setFlash(args)
+            "camera.zoom" -> a.num()?.let { cameraController?.setZoom(it.toFloat()) }
+            "camera.zoomRange" -> resolve(token, cameraController?.zoomRange() ?: "1.0,1.0")
+            "camera.focus" -> cameraController?.focusAt((a.num("x") ?: 0.5).toFloat(), (a.num("y") ?: 0.5).toFloat())
+            "camera.hasFlash" -> resolve(token, if (cameraController?.hasFlash() == true) "1" else "0")
             "camera.capturePreview" -> {
                 val ctrl = cameraController
                 if (ctrl == null) { fail(token, "no CameraView on screen"); return }
@@ -1948,6 +1974,8 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         super.onRequestPermissionsResult(code, permissions, grantResults)
         permInFlight = false
         val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        // A CameraView mounted before the app had the permission stayed dark: open it now.
+        if (granted && permissions.contains(Manifest.permission.CAMERA)) cameraController?.reopen()
         pendingPermActions.remove(code)?.let { it(granted) } ?: pendingPerms.remove(code)?.let { resolve(it, if (granted) "granted" else "denied") }
         pumpPermissionQueue()
     }
@@ -1995,6 +2023,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
     private val pendingMedia = mutableMapOf<Int, Pair<String, android.net.Uri?>>()
     private val pendingContactPick = mutableMapOf<Int, Pair<String, String>>()
     private val pendingCompose = mutableMapOf<Int, String>()
+    private val pendingVideo = HashSet<Int>()   // camera.video requests among pendingMedia
     private class PickReq(val token: String, val quality: Double, val maxSize: Int, val pathOnly: Boolean)
     private val pendingPick = mutableMapOf<Int, PickReq>()
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -2031,8 +2060,9 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         if (resultCode != RESULT_OK) { fail(token, "canceled"); return }
         val src = outUri ?: data?.data
         if (src == null) { fail(token, "no image"); return }
+        val isVideo = pendingVideo.remove(requestCode)
         try {
-            val dest = java.io.File(filesDir, "picked-$requestCode.jpg")
+            val dest = java.io.File(filesDir, if (isVideo) "cam_$requestCode.mp4" else "picked-$requestCode.jpg")
             contentResolver.openInputStream(src)?.use { input -> dest.outputStream().use { input.copyTo(it) } }
             resolve(token, "file://" + dest.absolutePath)
         } catch (e: Exception) { fail(token, "copy failed: ${e.message}") }
@@ -3615,6 +3645,13 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
         private val bgH = Handler(bg.looper)
         private var onCapOk: ((String) -> Unit)? = null
         private var onCapErr: ((String) -> Unit)? = null
+        // The live request, re-issued whenever a control changes it (trap: a Camera2
+        // setting is a field on the repeating request, not a device property).
+        private var previewReq: CaptureRequest.Builder? = null
+        private var chars: CameraCharacteristics? = null
+        private var flash = "off"          // off | on | auto at capture; torch = light on
+        private var zoomRatio = 1f
+        private var afRegion: android.hardware.camera2.params.MeteringRectangle? = null
 
         init {
             texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -3626,6 +3663,9 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             if (texture.isAvailable) open()
         }
 
+        /** After a permission grant: the view is there, the device is not. */
+        fun reopen() { if (device == null && texture.isAvailable) open() }
+
         fun setFacing(f: String) {
             val want = if (f == "front") "front" else "back"
             if (want == facing) return
@@ -3635,10 +3675,14 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
 
         private fun pickCamera(): String? {
             val want = if (facing == "front") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
-            for (id in camMgr.cameraIdList) {
-                if (camMgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == want) return id
-            }
-            return camMgr.cameraIdList.firstOrNull()
+            // A device can list several cameras of one facing: the main one, plus
+            // ultra-wide, tele, and logical wrappers, some with no flash and no zoom.
+            // Manufacturers number the main back camera 0 and the main front 1, so among
+            // the wanted facing prefer the lowest-numbered id, which is the main lens.
+            // (An emulator can list a limited "10" before the full "0".)
+            val matches = camMgr.cameraIdList.filter { camMgr.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want }
+            val best = matches.minByOrNull { it.toIntOrNull() ?: Int.MAX_VALUE }
+            return best ?: camMgr.cameraIdList.firstOrNull()
         }
 
         @SuppressLint("MissingPermission")
@@ -3660,6 +3704,7 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
             val cam = device ?: return
             val st = texture.surfaceTexture ?: return
             val chars = camMgr.getCameraCharacteristics(camId ?: return)
+            this.chars = chars
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val previewSize = map?.getOutputSizes(SurfaceTexture::class.java)?.maxByOrNull { it.width.toLong() * it.height } ?: Size(1280, 720)
@@ -3674,11 +3719,81 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                     override fun onConfigured(s: CameraCaptureSession) {
                         session = s
                         req.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        previewReq = req
+                        applyControls(req)
                         try { s.setRepeatingRequest(req.build(), null, bgH) } catch (e: Exception) {}
                     }
                     override fun onConfigureFailed(s: CameraCaptureSession) {}
                 }, bgH)
             } catch (e: Exception) {}
+        }
+
+        // ---- controls -----------------------------------------------------------
+        private fun applyControls(req: CaptureRequest.Builder) {
+            val c = chars
+            if (c != null) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    req.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
+                } else {
+                    // Below 30 zoom is a crop of the active array, centred.
+                    val rect = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    if (rect != null) {
+                        val w = (rect.width() / zoomRatio).toInt(); val h = (rect.height() / zoomRatio).toInt()
+                        val l = rect.centerX() - w / 2; val t = rect.centerY() - h / 2
+                        req.set(CaptureRequest.SCALER_CROP_REGION, android.graphics.Rect(l, t, l + w, t + h))
+                    }
+                }
+            }
+            val hasFlash = c?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            if (hasFlash) {
+                if (flash == "torch") { req.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON); req.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_TORCH) }
+                else { req.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF); req.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON) }
+            }
+            afRegion?.let { r ->
+                req.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(r))
+                req.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(r))
+            }
+        }
+        private fun reissue() {
+            val s = session ?: return; val req = previewReq ?: return
+            applyControls(req)
+            try { s.setRepeatingRequest(req.build(), null, bgH) } catch (e: Exception) {}
+        }
+        fun hasFlash(): Boolean = chars?.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        fun setFlash(mode: String) { flash = mode; bgH.post { reissue() } }
+        fun zoomRange(): String {
+            val c = chars ?: return "1.0,1.0"
+            val max = if (Build.VERSION.SDK_INT >= 30) (c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper ?: 1f)
+                      else (c.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f)
+            val min = if (Build.VERSION.SDK_INT >= 30) (c.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower ?: 1f) else 1f
+            return String.format(java.util.Locale.US, "%.1f,%.1f", min, max)
+        }
+        fun setZoom(factor: Float) {
+            val r = zoomRange().split(","); val lo = r[0].toFloat(); val hi = r[1].toFloat()
+            zoomRatio = factor.coerceIn(lo, hi)
+            bgH.post { reissue() }
+        }
+        fun focusAt(x: Float, y: Float) {
+            // The view's fraction to a metering rectangle on the sensor, which is
+            // rotated by the sensor orientation relative to the view.
+            val c = chars ?: return
+            val arr = c.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
+            if ((c.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) < 1) return
+            val (sx, sy) = when (sensorOrientation) { 90 -> y to 1f - x; 180 -> 1f - x to 1f - y; 270 -> 1f - y to x; else -> x to y }
+            val size = (minOf(arr.width(), arr.height()) / 10)
+            val cx = (arr.left + sx * arr.width()).toInt(); val cy = (arr.top + sy * arr.height()).toInt()
+            val rect = android.graphics.Rect((cx - size / 2).coerceIn(arr.left, arr.right - size), (cy - size / 2).coerceIn(arr.top, arr.bottom - size), 0, 0)
+            rect.right = rect.left + size; rect.bottom = rect.top + size
+            afRegion = android.hardware.camera2.params.MeteringRectangle(rect, android.hardware.camera2.params.MeteringRectangle.METERING_WEIGHT_MAX - 1)
+            bgH.post {
+                val s = session ?: return@post; val req = previewReq ?: return@post
+                applyControls(req)
+                req.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_AUTO)
+                req.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+                try { s.capture(req.build(), null, bgH) } catch (e: Exception) {}
+                req.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                try { s.setRepeatingRequest(req.build(), null, bgH) } catch (e: Exception) {}
+            }
         }
 
         fun capture(ok: (String) -> Unit, err: (String) -> Unit) {
@@ -3720,6 +3835,15 @@ class MainActivity : Activity(), ChuksModuleHost, ChuksViewHost {
                 val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 req.addTarget(rd.surface)
                 req.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                applyControls(req)
+                // The flash at capture: the AE mode carries it on Camera2.
+                if (hasFlash() && flash != "torch") {
+                    req.set(CaptureRequest.CONTROL_AE_MODE, when (flash) {
+                        "on" -> CameraMetadata.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                        "auto" -> CameraMetadata.CONTROL_AE_MODE_ON_AUTO_FLASH
+                        else -> CameraMetadata.CONTROL_AE_MODE_ON
+                    })
+                }
                 s.capture(req.build(), null, bgH)
             } catch (e: Exception) { runOnUiThread { err(e.message ?: "capture failed") } }
         }
