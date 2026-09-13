@@ -370,6 +370,30 @@ final class HitSlopView: UIView {
         if hitSlop <= 0 { return super.point(inside: point, with: event) }
         return bounds.insetBy(dx: -hitSlop, dy: -hitSlop).contains(point)
     }
+    // A container the app gave a role but no label reads its descendants' text, so a
+    // Pressable around an icon and a Text says "Add to cart, button". Computed when
+    // VoiceOver asks, not when the style lands: the children mount after the parent.
+    override var accessibilityLabel: String? {
+        get {
+            if let l = super.accessibilityLabel { return l }
+            return isAccessibilityElement ? chuksDescendantLabel(self) : nil
+        }
+        set { super.accessibilityLabel = newValue }
+    }
+}
+// The text of every label and button under v, in order, joined by a space; nil when
+// there is none. Skips subtrees hidden from accessibility.
+func chuksDescendantLabel(_ v: UIView) -> String? {
+    var parts: [String] = []
+    func walk(_ x: UIView) {
+        if x.accessibilityElementsHidden { return }
+        if let l = x as? UILabel { if let t = l.text, !t.isEmpty { parts.append(t) }; return }
+        if let b = x as? UIButton { if let t = b.title(for: .normal), !t.isEmpty { parts.append(t) }; return }
+        if x !== v, let lbl = x.accessibilityLabel, !lbl.isEmpty, !(x is HitSlopView) { parts.append(lbl); return }
+        for c in x.subviews { walk(c) }
+    }
+    walk(v)
+    return parts.isEmpty ? nil : parts.joined(separator: " ")
 }
 
 // A UIView whose backing layer IS the camera preview layer, so it tracks the view frame.
@@ -1622,6 +1646,12 @@ func chuksNotifFireAt(_ req: UNNotificationRequest) -> Int64 {
 // and leave the rest standing as a line the host would then RUN. See escText in
 // core/ui.chuks. One left-to-right scan, because search-and-replace would corrupt a
 // label ending in a real backslash.
+// A free-text style value (an accessibility label) arrives percent-encoded for the
+// six characters that are separators on the way here: %25 %3B %3D %7C %0A %0D %09.
+func chuksUnescapeStyle(_ s: String) -> String {
+    if !s.contains("%") { return s }
+    return s.removingPercentEncoding ?? s
+}
 func chuksUnescapeText(_ s: String) -> String {
     if !s.contains("\\") { return s }
     var out = ""
@@ -1881,6 +1911,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var pressLongTimers: [ObjectIdentifier: Timer] = [:]                  // gesture -> pending long-press timer
     var pressLongFired = Set<ObjectIdentifier>()                          // gestures whose long-press already fired
     var disabledIds = Set<String>()                                       // ids whose disabled=1 (block fire)
+    var a11yIds = Set<String>()                                           // ids carrying any a11y key (reset on reuse)
+    var a11yLive: [String: String] = [:]                                  // id -> "polite" | "assertive" (announce on text change)
     var mediaLoad: [String: String] = [:]                                 // id -> onLoad action (Image/Video)
     var mediaError: [String: String] = [:]                                // id -> onError action (Image)
     var mediaEnd: [String: String] = [:]                                  // id -> onEnd action (Video)
@@ -3462,9 +3494,38 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let t = (v as? UILabel)?.text, !t.isEmpty {
                 line += "  \"" + (t.count > 30 ? String(t.prefix(30)) + "…" : t) + "\""
             }
+            line += a11yDump(id, v)
             out += line + "\n"
         }
         return out.isEmpty ? "(no views)" : out
+    }
+    // What VoiceOver would get for this view, read back from UIKit rather than from
+    // what the host thinks it set: element-ness, label, role words, value, hint, hidden.
+    // Same shape on Android (from the AccessibilityNodeInfo), so a test can compare.
+    func a11yDump(_ id: String, _ v: UIView) -> String {
+        var parts: [String] = []
+        if v.accessibilityElementsHidden { parts.append("hidden") }
+        if v.isAccessibilityElement {
+            parts.append("element")
+            if let l = v.accessibilityLabel, !l.isEmpty { parts.append("label=\"\(l)\"") }
+            let tr = v.accessibilityTraits
+            var roles: [String] = []
+            if tr.contains(.button) { roles.append("button") }
+            if tr.contains(.link) { roles.append("link") }
+            if tr.contains(.image) { roles.append("image") }
+            if tr.contains(.header) { roles.append("header") }
+            if tr.contains(.searchField) { roles.append("search") }
+            if tr.contains(.adjustable) { roles.append("adjustable") }
+            if tr.contains(.staticText) { roles.append("text") }
+            if tr.contains(CardsVC.switchTrait) { roles.append("switch") }
+            if tr.contains(.selected) { roles.append("selected") }
+            if tr.contains(.notEnabled) { roles.append("disabled") }
+            if !roles.isEmpty { parts.append("role=" + roles.joined(separator: "+")) }
+            if let val = v.accessibilityValue, !val.isEmpty { parts.append("value=\"\(val)\"") }
+            if let h = v.accessibilityHint, !h.isEmpty { parts.append("hint=\"\(h)\"") }
+        }
+        if let live = a11yLive[id] { parts.append("live=" + live) }
+        return parts.isEmpty ? "" : "  a11y{" + parts.joined(separator: " ") + "}"
     }
 
     func handleCommand(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) {
@@ -4825,7 +4886,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let d = Self.parseISO(t, mode: datePickerModes[dp] ?? "date") { dp.date = d }
             return
         }
-        if views[id] is UILabel { labelRaw[id] = t; refreshLabel(id) }
+        if views[id] is UILabel { labelRaw[id] = t; refreshLabel(id); if let mode = a11yLive[id] { announce(t, mode) } }
         else if let b = views[id] as? UIButton { b.setTitle(t, for: .normal) }
         else if let tf = views[id] as? UITextField { tf.placeholder = t }
         else if let tv = views[id] as? UITextView { textAreaPlaceholders[tv]?.text = t }   // TextArea placeholder
@@ -5159,6 +5220,97 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         gv.layer.cornerRadius = v.layer.cornerRadius
     }
 
+    // ── Accessibility ──────────────────────────────────────────────────────────
+    // Six style keys say what VoiceOver reads and how it treats a node. The role maps
+    // onto UIAccessibilityTraits where a trait exists (button, link, image, header,
+    // search, adjustable, switch, text); the roles VoiceOver has no trait for (checkbox,
+    // radio, tab, alert) are spoken as the accessibilityValue, "checkbox, checked", which
+    // is what a native app that draws its own checkbox does too. A container given a role
+    // becomes ONE element: with no label of its own its label is read off its descendants,
+    // so a Pressable wrapping an icon and a Text says "Add to cart, button" unasked.
+    struct A11ySpec {
+        var label = "", hint = "", role = "", live = ""
+        var states: [String] = []
+        var hidden = false
+    }
+    static let switchTrait = UIAccessibilityTraits(rawValue: 0x20000000000)   // UISwitch's private trait: VoiceOver says "switch button, on/off"
+    static let roleValueWord: [String: String] = ["checkbox": "checkbox", "radio": "radio button", "tab": "tab", "alert": "alert"]
+
+    func applyA11y(_ id: String, _ v: UIView, _ a: A11ySpec) {
+        a11yIds.insert(id)
+        if a.hidden {
+            v.isAccessibilityElement = false
+            v.accessibilityElementsHidden = true
+            return
+        }
+        v.accessibilityElementsHidden = false
+        var traits: UIAccessibilityTraits = []
+        var value: [String] = []
+        switch a.role {
+        case "button": traits.insert(.button)
+        case "link": traits.insert(.link)
+        case "image": traits.insert(.image)
+        case "header": traits.insert(.header)
+        case "search": traits.insert(.searchField)
+        case "adjustable": traits.insert(.adjustable)
+        case "text": traits.insert(.staticText)
+        case "switch": traits.insert(CardsVC.switchTrait)
+        case "alert": traits.insert(.staticText)
+        default: break
+        }
+        if let word = CardsVC.roleValueWord[a.role] { value.append(word) }
+        for st in a.states {
+            switch st {
+            case "dis": traits.insert(.notEnabled)
+            case "sel": traits.insert(.selected)
+            case "chk": value.append(a.role == "switch" ? "1" : "checked")
+            case "unchk": value.append(a.role == "switch" ? "0" : "unchecked")
+            case "mixed": value.append("mixed")
+            case "exp": value.append("expanded")
+            case "col": value.append("collapsed")
+            case "busy": value.append("busy")
+            default: break
+            }
+        }
+        // A switch's value must be exactly "1"/"0" for VoiceOver to say on/off.
+        if a.role == "switch" { value = value.filter { $0 == "1" || $0 == "0" } }
+        // A role or a label makes the node one element, read as a whole. A bare hint on a
+        // container does not (the children keep reading themselves; the hint has nowhere
+        // to go), and "none" says the node is only a group.
+        let isElement = a.role != "none" && (!a.role.isEmpty || !a.label.isEmpty || defaultIsElement(v))
+        v.isAccessibilityElement = isElement
+        if a.role == "none" { v.accessibilityTraits = defaultTraits(v); v.accessibilityLabel = nil; v.accessibilityHint = nil; v.accessibilityValue = nil; return }
+        v.accessibilityTraits = traits.isEmpty ? defaultTraits(v) : defaultTraits(v).union(traits)
+        // No label: a HitSlopView reads its descendants when asked (see the class).
+        v.accessibilityLabel = a.label.isEmpty ? nil : a.label
+        v.accessibilityHint = a.hint.isEmpty ? nil : a.hint
+        v.accessibilityValue = value.isEmpty ? nil : value.joined(separator: ", ")
+        if a.live.isEmpty { a11yLive[id] = nil } else { a11yLive[id] = a.live }
+    }
+    func resetA11y(_ id: String, _ v: UIView) {
+        a11yIds.remove(id); a11yLive[id] = nil
+        v.isAccessibilityElement = defaultIsElement(v)
+        v.accessibilityElementsHidden = false
+        v.accessibilityTraits = defaultTraits(v)
+        v.accessibilityLabel = nil; v.accessibilityHint = nil; v.accessibilityValue = nil
+    }
+    // What UIKit gives the view before any key touched it, by class.
+    func defaultIsElement(_ v: UIView) -> Bool { v is UILabel || v is UIControl || v is UIImageView && (v as! UIImageView).image != nil }
+    func defaultTraits(_ v: UIView) -> UIAccessibilityTraits {
+        if v is UIButton { return .button }
+        if v is UILabel { return .staticText }
+        if v is UIImageView { return .image }
+        if v is UISlider { return .adjustable }
+        return []
+    }
+    // A live region: announce the new text. "polite" queues behind whatever VoiceOver is
+    // saying; "assertive" interrupts it.
+    func announce(_ text: String, _ mode: String) {
+        guard UIAccessibility.isVoiceOverRunning, !text.isEmpty else { return }
+        let attributed = NSAttributedString(string: text, attributes: [.accessibilitySpeechQueueAnnouncement: mode != "assertive"])
+        UIAccessibility.post(notification: .announcement, argument: attributed)
+    }
+
     // The paint/layer sibling of resetLayoutStyle: clear the decorative UIView/CALayer
     // properties that style() sets conditionally, so a reused node doesn't keep its
     // previous role's background, border, corner radius, shadow, dashed/side borders or
@@ -5212,6 +5364,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         v.layer.shadowRadius = 0; v.layer.shadowOffset = .zero       // shadow (opacity already 0 above)
         if !modalIds.contains(id) { v.isHidden = false }             // hidden/mvis (modal drives its own)
         disabledIds.remove(id)                                       // dis: interaction gate + alpha
+        if a11yIds.contains(id) { resetA11y(id, v) }                 // al/ah/ar/as/ax/av
         pressOpacity[id] = nil; pressLongDelay[id] = nil             // Pressable active-alpha / long-press
         imageTint[id] = nil; imageBlur[id] = nil; imageFilter[id] = nil   // Image tint/blur/filter (recycle re-drives the pixels)
         (v as? UITextView)?.textColor = .label                      // fg on a TextView
@@ -5268,11 +5421,20 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // animation: collect transform + opacity across the loop, apply (animated) after
         var tx: CGFloat = 0, ty: CGFloat = 0, sc: CGFloat = 1, rot: CGFloat = 0
         var hasTransform = false, opacity: CGFloat? = nil, animMs = -1, animEz = ""
+        // accessibility: collected across the loop, applied together after it (a role and
+        // a state combine into one trait set and one value string)
+        var a11y = A11ySpec(), hasA11y = false
         for kv in s.split(separator: ";") {
             let p = kv.split(separator: "="); guard p.count == 2 else { continue }
             let k = String(p[0]), val = String(p[1])
             let f = Float(val) ?? 0
             switch k {
+            case "al": a11y.label = chuksUnescapeStyle(val); hasA11y = true    // what it is
+            case "ah": a11y.hint = chuksUnescapeStyle(val); hasA11y = true     // what it does
+            case "ar": a11y.role = val; hasA11y = true                          // button|link|image|header|...
+            case "as": a11y.states = val.split(separator: ",").map(String.init); hasA11y = true   // dis,sel,chk,...
+            case "ax": a11y.hidden = (val == "1"); hasA11y = true              // decoration
+            case "av": a11y.live = val; hasA11y = true                          // polite|assertive
             case "d":   YGNodeStyleSetFlexDirection(n, val == "row" ? YGFlexDirection.row : (val == "row-reverse" ? YGFlexDirection.rowReverse : (val == "col-reverse" ? YGFlexDirection.columnReverse : YGFlexDirection.column)))
             case "j":   YGNodeStyleSetJustifyContent(n, justify(val))
             case "a":   YGNodeStyleSetAlignItems(n, align(val))
@@ -5317,6 +5479,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if let sw = v as? UISwitch { sw.isEnabled = (val != "1") }   // native block: a disabled toggle won't flip
                 if let sl = v as? UISlider { sl.isEnabled = (val != "1") }
                 if val == "1" { disabledIds.insert(id) } else { disabledIds.remove(id) }
+                // A screen reader says "dimmed" for a disabled control. UIControls do that
+                // from isEnabled; a Pressable is a plain view, so say it through the state.
+                if val == "1" && !(v is UIControl) { a11y.states.append("dis"); hasA11y = true }
             case "sec": (v as? UITextField)?.isSecureTextEntry = (val == "1")   // password field
             case "kbt": if let tf = field {
                 switch val { case "email": tf.keyboardType = .emailAddress; case "number": tf.keyboardType = .numberPad
@@ -5586,6 +5751,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             default:    break
             }
         }
+        if hasA11y { applyA11y(id, v, a11y) }
         // Apply transform + opacity, animated natively when `anim` is set (no per-frame
         // round-trip: Core Animation interpolates). Transforms are visual, not layout.
         if hasTransform || animMs >= 0 || opacity != nil {

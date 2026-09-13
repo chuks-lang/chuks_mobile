@@ -1,0 +1,105 @@
+// Accessibility props reach the wire as style keys, escaped, and leave it again.
+//
+// The six a11y props are LayoutProps, so every builtin and package view takes them,
+// and they cross as style keys (al/ah/ar/as/ax/av) so a reused node is reset with the
+// rest of its style. This drives the real reconciler and checks the exact wire text.
+//
+// Run:  chuks run tests/a11y_test.chuks   (exits non-zero on failure)
+
+import { Node, Column, Row, Text, Reconciler } from "../core/ui.chuks";
+import { Button, Chip, Stepper, Accordion } from "../core/kit.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+// Every S| line's style text, joined, so a check can ask "does any style carry X".
+function styles(stream: string): string {
+    const lines: []string = stream.split("\n")
+    var out: string = ""
+    var i: int = 0
+    while (i < lines.length) { if (lines[i].startsWith("S|")) { out = out + lines[i] + "\n" }; i = i + 1 }
+    return out
+}
+function styleOf(stream: string, nth: int): string {
+    const lines: []string = stream.split("\n")
+    var seen: int = 0
+    var i: int = 0
+    while (i < lines.length) {
+        if (lines[i].startsWith("S|")) {
+            if (seen == nth) { const rest: string = lines[i].slice(2); return rest.slice(rest.indexOf("|") + 1) }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+function main(): void {
+    // Every prop, on a plain Row.
+    const r: Reconciler = new Reconciler()
+    r.drain(); r.renderRoot(Column({}, [
+        Row({ a11yLabel: "Add to cart", a11yHint: "Adds the item to your cart", a11yRole: "button",
+              a11yState: { disabled: false, selected: true, checked: false, expanded: true, busy: true },
+              a11yHidden: false, a11yLive: "polite" }, []),
+    ]))
+    const s1: string = styleOf(r.drain(), 1)
+    check(s1.indexOf("al=Add to cart;") >= 0, "label crosses as al= (" + s1 + ")")
+    check(s1.indexOf("ah=Adds the item to your cart;") >= 0, "hint crosses as ah=")
+    check(s1.indexOf("ar=button;") >= 0, "role crosses as ar=")
+    check(s1.indexOf("as=sel,unchk,exp,busy;") >= 0, "state crosses as tokens, only the fields that were set, false checked/expanded spoken (" + s1 + ")")
+    check(s1.indexOf("ax=0;") >= 0, "hidden:false crosses as ax=0")
+    check(s1.indexOf("av=polite;") >= 0, "live crosses as av=")
+
+    // A state bag with nothing set says nothing; a bare disabled says only that.
+    const r2: Reconciler = new Reconciler()
+    r2.drain(); r2.renderRoot(Column({}, [
+        Row({ a11yState: {} }, []),
+        Row({ a11yState: { disabled: true } }, []),
+        Row({ a11yState: { checked: true } }, []),
+    ]))
+    const d2: string = r2.drain()
+    check(styleOf(d2, 1).indexOf("as=") < 0, "an empty state bag emits no as= key")
+    check(styleOf(d2, 2).indexOf("as=dis;") >= 0, "disabled alone is the one token")
+    check(styleOf(d2, 3).indexOf("as=chk;") >= 0, "checked true is chk")
+
+    // Free text is escaped for every separator on the way to the host.
+    const r3: Reconciler = new Reconciler()
+    r3.drain(); r3.renderRoot(Column({}, [ Row({ a11yLabel: "a;b=c|d\ne%f\tg café 😀" }, []) ]))
+    const s3: string = styleOf(r3.drain(), 1)
+    check(s3.indexOf("al=a%3Bb%3Dc%7Cd%0Ae%25f%09g café 😀;") >= 0, "separators percent-escaped, non-ASCII kept (" + s3 + ")")
+    const alPair: string = s3.slice(s3.indexOf("al="))
+    check(alPair.split("=").length == 2 && alPair.split(";").length == 2, "the escaped label is one key=value pair (" + alPair + ")")
+
+    // Reuse: a node that carried a11y keys and no longer does emits a style WITHOUT them,
+    // which is what lets the host reset them (style_reset_coverage classifies the keys).
+    const r4: Reconciler = new Reconciler()
+    r4.drain(); r4.renderRoot(Column({}, [ Row({ w: 10, a11yRole: "button", a11yLabel: "x" }, []) ]))
+    r4.drain()
+    r4.renderRoot(Column({}, [ Row({ w: 10 }, []) ]))
+    const s4: string = styleOf(r4.drain(), 0)
+    check(s4 != "" && s4.indexOf("ar=") < 0 && s4.indexOf("al=") < 0, "dropping the props re-emits the style without them (" + s4 + ")")
+
+    // The kit sets sensible defaults.
+    const r5: Reconciler = new Reconciler()
+    r5.drain(); r5.renderRoot(Column({}, [
+        Button({ label: "Save", variant: "primary" }),
+        Chip({ text: "Vegan", selected: true }),
+        Accordion({ title: "More", open: false, onToggle: null, children: [] }),
+        Stepper({ value: 0, min: 0, max: 5 }),
+    ]))
+    const all5: string = styles(r5.drain())
+    check(all5.indexOf("ar=button;") >= 0, "kit Button is a button")
+    check(all5.indexOf("as=sel;") >= 0, "a selected Chip says selected")
+    check(all5.indexOf("as=col;") >= 0, "a closed Accordion header says collapsed")
+    check(all5.indexOf("al=Decrease;") >= 0 && all5.indexOf("as=dis;") >= 0, "a Stepper at its minimum has a named, disabled Decrease button")
+    check(all5.indexOf("av=polite;") >= 0, "the Stepper value is a polite live region")
+
+    println("")
+    println("a11y: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("a11y tests failed") }
+}
+
+main();

@@ -144,6 +144,12 @@ fun hexColorStatic(h: String, fallback: Int = android.graphics.Color.TRANSPARENT
 // leave the rest standing as a line the host would then RUN. See escText in core/ui.chuks.
 // One left-to-right scan, because search-and-replace would corrupt a label ending in a
 // real backslash.
+// A free-text style value (an accessibility label) arrives percent-encoded for the
+// six characters that are separators on the way here: %25 %3B %3D %7C %0A %0D %09.
+fun chuksUnescapeStyle(s: String): String {
+    if (s.indexOf('%') < 0) return s
+    return try { java.net.URLDecoder.decode(s.replace("+", "%2B"), "UTF-8") } catch (e: Exception) { s }
+}
 fun chuksUnescapeText(s: String): String {
     if (s.indexOf('\\') < 0) return s
     val out = StringBuilder(s.length)
@@ -1201,9 +1207,54 @@ class MainActivity : Activity(), ChuksModuleHost {
             (v as? TextView)?.text?.toString()?.let {
                 if (it.isNotEmpty()) sb.append("  \"" + (if (it.length > 30) it.take(30) + "…" else it) + "\"")
             }
+            sb.append(a11yDump(id, v))
             sb.append("\n")
         }
         return if (sb.isEmpty()) "(no views)" else sb.toString()
+    }
+    // What TalkBack would get for this view, read back from the AccessibilityNodeInfo
+    // the view builds (so the delegate has run) rather than from what the host thinks
+    // it set. Same shape as the iOS dump, so a test can compare the two.
+    private fun a11yDump(id: String, v: View): String {
+        val parts = ArrayList<String>()
+        if (v.importantForAccessibility == View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS) parts.add("hidden")
+        // A node TalkBack would stop on: it says something of its own (text, a label) or
+        // the host made it focusable for a role. Mirrors iOS "element".
+        val isGroupElement = a11yIds.contains(id) && v.isFocusable && v is ViewGroup
+        val speaks = (v is TextView && v.text.isNotEmpty()) || !v.contentDescription.isNullOrEmpty() || isGroupElement || v is android.widget.CompoundButton || v is SeekBar
+        if (speaks && v.importantForAccessibility != View.IMPORTANT_FOR_ACCESSIBILITY_NO && v.importantForAccessibility != View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS) {
+            parts.add("element")
+            val info = try { v.createAccessibilityNodeInfo() } catch (e: Exception) { null }
+            if (info != null) {
+                // A focusable group with no label: TalkBack reads its descendants' text.
+                val cd = info.contentDescription?.toString() ?: ""
+                if (cd.isNotEmpty()) parts.add("label=\"$cd\"")
+                else if (isGroupElement) descendantText(v).let { if (it.isNotEmpty()) parts.add("label=\"$it\"") }
+                val roles = ArrayList<String>()
+                when (info.className?.toString() ?: "") {
+                    "android.widget.Button" -> roles.add("button")
+                    "android.widget.ImageView" -> roles.add("image")
+                    "android.widget.Switch" -> roles.add("switch")
+                    "android.widget.CheckBox" -> roles.add("checkbox")
+                    "android.widget.RadioButton" -> roles.add("radio")
+                    "android.widget.EditText" -> roles.add("search")
+                    "android.widget.SeekBar" -> roles.add("adjustable")
+                }
+                info.extras.getCharSequence("AccessibilityNodeInfo.roleDescription")?.let { roles.add(it.toString()) }
+                if (Build.VERSION.SDK_INT >= 28 && info.isHeading && !roles.contains("heading")) roles.add("heading")
+                if (info.isSelected) roles.add("selected")
+                if (!info.isEnabled) roles.add("disabled")
+                if (roles.isNotEmpty()) parts.add("role=" + roles.joinToString("+"))
+                val vals = ArrayList<String>()
+                if (info.isCheckable) vals.add(if (info.isChecked) "checked" else "unchecked")
+                if (Build.VERSION.SDK_INT >= 30) info.stateDescription?.let { if (it.isNotEmpty()) vals.add(it.toString()) }
+                if (vals.isNotEmpty()) parts.add("value=\"" + vals.joinToString(", ") + "\"")
+                if (Build.VERSION.SDK_INT >= 28) info.tooltipText?.let { if (it.isNotEmpty()) parts.add("hint=\"$it\"") }
+                info.recycle()
+            }
+        }
+        if (v.accessibilityLiveRegion != View.ACCESSIBILITY_LIVE_REGION_NONE) parts.add("live=" + (if (v.accessibilityLiveRegion == View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE) "assertive" else "polite"))
+        return if (parts.isEmpty()) "" else "  a11y{" + parts.joinToString(" ") + "}"
     }
 
     private fun handleCommand(token: String, cap: String, args: String, a: ChuksArgs) {
@@ -2686,6 +2737,8 @@ class MainActivity : Activity(), ChuksModuleHost {
     private val pressInActions = HashMap<String, String>()     // id -> onPressIn action
     private val pressOutActions = HashMap<String, String>()    // id -> onPressOut action
     private val disabledIds = HashSet<String>()                // ids whose disabled=1 (block fire)
+    private val a11yIds = HashSet<String>()                    // ids carrying any a11y key (reset on reuse)
+    private val a11yFocusable = HashMap<String, Boolean>()     // id -> the view's isFocusable before a11y made it focusable
     private val longDelayMs = HashMap<String, Long>()          // id -> onLongPress hold time (ms)
     private val mediaLoad = HashMap<String, String>()          // id -> onLoad action (Image)
     private val mediaError = HashMap<String, String>()         // id -> onError action (Image)
@@ -2731,6 +2784,98 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun iconFont(name: String): android.graphics.Typeface =
         iconFonts.getOrPut(name) { android.graphics.Typeface.createFromAsset(assets, "$name.ttf") }
 
+    // ── Accessibility ──────────────────────────────────────────────────────────
+    // Six style keys say what TalkBack reads and how it treats a node. The role is the
+    // widget class TalkBack announces ("button", "check box", "switch"), plus a role
+    // description for the roles that have no widget class (link, image, heading, tab,
+    // alert); the state goes through the node info (enabled, selected, checkable +
+    // checked) and, for expanded/collapsed/busy, the state description. A container given
+    // a role becomes ONE focusable node: with no label of its own TalkBack reads its
+    // descendants' text, so a Pressable wrapping an icon and a Text says "Add to cart,
+    // button" unasked. Mirrors the iOS host key for key.
+    class A11ySpec { var label = ""; var hint = ""; var role = ""; var live = ""; var states: List<String> = emptyList(); var hidden = false }
+    private val roleClass = mapOf(
+        "button" to "android.widget.Button", "link" to "android.widget.TextView", "image" to "android.widget.ImageView",
+        "header" to "android.widget.TextView", "switch" to "android.widget.Switch", "checkbox" to "android.widget.CheckBox",
+        "radio" to "android.widget.RadioButton", "tab" to "android.widget.Button", "search" to "android.widget.EditText",
+        "adjustable" to "android.widget.SeekBar", "alert" to "android.widget.TextView", "text" to "android.widget.TextView")
+    private val roleWord = mapOf("link" to "link", "image" to "image", "header" to "heading", "tab" to "tab", "alert" to "alert")
+
+    private fun applyA11y(id: String, v: View, a: A11ySpec) {
+        a11yIds.add(id)
+        if (a.hidden) {
+            v.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            v.accessibilityDelegate = null
+            return
+        }
+        v.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        v.contentDescription = if (a.label.isEmpty()) null else a.label
+        v.accessibilityLiveRegion = when (a.live) {
+            "polite" -> View.ACCESSIBILITY_LIVE_REGION_POLITE
+            "assertive" -> View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE
+            else -> View.ACCESSIBILITY_LIVE_REGION_NONE
+        }
+        if (a.role == "none") {
+            v.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            v.accessibilityDelegate = null
+            return
+        }
+        // A role or a label makes the node one focusable thing for TalkBack; a plain
+        // container with only a hint or a live region keeps its children separate.
+        val asElement = a.role.isNotEmpty() || a.label.isNotEmpty()
+        if (asElement && v is ViewGroup) {
+            if (!a11yFocusable.containsKey(id)) a11yFocusable[id] = v.isFocusable
+            v.isFocusable = true
+            if (Build.VERSION.SDK_INT >= 28) v.isScreenReaderFocusable = true
+        }
+        if (Build.VERSION.SDK_INT >= 28) v.isAccessibilityHeading = (a.role == "header")
+        val cls = roleClass[a.role]; val word = roleWord[a.role]
+        val states = a.states; val hint = a.hint
+        v.accessibilityDelegate = object : View.AccessibilityDelegate() {
+            override fun onInitializeAccessibilityNodeInfo(host: View, info: android.view.accessibility.AccessibilityNodeInfo) {
+                super.onInitializeAccessibilityNodeInfo(host, info)
+                if (cls != null) info.className = cls
+                if (word != null) info.extras.putCharSequence("AccessibilityNodeInfo.roleDescription", word)
+                val described = ArrayList<String>()
+                for (st in states) when (st) {
+                    "dis" -> info.isEnabled = false
+                    "sel" -> info.isSelected = true
+                    "chk" -> { info.isCheckable = true; info.isChecked = true }
+                    "unchk" -> { info.isCheckable = true; info.isChecked = false }
+                    "mixed" -> { info.isCheckable = true; described.add("partially checked") }
+                    "exp" -> described.add("expanded")
+                    "col" -> described.add("collapsed")
+                    "busy" -> described.add("busy")
+                }
+                if (Build.VERSION.SDK_INT >= 30) { if (described.isNotEmpty()) info.stateDescription = described.joinToString(", ") }
+                else if (described.isNotEmpty()) info.contentDescription = listOfNotNull(info.contentDescription?.toString(), described.joinToString(", ")).joinToString(", ")
+                if (hint.isNotEmpty()) {
+                    if (Build.VERSION.SDK_INT >= 28) info.tooltipText = hint
+                    else info.contentDescription = listOfNotNull(info.contentDescription?.toString(), hint).joinToString(", ")
+                }
+            }
+        }
+    }
+    private fun descendantText(v: View): String {
+        val parts = ArrayList<String>()
+        fun walk(x: View) {
+            if (x.importantForAccessibility == View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS) return
+            if (x is TextView) { if (x.text.isNotEmpty()) parts.add(x.text.toString()); return }
+            if (x is ViewGroup) for (i in 0 until x.childCount) walk(x.getChildAt(i))
+        }
+        walk(v)
+        return parts.joinToString(" ")
+    }
+    private fun resetA11y(id: String, v: View) {
+        a11yIds.remove(id)
+        v.accessibilityDelegate = null
+        v.contentDescription = null
+        v.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        v.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_NONE
+        if (Build.VERSION.SDK_INT >= 28) { v.isAccessibilityHeading = false; v.isScreenReaderFocusable = false }
+        a11yFocusable.remove(id)?.let { v.isFocusable = it }
+    }
+
     private fun style(id: String, s: String) {
         val n = ynodes[id] ?: return
         val v = views[id] ?: return
@@ -2764,6 +2909,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         v.clipToOutline = false                            // overflow / TextureView+ImageView radius outline
         v.isEnabled = true                                 // dis / edit
         disabledIds.remove(id)                             // dis (alpha handled post-loop)
+        if (a11yIds.contains(id)) resetA11y(id, v)         // al/ah/ar/as/ax/av
         blurAmt.remove(id); blurTint.remove(id)            // backdrop blur (drawn as a scrim)
         gradColors.remove(id); gradAngle.remove(id); gradStops.remove(id)   // linear gradient
         glassIds.remove(id)                                // glass frosted panel
@@ -2806,12 +2952,21 @@ class MainActivity : Activity(), ChuksModuleHost {
         var tx = 0f; var ty = 0f; var sc = 1f; var rot = 0f
         var hasTransform = false; var opacity: Float? = null; var animMs = -1; var animEz = ""
         var isSecure = false   // password field this pass: keeps the mask through the post-loop transformationMethod set
+        // accessibility: collected across the loop, applied together after it (a role and a
+        // state combine into one node-info delegate)
+        val a11y = A11ySpec(); var hasA11y = false
         for (kv in s.split(";")) {
             if (kv.isEmpty()) continue
             val p = kv.split("="); if (p.size != 2) continue
             val k = p[0]; val vl = p[1]
             val f = vl.toFloatOrNull() ?: 0f
             when (k) {
+                "al" -> { a11y.label = chuksUnescapeStyle(vl); hasA11y = true }    // what it is
+                "ah" -> { a11y.hint = chuksUnescapeStyle(vl); hasA11y = true }     // what it does
+                "ar" -> { a11y.role = vl; hasA11y = true }                          // button|link|image|header|...
+                "as" -> { a11y.states = vl.split(","); hasA11y = true }             // dis,sel,chk,...
+                "ax" -> { a11y.hidden = (vl == "1"); hasA11y = true }              // decoration
+                "av" -> { a11y.live = vl; hasA11y = true }                          // polite|assertive
                 "d" -> N.ySetF(n, 0, when (vl) { "row" -> 1f; "row-reverse" -> 2f; "col-reverse" -> 3f; else -> 0f })
                 "j" -> N.ySetF(n, 1, justify(vl))
                 "a" -> N.ySetF(n, 2, align(vl))
@@ -3085,6 +3240,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             v.max = maxOf(1, slMax - slMin)
             if (!v.isPressed) v.progress = slV - slMin   // don't fight an active drag (controlled sync)
         }
+        if (hasA11y) applyA11y(id, v, a11y)
         // Apply transform + opacity, animated natively when `anim` is set (a
         // ViewPropertyAnimator interpolates off the main render loop). Visual only.
         if (hasTransform || animMs >= 0 || opacity != null) {

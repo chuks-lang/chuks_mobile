@@ -73,12 +73,15 @@ export function wireUnesc(s: string): string { return unesc(s, true) }
 function unescKeepSemi(s: string): string { return unesc(s, false) }
 function unesc(s: string, semi: bool): string {
     if (!s.contains("\\")) { return s }
+    // Positions are bytes, so the scan walks the CHARACTERS (split("")) and looks one
+    // character ahead; a byte-stepping slice drops every non-ASCII character.
+    const cs: []string = s.split("")
     var out: string = ""
     var i: int = 0
-    while (i < s.length) {
-        const c: string = s.slice(i, i + 1)
-        if (c == "\\" && i + 1 < s.length) {
-            const n: string = s.slice(i + 1, i + 2)
+    while (i < cs.length) {
+        const c: string = cs[i]
+        if (c == "\\" && i + 1 < cs.length) {
+            const n: string = cs[i + 1]
             if (n == "t") { out = out + "\t"; i = i + 2; continue }
             if (n == "n") { out = out + "\n"; i = i + 2; continue }
             if (n == "r") { out = out + "\r"; i = i + 2; continue }

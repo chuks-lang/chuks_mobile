@@ -30,7 +30,8 @@ export function Button(p: ButtonProps): Node {
     if (variant == "primary") { bg = "bg-primary"; txt = "text-primaryText" }
     else if (variant == "secondary") { bg = "bg-surface2 border border-border"; txt = "text-text" }
     else if (variant == "danger") { bg = "bg-danger"; txt = "text-dangerText" }
-    return Row({ tw: "items-center justify-center p-lg rounded-lg " + bg + " " + (p.extra ?? ""), onPress: p.onPress },
+    // One element to a screen reader: "<label>, button". The label is read off the Text.
+    return Row({ tw: "items-center justify-center p-lg rounded-lg " + bg + " " + (p.extra ?? ""), onPress: p.onPress, a11yRole: "button" },
         [ Text({ tw: "text-base font-bold " + txt }, p.label) ])
 }
 
@@ -98,7 +99,8 @@ export function Chip(p: ChipProps): Node {
     const selected: bool = p.selected ?? false
     const cls: string = selected ? "bg-primary border border-primary" : "bg-surface2 border border-border"
     const col: string = selected ? "text-primaryText" : "text-muted"
-    return Row({ tw: "rounded-full p-sm items-center " + cls, onPress: p.onPress },
+    return Row({ tw: "rounded-full p-sm items-center " + cls, onPress: p.onPress,
+                 a11yRole: "button", a11yState: { selected: selected } },
         [ Text({ tw: "text-sm font-semibold " + col }, p.text) ])
 }
 
@@ -115,11 +117,11 @@ export function Avatar(p: AvatarProps): Node {
 }
 
 // Divider: a subtle horizontal rule. (No config — stays argument-free.)
-export function Divider(): Node { return Row({ tw: "h-1 bg-borderSoft" }, []) }
+export function Divider(): Node { return Row({ tw: "h-1 bg-borderSoft", a11yHidden: true }, []) }
 
 // SectionHeader: a small, quiet label above a group. (Single required arg.)
 export function SectionHeader(text: string): Node {
-    return Text({ tw: "text-xs font-bold text-subtle p-sm" }, text)
+    return Text({ tw: "text-xs font-bold text-subtle p-sm", a11yRole: "header" }, text)
 }
 
 // ListItem: a row with a title, optional subtitle + trailing text. Tappable when
@@ -140,7 +142,9 @@ export function ListItem(p: ListItemProps): Node {
     ]
     const trailing: string = p.trailing ?? ""
     if (trailing != "") { kids.push(Text({ tw: "text-sm text-subtle" }, trailing)) }
-    return Row({ tw: "items-center gap-md p-md bg-surface rounded-lg", onPress: p.onPress }, kids)
+    // Tappable rows are one button to a screen reader; static rows keep their texts separate.
+    return Row({ tw: "items-center gap-md p-md bg-surface rounded-lg", onPress: p.onPress,
+                 a11yRole: p.onPress != null ? "button" : "" }, kids)
 }
 
 // Switch: a controlled on/off toggle (RN-style). The parent owns the state and
@@ -192,7 +196,8 @@ function segment(label: string, on: bool, idx: int, cb: function?(i: int): void)
     const skin: string = on ? "bg-surface shadow-sm" : ""
     const txt: string = on ? "text-text font-bold" : "text-muted"
     return Row({ tw: "grow basis-0 items-center justify-center py-sm rounded-md " + skin,
-                 onPress: cb != null ? function(): void { const f: any = cb; f(idx) } : null },
+                 onPress: cb != null ? function(): void { const f: any = cb; f(idx) } : null,
+                 a11yRole: "tab", a11yState: { selected: on } },
         [ Text({ tw: "text-sm " + txt }, label) ])
 }
 
@@ -219,7 +224,7 @@ export function SearchBar(p: SearchBarProps): Node {
                           onChange: p.onChange }))
     if (p.value != "") {
         kids.push(Row({ tw: "w-6 h-6 items-center justify-center rounded-full bg-surface2",
-                        onPress: p.onClear },
+                        onPress: p.onClear, a11yRole: "button", a11yLabel: "Clear search" },
             [ Text({ tw: "text-xs text-muted" }, "✕") ]))
     }
     return Row({ tw: "items-center gap-sm px-md bg-surface2 border border-border rounded-lg " + (p.extra ?? "") }, kids)
@@ -244,14 +249,16 @@ export function Stepper(p: StepperProps): Node {
     const by: int = p.step ?? 1
     const v: int = p.value
     return Row({ tw: "items-center gap-sm bg-surface2 rounded-lg p-xs " + (p.extra ?? "") }, [
-        stepBtn("−", v - by >= lo, v - by, p.onChange),
-        Text({ tw: "text-base font-bold text-text w-10 text-center" }, string(v)),
-        stepBtn("+", v + by <= hi, v + by, p.onChange),
+        stepBtn("−", "Decrease", v - by >= lo, v - by, p.onChange),
+        Text({ tw: "text-base font-bold text-text w-10 text-center", a11yLive: "polite" }, string(v)),
+        stepBtn("+", "Increase", v + by <= hi, v + by, p.onChange),
     ])
 }
-function stepBtn(glyph: string, enabled: bool, next: int, cb: function?(v: int): void): Node {
+function stepBtn(glyph: string, name: string, enabled: bool, next: int, cb: function?(v: int): void): Node {
+    // A glyph says nothing to a screen reader, so the button carries its own name.
     return Row({ tw: "w-8 h-8 items-center justify-center rounded-md bg-surface",
                  opacity: enabled ? 100 : 40,
+                 a11yRole: "button", a11yLabel: name, a11yState: { disabled: !enabled },
                  onPress: (enabled && cb != null) ? function(): void { const f: any = cb; f(next) } : null },
         [ Text({ tw: "text-base font-bold text-text" }, glyph) ])
 }
@@ -296,9 +303,10 @@ export dataType AccordionProps {
 }
 export function Accordion(p: AccordionProps): Node {
     var kids: []Node = [
-        Row({ tw: "items-center justify-between py-md", onPress: p.onToggle }, [
+        Row({ tw: "items-center justify-between py-md", onPress: p.onToggle,
+              a11yRole: "button", a11yState: { expanded: p.open } }, [
             Text({ tw: "text-base font-bold text-text" }, p.title),
-            Text({ tw: "text-sm text-muted" }, p.open ? "▾" : "▸"),
+            Text({ tw: "text-sm text-muted", a11yHidden: true }, p.open ? "▾" : "▸"),
         ]),
     ]
     if (p.open) { kids.push(Column({ tw: "pb-md gap-sm" }, p.children)) }
@@ -329,7 +337,7 @@ export function Skeleton(p: SkeletonProps): Node {
         return function(): void { h.stop() }        // stop the pulse when it unmounts
     }, [])
     const fill: string = p.w == null ? "grow " : ""
-    return Row({ h: p.h, w: p.w ?? -1, radius: p.radius ?? 10, opacity: a.value(),
+    return Row({ h: p.h, w: p.w ?? -1, radius: p.radius ?? 10, opacity: a.value(), a11yHidden: true,
                  tw: "bg-surface2 " + fill + (p.extra ?? "") }, [])
 }
 
@@ -431,7 +439,7 @@ export function ToastHost(): Node {
     var kids: []Node = []
     for (var i: int = 0; i < TOASTS.length && i < 3; i = i + 1) {
         kids.push(Row({ tw: "items-center px-lg py-md rounded-xl bg-elevated border border-border shadow-sm" },
-            [ Text({ tw: "text-sm text-text" }, TOASTS[i]) ]))
+            [ Text({ tw: "text-sm text-text", a11yLive: "polite" }, TOASTS[i]) ]))
     }
     return Column({ tw: "items-center gap-xs px-lg pb-md" }, kids)
 }

@@ -136,6 +136,14 @@ export class Style {
     var selectable: int // Text: 1 = user can select/copy the text (-1 = no)
     var hitSlop: int    // Pressable: extra tappable px beyond the visual bounds (-1 = none)
     var spinner: int    // Image: 1 = show a loading spinner until the image loads (-1 = no)
+    // Accessibility: what a screen reader says and how it treats the node. Every value
+    // crosses as a style key so a reused node is reset with the rest (style_reset_coverage).
+    var a11yLabel: string   // what it is ("" = the host's default: a label's text, a button's title)
+    var a11yHint: string    // what it does ("Adds the item to your cart")
+    var a11yRole: string    // button|link|image|header|switch|checkbox|radio|tab|search|adjustable|alert|text|none
+    var a11yState: string   // comma-joined tokens: dis, sel, chk, unchk, mixed, exp, col, busy
+    var a11yHidden: int     // 1 = decoration, skipped by the screen reader (with its subtree)
+    var a11yLive: string    // "polite" | "assertive": announce this node's text when it changes
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
@@ -165,6 +173,7 @@ export class Style {
         this.tint = ""; this.imgFilter = ""; this.seekTo = -1; this.vidCtrls = -1
         this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
         this.selectable = -1; this.hitSlop = -1; this.spinner = -1
+        this.a11yLabel = ""; this.a11yHint = ""; this.a11yRole = ""; this.a11yState = ""; this.a11yHidden = -1; this.a11yLive = ""
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -270,6 +279,14 @@ export class Style {
         if (this.selectable >= 0) { s = s + "sel=" + string(this.selectable) + ";" }
         if (this.hitSlop >= 0) { s = s + "hitslop=" + string(this.hitSlop) + ";" }
         if (this.spinner >= 0) { s = s + "spin=" + string(this.spinner) + ";" }
+        // Free text is percent-escaped: a label may hold ";", "=", "|" or a newline, each of
+        // which is a separator somewhere between here and the host (styleEsc).
+        if (this.a11yLabel != "") { s = s + "al=" + styleEsc(this.a11yLabel) + ";" }
+        if (this.a11yHint != "") { s = s + "ah=" + styleEsc(this.a11yHint) + ";" }
+        if (this.a11yRole != "") { s = s + "ar=" + this.a11yRole + ";" }
+        if (this.a11yState != "") { s = s + "as=" + this.a11yState + ";" }
+        if (this.a11yHidden >= 0) { s = s + "ax=" + string(this.a11yHidden) + ";" }
+        if (this.a11yLive != "") { s = s + "av=" + this.a11yLive + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.swThumb != "") { s = s + "swtc=" + this.swThumb + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
@@ -649,7 +666,16 @@ export dataType LayoutProps {
     // Typography extras, box overflow, self-align, hidden/italic toggles.
     tracking: int?; leading: int?; deco: string?; transform: string?; fontFamily: string?;
     overflow: string?; self: string?; hidden: bool?; italic: bool?;
+    // Accessibility (see applyA11y): what a screen reader says and how it treats the node.
+    a11yLabel: string?; a11yHint: string?; a11yRole: string?; a11yState: A11yState?;
+    a11yHidden: bool?; a11yLive: string?;
 }
+/**
+ * The state a screen reader announces for a control. Only the fields you set are spoken:
+ * a checkbox with `checked: false` says "unchecked", one with no `checked` says nothing
+ * about it. `expanded` reads "expanded" / "collapsed" the same way.
+ */
+export dataType A11yState { disabled: bool?; selected: bool?; checked: bool?; expanded: bool?; busy: bool? }
 dataType EventProps {
     onPress: (function(): void)?; onChange: (function(v: string): void)?;
     onLongPress: (function(): void)?; onPressIn: (function(): void)?; onPressOut: (function(): void)?;
@@ -727,6 +753,27 @@ function applyLayoutV(s: Style, p: any): void {
     s.scl = pvI(p, "scale", s.scl)
     s.animMs = pvI(p, "anim", s.animMs)
     s.animEz = pvS(p, "easing", s.animEz)
+    applyA11y(s, p)
+}
+// Accessibility props onto the style. The state is a typed bag of optional bools and
+// crosses as tokens, one per field that was SET, so "checked: false" (say "unchecked")
+// and "no checked at all" (say nothing) stay different on the host.
+function applyA11y(s: Style, p: any): void {
+    s.a11yLabel = pvS(p, "a11yLabel", s.a11yLabel)
+    s.a11yHint = pvS(p, "a11yHint", s.a11yHint)
+    s.a11yRole = pvS(p, "a11yRole", s.a11yRole)
+    s.a11yLive = pvS(p, "a11yLive", s.a11yLive)
+    if (p["a11yHidden"] != null) { s.a11yHidden = pvB(p, "a11yHidden", false) ? 1 : 0 }
+    const st: any = p["a11yState"]
+    if (st != null) {
+        var toks: []string = []
+        if (st["disabled"] != null) { if (pvB(st, "disabled", false)) { toks.push("dis") } }
+        if (st["selected"] != null) { if (pvB(st, "selected", false)) { toks.push("sel") } }
+        if (st["checked"] != null) { toks.push(pvB(st, "checked", false) ? "chk" : "unchk") }
+        if (st["expanded"] != null) { toks.push(pvB(st, "expanded", false) ? "exp" : "col") }
+        if (st["busy"] != null) { if (pvB(st, "busy", false)) { toks.push("busy") } }
+        s.a11yState = toks.join(",")
+    }
 }
 // The typed-props twin of applyEvents: wire onPress/onChange/onLongPress/onPressIn/onPressOut
 // closures from a typed props bag (read by key) onto a node.
@@ -2349,12 +2396,30 @@ export class Component extends Node {
 // everything after the fixed fields (P, V, IF, X). A label, a controlled value, a URL
 // and a capability's JSON arguments may all contain "|". Verified on device, not
 // assumed: a label "a|b|c" renders whole, and "\nR|app" does not remove the root.
+// A style value that may be free text. The style string is split on ";" and "=", the
+// wire line on "|" and the stream on newlines, so those five (and "%" itself) are
+// percent-encoded here and decoded by the host (chuksUnescapeStyle). Anything else,
+// including every non-ASCII character, crosses as it is.
+function styleEsc(s: string): string {
+    var out: string = ""
+    for (var c of s) {
+        if (c == "%") { out = out + "%25" }
+        else if (c == ";") { out = out + "%3B" }
+        else if (c == "=") { out = out + "%3D" }
+        else if (c == "|") { out = out + "%7C" }
+        else if (c == "\n") { out = out + "%0A" }
+        else if (c == "\r") { out = out + "%0D" }
+        else if (c == "\t") { out = out + "%09" }
+        else { out = out + c }
+    }
+    return out
+}
 function escText(s: string): string {
     var out: string = ""
-    var i: int = 0
-    while (i < s.length) {
-        const c: string = s.slice(i, i + 1)
-        i = i + 1
+    // Walk CHARACTERS: a string position is a byte, so a byte-stepping slice(i, i + 1)
+    // returns "" on every byte of "é" or an emoji and the character vanishes from the
+    // wire (a typed "café" reached the host as "caf ").
+    for (var c of s) {
         if (c == "\\") { out = out + "\\\\" }
         else if (c == "\n") { out = out + "\\n" }
         else if (c == "\r") { out = out + "\\r" }
@@ -2374,12 +2439,7 @@ function escText(s: string): string {
 function packField(s: string): string {
     if (!s.contains("\t")) { return s }
     var out: string = ""
-    var i: int = 0
-    while (i < s.length) {
-        const c: string = s.slice(i, i + 1)
-        out = out + (c == "\t" ? "\\t" : c)
-        i = i + 1
-    }
+    for (var c of s) { out = out + (c == "\t" ? "\\t" : c) }   // by character, not byte (see escText)
     return out
 }
 
