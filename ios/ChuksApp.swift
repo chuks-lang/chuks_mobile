@@ -3067,8 +3067,28 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Don't hijack a tap that lands on a text field (let it focus normally); do
     // dismiss for taps anywhere else.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        if let t = g as? UITapGestureRecognizer, taps[t] != nil, let ov = g.view, let oid = views.first(where: { $0.value === ov })?.key, popoverIds.contains(oid) {
-            return popoverTouchIsOutsideContent(g, touch)
+        if let t = g as? UITapGestureRecognizer, taps[t] != nil, let ov = g.view, let oid = views.first(where: { $0.value === ov })?.key, modalIds.contains(oid) {
+            return overlayTouchIsOutsideContent(g, touch)
+        }
+        // The deepest handler wins. A tap recognizer on a container also receives a
+        // touch that landed on a child with a handler of its own (a Switch inside a
+        // labelled row, a button inside a tappable card), and both fired: the row's
+        // onToggle flipped the state the switch had just flipped, so the switch
+        // animated on and snapped back. A touch that a descendant handles is not
+        // this recognizer's.
+        var ours = false
+        if let t = g as? UITapGestureRecognizer, taps[t] != nil { ours = true }
+        if let l = g as? UILongPressGestureRecognizer, pressGestures[l] != nil { ours = true }
+        if ours {
+            var v: UIView? = touch.view
+            while let cur = v, cur !== g.view {
+                if cur is UIControl { return false }
+                for r in cur.gestureRecognizers ?? [] {
+                    if let t = r as? UITapGestureRecognizer, taps[t] != nil { return false }
+                    if let l = r as? UILongPressGestureRecognizer, pressGestures[l] != nil { return false }
+                }
+                v = cur.superview
+            }
         }
         return !(touch.view is UITextField)
     }
@@ -5424,6 +5444,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // here is safe.
         resetLayoutStyle(n)
         resetPaintStyle(id, v)
+        // A leaf native control has no measure func; make() gave its Yoga node the
+        // control's intrinsic size, and the reset above just cleared it. Put it back
+        // before the incoming keys, so an explicit w/h still wins. Without this a
+        // Switch laid out at 0x0 and, in a justify-between row, was pushed to the
+        // row's edge and drawn past it.
+        if let sw = v as? UISwitch {
+            let sz = sw.intrinsicContentSize
+            YGNodeStyleSetWidth(n, Float(sz.width)); YGNodeStyleSetHeight(n, Float(sz.height))
+        } else if let dp = v as? UIDatePicker {
+            let sz = dp.intrinsicContentSize
+            YGNodeStyleSetWidth(n, Float(sz.width)); YGNodeStyleSetHeight(n, Float(sz.height))
+        }
         let label = v as? UILabel
         let btn = v as? UIButton
         let field = v as? UITextField
@@ -5531,6 +5563,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 }
             case "mvis":
                 let vis = (val == "1")
+                if !vis && !v.isHidden { animateOverlayOut(id, v) }   // a snapshot slides/fades out; the real view can go now
                 v.isHidden = !vis
                 if vis { activeModal = id } else if activeModal == id { activeModal = nil }
                 if !vis, let al = popoverArrowLayers[id] { al.removeFromSuperlayer(); popoverArrowLayers[id] = nil }
@@ -6062,7 +6095,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             return
         }
         let g = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
-        if popoverIds.contains(id) { g.delegate = self }   // outside-tap only (see popoverTouchIsOutsideContent)
+        g.delegate = self   // scrim-tap only on an overlay; deepest handler wins elsewhere (shouldReceive)
         v.addGestureRecognizer(g)
         taps[g] = action
     }
@@ -6778,17 +6811,62 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         al.path = path.cgPath
         al.fillColor = (content.backgroundColor ?? .clear).cgColor
     }
-    // A tap on a popover's content is the content's; only a tap on the empty overlay
-    // dismisses. Called from the tap recognizer's delegate for popover overlays.
-    func popoverTouchIsOutsideContent(_ g: UIGestureRecognizer, _ touch: UITouch) -> Bool {
-        guard let ov = g.view, let content = ov.subviews.first(where: { $0.tag != CHUKS_DECOR_TAG }) else { return true }
-        return !content.frame.contains(touch.location(in: ov))
+    // A tap on an overlay's content is the content's; only a tap on the scrim (the
+    // overlay outside every content view) dismisses. Called from the tap recognizer's
+    // delegate for Modal and Popover overlays. A sheet's own chrome (background,
+    // handle) counts as content: a tap on the handle is not a dismiss.
+    func overlayTouchIsOutsideContent(_ g: UIGestureRecognizer, _ touch: UITouch) -> Bool {
+        guard let ov = g.view else { return true }
+        let p = touch.location(in: ov)
+        for sub in ov.subviews where sub.tag != CHUKS_DECOR_TAG && !sub.isHidden {
+            if sub.frame.contains(p) { return false }
+        }
+        return true
     }
 
     func clearSheetChrome() {
         sheetBg?.removeFromSuperview(); sheetHandle?.removeFromSuperview()
         if let p = sheetPan { p.view?.removeGestureRecognizer(p); sheetPan = nil }
         shownSheet = nil
+    }
+
+    // Dismissal is animated the way presentation is. The overlay's content is torn
+    // down by the same mutation batch that hides it (a hidden Modal has no children),
+    // so what animates out is a SNAPSHOT of the last rendered frame: a sheet slides
+    // down from wherever it is (a drag past the threshold continues from the finger),
+    // a dialog or popover fades. The real view hides at once and the app's next render
+    // finds nothing left over. Without this a sheet that slid up in 340ms vanished in
+    // one frame, and a drag-to-dismiss jumped from the finger to gone.
+    func animateOverlayOut(_ id: String, _ mv: UIView) {
+        if sheetModals.contains(id) {
+            let content = mv.subviews.filter { !$0.isHidden }
+            guard !content.isEmpty else { return }
+            var union = CGRect.null
+            for c in content { union = union.union(c.frame.applying(c.transform)) }
+            union = union.intersection(mv.bounds)
+            guard !union.isNull, union.height > 0,
+                  let snap = mv.resizableSnapshotView(from: union, afterScreenUpdates: false, withCapInsets: .zero) else { return }
+            let scrim = UIView(frame: mv.frame)
+            scrim.backgroundColor = mv.backgroundColor
+            scrim.isUserInteractionEnabled = false
+            snap.frame = union.offsetBy(dx: mv.frame.minX, dy: mv.frame.minY)
+            snap.isUserInteractionEnabled = false
+            view.addSubview(scrim); view.addSubview(snap)
+            let travel = view.bounds.height - snap.frame.minY
+            UIView.animate(withDuration: 0.26, delay: 0, options: [.curveEaseIn], animations: {
+                snap.transform = CGAffineTransform(translationX: 0, y: travel)
+                scrim.alpha = 0
+            }, completion: { _ in snap.removeFromSuperview(); scrim.removeFromSuperview() })
+            for sub in mv.subviews { sub.transform = .identity }   // the real views are reused next time
+            mv.backgroundColor = UIColor(white: 0, alpha: 0.5)
+            return
+        }
+        guard let snap = mv.snapshotView(afterScreenUpdates: false) else { return }
+        snap.frame = mv.frame
+        snap.isUserInteractionEnabled = false
+        view.addSubview(snap)
+        UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseOut], animations: { snap.alpha = 0 },
+                       completion: { _ in snap.removeFromSuperview() })
     }
 
     @objc func handleSheetPan(_ g: UIPanGestureRecognizer) {

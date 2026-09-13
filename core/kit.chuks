@@ -1,7 +1,12 @@
-// @chuks/ui -- the component kit. The chuks-mobile analogue of RN Paper /
-// Tamagui: higher-level, good-looking components composed from the primitives
-// and styled entirely through semantic theme tokens (see theme.chuks), so every
-// one of them reskins with setTheme("light") and stays consistent by default.
+// DEPRECATED: the component kit now lives in the @chuks/ui package (`chuks add
+// @chuks/ui`, then `import { Button } from "pkg/@chuks/ui"`), with the same components
+// under a stricter contract (action / variant / size, accessible by default) and
+// twice as many of them. This file stays for one release so existing imports keep
+// working, and will be removed; nothing in the framework imports it.
+//
+// The component kit. Higher-level, good-looking components composed from the
+// primitives and styled entirely through semantic theme tokens (see theme.chuks), so
+// every one of them reskins with setTheme("light") and stays consistent by default.
 //
 // API convention (single props-map model): every component takes a SINGLE props
 // `dataType`, so callers set only what they need by name (no positional nulls).

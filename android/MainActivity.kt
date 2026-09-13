@@ -2915,6 +2915,13 @@ class MainActivity : Activity(), ChuksModuleHost {
         // the node. minimumHeight/Width mirror the `h`/`w` cases and are re-set there if present.
         N.yResetStyle(n)
         v.minimumHeight = 0; v.minimumWidth = 0
+        // A leaf native control's Yoga size came from make() (its measured size) and the
+        // reset just cleared it; put it back before the keys, so an explicit w/h wins.
+        if (v is Switch) {
+            val spec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            v.measure(spec, spec)
+            N.ySetF(n, 5, v.measuredWidth.toFloat()); N.ySetF(n, 6, v.measuredHeight.toFloat())
+        }
         // Text props are set conditionally below (ta/nlines only if present), so a reused
         // TextView would keep the previous role's alignment/line-clamp when the new role
         // relies on defaults (e.g. a reused label staying centered). Reset to make()'s
@@ -3197,6 +3204,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "sbnavcolor" -> setNavBarColor(vl)       // StatusBar: Android nav-bar color
                 "mvis" -> {                              // Modal visible: show/hide the overlay
                     val vis = (vl == "1")
+                    if (!vis && v.visibility == View.VISIBLE) animateOverlayOut(id, v as FrameLayout)   // a snapshot slides/fades out
                     v.visibility = if (vis) View.VISIBLE else View.GONE
                     if (vis) { activeModal = id; v.bringToFront() } else if (activeModal == id) activeModal = null
                     if (!vis) popoverArrowViews.remove(id)?.let { (it.parent as? ViewGroup)?.removeView(it) }
@@ -4440,16 +4448,21 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun bindAction(id: String, action: String) {
         val v = views[id] ?: return
         if (modalIds.contains(id)) modalActions[id] = action   // onDismiss: scrim tap AND sheet drag
-        if (popoverIds.contains(id)) {
-            // A tap on the popover's content is the content's; only a tap on the empty
-            // overlay dismisses. Children consume their own touches first, so this listener
-            // sees the rest: inside the content it declines (the overlay swallows it),
-            // outside it captures the DOWN and fires on the UP.
+        if (modalIds.contains(id) && !sheetModals.contains(id)) {
+            // A tap on the overlay's content is the content's; only a tap on the scrim
+            // dismisses. Children consume their own touches first, so this listener sees
+            // the rest: inside any content view it declines (the overlay swallows it),
+            // outside it captures the DOWN and fires on the UP. A bottom sheet keeps its
+            // own drag listener (attachSheetDrag), which already checks the scrim.
             v.isClickable = true
             v.setOnClickListener(null)
             v.setOnTouchListener { ov, ev ->
-                val content = (ov as? ViewGroup)?.let { g -> (0 until g.childCount).map { g.getChildAt(it) }.firstOrNull { it !== popoverArrowViews[id] } }
-                val inside = content != null && ev.x >= content.left && ev.x <= content.right && ev.y >= content.top && ev.y <= content.bottom
+                val g = ov as? ViewGroup
+                var inside = false
+                if (g != null) for (i in 0 until g.childCount) {
+                    val c = g.getChildAt(i)
+                    if (c.visibility == View.VISIBLE && ev.x >= c.left && ev.x <= c.right && ev.y >= c.top && ev.y <= c.bottom) { inside = true; break }
+                }
                 when (ev.action) {
                     MotionEvent.ACTION_DOWN -> !inside
                     MotionEvent.ACTION_UP -> { if (!inside && action.isNotEmpty()) fire(action); true }
@@ -5069,6 +5082,47 @@ class MainActivity : Activity(), ChuksModuleHost {
         var color: Int = 0
         private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
         override fun onDraw(canvas: android.graphics.Canvas) { paint.color = color; canvas.drawPath(path, paint) }
+    }
+
+    // Dismissal is animated the way presentation is. The overlay's content is torn
+    // down by the same mutation batch that hides it, so what animates out is a BITMAP
+    // of the last frame: a sheet slides down from wherever it is (a drag past the
+    // threshold continues from the finger), a dialog fades. Mirrors iOS.
+    private fun animateOverlayOut(id: String, mv: FrameLayout) {
+        if (mv.width <= 0 || mv.height <= 0) return
+        if (sheetModals.contains(id)) {
+            var top = mv.height; var bottom = 0
+            for (i in 0 until mv.childCount) {
+                val c = mv.getChildAt(i); if (c.visibility != View.VISIBLE) continue
+                top = minOf(top, (c.top + c.translationY).toInt()); bottom = maxOf(bottom, (c.bottom + c.translationY).toInt())
+            }
+            bottom = minOf(bottom, mv.height)
+            if (bottom <= top) return
+            val bmp = android.graphics.Bitmap.createBitmap(mv.width, bottom - top, android.graphics.Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bmp)
+            canvas.translate(0f, -top.toFloat())
+            for (i in 0 until mv.childCount) {
+                val c = mv.getChildAt(i); if (c.visibility != View.VISIBLE) continue
+                canvas.save(); canvas.translate(c.left.toFloat(), c.top + c.translationY); c.draw(canvas); canvas.restore()
+            }
+            val scrim = View(this); scrim.background = mv.background?.constantState?.newDrawable()
+            scrim.layoutParams = FrameLayout.LayoutParams(mv.width, mv.height).also { it.leftMargin = mv.left; it.topMargin = mv.top }
+            val snap = ImageView(this); snap.setImageBitmap(bmp)
+            snap.layoutParams = FrameLayout.LayoutParams(mv.width, bottom - top).also { it.leftMargin = mv.left; it.topMargin = mv.top + top }
+            root.addView(scrim); root.addView(snap)
+            val travel = (mv.height - top).toFloat()
+            scrim.animate().alpha(0f).setDuration(260).start()
+            snap.animate().translationY(travel).setDuration(260).setInterpolator(android.view.animation.AccelerateInterpolator())
+                .withEndAction { root.removeView(snap); root.removeView(scrim); bmp.recycle() }.start()
+            for (i in 0 until mv.childCount) mv.getChildAt(i).translationY = 0f   // the real views are reused next time
+            return
+        }
+        val bmp = android.graphics.Bitmap.createBitmap(mv.width, mv.height, android.graphics.Bitmap.Config.ARGB_8888)
+        mv.draw(android.graphics.Canvas(bmp))
+        val snap = ImageView(this); snap.setImageBitmap(bmp)
+        snap.layoutParams = FrameLayout.LayoutParams(mv.width, mv.height).also { it.leftMargin = mv.left; it.topMargin = mv.top }
+        root.addView(snap)
+        snap.animate().alpha(0f).setDuration(180).withEndAction { root.removeView(snap); bmp.recycle() }.start()
     }
 
     private fun clearSheetChrome() {
