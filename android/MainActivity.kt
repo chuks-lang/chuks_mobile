@@ -200,6 +200,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     private val popoverGap = HashMap<String, Int>()        // popover id -> gap to the anchor (px)
     private val popoverArrow = HashSet<String>()           // popovers that draw a pointer
     private val popoverArrowViews = HashMap<String, View>()  // popover id -> its pointer
+    private val sheetIds = HashSet<String>()             // Sheet overlays (host-driven bottom sheets)
     private val layoutIds = HashSet<String>()            // ids whose node has onLayout
     private val lastLayoutReport = HashMap<String, String>()  // id -> last "x,y,w,h" reported
     private var sheetBg: View? = null                    // host-drawn sheet surface (rounded top, behind content)
@@ -441,6 +442,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                             modalActions[mid]?.let { fire(it) }   // parent flips `visible`; the re-render hides it
                             return
                         }
+                        if (closeTopSheet()) return
                         if (backTop != null) backSettle(true) else doBack()
                     }
                 })
@@ -644,8 +646,21 @@ class MainActivity : Activity(), ChuksModuleHost {
                 // VC|<id>|<name>|<json>: the app told ONE package view to do something.
                 // The arguments are JSON, so a pipe inside them is safe: everything after
                 // the third field is joined back together, as a capability's args are.
-                "VC" -> if (f.size >= 3) packageViews[f[1]]?.command(
-                    f[2], ChuksArgs(if (f.size >= 4) f.drop(3).joinToString("|") else "", "view." + f[2], "0", this))
+                "VC" -> if (f.size >= 3) {
+                    val raw = if (f.size >= 4) f.drop(3).joinToString("|") else ""
+                    val pv = packageViews[f[1]]
+                    val sl = views[f[1]] as? SheetLayout
+                    if (pv != null) pv.command(f[2], ChuksArgs(raw, "view." + f[2], "0", this))
+                    else if (sl != null) {
+                        val a = ChuksArgs(raw, "sheet." + f[2], "0", this)
+                        when (f[2]) {
+                            "snapTo" -> sheetAnimate(f[1], sl, a.int("index") ?: 0)
+                            "expand" -> sheetAnimate(f[1], sl, sl.heights.size - 1)
+                            "collapse" -> sheetAnimate(f[1], sl, 0)
+                            "close" -> sheetAnimate(f[1], sl, -1)
+                        }
+                    }
+                }
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
                 // LV|<id>: the engine names the LIVE list (the one on the top screen).
@@ -2705,6 +2720,11 @@ class MainActivity : Activity(), ChuksModuleHost {
                 it.visibility = View.GONE                // shown when mvis=1
                 modalIds.add(id)
             }
+            "Sheet" -> SheetLayout(this).also { sl ->
+                sl.id = id; sl.visibility = View.GONE
+                N.ySetF(n, 1, 0f); N.ySetF(n, 2, 4f)     // justify flex-start, align stretch: children fill the box
+                sheetIds.add(id)
+            }
             "Popover" -> FrameLayout(this).also {       // an anchored Modal: transparent overlay, content
                 it.visibility = View.GONE                // laid out at its natural size at the origin and
                 N.ySetF(n, 1, 0f); N.ySetF(n, 2, 0f)     // moved beside the anchor by placePopover
@@ -2906,6 +2926,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         // this a previous bordered/filled element leaves its border/bg under the new
         // one (e.g. a stray outline around a row that later holds a Switch).
         bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
+        (views[id] as? SheetLayout)?.surfaceOverride = null   // a Sheet's bg is its surface; back to the platform's unless set again
         borderStyleM.remove(id); bwSideM.remove(id)
         // Also drop stale LAYOUT geometry (Yoga width/height/grow/basis/padding/…): the visual
         // removes above didn't touch the Yoga node, so a reused node kept its previous role's
@@ -3025,7 +3046,8 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "left" -> N.ySetF(n, 11, dpf(f))
                 "right" -> N.ySetF(n, 12, dpf(f))
                 "on" -> (v as? Switch)?.isChecked = (vl == "1")
-                "bg" -> if (v is Switch) {
+                "bg" -> if (v is SheetLayout) v.surfaceOverride = hexColor(vl)   // the panel's surface, not the backdrop
+                else if (v is Switch) {
                     v.trackTintList = ColorStateList.valueOf(hexColor(vl))   // on-track = primary
                     v.thumbTintList = ColorStateList.valueOf(switchThumb[id] ?: Color.WHITE)   // white thumb, like iOS (unless thumbColor set)
                 } else bgColor[id] = hexColor(vl)
@@ -3210,6 +3232,12 @@ class MainActivity : Activity(), ChuksModuleHost {
                     if (!vis) popoverArrowViews.remove(id)?.let { (it.parent as? ViewGroup)?.removeView(it) }
                     root.requestLayout()
                 }
+                "shsnap" -> (v as? SheetLayout)?.let { it.snapSpec = vl.split(",") }
+                "shidx" -> (v as? SheetLayout)?.let { sheetSetIndex(id, it, f.toInt()) }
+                "shbd" -> (v as? SheetLayout)?.let { it.backdrop = (vl == "1") }
+                "shptc" -> (v as? SheetLayout)?.let { it.panToClose = (vl == "1") }
+                "shhdl" -> (v as? SheetLayout)?.let { it.showHandle = (vl == "1") }
+                "shkb" -> (v as? SheetLayout)?.let { it.keyboard = vl }
                 "panc" -> popoverAnchor[id] = vl                                // Popover: the anchor node
                 "pplc" -> popoverPlace[id] = vl                                 // Popover: preferred side
                 "pgap" -> popoverGap[id] = dp(f.toInt())                        // Popover: gap to the anchor
@@ -3857,7 +3885,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun insert(id: String, parent: String, index: Int) {
         val child = views[id] ?: return
         if (parent == "root") { root.addView(child); return }
-        if (modalIds.contains(id)) { root.addView(child); return }   // Modal overlays mount on root, above the app
+        if (modalIds.contains(id) || sheetIds.contains(id)) { root.addView(child); return }   // overlays mount on root, above the app
         if (parent == scrollId) contentId = id
         val pn = ynodes[parent] ?: return
         // A package view may own where its children go: its root can be a decoration layer,
@@ -3869,7 +3897,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             container.insertChild(child, index)
             containerPlaced[id] = parent
         } else {
-            val pv = views[parent] as? ViewGroup ?: return
+            val pv = (views[parent] as? SheetLayout)?.panel ?: (views[parent] as? ViewGroup ?: return)   // a Sheet's content lives in its panel
             val base = if (bgImageViews.containsKey(parent)) 1 else 0   // keep an ImageBackground's bg image at the back
             pv.addView(child, minOf(index + base, pv.childCount))
         }
@@ -4111,6 +4139,10 @@ class MainActivity : Activity(), ChuksModuleHost {
     // nearest multiple of the viewport height. Off by default = a normal ScrollView.
     inner class SnapScrollView(ctx: Context) : ScrollView(ctx) {
         var pageSnap = false
+        // The platform ScrollView reports its scrolling to a nested-scroll parent only when
+        // asked to (it is off by default). A Sheet above a list needs the report for the
+        // hand-off: the list scrolls at the top point, the sheet moves everywhere else.
+        init { isNestedScrollingEnabled = true }
         private var lastY = -1
         private val settle = object : Runnable {
             override fun run() {
@@ -4440,7 +4472,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { popoverIds.remove(it); popoverAnchor.remove(it); popoverPlace.remove(it); popoverGap.remove(it); popoverArrow.remove(it); popoverArrowViews.remove(it); layoutIds.remove(it); lastLayoutReport.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { sheetIds.remove(it); popoverIds.remove(it); popoverAnchor.remove(it); popoverPlace.remove(it); popoverGap.remove(it); popoverArrow.remove(it); popoverArrowViews.remove(it); layoutIds.remove(it); lastLayoutReport.remove(it) }
         views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
@@ -4596,6 +4628,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             modalActions[mid]?.let { fire(it) }   // parent flips `visible` false; the re-render hides it
             return
         }
+        if (closeTopSheet()) return
         // Ask the app before leaving. A registered back handler or a stacked route
         // consumes the press; only when nothing does are we really at the root, and the
         // default (finish the activity) is correct. Without this, back exited the app
@@ -4845,6 +4878,28 @@ class MainActivity : Activity(), ChuksModuleHost {
     // the keyboard height. See applyKeyboard.
     private var kbShift = 0
     private var kbScroll: ScrollView? = null
+    private var kbSheet: String? = null                 // the Sheet holding the focused field, to restore on hide
+    // The Sheet a view sits in, if any.
+    private fun sheetContaining(v: View): Pair<String, SheetLayout>? {
+        var p: View? = v.parent as? View
+        while (p != null) {
+            if (p is SheetLayout) { val sid = views.entries.firstOrNull { it.value === p }?.key ?: return null; return Pair(sid, p) }
+            p = p.parent as? View
+        }
+        return null
+    }
+    // A field inside a Sheet: the sheet makes room the way its `keyboard` prop says, and
+    // the app tree under it does not move.
+    private fun sheetKeyboard(sid: String, sl: SheetLayout, kbH: Float) {
+        val mode = if (kbH > 0f) sl.keyboard else ""
+        val lift = if (mode == "interactive") kbH else 0f
+        val pad = if (mode == "extend" || mode == "fillParent") kbH else 0f
+        val fill = mode == "fillParent"
+        if (sl.kbLift == lift && sl.kbPad == pad && sl.kbFill == fill) return
+        sl.kbLift = lift; sl.kbPad = pad; sl.kbFill = fill
+        if (mode == "extend") sheetAnimate(sid, sl, sl.heights.size - 1) else sheetAnimate(sid, sl, sl.index, 0f, false)
+        relayout()
+    }
 
     // The keyboard overlays the app; lift only what it covers, and only as much as it
     // takes. A focused field inside a Scroll gets bottom padding on that scroll and is
@@ -4854,9 +4909,11 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun applyKeyboard(imeH: Int) {
         kbScroll?.let { it.setPadding(it.paddingLeft, it.paddingTop, it.paddingRight, 0) }
         kbScroll = null
+        kbSheet?.let { sid -> if (imeH <= 0 || currentFocus?.let { sheetContaining(it)?.first } != sid) { kbSheet = null; (views[sid] as? SheetLayout)?.let { sheetKeyboard(sid, it, 0f) } } }
         if (imeH <= 0) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
         val f = currentFocus
         if (f == null) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
+        sheetContaining(f)?.let { (sid, sl) -> kbSheet = sid; sheetKeyboard(sid, sl, imeH.toFloat()); return }
         val loc = IntArray(2); f.getLocationInWindow(loc)
         val rootLoc = IntArray(2); root.getLocationInWindow(rootLoc)
         // Measured against the UNLIFTED layout (add back the current shift), so repeated
@@ -4897,9 +4954,35 @@ class MainActivity : Activity(), ChuksModuleHost {
                 N.yCalc(mn, root.width.toFloat(), root.height.toFloat())
             }
         }
+        // Every Sheet is its own root-sized Yoga root, padded at the top so its children
+        // fill the tallest snap box; the overlay translates them to the current point.
+        for (sid in sheetIds) {
+            val sn = ynodes[sid] ?: continue
+            val sl = views[sid] as? SheetLayout ?: continue
+            sl.layoutParams = FrameLayout.LayoutParams(root.width, root.height).also { it.leftMargin = 0; it.topMargin = 0 }
+            if (sl.width != root.width || sl.height != root.height) sl.layout(0, 0, root.width, root.height)
+            @Suppress("DEPRECATION")
+            sl.topInset = (window.decorView.rootWindowInsets?.systemWindowInsetTop ?: 0).toFloat()
+            @Suppress("DEPRECATION")
+            sl.bottomInset = (window.decorView.rootWindowInsets?.systemWindowInsetBottom ?: 0).toFloat()
+            sl.resolveHeights()
+            N.ySetF(sn, 5, root.width.toFloat()); N.ySetF(sn, 6, root.height.toFloat())
+            N.ySetF(sn, 16, sl.layoutTop + sl.handleStrip)
+            N.ySetF(sn, 18, sl.bottomPad)
+            N.yCalc(sn, root.width.toFloat(), root.height.toFloat())
+            if (sl.snapSpec.contains("c")) {
+                var total = 0f
+                for ((cid, cn) in ynodes) if (cid.startsWith("$sid.") && cid.indexOf('.', sid.length + 1) < 0) total += N.yGet(cn, 3)
+                if (total > 0f && Math.abs(total - sl.contentHeight) > 0.5f) {
+                    sl.contentHeight = total; sl.resolveHeights()
+                    N.ySetF(sn, 16, sl.layoutTop + sl.handleStrip)
+                    N.yCalc(sn, root.width.toFloat(), root.height.toFloat())
+                }
+            }
+        }
         val pendingLayout = ArrayList<Pair<String, String>>()   // onLayout reports, delivered after this pass
         for ((id, node) in ynodes) {
-            if (modalIds.contains(id)) continue          // modal overlay node placed explicitly below
+            if (modalIds.contains(id) || sheetIds.contains(id)) continue   // overlay roots are placed explicitly below
             val v = views[id] ?: continue
             val left = N.yGet(node, 0).toInt(); val top = N.yGet(node, 1).toInt()
             val wd = N.yGet(node, 2).toInt()
@@ -4929,6 +5012,15 @@ class MainActivity : Activity(), ChuksModuleHost {
         if (pendingLayout.isNotEmpty()) root.post { for ((id, key) in pendingLayout) if (layoutIds.contains(id)) hostInput("$id:layout", key) }
         // place the whole Chuks app just below the top inset
         (views["app"]?.layoutParams as? FrameLayout.LayoutParams)?.let { it.leftMargin = 0; it.topMargin = topY }
+        // Sheets: on top of the app, at their current point (a drag or animation in flight
+        // keeps its position; a layout never fights the finger).
+        for (sid in sheetIds) {
+            val sl = views[sid] as? SheetLayout ?: continue
+            if (sl.closed && !sl.animating) { sl.visibility = View.GONE; continue }
+            sl.bringToFront()
+            if (!sl.animating && !sl.dragging) sl.position = sl.positionFor(sl.index)
+            sl.apply()
+        }
         // a visible modal fills the window and sits on top (children laid out above)
         if (mid != null && views[mid]?.visibility == View.VISIBLE) {
             views[mid]?.let { mv ->
@@ -4997,6 +5089,52 @@ class MainActivity : Activity(), ChuksModuleHost {
                     .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
             }
         }
+    }
+
+    // Back closes an open sheet with a backdrop, as it closes a Modal.
+    private fun closeTopSheet(): Boolean {
+        for (sid in sheetIds) {
+            val sl = views[sid] as? SheetLayout ?: continue
+            if (sl.visibility == View.VISIBLE && !sl.closed && sl.backdrop) { sheetAnimate(sid, sl, -1); return true }
+        }
+        return false
+    }
+
+    // ── Sheet: index and animation ─────────────────────────────────────────────
+    private fun sheetSetIndex(id: String, sl: SheetLayout, idx: Int) {
+        val target = maxOf(-1, minOf(idx, maxOf(sl.heights.size - 1, 0)))
+        if (sl.dragging) { sl.index = target; return }
+        if (sl.visibility != View.VISIBLE && target < 0) { sl.index = -1; return }
+        if (sl.visibility != View.VISIBLE) {
+            // Opening from closed: place it closed, then slide to the point.
+            sl.index = -1
+            if (sl.width == 0) sl.layout(0, 0, root.width, root.height)
+            sl.resolveHeights(); sl.position = sl.closedPosition; sl.apply(); sl.bringToFront()
+        }
+        if (sl.index != target) sheetAnimate(id, sl, target, 0f, false) else sl.index = target
+    }
+    // Spring to a point. `report` tells the app through onChange when the point is not
+    // the one it last set (a drag, a command, the backdrop); an index the app sent is
+    // not echoed back.
+    private fun sheetAnimate(id: String, sl: SheetLayout, idx: Int, velocity: Float = 0f, report: Boolean = true) {
+        val target = maxOf(-1, minOf(idx, maxOf(sl.heights.size - 1, 0)))
+        if (sl.heights.isEmpty()) sl.resolveHeights()
+        val dest = sl.positionFor(target)
+        val reported = sl.index
+        sl.index = target; sl.animating = true; sl.visibility = View.VISIBLE; sl.bringToFront()
+        val from = sl.position
+        val anim = android.animation.ValueAnimator.ofFloat(0f, 1f)
+        anim.duration = 320
+        anim.interpolator = android.view.animation.DecelerateInterpolator(1.6f)
+        anim.addUpdateListener { va -> val t = va.animatedValue as Float; sl.position = from + (dest - from) * t; sl.apply() }
+        anim.addListener(object : android.animation.AnimatorListenerAdapter() {
+            override fun onAnimationEnd(a: android.animation.Animator) {
+                sl.position = dest; sl.apply(); sl.animating = false
+                if (sl.closed) sl.visibility = View.GONE
+                if (report && reported != target) hostInput("$id:change", target.toString())
+            }
+        })
+        anim.start()
     }
 
     // ── Popover placement ──────────────────────────────────────────────────────
@@ -5077,6 +5215,207 @@ class MainActivity : Activity(), ChuksModuleHost {
         arrow.layoutParams = FrameLayout.LayoutParams(aw, ah).also { it.leftMargin = ax; it.topMargin = ay }
         arrow.invalidate()
     }
+    // ── Sheet ──────────────────────────────────────────────────────────────────
+    // A bottom sheet the host drives between snap points with the finger; the design
+    // and the vocabulary are the iOS host's (SheetOverlay), which follows
+    // @gorhom/react-native-bottom-sheet. The overlay fills the root; the app's children
+    // are laid out once in the tallest snap box (a top padding on the sheet's Yoga root)
+    // and the panel (surface, handle, children) is translated to the current position.
+    // A drag on the panel is handled here; a scrollable inside hands off through nested
+    // scrolling, the way Material's BottomSheetBehavior does it: the sheet consumes the
+    // scroll until it is at its highest point, then the list scrolls, and a list at its
+    // top that is pulled down moves the sheet again.
+    inner class SheetLayout(ctx: Context) : FrameLayout(ctx) {
+        // The panel holds the content. Its background is the surface, inset down to the
+        // highest point, and it carries the elevation: on Android elevation orders the
+        // drawing, so a surface that was a sibling of the content painted over it. The
+        // content is root-relative (Yoga pads it down to the highest point) and the panel
+        // is translated as one to the current point.
+        val panel = FrameLayout(ctx)
+        val handle = View(ctx)
+        private val surfaceDrawable = GradientDrawable()
+        private var surfaceInset = -1
+        private var surfaceShown = 0
+        var surfaceOverride: Int? = null   // the app's `bg` for the surface; null = the platform's sheet colour
+        var id = ""
+        var backdrop = true
+        var panToClose = true
+        var showHandle = true
+        var keyboard = "interactive"
+        var snapSpec: List<String> = emptyList()
+        var heights: FloatArray = FloatArray(0)
+        var index = -1
+        var position = 0f
+        var contentHeight = 0f
+        var animating = false
+        var dragging = false
+        val handleStrip = dp(22)
+        // The keyboard, while a field inside the sheet has it (see applyKeyboard). The
+        // `keyboard` prop picks one: "interactive" lifts the sheet by the keyboard's height
+        // (kbLift), "extend" goes to the highest point and pads the content bottom by it
+        // (kbPad), "fillParent" takes the whole window (kbFill) and pads.
+        var kbLift = 0f
+        var kbPad = 0f
+        var kbFill = false
+        var topInset = 0f                  // the status bar's height: no point sits above it (set each layout)
+        var bottomInset = 0f               // the navigation bar's height: the content clears it
+        // Bottom padding for the children: the keyboard when it pads, nothing when the sheet
+        // is lifted onto the keyboard (its bottom edge is above it), else the system bar.
+        val bottomPad: Float get() = if (kbPad > 0f) kbPad else if (kbLift > 0f) 0f else bottomInset
+        private var downY = 0f; private var initial = 0f; private var ownsDrag = false
+        private var tracker: android.view.VelocityTracker? = null
+        private var nestedVelocity = 0f
+        init {
+            surfaceDrawable.setColor(surfaceColor())
+            surfaceDrawable.cornerRadii = floatArrayOf(dpf(20f), dpf(20f), dpf(20f), dpf(20f), 0f, 0f, 0f, 0f)
+            panel.elevation = dpf(8f)
+            val hd = GradientDrawable(); hd.setColor(Color.argb(102, 128, 128, 128)); hd.cornerRadius = dpf(2.5f)
+            handle.background = hd
+            panel.addView(handle)
+            addView(panel)
+            isClickable = true
+        }
+        val closed: Boolean get() = index < 0
+        val highestHeight: Float get() = heights.maxOrNull() ?: 0f
+        val closedPosition: Float get() = height.toFloat()
+        val highestPosition: Float get() = height - highestHeight
+        // Where the children are laid out from (the top of the tallest box), and the
+        // highest the top edge may go: the same point, unless the keyboard changed them.
+        val layoutTop: Float get() = if (kbFill) topInset else highestPosition
+        val minPosition: Float get() = if (kbFill) topInset else maxOf(topInset, highestPosition - kbLift)
+        fun positionFor(i: Int): Float {
+            if (i < 0 || i >= heights.size) return closedPosition
+            if (kbFill) return topInset
+            return maxOf(topInset, height - heights[i] - kbLift)
+        }
+        fun settlePositions(): List<Float> { val ps = heights.indices.map { positionFor(it) }.toMutableList(); if (panToClose) ps.add(closedPosition); return ps }
+        fun indexFor(p: Float): Int { for (i in heights.indices) if (Math.abs(positionFor(i) - p) < 0.5f) return i; return -1 }
+        fun resolveHeights() {
+            val h = height.toFloat()
+            var hs = snapSpec.map { spec ->
+                when {
+                    spec == "c" -> if (contentHeight > 0f) minOf(contentHeight + handleStrip + bottomInset, h) else 0f
+                    spec.endsWith("p") -> h * ((spec.dropLast(1).toFloatOrNull() ?: 50f) / 100f)
+                    else -> dpf(spec.toFloatOrNull() ?: 300f)
+                }
+            }
+            val mx = hs.maxOrNull() ?: 0f
+            if (mx > 0f) hs = hs.map { if (it == 0f) mx else it }
+            heights = hs.map { minOf(maxOf(it, handleStrip + 1f), h) }.toFloatArray()
+        }
+        fun apply() {
+            val w = width; val h = height
+            val inset = layoutTop.toInt()
+            val color = surfaceOverride ?: surfaceColor()
+            if (inset != surfaceInset || color != surfaceShown) {
+                surfaceInset = inset; surfaceShown = color
+                surfaceDrawable.setColor(color)
+                panel.background = android.graphics.drawable.InsetDrawable(surfaceDrawable, 0, inset, 0, 0)
+                panel.setPadding(0, 0, 0, 0)   // a background's insets become view padding; the content is root-relative already
+            }
+            val ph = (h - inset + h).toInt()
+            if (panel.layoutParams?.width != w || panel.layoutParams?.height != ph) panel.layoutParams = LayoutParams(w, ph)
+            val hl = (w - dp(40)) / 2; val ht = inset + dp(8)
+            val hlp = handle.layoutParams as? LayoutParams
+            if (hlp == null || hlp.leftMargin != hl || hlp.topMargin != ht) handle.layoutParams = LayoutParams(dp(40), dp(5)).also { it.leftMargin = hl; it.topMargin = ht }
+            handle.visibility = if (showHandle) View.VISIBLE else View.GONE
+            panel.translationY = position - layoutTop
+            val openness = if (highestHeight > 0f) maxOf(0f, minOf(1f, (closedPosition - position) / highestHeight)) else 0f
+            setBackgroundColor(if (backdrop) Color.argb((128 * openness).toInt(), 0, 0, 0) else Color.TRANSPARENT)
+            visibility = View.VISIBLE
+        }
+        fun destination(p: Float, v: Float): Float {
+            val target = p + 0.2f * v
+            var best = closedPosition; var bestD = Float.MAX_VALUE
+            for (sp in settlePositions()) { val d = Math.abs(target - sp); if (d < bestD) { bestD = d; best = sp } }
+            return best
+        }
+        // A persistent sheet must not eat the touches beside it.
+        override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+            if (!backdrop && ev.action == MotionEvent.ACTION_DOWN && ev.y < position) return false
+            return super.dispatchTouchEvent(ev)
+        }
+        private fun clampDrag(raw: Float): Float {
+            val lowest = if (panToClose) closedPosition else (settlePositions().maxOrNull() ?: closedPosition)
+            return when {
+                raw < minPosition -> minPosition - Math.sqrt(1.0 + (minPosition - raw)).toFloat() * dpf(2.5f)
+                raw > lowest -> lowest + Math.sqrt(1.0 + (raw - lowest)).toFloat() * dpf(2.5f)
+                else -> raw
+            }
+        }
+        // Touches that no scrollable child took: the handle, the surface, inert content.
+        override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> { downY = ev.y; initial = position; ownsDrag = false; tracker = android.view.VelocityTracker.obtain(); tracker?.addMovement(ev) }
+                MotionEvent.ACTION_MOVE -> {
+                    tracker?.addMovement(ev)
+                    if (!ownsDrag && Math.abs(ev.y - downY) > dp(6) && ev.y >= position - dp(1)) {
+                        // A drag on the panel outside any scrollable: the sheet's. Inside a
+                        // scrollable the child took the DOWN and nested scrolling reports here.
+                        if (findScrollableAt(ev) == null) { ownsDrag = true; dragging = true; initial = position; downY = ev.y; return true }
+                    }
+                }
+            }
+            return false
+        }
+        override fun onTouchEvent(ev: MotionEvent): Boolean {
+            tracker?.addMovement(ev)
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> { downY = ev.y; initial = position; return true }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!ownsDrag) { if (Math.abs(ev.y - downY) > dp(6)) { ownsDrag = true; dragging = true; initial = position; downY = ev.y } else return true }
+                    position = clampDrag(initial + (ev.y - downY)); apply(); return true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    val wasDrag = ownsDrag
+                    ownsDrag = false; dragging = false
+                    var vy = 0f
+                    tracker?.let { it.computeCurrentVelocity(1000); vy = it.yVelocity; it.recycle() }; tracker = null
+                    if (wasDrag) settle(vy)
+                    else if (backdrop && ev.action == MotionEvent.ACTION_UP && ev.y < position) sheetAnimate(id, this, -1)   // backdrop tap
+                    return true
+                }
+            }
+            return true
+        }
+        private fun findScrollableAt(ev: MotionEvent): View? {
+            fun walk(v: View, x: Float, y: Float): View? {
+                if (v is ScrollView || v is android.widget.HorizontalScrollView || v is android.widget.ListView) return v
+                if (v is ViewGroup) for (i in v.childCount - 1 downTo 0) {
+                    val c = v.getChildAt(i); if (c.visibility != View.VISIBLE) continue
+                    val cx = x - c.left - c.translationX; val cy = y - c.top - c.translationY
+                    if (cx >= 0 && cy >= 0 && cx <= c.width && cy <= c.height) { val r = walk(c, cx, cy); if (r != null) return r }
+                }
+                return null
+            }
+            return walk(this, ev.x, ev.y)
+        }
+        fun settle(vy: Float) { val dest = destination(position, vy); sheetAnimate(id, this, indexFor(dest), vy) }
+        // ── nested scrolling: the hand-off with a Scroll inside ──────────────────
+        override fun onStartNestedScroll(child: View, target: View, axes: Int): Boolean = (axes and View.SCROLL_AXIS_VERTICAL) != 0
+        override fun onNestedScrollAccepted(child: View, target: View, axes: Int) { initial = position; nestedVelocity = 0f; dragging = true }
+        override fun onNestedPreScroll(target: View, dx: Int, dy: Int, consumed: IntArray) {
+            // dy > 0: the finger moves up. Below the highest point the sheet takes it; at
+            // the highest point the list scrolls.
+            if (dy > 0 && position > minPosition) {
+                val take = minOf(dy.toFloat(), position - minPosition)
+                position -= take; apply(); consumed[1] = take.toInt()
+            }
+        }
+        override fun onNestedScroll(target: View, dxConsumed: Int, dyConsumed: Int, dxUnconsumed: Int, dyUnconsumed: Int) {
+            // dyUnconsumed < 0: the list is at its top and the finger keeps pulling down: the sheet takes it.
+            if (dyUnconsumed < 0) { position = clampDrag(position - dyUnconsumed); apply() }
+        }
+        override fun onNestedPreFling(target: View, velocityX: Float, velocityY: Float): Boolean {
+            nestedVelocity = -velocityY
+            // A fling while the sheet is between points is the sheet's; at the top the list's.
+            return position > minPosition + 0.5f
+        }
+        override fun onNestedFling(target: View, velocityX: Float, velocityY: Float, consumed: Boolean): Boolean = false
+        override fun onStopNestedScroll(target: View) { dragging = false; if (Math.abs(position - positionFor(index)) > 0.5f) settle(nestedVelocity) }
+        override fun getNestedScrollAxes(): Int = View.SCROLL_AXIS_VERTICAL
+    }
+
     class PopoverArrowView(ctx: Context) : View(ctx) {
         var path: android.graphics.Path = android.graphics.Path()
         var color: Int = 0

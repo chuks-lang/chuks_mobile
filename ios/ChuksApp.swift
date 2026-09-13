@@ -364,6 +364,128 @@ final class SelectableLabel: UILabel {
 }
 
 // A view that also accepts touches within `hitSlop` px beyond its bounds (Pressable `hitSlop`).
+// ── Sheet ──────────────────────────────────────────────────────────────────
+// A bottom sheet the host drives between snap points with the finger. The overlay
+// fills the window; the sheet's Yoga root is that window with a top padding of
+// (window - highest snap height + handle strip), so the app's children are laid out
+// once, in the sheet's tallest box, and the whole panel (surface, handle, children) is
+// translated by (position - highestPosition) while it moves. A position is the y of
+// the sheet's top edge: the highest snap point is the smallest position, closed is the
+// window height. The design is the one @gorhom/react-native-bottom-sheet arrived at:
+// drag settles on the nearest point by distance plus a fifth of the velocity, a
+// scrollable inside hands off (the sheet moves until it is at its highest point, then
+// the list scrolls, and pulling the list past its top moves the sheet again), the
+// backdrop's opacity follows the position, and closing is just another point.
+final class SheetOverlay: UIView {
+    let surface = UIView()                 // the rounded panel behind the children
+    let handle = UIView()
+    var backdrop = true                    // scrim behind, dismiss on tap; false = the app under it stays live
+    var panToClose = true
+    var showHandle = true
+    var keyboard = "interactive"
+    var heights: [CGFloat] = []            // snap heights, lowest first (resolved from the spec against the window)
+    var snapSpec: [String] = []            // "25p" | "320" | "c"
+    var index = -1                         // the point it sits at (-1 closed); what the app was last told
+    var position: CGFloat = 0              // current top edge, in the overlay's coordinates
+    var contentHeight: CGFloat = 0         // measured children height, for a "c" snap point
+    var closed: Bool { return index < 0 }
+    var onSettle: ((Int) -> Void)?         // reports every settle (index, -1 for closed)
+    var animating = false
+    let handleStrip: CGFloat = 22
+    // The keyboard, while a field inside the sheet has it (see CardsVC.kbShow). The
+    // `keyboard` prop picks one: "interactive" lifts the sheet by the keyboard's height
+    // (kbLift), "extend" goes to the highest point and pads the content bottom by it
+    // (kbPad), "fillParent" takes the whole window (kbFill) and pads.
+    var kbLift: CGFloat = 0
+    var kbPad: CGFloat = 0
+    var kbFill = false
+    var topInset: CGFloat = 0              // the window's safe-area top: no point sits above it
+    var bottomInset: CGFloat = 0           // the safe-area bottom (home indicator): the content clears it
+    // Bottom padding for the children: the keyboard when it pads, nothing when the sheet
+    // is lifted onto the keyboard (its bottom edge is above it), else the safe area.
+    var bottomPad: CGFloat { return kbPad > 0 ? kbPad : (kbLift > 0 ? 0 : bottomInset) }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        surface.backgroundColor = .secondarySystemBackground
+        surface.layer.cornerRadius = 20
+        surface.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        surface.layer.shadowColor = UIColor.black.cgColor; surface.layer.shadowOpacity = 0.12
+        surface.layer.shadowRadius = 12; surface.layer.shadowOffset = CGSize(width: 0, height: -2)
+        surface.tag = CHUKS_DECOR_TAG
+        handle.backgroundColor = UIColor.gray.withAlphaComponent(0.4); handle.layer.cornerRadius = 2.5
+        handle.tag = CHUKS_DECOR_TAG
+        addSubview(surface); addSubview(handle)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    var highestHeight: CGFloat { return heights.max() ?? 0 }
+    var closedPosition: CGFloat { return bounds.height }
+    var highestPosition: CGFloat { return bounds.height - highestHeight }
+    // Where the children are laid out from (the top of the tallest box), and the
+    // highest the top edge may go: the same point, unless the keyboard changed them.
+    var layoutTop: CGFloat { return kbFill ? topInset : highestPosition }
+    var minPosition: CGFloat { return kbFill ? topInset : max(topInset, highestPosition - kbLift) }
+    func positionFor(index i: Int) -> CGFloat {
+        if i < 0 || i >= heights.count { return closedPosition }
+        if kbFill { return topInset }
+        return max(topInset, bounds.height - heights[i] - kbLift)
+    }
+    // The snap positions a drag may settle on: every point, and closed when allowed.
+    var settlePositions: [CGFloat] {
+        var ps = heights.indices.map { positionFor(index: $0) }
+        if panToClose { ps.append(closedPosition) }
+        return ps
+    }
+    func indexFor(position p: CGFloat) -> Int {
+        for i in heights.indices where abs(positionFor(index: i) - p) < 0.5 { return i }
+        return -1
+    }
+    // Resolve the spec against the window: "25p" is a quarter of it, "320" is points,
+    // "c" is the children's measured height (until measured, the tallest other point).
+    func resolveHeights() {
+        let H = bounds.height
+        heights = snapSpec.map { spec -> CGFloat in
+            if spec == "c" { return contentHeight > 0 ? min(contentHeight + handleStrip + bottomInset, H) : 0 }
+            if spec.hasSuffix("p") { return H * (CGFloat(Double(spec.dropLast()) ?? 50) / 100) }
+            return CGFloat(Double(spec) ?? 300)
+        }
+        if let mx = heights.max(), mx > 0 { heights = heights.map { $0 == 0 ? mx : $0 } }
+        heights = heights.map { min(max($0, handleStrip + 1), H) }
+    }
+    // Lay the panel out for the current position: the surface covers from the top edge
+    // to well below the window (over-drag shows surface, never a gap); the children are
+    // translated as a block so their frames (laid out at the highest point) stay valid.
+    func apply() {
+        let W = bounds.width, H = bounds.height
+        let top = layoutTop
+        let ty = position - top
+        surface.transform = .identity
+        surface.frame = CGRect(x: 0, y: top, width: W, height: (H - top) + H)
+        handle.transform = .identity
+        handle.frame = CGRect(x: (W - 40) / 2, y: top + 8, width: 40, height: 5)
+        handle.isHidden = !showHandle
+        for sub in subviews { sub.transform = CGAffineTransform(translationX: 0, y: ty) }
+        let openness = highestHeight > 0 ? max(0, min(1, (closedPosition - position) / highestHeight)) : 0
+        backgroundColor = backdrop ? UIColor(white: 0, alpha: 0.5 * openness) : .clear
+        isHidden = false
+    }
+    // A persistent sheet must not eat the touches beside it: outside the panel the app
+    // underneath is live. With a backdrop, the overlay owns the whole window.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if isHidden || alpha == 0 { return nil }
+        if !backdrop && point.y < position { return nil }
+        return super.hitTest(point, with: event)
+    }
+    // The nearest settle point to where the finger would coast: gorhom's rule.
+    func destination(from p: CGFloat, velocity v: CGFloat) -> CGFloat {
+        let target = p + 0.2 * v
+        var best = settlePositions.first ?? closedPosition, bestD = CGFloat.greatestFiniteMagnitude
+        for sp in settlePositions { let d = abs(target - sp); if d < bestD { bestD = d; best = sp } }
+        return best
+    }
+}
+
 final class HitSlopView: UIView {
     var hitSlop: CGFloat = 0
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
@@ -1953,6 +2075,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var popoverGap: [String: CGFloat] = [:]                               // popover id -> gap to the anchor (pt)
     var popoverArrow: Set<String> = []                                    // popovers that draw a pointer
     var popoverArrowLayers: [String: CAShapeLayer] = [:]                  // popover id -> its pointer
+    var sheetIds: Set<String> = []                                        // Sheet overlays (host-driven bottom sheets)
+    var sheetPans: [UIPanGestureRecognizer: String] = [:]                 // sheet pan -> id
+    var sheetTaps: [UITapGestureRecognizer: String] = [:]                 // sheet backdrop tap -> id
+    var sheetDrag: (id: String, initial: CGFloat, owns: Bool, scroll: UIScrollView?)? = nil   // the drag in progress
+    var sheetPinnedScrolls = Set<UIScrollView>()                          // scrolls held at their top under a sheet drag
     var layoutIds = Set<String>()                                         // ids whose node has onLayout
     var lastLayoutReport: [String: String] = [:]                          // id -> last "x,y,w,h" reported
     var sheetBg: UIView? = nil                                            // host-drawn sheet surface (rounded top, behind content)
@@ -3070,6 +3197,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let t = g as? UITapGestureRecognizer, taps[t] != nil, let ov = g.view, let oid = views.first(where: { $0.value === ov })?.key, modalIds.contains(oid) {
             return overlayTouchIsOutsideContent(g, touch)
         }
+        if let t = g as? UITapGestureRecognizer, sheetTaps[t] != nil, let sv = g.view as? SheetOverlay {
+            return touch.location(in: sv).y < sv.position   // the backdrop, not the panel
+        }
+        if let p = g as? UIPanGestureRecognizer, sheetPans[p] != nil, let sv = g.view as? SheetOverlay {
+            return touch.location(in: sv).y >= sv.position - 1   // a drag starts on the panel
+        }
         // The deepest handler wins. A tap recognizer on a container also receives a
         // touch that landed on a child with a handler of its own (a Switch inside a
         // labelled row, a button inside a tappable card), and both fired: the row's
@@ -3101,9 +3234,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // instead of scrolling (a drag elsewhere never involves ours, so the scroll is normal).
     // Delegate-driven (called at recognition time), so no attach-order race.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+        // A Sheet's pan runs BESIDE the pans of the scrolls inside it, never ahead of
+        // them: the hand-off is decided per frame in handleSheetDrag (who owns the
+        // finger), so a scroll that had to wait for the sheet pan to fail would never
+        // scroll at all (the sheet pan begins on the first move and does not fail).
+        if let p = g as? UIPanGestureRecognizer, sheetPans[p] != nil { return false }
         // g is one of OUR Gesture recognizers (delegate === self). If `other` is an
         // enclosing scroll's pan, return true so the scroll must wait for ours to fail.
         return (g is UIPanGestureRecognizer) && (other.view is UIScrollView)
+    }
+    // A scroll the sheet held still under a drag it owned must not fling when the
+    // finger lifts: its pan ran beside the sheet's and carries the sheet's velocity.
+    func scrollViewWillEndDragging(_ sv: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+        if sheetPinnedScrolls.contains(sv) {
+            sheetPinnedScrolls.remove(sv)
+            targetContentOffset.pointee = CGPoint(x: sv.contentOffset.x, y: 0)
+        }
     }
 
     // Keyboard avoidance. The keyboard OVERLAYS the app; it does not resize it. Shrinking
@@ -3120,6 +3266,31 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     //   - focused field already above the keyboard: nothing moves at all.
     var kbHeight: CGFloat = 0            // the SHIFT applied to the tree, not the keyboard height
     var kbScroll: UIScrollView?          // the scroll we inset, to undo on hide
+    var kbSheet: String?                 // the Sheet holding the focused field, to restore on hide
+    // The Sheet a view sits in, if any.
+    func sheetContaining(_ v: UIView) -> (String, SheetOverlay)? {
+        var p: UIView? = v.superview
+        while let cur = p {
+            if let sv = cur as? SheetOverlay, let sid = views.first(where: { $0.value === sv })?.key { return (sid, sv) }
+            p = cur.superview
+        }
+        return nil
+    }
+    // A field inside a Sheet: the sheet makes room the way its `keyboard` prop says, and
+    // the app tree under it does not move.
+    func sheetKeyboard(_ sid: String, _ sv: SheetOverlay, height kbH: CGFloat) {
+        let mode = kbH > 0 ? sv.keyboard : ""
+        let lift: CGFloat = mode == "interactive" ? kbH : 0
+        let pad: CGFloat = (mode == "extend" || mode == "fillParent") ? kbH : 0
+        let fill = mode == "fillParent"
+        if sv.kbLift == lift && sv.kbPad == pad && sv.kbFill == fill { return }
+        sv.kbLift = lift; sv.kbPad = pad; sv.kbFill = fill
+        // Animate first (so the layout pass below does not snap the position), then
+        // re-lay the children out for the new padding.
+        if mode == "extend" { sheetAnimate(sid, sv, to: sv.heights.count - 1) }
+        else { sheetAnimate(sid, sv, to: sv.index, report: false) }
+        relayout()
+    }
     @objc func kbShow(_ n: Notification) {
         guard let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
         let kbTop = view.bounds.height - max(0, end.height)          // keyboard's top edge, in view coords
@@ -3129,6 +3300,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         var field: UIView? = nil
         for (_, v) in views where (v is UITextField || v is UITextView) && v.isFirstResponder { field = v; break }
         guard let f = field else { return }
+        if let (sid, sv) = sheetContaining(f) { kbSheet = sid; sheetKeyboard(sid, sv, height: max(0, end.height)); return }
         // Measure against the UNLIFTED layout: the tree is already shifted by kbHeight, so
         // add it back. The keyboard sends several notifications (show, then frame changes
         // as it settles or as focus moves), and without this each pass would measure the
@@ -3156,6 +3328,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     @objc func kbHide(_ n: Notification) {
         let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        if let sid = kbSheet { kbSheet = nil; if let sv = views[sid] as? SheetOverlay { sheetKeyboard(sid, sv, height: 0) } }
         if let sc = kbScroll {
             kbScroll = nil
             UIView.animate(withDuration: dur) { sc.contentInset.bottom = 0; sc.verticalScrollIndicatorInsets.bottom = 0 }
@@ -3237,6 +3410,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if let pv = packageViews[f[1]] {
                     let raw = f.count >= 4 ? f[3...].joined(separator: "|") : ""
                     pv.command(f[2], ChuksArgs(raw, type(of: pv).kind + "." + f[2], "0", self))
+                } else if sheetIds.contains(f[1]), let sv = views[f[1]] as? SheetOverlay {
+                    let raw = f.count >= 4 ? f[3...].joined(separator: "|") : ""
+                    let a = ChuksArgs(raw, "sheet." + f[2], "0", self)
+                    switch f[2] {
+                    case "snapTo": sheetAnimate(f[1], sv, to: a.int("index") ?? 0)
+                    case "expand": sheetAnimate(f[1], sv, to: sv.heights.count - 1)
+                    case "collapse": sheetAnimate(f[1], sv, to: 0)
+                    case "close": sheetAnimate(f[1], sv, to: -1)
+                    default: break
+                    }
                 }
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -5121,6 +5304,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
             mv.isHidden = true                     // shown when mvis=1
             modalIds.insert(id); v = mv
+        case "Sheet":
+            let sv = SheetOverlay(frame: view.bounds)
+            sv.isHidden = true
+            sv.onSettle = { [weak self] idx in self?.fireValue(id + ":change", String(idx)) }
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleSheetDrag(_:)))
+            pan.delegate = self
+            sv.addGestureRecognizer(pan); sheetPans[pan] = id
+            let tap = UITapGestureRecognizer(target: self, action: #selector(handleSheetBackdropTap(_:)))
+            tap.delegate = self
+            sv.addGestureRecognizer(tap); sheetTaps[tap] = id
+            YGNodeStyleSetJustifyContent(n, YGJustify.flexStart); YGNodeStyleSetAlignItems(n, YGAlign.stretch)
+            sheetIds.insert(id); v = sv
         case "Popover":
             // An anchored Modal: the same overlay root, transparent, whose content is laid
             // out at its natural size at the origin and then moved beside the anchor by
@@ -5368,6 +5563,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             v.backgroundColor = .clear
             v.clipsToBounds = false
         }
+        if let sv = v as? SheetOverlay { sv.surface.backgroundColor = .secondarySystemBackground }   // a Sheet's bg is its surface; back to the platform's unless set again
         // Text properties are neither layout nor the paint props above, but they too must
         // be reset on a reused node: Style.str() omits defaults, so a role that relies on
         // default alignment/font/lines would otherwise inherit the previous role's values
@@ -5568,6 +5764,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if vis { activeModal = id } else if activeModal == id { activeModal = nil }
                 if !vis, let al = popoverArrowLayers[id] { al.removeFromSuperlayer(); popoverArrowLayers[id] = nil }
                 view.setNeedsLayout()
+            case "shsnap": if let sv = v as? SheetOverlay { sv.snapSpec = val.split(separator: ",").map(String.init) }
+            case "shidx":  if let sv = v as? SheetOverlay { sheetSetIndex(id, sv, Int(f)) }
+            case "shbd":   if let sv = v as? SheetOverlay { sv.backdrop = (val == "1") }
+            case "shptc":  if let sv = v as? SheetOverlay { sv.panToClose = (val == "1") }
+            case "shhdl":  if let sv = v as? SheetOverlay { sv.showHandle = (val == "1") }
+            case "shkb":   if let sv = v as? SheetOverlay { sv.keyboard = val }
             case "panc": popoverAnchor[id] = val                       // Popover: the anchor node
             case "pplc": popoverPlace[id] = val                        // Popover: preferred side
             case "pgap": popoverGap[id] = CGFloat(f)                   // Popover: gap to the anchor
@@ -5604,7 +5806,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                           }
             case "avis":  if val == "1" { presentAlert(id) } else { dismissAlert(id) }
             case "bg":
-                if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) }
+                if let sv = v as? SheetOverlay { sv.surface.backgroundColor = hexColor(val) }   // the panel's surface, not the backdrop
+                else if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) }
                 else if glassViews[id] != nil || glassPending.contains(id) {
                     // A glass surface's `bg` is what it falls back to, not what sits
                     // behind it: an opaque colour behind the material is exactly what the
@@ -5925,7 +6128,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             view.addSubview(child)
             return
         }
-        if modalIds.contains(id) {                           // a Modal is a full-screen overlay on the
+        if modalIds.contains(id) || sheetIds.contains(id) {  // a Modal or Sheet is a full-screen overlay on the
             view.addSubview(child)                           // ROOT, not inline; its Yoga node stays a
             return                                           // separate root (laid out in relayout)
         }
@@ -6008,6 +6211,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             pressOpacity[k] = nil
             modalIds.remove(k); if activeModal == k { activeModal = nil }
             if popoverIds.contains(k) { popoverIds.remove(k); popoverAnchor[k] = nil; popoverPlace[k] = nil; popoverGap[k] = nil; popoverArrow.remove(k); popoverArrowLayers[k]?.removeFromSuperlayer(); popoverArrowLayers[k] = nil }
+            if sheetIds.contains(k) { sheetIds.remove(k); for (g, sid) in sheetPans where sid == k { sheetPans[g] = nil }; for (g, sid) in sheetTaps where sid == k { sheetTaps[g] = nil } }
             layoutIds.remove(k); lastLayoutReport[k] = nil
             if let p = videoPlayers[k] {                     // recycle: pool the player, keep it primed
                 p.pause()
@@ -6615,11 +6819,37 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             YGNodeStyleSetWidth(mn, fw); YGNodeStyleSetHeight(mn, fh)
             YGNodeCalculateLayout(mn, fw, fh, YGDirection.LTR)
         }
+        // Every Sheet is its own window-sized root too, padded at the top so its children
+        // fill the tallest snap box; the overlay translates them to the current point.
+        for sid in sheetIds {
+            guard let sn = ynodes[sid], let sv = views[sid] as? SheetOverlay else { continue }
+            sv.frame = view.bounds
+            sv.topInset = view.safeAreaInsets.top
+            sv.bottomInset = view.safeAreaInsets.bottom
+            sv.resolveHeights()
+            let fw = Float(view.bounds.width), fh = Float(view.bounds.height)
+            YGNodeStyleSetWidth(sn, fw); YGNodeStyleSetHeight(sn, fh)
+            YGNodeStyleSetPadding(sn, YGEdge.top, Float(sv.layoutTop + sv.handleStrip))
+            YGNodeStyleSetPadding(sn, YGEdge.bottom, Float(sv.bottomPad))
+            YGNodeCalculateLayout(sn, fw, fh, YGDirection.LTR)
+            // A "content" point wants the children's natural height: the sum of the direct
+            // children's laid-out heights is that, once they have been laid out.
+            if sv.snapSpec.contains("c") {
+                var total: CGFloat = 0
+                let n = YGNodeGetChildCount(sn)
+                for i in 0..<n { if let c = YGNodeGetChild(sn, i) { total += CGFloat(YGNodeLayoutGetHeight(c)) } }
+                if total > 0 && abs(total - sv.contentHeight) > 0.5 {
+                    sv.contentHeight = total; sv.resolveHeights()
+                    YGNodeStyleSetPadding(sn, YGEdge.top, Float(sv.layoutTop + sv.handleStrip))
+                    YGNodeCalculateLayout(sn, fw, fh, YGDirection.LTR)
+                }
+            }
+        }
         let _ta = layoutTiming ? CACurrentMediaTime() : 0
         var _applied = 0
         var pendingLayout: [(String, String)] = []   // onLayout reports, delivered after this pass
         for (id, n) in ynodes {
-            if modalIds.contains(id) { continue }   // modal overlay node has no app-tree layout (placed below)
+            if modalIds.contains(id) || sheetIds.contains(id) { continue }   // overlay roots are placed below
             // Incremental apply: skip nodes Yoga did not re-lay-out this pass (unless the view
             // was just created). Yoga sets HasNewLayout on every node it recomputes (a fresh
             // insert dirties it), so an unchanged subtree costs nothing here.
@@ -6662,6 +6892,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         // place the whole Chuks app edge-to-edge (below the diagnostics header if shown)
         views["app"]?.frame = CGRect(x: 0, y: topY, width: CGFloat(W), height: CGFloat(H))
+        // Sheets: on top of the app, at their current point (a drag or animation in
+        // flight keeps its position; a layout never fights the finger).
+        for sid in sheetIds {
+            guard let sv = views[sid] as? SheetOverlay else { continue }
+            if sv.closed && !sv.animating { sv.isHidden = true; continue }
+            view.bringSubviewToFront(sv)
+            if !sv.animating && sheetDrag?.id != sid { sv.position = sv.positionFor(index: sv.index) }
+            sv.apply()
+        }
         // a visible modal fills the window and sits on top (its children were laid out above)
         if let mid = activeModal, let mv = views[mid], !mv.isHidden {
             mv.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: view.bounds.height)
@@ -6822,6 +7061,117 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if sub.frame.contains(p) { return false }
         }
         return true
+    }
+
+    // ── Sheet: index, animation, drag ──────────────────────────────────────────
+    // The app's index arrived (a render): animate to that point unless the sheet is
+    // already there or the finger has it.
+    func sheetSetIndex(_ id: String, _ sv: SheetOverlay, _ idx: Int) {
+        let target = max(-1, min(idx, max(sv.heights.count - 1, 0)))
+        if sheetDrag?.id == id { sv.index = target; return }
+        if sv.isHidden && target < 0 { sv.index = -1; return }
+        if sv.isHidden {
+            // Opening from closed: place it closed, then slide to the point.
+            sv.index = -1; sv.resolveHeights(); sv.position = sv.closedPosition; sv.apply()
+            view.bringSubviewToFront(sv)
+        }
+        if sv.index != target { sheetAnimate(id, sv, to: target, report: false) } else { sv.index = target }
+    }
+    // Spring to a point. `report` tells the app through onChange when the point is not
+    // the one it last set (a drag, a command, the backdrop); an index the app itself
+    // sent is not echoed back.
+    func sheetAnimate(_ id: String, _ sv: SheetOverlay, to idx: Int, velocity: CGFloat = 0, report: Bool = true) {
+        let target = max(-1, min(idx, max(sv.heights.count - 1, 0)))
+        if sv.heights.isEmpty { sv.resolveHeights() }
+        let dest = sv.positionFor(index: target)
+        let reported = sv.index
+        sv.index = target
+        sv.animating = true
+        sv.isHidden = false
+        view.bringSubviewToFront(sv)
+        let distance = max(1, abs(dest - sv.position))
+        let iv = min(4, abs(velocity) / distance)   // initial spring velocity in units of distance
+        UIView.animate(withDuration: 0.42, delay: 0, usingSpringWithDamping: 0.86, initialSpringVelocity: iv, options: [.allowUserInteraction, .beginFromCurrentState], animations: {
+            sv.position = dest
+            sv.apply()
+        }, completion: { _ in
+            sv.animating = false
+            if sv.closed { sv.isHidden = true }
+            if report && reported != target { sv.onSettle?(target) }
+        })
+    }
+    // The scroll view the finger is over, if any, inside this sheet: the one the
+    // hand-off is negotiated with.
+    func scrollUnder(_ sv: SheetOverlay, _ g: UIGestureRecognizer) -> UIScrollView? {
+        var v = sv.hitTest(g.location(in: sv), with: nil)
+        while let cur = v, cur !== sv {
+            if let s = cur as? UIScrollView, !(s is UITextView) { return s }
+            v = cur.superview
+        }
+        return nil
+    }
+    @objc func handleSheetDrag(_ g: UIPanGestureRecognizer) {
+        guard let id = sheetPans[g], let sv = views[id] as? SheetOverlay else { return }
+        let dy = g.translation(in: view).y
+        switch g.state {
+        case .began:
+            sv.layer.removeAllAnimations(); for sub in sv.subviews { sub.layer.removeAllAnimations() }
+            sv.animating = false
+            let sc = scrollUnder(sv, g)
+            // The sheet owns the drag unless it is at its highest point with a scrollable
+            // under the finger that is scrolled down or being scrolled up: then the list owns.
+            let atTop = abs(sv.position - sv.minPosition) < 0.5
+            let listOwns = sc != nil && atTop
+            sheetDrag = (id: id, initial: sv.position, owns: !listOwns, scroll: sc)
+        case .changed:
+            guard var d = sheetDrag, d.id == id else { return }
+            let vy = g.velocity(in: view).y
+            if let sc = d.scroll {
+                let atTop = abs(sv.position - sv.minPosition) < 0.5
+                if d.owns {
+                    // Reached the highest point while dragging up over a list: the sheet stops
+                    // there and the list takes the rest of the finger (its pan has run beside
+                    // ours all along, so letting go of its offset is enough).
+                    if (atTop || d.initial + dy <= sv.minPosition) && vy < 0 {
+                        sv.position = sv.minPosition; sv.apply()
+                        d.owns = false; sheetDrag = d; sheetPinnedScrolls.remove(sc)
+                        // The sheet has arrived: make the top point its index now (and tell the
+                        // app), or the next layout pass would put it back where its index was.
+                        sheetAnimate(id, sv, to: sv.indexFor(position: sv.minPosition))
+                        return
+                    }
+                    sc.contentOffset = CGPoint(x: sc.contentOffset.x, y: 0)   // the list holds still under a moving sheet
+                    sheetPinnedScrolls.insert(sc)
+                } else {
+                    // The list is scrolled to its top and the finger pulls down: the sheet takes it.
+                    if sc.contentOffset.y <= 0 && vy > 0 {
+                        sc.contentOffset = CGPoint(x: sc.contentOffset.x, y: 0)
+                        sheetPinnedScrolls.insert(sc)
+                        d.owns = true; d.initial = sv.position; sheetDrag = d
+                        g.setTranslation(.zero, in: view)
+                    }
+                    return
+                }
+            }
+            let lowest = sv.panToClose ? sv.closedPosition : (sv.settlePositions.max() ?? sv.closedPosition)
+            var p = d.initial + g.translation(in: view).y
+            if p < sv.minPosition { p = sv.minPosition - sqrt(1 + (sv.minPosition - p)) * 2.5 }   // over-drag, with resistance
+            else if p > lowest { p = lowest + sqrt(1 + (p - lowest)) * 2.5 }
+            sv.position = p
+            sv.apply()
+        case .ended, .cancelled, .failed:
+            guard let d = sheetDrag, d.id == id else { return }
+            sheetDrag = nil
+            if !d.owns { return }   // the list had it; nothing to settle
+            let vy = g.velocity(in: view).y
+            let dest = sv.destination(from: sv.position, velocity: vy)
+            sheetAnimate(id, sv, to: sv.indexFor(position: dest), velocity: vy)
+        default: break
+        }
+    }
+    @objc func handleSheetBackdropTap(_ g: UITapGestureRecognizer) {
+        guard let id = sheetTaps[g], let sv = views[id] as? SheetOverlay, sv.backdrop else { return }
+        if g.location(in: sv).y < sv.position { sheetAnimate(id, sv, to: -1) }
     }
 
     func clearSheetChrome() {

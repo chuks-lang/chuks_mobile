@@ -149,6 +149,14 @@ export class Style {
     var pPlace: string      // "auto" | "top" | "bottom" | "left" | "right"
     var pGap: int           // points between the anchor and the content (-1 = default 8)
     var pArrow: int         // 1 = draw an arrow pointing at the anchor (-1 = none)
+    // Sheet: a host-driven bottom sheet with snap points. All re-sent while the node is a
+    // Sheet (they describe the sheet, not a frame), so the host always has the whole spec.
+    var shSnap: string      // snap points, comma-joined: "25p" (percent), "320" (points), "c" (content)
+    var shIdx: int          // current snap index; -1 = closed (-2 = not a Sheet)
+    var shBackdrop: int     // 1 = scrim behind, dismiss on tap; 0 = persistent, the app stays interactive
+    var shPanClose: int     // 1 = dragging below the lowest point closes
+    var shHandle: int       // 1 = draw the grab handle
+    var shKeyboard: string  // "" | "interactive" | "extend" | "fillParent"
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
@@ -180,6 +188,7 @@ export class Style {
         this.selectable = -1; this.hitSlop = -1; this.spinner = -1
         this.a11yLabel = ""; this.a11yHint = ""; this.a11yRole = ""; this.a11yState = ""; this.a11yHidden = -1; this.a11yLive = ""
         this.pAnchor = ""; this.pPlace = ""; this.pGap = -1; this.pArrow = -1
+        this.shSnap = ""; this.shIdx = -2; this.shBackdrop = -1; this.shPanClose = -1; this.shHandle = -1; this.shKeyboard = ""
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -309,6 +318,13 @@ export class Style {
         if (this.pPlace != "") { s = s + "pplc=" + this.pPlace + ";" }
         if (this.pGap >= 0) { s = s + "pgap=" + string(this.pGap) + ";" }
         if (this.pArrow >= 0) { s = s + "parw=" + string(this.pArrow) + ";" }
+        if (this.shIdx >= -1) {
+            s = s + "shsnap=" + this.shSnap + ";" + "shidx=" + string(this.shIdx) + ";"
+            if (this.shBackdrop >= 0) { s = s + "shbd=" + string(this.shBackdrop) + ";" }
+            if (this.shPanClose >= 0) { s = s + "shptc=" + string(this.shPanClose) + ";" }
+            if (this.shHandle >= 0) { s = s + "shhdl=" + string(this.shHandle) + ";" }
+            if (this.shKeyboard != "") { s = s + "shkb=" + this.shKeyboard + ";" }
+        }
         if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
             s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
             s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
@@ -480,6 +496,8 @@ function mkModal(style: Style, kids: []Node): Node { return new Node("Modal", st
 // Build a popover node: an overlay like a Modal, whose content the host places beside the
 // anchor node named in the style (measured at layout time), flipping to fit the screen.
 function mkPopover(style: Style, kids: []Node): Node { return new Node("Popover", style, "", kids) }
+// Build a sheet node: an overlay the host drives between snap points with the finger.
+function mkSheet(style: Style, kids: []Node): Node { return new Node("Sheet", style, "", kids) }
 // Build an alert node: the host presents a NATIVE alert when avis=1. Title / message /
 // button labels ride the text field (tab-joined). Renders nothing inline.
 function mkAlert(style: Style, joined: string): Node { return new Node("Alert", style, joined, []) }
@@ -1754,6 +1772,63 @@ export function Popover(p: PopoverProps, kids: []Kid): Node {
     if (od != null) { n.onPress = od }
     return n
 }
+dataType SheetProps {
+    ViewProps; snapPoints: []string; index: int; onChange: (function(i: int): void)?;
+    backdrop: bool?; panToClose: bool?; handle: bool?; keyboard: string?; ref: ViewRef?;
+}
+/**
+ * A bottom sheet with snap points, driven by the finger on the host. `snapPoints` are
+ * heights, lowest first: a percent of the screen ("25%", "90%"), points ("320"), or
+ * "content" (as tall as the children). `index` is the snap point the sheet sits at
+ * (-1 = closed) and is yours: the host reports every settle through `onChange`, the
+ * app stores it, and the sheet is where the app says. A drag settles on the nearest
+ * point by distance and velocity; below the lowest it closes when `panToClose` (the
+ * default). `backdrop` (default true) puts a scrim behind and a tap on it closes;
+ * `backdrop: false` is a persistent sheet, a map's panel, with the app under it live.
+ * A Scroll inside hands off: the sheet moves until it is at its highest point, then the
+ * list scrolls, and pulling the list past its top moves the sheet again.
+ *
+ * `keyboard`: "interactive" (default) lifts the sheet with the keyboard, "extend"
+ * raises it to its highest point, "fillParent" to the screen.
+ *
+ * Commands through `ref`: `snapTo({ index })`, `expand()`, `collapse()`, `close()`.
+ *
+ * ```chuks
+ * Sheet({ snapPoints: ["25%", "60%", "90%"], index: at.get(),
+ *         onChange: function(i: int): void { at.set(i) } }, [
+ *     Scroll({ grow: 1 }, [ ...rows ]),
+ * ])
+ * ```
+ */
+export function Sheet(p: SheetProps, kids: []Kid): Node {
+    const s: Style = new Style()
+    var enc: []string = []
+    for (var pt of p.snapPoints) {
+        if (pt == "content") { enc.push("c") }
+        else if (pt.endsWith("%")) { enc.push(pt.slice(0, pt.length - 1) + "p") }
+        else { enc.push(pt) }
+    }
+    s.shSnap = enc.join(",")
+    s.shIdx = p.index < -1 ? -1 : p.index
+    s.shBackdrop = pvB(p, "backdrop", true) ? 1 : 0
+    s.shPanClose = pvB(p, "panToClose", true) ? 1 : 0
+    s.shHandle = pvB(p, "handle", true) ? 1 : 0
+    s.shKeyboard = pvS(p, "keyboard", "interactive")
+    applyLayoutV(s, p)
+    const n: Node = mkSheet(s, flatKids(kids))
+    const oc: any = p["onChange"]
+    if (oc != null) { n.events["change"] = function(v: string): void { oc(int(v)) } }
+    const rf: any = p["ref"]; if (rf != null) { n.ref = rf }
+    return n
+}
+/** Ask a Sheet to settle at snap point `index`. */
+export function sheetSnapTo(r: ViewRef, index: int): void { r.command("snapTo", { index: index }) }
+/** Ask a Sheet to open to its highest point. */
+export function sheetExpand(r: ViewRef): void { r.command("expand") }
+/** Ask a Sheet to settle at its lowest point. */
+export function sheetCollapse(r: ViewRef): void { r.command("collapse") }
+/** Ask a Sheet to close. The settle is reported through `onChange(-1)`. */
+export function sheetClose(r: ViewRef): void { r.command("close") }
 dataType AlertProps {
     visible: bool?; title: string?; message: string?;
     confirmText: string?; cancelText: string?; destructive: bool?;
