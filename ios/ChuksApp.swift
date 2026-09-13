@@ -1947,6 +1947,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var activeModal: String? = nil                                        // the currently-visible Modal
     var sheetModals: Set<String> = []                                     // Modal ids with position=bottom (draggable sheets)
     var modalActions: [String: String] = [:]                             // Modal id -> onDismiss action
+    var popoverIds: Set<String> = []                                      // Popover ids (an anchored Modal)
+    var popoverAnchor: [String: String] = [:]                             // popover id -> anchor node id
+    var popoverPlace: [String: String] = [:]                              // popover id -> auto|top|bottom|left|right
+    var popoverGap: [String: CGFloat] = [:]                               // popover id -> gap to the anchor (pt)
+    var popoverArrow: Set<String> = []                                    // popovers that draw a pointer
+    var popoverArrowLayers: [String: CAShapeLayer] = [:]                  // popover id -> its pointer
+    var layoutIds = Set<String>()                                         // ids whose node has onLayout
+    var lastLayoutReport: [String: String] = [:]                          // id -> last "x,y,w,h" reported
     var sheetBg: UIView? = nil                                            // host-drawn sheet surface (rounded top, behind content)
     var sheetHandle: UIView? = nil                                        // host-drawn grab handle pill
     var sheetPan: UIPanGestureRecognizer? = nil                          // drag-to-dismiss recognizer on the sheet
@@ -3059,6 +3067,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Don't hijack a tap that lands on a text field (let it focus normally); do
     // dismiss for taps anywhere else.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if let t = g as? UITapGestureRecognizer, taps[t] != nil, let ov = g.view, let oid = views.first(where: { $0.value === ov })?.key, popoverIds.contains(oid) {
+            return popoverTouchIsOutsideContent(g, touch)
+        }
         return !(touch.view is UITextField)
     }
     // Let the dismiss tap coexist with node onPress taps and the scroll gestures.
@@ -3193,6 +3204,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
             case "SC" where f.count >= 2: if let sl = views[f[1]] as? UISlider { sliderDoneAction[sl] = f[1] + ":slidedone" }   // Slider onSlidingComplete
             case "SS" where f.count >= 2: if let sc = views[f[1]] as? UIScrollView { scrollOnScroll[sc] = f[1] + ":scroll" }   // Scroll onScroll
+            case "LY" where f.count >= 3:                                   // onLayout bound (1) or dropped (0)
+                if f[2] == "1" { layoutIds.insert(f[1]); lastLayoutReport[f[1]] = nil; needsFrame.insert(f[1]) } else { layoutIds.remove(f[1]) }
             case "IF" where f.count >= 3:   // Image GPU op-chain (JSON may contain '|', so rejoin)
                 imageOpChain[f[1]] = f[2...].joined(separator: "|")
                 if let iv = views[f[1]] as? UIImageView { applyOps(iv, f[1]) }
@@ -5088,6 +5101,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
             mv.isHidden = true                     // shown when mvis=1
             modalIds.insert(id); v = mv
+        case "Popover":
+            // An anchored Modal: the same overlay root, transparent, whose content is laid
+            // out at its natural size at the origin and then moved beside the anchor by
+            // placePopover once both frames are known.
+            let pv = UIView(); pv.backgroundColor = .clear
+            pv.isHidden = true
+            YGNodeStyleSetJustifyContent(n, YGJustify.flexStart); YGNodeStyleSetAlignItems(n, YGAlign.flexStart)
+            modalIds.insert(id); popoverIds.insert(id); v = pv
         case "Alert":
             let a = UIView(); a.isUserInteractionEnabled = false   // invisible placeholder; the OS alert shows on avis=1
             alertIds.insert(id); v = a
@@ -5512,7 +5533,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 let vis = (val == "1")
                 v.isHidden = !vis
                 if vis { activeModal = id } else if activeModal == id { activeModal = nil }
+                if !vis, let al = popoverArrowLayers[id] { al.removeFromSuperlayer(); popoverArrowLayers[id] = nil }
                 view.setNeedsLayout()
+            case "panc": popoverAnchor[id] = val                       // Popover: the anchor node
+            case "pplc": popoverPlace[id] = val                        // Popover: preferred side
+            case "pgap": popoverGap[id] = CGFloat(f)                   // Popover: gap to the anchor
+            case "parw": if val == "1" { popoverArrow.insert(id) } else { popoverArrow.remove(id) }
             case "mpos":
                 let bottom = (val == "bottom")
                 if bottom { sheetModals.insert(id) } else { sheetModals.remove(id) }
@@ -5948,6 +5974,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             imageSrc[k] = nil; imageDecodedDim[k] = nil
             pressOpacity[k] = nil
             modalIds.remove(k); if activeModal == k { activeModal = nil }
+            if popoverIds.contains(k) { popoverIds.remove(k); popoverAnchor[k] = nil; popoverPlace[k] = nil; popoverGap[k] = nil; popoverArrow.remove(k); popoverArrowLayers[k]?.removeFromSuperlayer(); popoverArrowLayers[k] = nil }
+            layoutIds.remove(k); lastLayoutReport[k] = nil
             if let p = videoPlayers[k] {                     // recycle: pool the player, keep it primed
                 p.pause()
                 (views[k] as? VideoView)?.playerLayer.player = nil
@@ -6034,6 +6062,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             return
         }
         let g = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        if popoverIds.contains(id) { g.delegate = self }   // outside-tap only (see popoverTouchIsOutsideContent)
         v.addGestureRecognizer(g)
         taps[g] = action
     }
@@ -6555,6 +6584,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         let _ta = layoutTiming ? CACurrentMediaTime() : 0
         var _applied = 0
+        var pendingLayout: [(String, String)] = []   // onLayout reports, delivered after this pass
         for (id, n) in ynodes {
             if modalIds.contains(id) { continue }   // modal overlay node has no app-tree layout (placed below)
             // Incremental apply: skip nodes Yoga did not re-lay-out this pass (unless the view
@@ -6570,6 +6600,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if vv.transform.isIdentity { vv.frame = fr }
                 else { vv.bounds = CGRect(origin: .zero, size: fr.size); vv.center = CGPoint(x: fr.midX, y: fr.midY) }
             }
+            if layoutIds.contains(id) {
+                let key = "\(Int(fr.minX.rounded())),\(Int(fr.minY.rounded())),\(Int(fr.width.rounded())),\(Int(fr.height.rounded()))"
+                if lastLayoutReport[id] != key { lastLayoutReport[id] = key; pendingLayout.append((id, key)) }
+            }
             // now that the frame is known, decode the image to its display size.
             if imageSrc[id] != nil { ensureSizedImage(id, max(fr.width, fr.height) * UIScreen.main.scale) }
             if pillIds.contains(id) { views[id]?.layer.cornerRadius = min(fr.width, fr.height) / 2 }
@@ -6583,6 +6617,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let bv = blurViews[id] { bv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }
         }
         needsFrame.removeAll()   // consumed for this pass
+        // onLayout: the frame changed for a node that asked. Delivered after this pass
+        // returns, because a handler re-renders and re-enters relayout.
+        if !pendingLayout.isEmpty {
+            let reports = pendingLayout
+            DispatchQueue.main.async { for (id, key) in reports { if self.layoutIds.contains(id) { self.fireValue(id + ":layout", key) } } }
+        }
         if layoutTiming {
             let applyUs = (CACurrentMediaTime() - _ta) * 1_000_000
             NSLog("chuks-layout compute=%.0fus apply=%.0fus nodes=%d applied=%d", layoutComputeUs, applyUs, ynodes.count, _applied)
@@ -6593,7 +6633,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let mid = activeModal, let mv = views[mid], !mv.isHidden {
             mv.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: view.bounds.height)
             view.bringSubviewToFront(mv)
-            if sheetModals.contains(mid) {
+            if popoverIds.contains(mid) { placePopover(mid, mv); clearSheetChrome() }
+            else if sheetModals.contains(mid) {
                 let firstOpen = (shownSheet != mid); shownSheet = mid
                 layoutSheetChrome(mv, animateIn: firstOpen)
             } else { clearSheetChrome() }
@@ -6670,6 +6711,78 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 mv.backgroundColor = UIColor(white: 0, alpha: 0.5)
             }
         }
+    }
+
+    // ── Popover placement ──────────────────────────────────────────────────────
+    // The content was laid out at the overlay's origin at its natural size. Measure the
+    // anchor in the overlay's coordinates (a window-sized view, so this is the screen),
+    // choose a side, flip when it would not fit, clamp inside the safe area, and point
+    // the arrow at the anchor's middle. Runs on every layout pass the popover is visible
+    // for, so it follows the anchor through a scroll or a rotation.
+    func placePopover(_ mid: String, _ mv: UIView) {
+        guard let content = mv.subviews.first(where: { $0.tag != CHUKS_DECOR_TAG }) else { return }
+        let W = view.bounds.width, H = view.bounds.height
+        let sa = view.safeAreaInsets, margin: CGFloat = 8
+        let minX = sa.left + margin, maxX = W - sa.right - margin, minY = sa.top + margin, maxY = H - sa.bottom - margin
+        let cw = content.bounds.width, ch = content.bounds.height
+        let gap = popoverGap[mid] ?? 8
+        var anchor: CGRect? = nil
+        if let aid = popoverAnchor[mid], let av = views[aid], av.window != nil { anchor = av.convert(av.bounds, to: view) }
+        guard let a = anchor else {
+            // No anchor yet (a popover visible before its anchor mounted): a dialog.
+            content.frame.origin = CGPoint(x: ((W - cw) / 2).rounded(), y: ((H - ch) / 2).rounded())
+            popoverArrowLayers[mid]?.removeFromSuperlayer(); popoverArrowLayers[mid] = nil
+            return
+        }
+        let fitsBelow = a.maxY + gap + ch <= maxY, fitsAbove = a.minY - gap - ch >= minY
+        let fitsRight = a.maxX + gap + cw <= maxX, fitsLeft = a.minX - gap - cw >= minX
+        var place = popoverPlace[mid] ?? "auto"
+        switch place {
+        case "top": if !fitsAbove && fitsBelow { place = "bottom" }
+        case "bottom": if !fitsBelow && fitsAbove { place = "top" }
+        case "left": if !fitsLeft && fitsRight { place = "right" }
+        case "right": if !fitsRight && fitsLeft { place = "left" }
+        default: place = fitsBelow ? "bottom" : (fitsAbove ? "top" : (a.midY < H / 2 ? "bottom" : "top"))
+        }
+        var x: CGFloat, y: CGFloat
+        switch place {
+        case "top": x = a.midX - cw / 2; y = a.minY - gap - ch
+        case "left": x = a.minX - gap - cw; y = a.midY - ch / 2
+        case "right": x = a.maxX + gap; y = a.midY - ch / 2
+        default: x = a.midX - cw / 2; y = a.maxY + gap
+        }
+        x = min(max(x, minX), max(minX, maxX - cw)).rounded()
+        y = min(max(y, minY), max(minY, maxY - ch)).rounded()
+        content.frame.origin = CGPoint(x: x, y: y)
+        // The pointer: a triangle on the anchor's side of the content, on the content's own
+        // colour, its tip at the anchor's middle (kept clear of the content's corners).
+        guard popoverArrow.contains(mid) else { popoverArrowLayers[mid]?.removeFromSuperlayer(); popoverArrowLayers[mid] = nil; return }
+        let al = popoverArrowLayers[mid] ?? { let l = CAShapeLayer(); mv.layer.addSublayer(l); popoverArrowLayers[mid] = l; return l }()
+        let r = max(content.layer.cornerRadius, 6), sz: CGFloat = 8
+        let path = UIBezierPath()
+        switch place {
+        case "top":
+            let tx = min(max(a.midX, x + r + sz), x + cw - r - sz)
+            path.move(to: CGPoint(x: tx - sz, y: y + ch)); path.addLine(to: CGPoint(x: tx, y: y + ch + sz)); path.addLine(to: CGPoint(x: tx + sz, y: y + ch))
+        case "left":
+            let ty = min(max(a.midY, y + r + sz), y + ch - r - sz)
+            path.move(to: CGPoint(x: x + cw, y: ty - sz)); path.addLine(to: CGPoint(x: x + cw + sz, y: ty)); path.addLine(to: CGPoint(x: x + cw, y: ty + sz))
+        case "right":
+            let ty = min(max(a.midY, y + r + sz), y + ch - r - sz)
+            path.move(to: CGPoint(x: x, y: ty - sz)); path.addLine(to: CGPoint(x: x - sz, y: ty)); path.addLine(to: CGPoint(x: x, y: ty + sz))
+        default:
+            let tx = min(max(a.midX, x + r + sz), x + cw - r - sz)
+            path.move(to: CGPoint(x: tx - sz, y: y)); path.addLine(to: CGPoint(x: tx, y: y - sz)); path.addLine(to: CGPoint(x: tx + sz, y: y))
+        }
+        path.close()
+        al.path = path.cgPath
+        al.fillColor = (content.backgroundColor ?? .clear).cgColor
+    }
+    // A tap on a popover's content is the content's; only a tap on the empty overlay
+    // dismisses. Called from the tap recognizer's delegate for popover overlays.
+    func popoverTouchIsOutsideContent(_ g: UIGestureRecognizer, _ touch: UITouch) -> Bool {
+        guard let ov = g.view, let content = ov.subviews.first(where: { $0.tag != CHUKS_DECOR_TAG }) else { return true }
+        return !content.frame.contains(touch.location(in: ov))
     }
 
     func clearSheetChrome() {

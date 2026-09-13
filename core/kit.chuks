@@ -9,7 +9,7 @@
 // `function?(...)`) that defaults to null when omitted. Every component accepts an
 // optional `extra` tw-class string that is appended last, so it wins:
 //   Button({ variant: "primary", label: "Save", extra: "grow rounded-full" })
-import { Node, Row, Column, Text, TextInput, Toggle, List, viewportWidth, requestRender } from "./ui.chuks";
+import { Node, Row, Column, Text, TextInput, Toggle, List, Popover, ViewRef, viewportWidth, requestRender } from "./ui.chuks";
 import { time } from "std/time";
 import { tk } from "./theme.chuks";
 import { useEffect } from "./state.chuks";
@@ -339,6 +339,30 @@ export function Skeleton(p: SkeletonProps): Node {
     const fill: string = p.w == null ? "grow " : ""
     return Row({ h: p.h, w: p.w ?? -1, radius: p.radius ?? 10, opacity: a.value(), a11yHidden: true,
                  tw: "bg-surface2 " + fill + (p.extra ?? "") }, [])
+}
+
+// Tooltip: a short line anchored to a view, on a dark pill with a pointer. The parent
+// owns `visible` (show it on a long-press or a tap of an info glyph, hide it in
+// `onDismiss`); `anchor` is the useViewRef() handle passed to the anchored view as `ref`.
+//
+//   const info: ViewRef = useViewRef()
+//   Row({ ref: info, onPress: function(): void { tip.set(true) } }, [ Text({}, "?") ])
+//   Tooltip({ text: "Sent once a day", anchor: info, visible: tip.get(),
+//             onDismiss: function(): void { tip.set(false) } })
+export dataType TooltipProps {
+    text: string,
+    anchor: ViewRef,
+    visible: bool,
+    placement: string?,             // "top" (default) | "bottom" | "left" | "right" | "auto"
+    onDismiss: function?(): void,
+}
+export function Tooltip(p: TooltipProps): Node {
+    return Popover({ visible: p.visible, anchor: p.anchor, placement: p.placement ?? "top", arrow: true, offset: 6,
+                     onDismiss: p.onDismiss }, [
+        Row({ tw: "rounded-lg px-md py-sm", bg: tk("text"), maxw: 260 }, [
+            Text({ tw: "text-sm", color: tk("bg") }, p.text),
+        ]),
+    ])
 }
 
 // Carousel: a paged horizontal strip with page dots. One child per page; each fills

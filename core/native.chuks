@@ -1797,5 +1797,7 @@ export class Debug {
      * app logic would be reading the host's mind.
      */
     public static viewTree(onResult: (string)=> void): void { emitNativeCommand("debug.viewTree", "", onResult) }
+    /** The same dump, awaited (see the rule on awaiting a capability). */
+    public static async viewTreeAsync(): Task<string> { return await awaitCommand("debug.viewTree", "", false, CAP_QUICK_MS) }
     public static fail(onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("debug.fail", "", onResult, onError) }
 }

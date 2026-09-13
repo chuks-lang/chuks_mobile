@@ -110,6 +110,8 @@ MANIFEST = {
     "slmax": (PERSISTENT, "slider max (controlled)"), "slstep": (PERSISTENT, "slider step (controlled)"),
     "rfsh": (PERSISTENT, "pull-to-refresh (controlled)"), "seli": (PERSISTENT, "select index (controlled)"),
     "mvis": (PERSISTENT, "modal visible (driven every render)"), "mpos": (PERSISTENT, "modal position"),
+    "panc": (PERSISTENT, "popover anchor (with the popover)"), "pplc": (PERSISTENT, "popover placement (with the popover)"),
+    "pgap": (PERSISTENT, "popover gap (with the popover)"), "parw": (PERSISTENT, "popover arrow (with the popover)"),
     "swtc": (PERSISTENT, "switch thumb color (with the switch)"), "paging": (PERSISTENT, "scroll paging (with the scroll)"),
     "stick": (PERSISTENT, "scroll stick-bottom (with the scroll)"), "horiz": (PERSISTENT, "horizontal list (with the scroll)"),
     "dp": (PERSISTENT, "date-picker mode"), "dpd": (PERSISTENT, "date-picker display"),

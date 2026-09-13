@@ -194,6 +194,14 @@ class MainActivity : Activity(), ChuksModuleHost {
     private var activeModal: String? = null              // the currently-visible Modal
     private val sheetModals = HashSet<String>()          // Modal ids with position=bottom (draggable sheets)
     private val modalActions = HashMap<String, String>() // Modal id -> onDismiss action
+    private val popoverIds = HashSet<String>()           // Popover ids (an anchored Modal)
+    private val popoverAnchor = HashMap<String, String>()  // popover id -> anchor node id
+    private val popoverPlace = HashMap<String, String>()   // popover id -> auto|top|bottom|left|right
+    private val popoverGap = HashMap<String, Int>()        // popover id -> gap to the anchor (px)
+    private val popoverArrow = HashSet<String>()           // popovers that draw a pointer
+    private val popoverArrowViews = HashMap<String, View>()  // popover id -> its pointer
+    private val layoutIds = HashSet<String>()            // ids whose node has onLayout
+    private val lastLayoutReport = HashMap<String, String>()  // id -> last "x,y,w,h" reported
     private var sheetBg: View? = null                    // host-drawn sheet surface (rounded top, behind content)
     private var sheetHandle: View? = null                // host-drawn grab handle pill
     private var shownSheet: String? = null               // sheet currently on screen (null = none); a change drives the slide-up
@@ -625,6 +633,8 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
                 "SC" -> if (f.size >= 2) sliderDone[f[1]] = f[1] + ":slidedone"          // Slider onSlidingComplete
                 "SS" -> if (f.size >= 2) scrollOnScroll[f[1]] = f[1] + ":scroll"         // Scroll onScroll
+                "LY" -> if (f.size >= 3) {                                                // onLayout bound (1) or dropped (0)
+                    if (f[2] == "1") { layoutIds.add(f[1]); lastLayoutReport.remove(f[1]); needsFrame.add(f[1]) } else layoutIds.remove(f[1]) }
                 "IF" -> if (f.size >= 3) {                                                // Image GPU op-chain (JSON; rejoin '|')
                     imageOpChain[f[1]] = f.drop(2).joinToString("|")
                     imageOrigBmp[f[1]]?.let { b -> (views[f[1]] as? ImageView)?.setImageBitmap(runOps(f[1], b)) }
@@ -1194,7 +1204,14 @@ class MainActivity : Activity(), ChuksModuleHost {
             // frame is assigned to the view directly, so the two agree).
             val yn = ynodes[id]
             val x: Int; val y: Int; val w: Int; val h: Int
-            if (yn != null) {
+            // A popover's content is placed by the host after Yoga, so its truth is the
+            // LayoutParams the host wrote, not the node.
+            val placed = popoverIds.contains(id.substringBeforeLast(".")) && v.layoutParams is FrameLayout.LayoutParams
+            if (placed) {
+                val lp = v.layoutParams as FrameLayout.LayoutParams
+                x = (lp.leftMargin / density).toInt(); y = (lp.topMargin / density).toInt()
+                w = (lp.width / density).toInt(); h = (lp.height / density).toInt()
+            } else if (yn != null) {
                 x = (N.yGet(yn, 0) / density).toInt(); y = (N.yGet(yn, 1) / density).toInt()
                 w = (N.yGet(yn, 2) / density).toInt(); h = (N.yGet(yn, 3) / density).toInt()
             } else {
@@ -2688,6 +2705,11 @@ class MainActivity : Activity(), ChuksModuleHost {
                 it.visibility = View.GONE                // shown when mvis=1
                 modalIds.add(id)
             }
+            "Popover" -> FrameLayout(this).also {       // an anchored Modal: transparent overlay, content
+                it.visibility = View.GONE                // laid out at its natural size at the origin and
+                N.ySetF(n, 1, 0f); N.ySetF(n, 2, 0f)     // moved beside the anchor by placePopover
+                modalIds.add(id); popoverIds.add(id)
+            }
             // A kind the framework does not know may be one a package claims. Only then
             // do we look: an unknown kind is otherwise a plain container, exactly as
             // before, so an app with no view packages pays one map miss.
@@ -3177,8 +3199,13 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val vis = (vl == "1")
                     v.visibility = if (vis) View.VISIBLE else View.GONE
                     if (vis) { activeModal = id; v.bringToFront() } else if (activeModal == id) activeModal = null
+                    if (!vis) popoverArrowViews.remove(id)?.let { (it.parent as? ViewGroup)?.removeView(it) }
                     root.requestLayout()
                 }
+                "panc" -> popoverAnchor[id] = vl                                // Popover: the anchor node
+                "pplc" -> popoverPlace[id] = vl                                 // Popover: preferred side
+                "pgap" -> popoverGap[id] = dp(f.toInt())                        // Popover: gap to the anchor
+                "parw" -> if (vl == "1") popoverArrow.add(id) else popoverArrow.remove(id)
                 "mpos" -> {                              // sheet pins bottom + stretches; dialog centers
                     val bottom = (vl == "bottom")
                     if (bottom) sheetModals.add(id) else sheetModals.remove(id)
@@ -4405,6 +4432,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { popoverIds.remove(it); popoverAnchor.remove(it); popoverPlace.remove(it); popoverGap.remove(it); popoverArrow.remove(it); popoverArrowViews.remove(it); layoutIds.remove(it); lastLayoutReport.remove(it) }
         views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
@@ -4412,6 +4440,24 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun bindAction(id: String, action: String) {
         val v = views[id] ?: return
         if (modalIds.contains(id)) modalActions[id] = action   // onDismiss: scrim tap AND sheet drag
+        if (popoverIds.contains(id)) {
+            // A tap on the popover's content is the content's; only a tap on the empty
+            // overlay dismisses. Children consume their own touches first, so this listener
+            // sees the rest: inside the content it declines (the overlay swallows it),
+            // outside it captures the DOWN and fires on the UP.
+            v.isClickable = true
+            v.setOnClickListener(null)
+            v.setOnTouchListener { ov, ev ->
+                val content = (ov as? ViewGroup)?.let { g -> (0 until g.childCount).map { g.getChildAt(it) }.firstOrNull { it !== popoverArrowViews[id] } }
+                val inside = content != null && ev.x >= content.left && ev.x <= content.right && ev.y >= content.top && ev.y <= content.bottom
+                when (ev.action) {
+                    MotionEvent.ACTION_DOWN -> !inside
+                    MotionEvent.ACTION_UP -> { if (!inside && action.isNotEmpty()) fire(action); true }
+                    else -> true
+                }
+            }
+            return
+        }
         if (alertIds.contains(id)) { alertActions[id] = action; return }   // alert buttons dispatch this
         if (contextMenuIds.contains(id)) { v.setTag(TAG, action); return }  // long-press PopupMenu reads this
         if (gestureIds.contains(id)) { v.setTag(TAG, action); return }      // GestureDetector reads this
@@ -4838,6 +4884,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 N.yCalc(mn, root.width.toFloat(), root.height.toFloat())
             }
         }
+        val pendingLayout = ArrayList<Pair<String, String>>()   // onLayout reports, delivered after this pass
         for ((id, node) in ynodes) {
             if (modalIds.contains(id)) continue          // modal overlay node placed explicitly below
             val v = views[id] ?: continue
@@ -4858,8 +4905,15 @@ class MainActivity : Activity(), ChuksModuleHost {
             lastFrame[id] = intArrayOf(left, top, wd, ht)
             // now that the frame is known, decode the image to its display size.
             if (imageSrc.containsKey(id)) ensureSizedImage(id, maxOf(wd, ht))
+            if (layoutIds.contains(id)) {
+                val key = "${Math.round(left / density)},${Math.round(top / density)},${Math.round(wd / density)},${Math.round(ht / density)}"
+                if (lastLayoutReport[id] != key) { lastLayoutReport[id] = key; pendingLayout.add(Pair(id, key)) }
+            }
         }
         needsFrame.clear()   // consumed for this pass
+        // onLayout: the frame changed for a node that asked. Delivered after this pass
+        // returns, because a handler re-renders and re-enters relayout.
+        if (pendingLayout.isNotEmpty()) root.post { for ((id, key) in pendingLayout) if (layoutIds.contains(id)) hostInput("$id:layout", key) }
         // place the whole Chuks app just below the top inset
         (views["app"]?.layoutParams as? FrameLayout.LayoutParams)?.let { it.leftMargin = 0; it.topMargin = topY }
         // a visible modal fills the window and sits on top (children laid out above)
@@ -4867,7 +4921,8 @@ class MainActivity : Activity(), ChuksModuleHost {
             views[mid]?.let { mv ->
                 mv.layoutParams = FrameLayout.LayoutParams(root.width, root.height).also { it.leftMargin = 0; it.topMargin = 0 }
                 mv.bringToFront()
-                if (sheetModals.contains(mid)) {
+                if (popoverIds.contains(mid)) { clearSheetChrome(); placePopover(mid, mv as FrameLayout) }
+                else if (sheetModals.contains(mid)) {
                     val firstOpen = shownSheet != mid; shownSheet = mid
                     layoutSheetChrome(mv as FrameLayout, firstOpen)
                 } else clearSheetChrome()
@@ -4929,6 +4984,91 @@ class MainActivity : Activity(), ChuksModuleHost {
                     .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
             }
         }
+    }
+
+    // ── Popover placement ──────────────────────────────────────────────────────
+    // The content was laid out at the overlay's origin at its natural size. Measure the
+    // anchor in the root's coordinates (the overlay fills the root, so this is the
+    // screen), choose a side, flip when it would not fit, clamp inside the system bars,
+    // and point the arrow at the anchor's middle. Runs on every layout pass the popover
+    // is visible for, so it follows the anchor through a scroll or a rotation. Frames
+    // come from the Yoga nodes, which hold the resolved layout before Android's own pass.
+    private fun placePopover(mid: String, mv: FrameLayout) {
+        val content = (0 until mv.childCount).map { mv.getChildAt(it) }.firstOrNull { it !== popoverArrowViews[mid] } ?: return
+        val cid = views.entries.firstOrNull { it.value === content }?.key ?: return
+        val cnode = ynodes[cid] ?: return
+        val cw = N.yGet(cnode, 2).toInt(); val ch = N.yGet(cnode, 3).toInt()
+        val W = root.width; val H = root.height
+        val wi = window.decorView.rootWindowInsets
+        @Suppress("DEPRECATION")
+        val saT = wi?.systemWindowInsetTop ?: 0; @Suppress("DEPRECATION") val saB = wi?.systemWindowInsetBottom ?: 0
+        @Suppress("DEPRECATION")
+        val saL = wi?.systemWindowInsetLeft ?: 0; @Suppress("DEPRECATION") val saR = wi?.systemWindowInsetRight ?: 0
+        val margin = dp(8)
+        val minX = saL + margin; val maxX = W - saR - margin; val minY = saT + margin; val maxY = H - saB - margin
+        val gap = popoverGap[mid] ?: dp(8)
+        val aid = popoverAnchor[mid]
+        val av = if (aid != null) views[aid] else null
+        val anchor: android.graphics.Rect? = if (av != null && av.isAttachedToWindow) {
+            val loc = IntArray(2); av.getLocationInWindow(loc)
+            val rl = IntArray(2); root.getLocationInWindow(rl)
+            android.graphics.Rect(loc[0] - rl[0], loc[1] - rl[1], loc[0] - rl[0] + av.width, loc[1] - rl[1] + av.height)
+        } else null
+        fun put(x: Int, y: Int) { content.layoutParams = FrameLayout.LayoutParams(cw, ch).also { it.leftMargin = x; it.topMargin = y } }
+        if (anchor == null) {
+            // No anchor yet (a popover visible before its anchor mounted): a dialog.
+            put((W - cw) / 2, (H - ch) / 2)
+            popoverArrowViews.remove(mid)?.let { mv.removeView(it) }
+            return
+        }
+        val a = anchor
+        val fitsBelow = a.bottom + gap + ch <= maxY; val fitsAbove = a.top - gap - ch >= minY
+        val fitsRight = a.right + gap + cw <= maxX; val fitsLeft = a.left - gap - cw >= minX
+        var place = popoverPlace[mid] ?: "auto"
+        place = when (place) {
+            "top" -> if (!fitsAbove && fitsBelow) "bottom" else "top"
+            "bottom" -> if (!fitsBelow && fitsAbove) "top" else "bottom"
+            "left" -> if (!fitsLeft && fitsRight) "right" else "left"
+            "right" -> if (!fitsRight && fitsLeft) "left" else "right"
+            else -> if (fitsBelow) "bottom" else if (fitsAbove) "top" else if (a.centerY() < H / 2) "bottom" else "top"
+        }
+        var x: Int; var y: Int
+        when (place) {
+            "top" -> { x = a.centerX() - cw / 2; y = a.top - gap - ch }
+            "left" -> { x = a.left - gap - cw; y = a.centerY() - ch / 2 }
+            "right" -> { x = a.right + gap; y = a.centerY() - ch / 2 }
+            else -> { x = a.centerX() - cw / 2; y = a.bottom + gap }
+        }
+        x = minOf(maxOf(x, minX), maxOf(minX, maxX - cw)); y = minOf(maxOf(y, minY), maxOf(minY, maxY - ch))
+        put(x, y)
+        // The pointer: a triangle on the anchor's side of the content, on the content's own
+        // colour, its tip at the anchor's middle (kept clear of the content's corners).
+        if (!popoverArrow.contains(mid)) { popoverArrowViews.remove(mid)?.let { mv.removeView(it) }; return }
+        val sz = dp(8); val r = maxOf((bgRadius[cid] ?: 0f).toInt(), dp(6))
+        val color = bgColor[cid] ?: Color.TRANSPARENT
+        val path = android.graphics.Path()
+        val ax: Int; val ay: Int; val aw: Int; val ah: Int
+        when (place) {
+            "top" -> { val tx = minOf(maxOf(a.centerX(), x + r + sz), x + cw - r - sz); ax = tx - sz; ay = y + ch; aw = 2 * sz; ah = sz
+                path.moveTo(0f, 0f); path.lineTo(sz.toFloat(), sz.toFloat()); path.lineTo(2f * sz, 0f) }
+            "left" -> { val ty = minOf(maxOf(a.centerY(), y + r + sz), y + ch - r - sz); ax = x + cw; ay = ty - sz; aw = sz; ah = 2 * sz
+                path.moveTo(0f, 0f); path.lineTo(sz.toFloat(), sz.toFloat()); path.lineTo(0f, 2f * sz) }
+            "right" -> { val ty = minOf(maxOf(a.centerY(), y + r + sz), y + ch - r - sz); ax = x - sz; ay = ty - sz; aw = sz; ah = 2 * sz
+                path.moveTo(sz.toFloat(), 0f); path.lineTo(0f, sz.toFloat()); path.lineTo(sz.toFloat(), 2f * sz) }
+            else -> { val tx = minOf(maxOf(a.centerX(), x + r + sz), x + cw - r - sz); ax = tx - sz; ay = y - sz; aw = 2 * sz; ah = sz
+                path.moveTo(0f, sz.toFloat()); path.lineTo(sz.toFloat(), 0f); path.lineTo(2f * sz, sz.toFloat()) }
+        }
+        path.close()
+        val arrow = (popoverArrowViews[mid] as? PopoverArrowView) ?: PopoverArrowView(this).also { popoverArrowViews[mid] = it; mv.addView(it) }
+        arrow.path = path; arrow.color = color
+        arrow.layoutParams = FrameLayout.LayoutParams(aw, ah).also { it.leftMargin = ax; it.topMargin = ay }
+        arrow.invalidate()
+    }
+    class PopoverArrowView(ctx: Context) : View(ctx) {
+        var path: android.graphics.Path = android.graphics.Path()
+        var color: Int = 0
+        private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        override fun onDraw(canvas: android.graphics.Canvas) { paint.color = color; canvas.drawPath(path, paint) }
     }
 
     private fun clearSheetChrome() {

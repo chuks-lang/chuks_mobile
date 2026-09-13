@@ -144,6 +144,11 @@ export class Style {
     var a11yState: string   // comma-joined tokens: dis, sel, chk, unchk, mixed, exp, col, busy
     var a11yHidden: int     // 1 = decoration, skipped by the screen reader (with its subtree)
     var a11yLive: string    // "polite" | "assertive": announce this node's text when it changes
+    // Popover: anchored overlay. The anchor is a mounted node's id; the host measures it.
+    var pAnchor: string     // node id of the anchor ("" = none: the content is centered)
+    var pPlace: string      // "auto" | "top" | "bottom" | "left" | "right"
+    var pGap: int           // points between the anchor and the content (-1 = default 8)
+    var pArrow: int         // 1 = draw an arrow pointing at the anchor (-1 = none)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
@@ -174,6 +179,7 @@ export class Style {
         this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
         this.selectable = -1; this.hitSlop = -1; this.spinner = -1
         this.a11yLabel = ""; this.a11yHint = ""; this.a11yRole = ""; this.a11yState = ""; this.a11yHidden = -1; this.a11yLive = ""
+        this.pAnchor = ""; this.pPlace = ""; this.pGap = -1; this.pArrow = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -297,6 +303,12 @@ export class Style {
         if (this.sbNavColor != "") { s = s + "sbnavcolor=" + this.sbNavColor + ";" }
         if (this.mvis >= 0) { s = s + "mvis=" + string(this.mvis) + ";" }
         if (this.mpos != "") { s = s + "mpos=" + this.mpos + ";" }
+        // Popover placement rides with mvis: re-sent while the popover is active, so the
+        // host re-measures the anchor on every render it is visible for.
+        if (this.pAnchor != "") { s = s + "panc=" + this.pAnchor + ";" }
+        if (this.pPlace != "") { s = s + "pplc=" + this.pPlace + ";" }
+        if (this.pGap >= 0) { s = s + "pgap=" + string(this.pGap) + ";" }
+        if (this.pArrow >= 0) { s = s + "parw=" + string(this.pArrow) + ";" }
         if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
             s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
             s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
@@ -352,6 +364,9 @@ export class Node {
     // Slider: fires once when the drag gesture ENDS (RN onSlidingComplete), with
     // the final value; distinct from onChange which streams during the drag.
     var onSlideDone: any
+    // Any node: onLayout fires with the node's frame (x, y relative to its parent, w, h;
+    // points) after the host lays it out, and again whenever that frame changes.
+    var onLayout: any
     // Scroll container: onScroll streams the scroll offset (logical points) as the
     // user scrolls; scrollTo imperatively scrolls to an offset (>= 0 = active).
     var onScroll: any
@@ -374,7 +389,7 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
-        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1; this.opsChain = ""
+        this.onSlideDone = null; this.onScroll = null; this.onLayout = null; this.scrollTo = -1; this.opsChain = ""
         this.events = {}
         this.ref = null
     }
@@ -462,6 +477,9 @@ function mkStatusBar(style: Style): Node { return new Node("StatusBar", style, "
 // Build a modal node. The host renders its children in an OVERLAY layer (scrim +
 // content) on top of everything when mvis=1; renders nothing inline.
 function mkModal(style: Style, kids: []Node): Node { return new Node("Modal", style, "", kids) }
+// Build a popover node: an overlay like a Modal, whose content the host places beside the
+// anchor node named in the style (measured at layout time), flipping to fit the screen.
+function mkPopover(style: Style, kids: []Node): Node { return new Node("Popover", style, "", kids) }
 // Build an alert node: the host presents a NATIVE alert when avis=1. Title / message /
 // button labels ride the text field (tab-joined). Renders nothing inline.
 function mkAlert(style: Style, joined: string): Node { return new Node("Alert", style, joined, []) }
@@ -679,8 +697,16 @@ export dataType A11yState { disabled: bool?; selected: bool?; checked: bool?; ex
 dataType EventProps {
     onPress: (function(): void)?; onChange: (function(v: string): void)?;
     onLongPress: (function(): void)?; onPressIn: (function(): void)?; onPressOut: (function(): void)?;
+    onLayout: (function(e: LayoutBox): void)?;
 }
-export dataType ViewProps { LayoutProps; EventProps }
+/**
+ * The frame the host gave a node: `x`, `y` relative to its parent, `w`, `h`, in points.
+ * Delivered by `onLayout` after the first layout and again whenever the frame changes.
+ */
+export dataType LayoutBox { x: int; y: int; w: int; h: int }
+// `ref` is a useViewRef() handle: the node's id is written into it when it mounts, so
+// the view can be named to something else (a Popover's anchor) or sent a command.
+export dataType ViewProps { LayoutProps; EventProps; ref: ViewRef? }
 export dataType TextProps { ViewProps; numberOfLines: int?; ellipsizeMode: string?; selectable: bool? }
 
 // By-key field readers over an `any` (a map-backed dataType), mirroring pInt/pStr/pBool.
@@ -783,6 +809,15 @@ function applyEventsV(n: Node, p: any): void {
     const c: any = p["onLongPress"]; if (c != null) { n.onLongPress = c }
     const d: any = p["onPressIn"]; if (d != null) { n.onPressIn = d }
     const e: any = p["onPressOut"]; if (e != null) { n.onPressOut = e }
+    const rf: any = p["ref"]; if (rf != null) { n.ref = rf }
+    // The host reports "x,y,w,h"; the app gets a LayoutBox.
+    const l: any = p["onLayout"]
+    if (l != null) { n.onLayout = function(v: string): void { l(decodeLayoutBox(v)) } }
+}
+function decodeLayoutBox(v: string): LayoutBox {
+    const f: []string = v.split(",")
+    return { x: f.length > 0 ? int(f[0]) : 0, y: f.length > 1 ? int(f[1]) : 0,
+             w: f.length > 2 ? int(f[2]) : 0, h: f.length > 3 ? int(f[3]) : 0 }
 }
 // The typed-props twin of applyMediaEvents: wire onLoad/onError/onEnd/onProgress (Image/Video)
 // from a typed props bag (read by key) onto a node.
@@ -1674,6 +1709,48 @@ export function Modal(first: ModalProps | []Kid, kids: []Kid = []): Node {
     // Hidden: emit the node but with NO children, so the content isn't mounted.
     const n: Node = mkModal(s, vis ? flatKids(kids) : [])
     const od: any = p["onDismiss"]           // scrim tap fires onDismiss (wired as onPress)
+    if (od != null) { n.onPress = od }
+    return n
+}
+dataType PopoverProps {
+    ViewProps; visible: bool?; anchor: ViewRef; placement: string?; offset: int?; arrow: bool?;
+    onDismiss: (function(): void)?
+}
+/**
+ * An anchored overlay: `kids` render on top of everything, beside the view that holds
+ * `anchor`, when `visible`. The host measures the anchor at layout time and places the
+ * content on the `placement` side ("auto" default, "top", "bottom", "left", "right"),
+ * flips to the other side when it would leave the screen, and keeps it inside the safe
+ * area. `offset` is the gap to the anchor in points (8); `arrow: true` draws a pointer
+ * on the content's own background colour. Tapping anywhere outside the content fires
+ * `onDismiss`; tapping the content does not.
+ *
+ * The anchor is a `useViewRef()` handle passed to the anchored view as `ref`. It is
+ * bound when that view mounts, so a popover opened from a tap on its anchor always
+ * finds it; a popover visible on the very first render, before its anchor exists, is
+ * centred like a dialog.
+ *
+ * ```chuks
+ * const more: ViewRef = useViewRef()
+ * Row({ ref: more, onPress: function(): void { open.set(true) } }, [ Text({}, "More") ])
+ * Popover({ visible: open.get(), anchor: more, placement: "bottom", arrow: true,
+ *           onDismiss: function(): void { open.set(false) } }, [
+ *     Card({ children: [ Text({}, "Rename"), Text({}, "Delete") ] }),
+ * ])
+ * ```
+ */
+export function Popover(p: PopoverProps, kids: []Kid): Node {
+    const vis: bool = pvB(p, "visible", false)
+    const s: Style = new Style()
+    s.mvis = vis ? 1 : 0
+    const r: ViewRef = p.anchor
+    s.pAnchor = r.id
+    s.pPlace = pvS(p, "placement", "auto")
+    s.pGap = pvI(p, "offset", 8)
+    s.pArrow = pvB(p, "arrow", false) ? 1 : 0
+    applyLayoutV(s, p)
+    const n: Node = mkPopover(s, vis ? flatKids(kids) : [])
+    const od: any = p["onDismiss"]           // an outside tap fires onDismiss (wired as onPress)
     if (od != null) { n.onPress = od }
     return n
 }
@@ -2753,6 +2830,7 @@ export class Reconciler {
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
         if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
         if (n.onScroll != null) { this.handlers[id + ":scroll"] = n.onScroll; this.emit("SS|" + id) }
+        if (n.onLayout != null) { this.handlers[id + ":layout"] = n.onLayout; this.emit("LY|" + id + "|1") }
         // A package view's handle learns which node it is. Nothing is emitted: a command
         // is sent when the APP asks for one, not when the view mounts. Anything the app
         // asked for before this point was queued on the handle and goes out now.
@@ -2881,6 +2959,10 @@ export class Reconciler {
         this.rebindOrDrop(id + ":progress", next.onProgress)
         this.rebindOrDrop(id + ":slidedone", next.onSlideDone)
         this.rebindOrDrop(id + ":scroll", next.onScroll)
+        // onLayout is bound on the host too, so gaining or losing it on an update must
+        // reach the host (the same rule as T|: a binding made at mount is re-diffed).
+        this.rebindOrDrop(id + ":layout", next.onLayout)
+        if ((p.onLayout == null) != (next.onLayout == null)) { this.emit("LY|" + id + "|" + (next.onLayout != null ? "1" : "0")) }
         // A package view's named events, rebound the same way: the new closure captures
         // this render's state, and a name the node no longer carries is dropped so a
         // recycled cell cannot fire the previous row's handler.
