@@ -629,7 +629,7 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
 // caller imports nothing but the component. Inside, a builder hands the props
 // (as `any`) to the shared applyLayoutV/applyEventsV, which read fields BY KEY (a
 // dataType is map-backed), so one pair of helpers serves every typed builder.
-dataType LayoutProps {
+export dataType LayoutProps {
     gap: int?; pad: int?; px: int?; py: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
     align: string?; justify: string?; bg: string?; color: string?; size: int?;
     weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
@@ -1122,8 +1122,8 @@ export function eventData(raw: string): any {
  *
  * ```chuks
  * export dataType RingProps {
- *     progress: float?; color: string?;
- *     w: int?; h: int?; grow: int?; pad: int?; bg: string?; radius: int?; tw: string?;
+ *     LayoutProps;                          // w, h, grow, pad, bg, radius, tw and the rest
+ *     progress: float?; color: string?;     // the package's own
  * }
  *
  * export function Ring(p: RingProps): Node {
@@ -1134,8 +1134,11 @@ export function eventData(raw: string): any {
  * }
  * ```
  *
- * The layout half of that type is listed rather than inherited because a dataType cannot
- * embed a type from another module yet, so `ViewProps` is out of reach from a package.
+ * Embed `LayoutProps`, not `ViewProps`. ViewProps also carries the framework's own
+ * event props, and its `onChange` means "the value changed" and is bound under the
+ * node's id, so a tap on the view would call a package's differently-typed onChange
+ * with nothing. A package's events go through the events map below, where the payload
+ * is the package's own type.
  *
  * Events: pass a fifth argument, a map of name to closure, and the native side calls
  * `emit("<name>", value)` on its view host to fire one. The names are yours; the
