@@ -147,18 +147,14 @@ function mobileSourcesStr(projdir: string, platform: string): string {
 // literals ARE the implemented surface. Requiring the closing quote right after the
 // name keeps error messages like "health.read is unavailable" out of the results.
 function capNamesIn(src: string, ns: string): []string {
+    // Split, not indexOf-then-slice: see callNamesIn for why a position is never computed.
     var out: []string = []
-    const needle: string = "\"" + ns + "."
-    var rest: string = src
-    while (true) {
-        const at: int = rest.indexOf(needle)
-        if (at < 0) { break }
-        const after: string = rest.slice(at + needle.length, rest.length)
-        const close: int = after.indexOf("\"")
-        rest = after
-        if (close < 0) { break }
-        const name: string = after.slice(0, close)
+    const pieces: []string = src.split("\"" + ns + ".")
+    var i: int = 1
+    while (i < pieces.length) {
+        const name: string = pieces[i].split("\"")[0]
         if (name.length > 0 && isPlainName(name) && !contains(out, name)) { out.push(name) }
+        i = i + 1
     }
     return out
 }
@@ -187,7 +183,7 @@ function implementedCaps(pkg: any, platform: string, ns: string): []string {
         const path: string = string(pkg["__dir"]) + "/" + string(srcs[j])
         j = j + 1
         if (!fs.exists(path)) { continue }
-        const found: []string = capNamesIn(fs.readFile(path), ns)
+        const found: []string = capNamesIn(withoutLineComments(fs.readFile(path)), ns)
         var k: int = 0
         while (k < found.length) {
             if (!contains(out, found[k])) { out.push(found[k]) }
@@ -206,6 +202,25 @@ function implementedCaps(pkg: any, platform: string, ns: string): []string {
 // missing callback, just nothing on screen.
 function chuksEmitted(pkg: any, ns: string): []string {
     var out: []string = []
+    const files: []string = chuksSourceFiles(pkg)
+    var j: int = 0
+    while (j < files.length) {
+        const f: string = files[j]
+        j = j + 1
+        if (!fs.exists(f)) { continue }
+        const found: []string = capNamesIn(fs.readFile(f), ns)
+        var k: int = 0
+        while (k < found.length) {
+            if (!contains(out, found[k])) { out.push(found[k]) }
+            k = k + 1
+        }
+    }
+    return out
+}
+
+// The package's own Chuks: its main file plus everything under src/. This is the side of
+// the boundary that ASKS: for capabilities, for view kinds, and for commands.
+function chuksSourceFiles(pkg: any): []string {
     const dir: string = string(pkg["__dir"])
     var files: []string = []
     const main: any = pkg["main"]
@@ -223,17 +238,25 @@ function chuksEmitted(pkg: any, ns: string): []string {
             if (!contains(files, path)) { files.push(path) }
         }
     }
-    var j: int = 0
-    while (j < files.length) {
-        const f: string = files[j]
-        j = j + 1
-        if (!fs.exists(f)) { continue }
-        const found: []string = capNamesIn(fs.readFile(f), ns)
-        var k: int = 0
-        while (k < found.length) {
-            if (!contains(out, found[k])) { out.push(found[k]) }
-            k = k + 1
-        }
+    return files
+}
+
+// Every `<call>("<name>"` literal in `src`: the names a source sends a command to, or
+// emits an event under. `call` is the text before the quote, e.g. `.command(` or
+// `emit(`. The closing quote must follow the name, so prose never matches.
+//
+// Split, not indexOf-then-slice. A native source is text, and text has a `★`, a curly
+// quote or an accent in it sooner or later; the first one before a match is enough to
+// put an index from indexOf and a slice taken with it in different units, and the name
+// comes back with its first letters missing. Splitting never computes a position.
+function callNamesIn(src: string, call: string): []string {
+    var out: []string = []
+    const pieces: []string = src.split(call + "\"")
+    var i: int = 1
+    while (i < pieces.length) {
+        const name: string = pieces[i].split("\"")[0]
+        if (name.length > 0 && isPlainName(name) && !contains(out, name)) { out.push(name) }
+        i = i + 1
     }
     return out
 }
@@ -568,6 +591,49 @@ function viewSymmetryStr(projdir: string): string {
                 out = out + "gap\t" + pname + "\t" + kind + "\tno Kotlin source declares " + cls + "\n"
             }
         }
+
+        // Commands: the package's Chuks is the side that asks, `ref.command("flash")`,
+        // and each native half either answers `"flash"` or does not. A command answered
+        // on one platform and not the other fails in the quietest way there is: the
+        // app calls it, one platform does the thing, the other does nothing.
+        var chuksSrc: string = ""
+        const files: []string = chuksSourceFiles(pkg)
+        var f: int = 0
+        while (f < files.length) { if (fs.exists(files[f])) { chuksSrc = chuksSrc + fs.readFile(files[f]) + "\n" }; f = f + 1 }
+        const asked: []string = callNamesIn(chuksSrc, ".command(")
+        var c: int = 0
+        while (c < asked.length) {
+            const cmd: string = asked[c]
+            c = c + 1
+            if (m["ios"] != null && swift.indexOf("\"" + cmd + "\"") < 0) {
+                out = out + "gap\t" + pname + "\t" + ns + " command \"" + cmd + "\"\tthe package's Chuks sends this command, but no Swift source answers it\n"
+            }
+            if (m["android"] != null && kotlin.indexOf("\"" + cmd + "\"") < 0) {
+                out = out + "gap\t" + pname + "\t" + ns + " command \"" + cmd + "\"\tthe package's Chuks sends this command, but no Kotlin source answers it\n"
+            }
+        }
+
+        // Events: each native half emits under names of its own choosing, and the two
+        // halves must choose the same ones, or a handler the app registered fires on
+        // one platform only.
+        if (m["ios"] != null && m["android"] != null) {
+            const iosEv: []string = callNamesIn(swift, "emit(")
+            const andEv: []string = callNamesIn(kotlin, "emit(")
+            var e1: int = 0
+            while (e1 < iosEv.length) {
+                if (!contains(andEv, iosEv[e1])) {
+                    out = out + "gap\t" + pname + "\t" + ns + " event \"" + iosEv[e1] + "\"\tthe Swift emits this event and the Kotlin never does\n"
+                }
+                e1 = e1 + 1
+            }
+            var e2: int = 0
+            while (e2 < andEv.length) {
+                if (!contains(iosEv, andEv[e2])) {
+                    out = out + "gap\t" + pname + "\t" + ns + " event \"" + andEv[e2] + "\"\tthe Kotlin emits this event and the Swift never does\n"
+                }
+                e2 = e2 + 1
+            }
+        }
     }
     return out
 }
@@ -584,9 +650,28 @@ function sourcesText(pkg: any, platform: string): string {
     while (j < srcs.length) {
         const path: string = string(pkg["__dir"]) + "/" + string(srcs[j])
         j = j + 1
-        if (fs.exists(path)) { out = out + fs.readFile(path) + "\n" }
+        if (fs.exists(path)) { out = out + withoutLineComments(fs.readFile(path)) + "\n" }
     }
     return out
+}
+
+// A native source with its `//` comments removed, line by line. A comment that says
+// `host.emit("change", ...)` is prose about the code, not the code, and the checks in
+// this file read string literals as the implemented surface: left in, a comment naming
+// an event or a capability masks the gap it describes. Block comments and a `//`
+// inside a string are left alone; the former are rare in these sources and the latter
+// would cost a tokenizer for a gain no package has needed yet.
+function withoutLineComments(src: string): string {
+    const lines: []string = src.split("\n")
+    var out: []string = []
+    var i: int = 0
+    while (i < lines.length) {
+        const line: string = lines[i]
+        i = i + 1
+        const parts: []string = line.split("//")
+        out.push(parts[0])
+    }
+    return out.join("\n")
 }
 
 function mobileViewsStr(projdir: string, platform: string): string {

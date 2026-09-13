@@ -1334,6 +1334,11 @@ export class FileSystem {
 // unreadable if the biometrics are removed or changed. A plain set() reads back with
 // no prompt. get() handles both, prompting only when the value is protected.
 export class SecureStore {
+    /**
+     * Store a value. Fire and forget: a write the store refuses (a simulator with no
+     * keychain access, an empty key) is logged by the host and nothing else happens.
+     * `setAsync` is the form that throws instead.
+     */
     public static set(key: string, value: string): void {
         emitNativeCommand("secure.set", { key: key, value: value }, null)
     }
@@ -1364,6 +1369,14 @@ export class SecureStore {
 
     /** A stored secret, awaited. A protected value prompts. Throws if the key is not there. */
     public static async getAsync(key: string): Task<string> { return await awaitCommand("secure.get", key, true, CAP_PROMPT_MS) }
+    /**
+     * Store a value, awaited. Throws if the store refused it, which is what `set` cannot
+     * tell you: a fire-and-forget write that fails is logged by the host, and that is all.
+     * Use this where a lost token is a bug you want to see.
+     */
+    public static async setAsync(key: string, value: string): Task<void> {
+        await awaitCommand("secure.set", { key: key, value: value }, true, CAP_QUICK_MS)
+    }
     /** Store behind the biometric gate, awaited. Throws if cancelled. */
     public static async setProtectedAsync(key: string, value: string): Task<void> {
         await awaitCommand("secure.setProtected", { key: key, value: value }, true, CAP_PROMPT_MS)

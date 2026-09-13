@@ -304,6 +304,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             android.content.res.Configuration.UI_MODE_NIGHT_YES
         N.setColorScheme(if (dark) 1 else 0)
         N.tick(); applyDrain(); relayout()
+        if (appAppearance == "auto") repaintDefaultText()   // following the OS: the default moved with it
     }
 
     private fun hideKeyboard(v: View) {
@@ -1676,7 +1677,15 @@ class MainActivity : Activity(), ChuksModuleHost {
             "fs.diskSpace" -> resolve(token, ChuksFiles.diskSpace(this))
             "fs.dir" -> resolve(token, ChuksFiles.dir(this, args))
             // ---- secure storage: see ChuksSecure.kt ----------------------------
-            "secure.set" -> secure.setPlain(a.s("key"), a.s("value"))
+            "secure.set" -> {
+                // A write can fail (the keystore can refuse, the key can be empty). With
+                // a token the awaited form throws; without one the host logs it, rather
+                // than the app reading nothing back later with no reason anywhere.
+                val key = a.s("key")
+                if (key.isEmpty()) fail(token, "SecureStore.set: the key is empty")
+                else try { secure.setPlain(key, a.s("value")); resolve(token, "") }
+                     catch (e: Exception) { fail(token, "SecureStore.set: cannot store \"$key\": ${e.message}") }
+            }
             "secure.setProtected" -> secure.setProtected(a.s("key"), a.s("value"), "", { resolve(token, "") }, { m -> fail(token, m) })
             "secure.get" -> secure.get(args, "", { v -> resolve(token, v) }, { fail(token, "no such key: $args") }, { m -> fail(token, m) })
             "secure.has" -> resolve(token, if (secure.has(args)) "1" else "0")
@@ -1792,11 +1801,11 @@ class MainActivity : Activity(), ChuksModuleHost {
             // The framework noticed something the app probably did not mean. Logged
             // natively because the engine's own println reaches nothing on Android.
             "dev.warn" -> android.util.Log.w("Chuks", args)
-            // Which appearance the APP is in. Android's glass is a static scrim rather
-            // than a system material, so nothing here resolves against a trait and this
-            // is recorded rather than applied; it exists so the capability answers on
-            // both platforms instead of failing on one.
-            "appearance.set" -> appAppearance = args
+            // Which appearance the APP is in. iOS applies this to the window and every
+            // dynamic colour follows; Android has no dynamic colours on a plain view, so
+            // the one default the host owns, the colour of text the app left colourless,
+            // is repainted here instead.
+            "appearance.set" -> { appAppearance = args; repaintDefaultText() }
             // ---- clipboard: see ChuksClipboard.kt ------------------------------
             "clipboard.set" -> clipboard().setPrimaryClip(ClipData.newPlainText("", args))
             "clipboard.get" -> {
@@ -2686,7 +2695,23 @@ class MainActivity : Activity(), ChuksModuleHost {
     private val imageBlur = HashMap<String, Float>()           // id -> Image blur radius (px)
     // The color a fresh TextView gets: the default a reused label resets to when its
     // new role emits no `fg` (a colorless Text uses the theme default).
-    private val defaultTextColor: Int by lazy { TextView(this).currentTextColor }
+    // The colour a Text, Button or field gets when the app gave it none. iOS uses
+    // `.label`, which resolves against the appearance the APP is rendering in, because
+    // the host applies the app's theme choice to the window. This used to come from the
+    // Activity theme instead, so a colourless Button was white on a light app whenever
+    // the device happened to be in dark mode: invisible. Same two colours as `.label`.
+    private fun defaultTextColor(): Int = if (appIsDark()) Color.WHITE else Color.BLACK
+    private fun appIsDark(): Boolean = when (appAppearance) { "dark" -> true; "light" -> false; else -> osDark() }
+    // Ids the app gave an explicit text colour. On an appearance change the rest are
+    // repainted to the new default, which is what a dynamic colour does on iOS for free.
+    private val explicitFg = HashSet<String>()
+    private fun repaintDefaultText() {
+        val c = defaultTextColor()
+        for ((id, v) in views) {
+            if (explicitFg.contains(id)) continue
+            if (v is TextView && v !is EditText) v.setTextColor(c)
+        }
+    }
     private val imageOpChain = HashMap<String, String>()       // id -> Image GPU op-chain (JSON)
     private val imageOrigBmp = HashMap<String, android.graphics.Bitmap>()   // id -> pre-op bitmap, for re-applying a changed chain
     private val imageSrc = HashMap<String, String>()           // id -> local image source (asset name or file://), for sized re-decode
@@ -2751,9 +2776,10 @@ class MainActivity : Activity(), ChuksModuleHost {
         // resets these in resetPaintStyle; Android now matches. The loop below re-applies
         // whatever the new role sets.
         (v as? TextView)?.let {
-            it.setTextColor(defaultTextColor)              // fg: a colorless Text uses the default
+            it.setTextColor(defaultTextColor())            // fg: a colorless Text uses the default
             it.setLineSpacing(0f, 1f)                      // leading: back to the font's natural line height
         }
+        explicitFg.remove(id)                              // the loop below records it again if fg is set
         if (v is SeekBar) { v.progressTintList = null; v.thumbTintList = null }              // fg on a Slider
         else if (v is ProgressBar) { v.progressTintList = null; v.indeterminateTintList = null }   // fg on Progress
         (v as? EditText)?.let {                            // input config: kbt/ret/edit/acap/acor/maxlen/sec
@@ -2888,7 +2914,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val st = if (vl == "contain") ImageView.ScaleType.FIT_CENTER else if (vl == "center") ImageView.ScaleType.CENTER else ImageView.ScaleType.CENTER_CROP
                     (v as? ImageView)?.scaleType = st; bgImageViews[id]?.scaleType = st
                 }
-                "fg" -> { val c = hexColor(vl)
+                "fg" -> { val c = hexColor(vl); explicitFg.add(id)
                     (v as? TextView)?.setTextColor(c); (v as? EditText)?.setTextColor(c)
                     // A field's placeholder must follow its text color. The platform default
                     // hint color comes from the Activity theme, not from the field's own
@@ -4223,7 +4249,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 

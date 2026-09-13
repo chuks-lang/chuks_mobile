@@ -4194,7 +4194,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             default: resolve(token, appDir().path)
             }
         case "secure.set":
-            keychainSet(a.s("key"), a.s("value"), protected: false)
+            // A write can fail: the keychain is unavailable on a simulator without the
+            // entitlement, or the key is empty. That used to be discarded here, so the app
+            // read the value back later and found nothing, with nothing anywhere saying
+            // why. With a token the awaited form throws; without one the host logs it.
+            let key = a.s("key")
+            if key.isEmpty { fail(token, "SecureStore.set: the key is empty"); break }
+            if keychainSet(key, a.s("value"), protected: false) { resolve(token, "") }
+            else { fail(token, "SecureStore.set: the keychain refused to store \"\(key)\" (on a simulator this usually means the app has no keychain access; test on a device)") }
         case "secure.setProtected":
             // The write is what creates the access control; it does not itself prompt on
             // iOS (adding an item is allowed), but a later get() does. Off the main
