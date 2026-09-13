@@ -121,8 +121,59 @@ interface ChuksNativeView {
     /** The package's own props, already parsed. Layout and background are the
      *  framework's business and have been applied already. */
     fun apply(a: ChuksArgs)
+    /** Do something, once, because the app asked this instance to: scroll to an index,
+     *  present a sheet, seek to a second, play it again. Props cannot say those: setting
+     *  a prop to the value it already holds changes nothing, so "again" has no spelling.
+     *  The name is the package's own and the arguments arrive parsed, like a command's. */
+    fun command(name: String, a: ChuksArgs) {}
     /** The node left the tree. Stop timers, close sessions, release what you hold. */
     fun destroy() {}
+}
+
+/** How big a self-sizing view wants to be, in pixels. */
+class ChuksSize(val width: Float, val height: Float)
+
+/**
+ * A package view that knows how big it wants to be.
+ *
+ * Implement this and the app can place the view with no `w`/`h` at all: the layout asks
+ * during its own pass, the way it asks a Text. A badge, a chip, a legend, an icon, a
+ * chart as tall as its rows, anything whose size is a property of its content rather than
+ * of the screen. An explicit `w`/`h` from the app still wins, as for every other view.
+ */
+interface ChuksMeasurableView : ChuksNativeView {
+    /**
+     * The size this view wants for the width it is offered, in PIXELS (not dp: the layout
+     * works in device pixels here). `maxWidth` is negative when the layout has not
+     * constrained it, so a view that wants its natural width can ignore the argument.
+     *
+     * Called during layout, possibly several times in one pass, so it must be cheap and
+     * must not change the view tree. When the content changes and the answer would
+     * differ, call `invalidateSize()` on the host rather than measuring eagerly.
+     */
+    fun measure(maxWidth: Float): ChuksSize
+}
+
+/**
+ * A package view that chooses which of its own layers holds the app's children.
+ *
+ * By default a child goes straight into the view the package returned, which is right for
+ * a plain container. Implement this when the package's root is not where children belong:
+ * a card with its own decoration layer above them, a clipping or masking layer, a view
+ * that wraps someone else's SDK surface.
+ *
+ * The framework still LAYS the children out and writes their frames, in the package
+ * root's coordinate space. So the layer handed back must cover the root; use this to
+ * choose the layer, not to move the children. Moving them is the layout's job, and the
+ * app already controls it with ordinary layout props.
+ */
+interface ChuksContainerView : ChuksNativeView {
+    /** Put `child` at `index` among the children the app gave this view. */
+    fun insertChild(child: android.view.View, index: Int)
+    /** Take it out again. */
+    fun removeChild(child: android.view.View) {
+        (child.parent as? android.view.ViewGroup)?.removeView(child)
+    }
 }
 
 /// What a view is handed. Deliberately small: a view draws, reports what the user did,
@@ -136,6 +187,23 @@ interface ChuksViewHost {
      *  A name nothing is listening for costs a map miss and does nothing, so a view may
      *  report freely without knowing what the app subscribed to. */
     fun emit(name: String, value: String)
+
+    /** Report an event that carries more than one thing: which star, which index, which
+     *  region, and what it was before.
+     *
+     *  The payload crosses as JSON, the same way a command's arguments arrive, and the
+     *  package's Chuks half decodes it into a type it declares. Encoding it here rather
+     *  than leaving the view to build a string is the point: a view that joins its values
+     *  with a comma works until a value contains a comma, and every framework that leaves
+     *  this to the author collects one of those bugs per kit. */
+    fun emit(name: String, payload: Map<String, Any?>) {
+        emit(name, org.json.JSONObject(payload).toString())
+    }
+
+    /** This view's content changed, and a self-sizing view would now answer `measure`
+     *  differently. Cheap and idempotent: the layout re-runs once, on the next pass.
+     *  Does nothing for a view that does not size itself. */
+    fun invalidateSize() {}
 }
 
 /// One package's native capability. The namespace it claims is declared in the package's

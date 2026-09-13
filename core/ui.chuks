@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty, useState, Cell } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
@@ -346,6 +346,10 @@ export class Node {
     // are not knowable here, so they are a map. Each is registered under "<id>:<name>"
     // and the host fires it by calling emit(name, value) on the view's host object.
     var events: map[string]any
+    // A package view's handle, when the app asked for one. The reconciler writes this
+    // node's id into it at mount, which is what lets the app call a command on THIS
+    // instance rather than on "the last one rendered".
+    var ref: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -355,6 +359,7 @@ export class Node {
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
         this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1; this.opsChain = ""
         this.events = {}
+        this.ref = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -983,6 +988,121 @@ dataType WebViewProps { ViewProps; url: string? }
  * WebView({ url: "https://chuks.dev", grow: 1, radius: 12 })
  * ```
  */
+// ---- A handle to one mounted view ------------------------------------------
+//
+// Props say what a view IS. A command says what it should DO, once: scroll to this
+// index, present this sheet, seek to this second, play it again. The difference is not
+// style. A prop cannot say "again", because setting it to the value it already holds
+// changes nothing, and the workaround a framework without commands ends up with is a
+// counter prop meaning "I have now asked N times", a state the app has to carry and the
+// view has to remember.
+//
+// The app owns the handle and hands it to the view; the reconciler writes that node's
+// id into it as it mounts. So a command reaches THAT instance and not the last one
+// rendered, for the same reason an event binding is per node.
+export class ViewRef {
+    var id: string
+    // The reconciler that bound this handle, so a command goes out on the same stream as
+    // the mutations it belongs with. Holding it here rather than reaching for the global
+    // host is what lets a screen test observe a command at all.
+    var recon: any
+    // Commands issued before the view existed. A handle is made during a render and an
+    // effect can fire before the host has created anything, so this queue is the
+    // difference between working and silently dropping the first call. Bounded, because
+    // a handle never attached to a view must not grow forever.
+    var queued: []string
+    constructor() { this.id = ""; this.recon = null; this.queued = [] }
+
+    /**
+     * Tell this view to do something. `name` is the package's own; `args` crosses as
+     * JSON, so the native half reads it with the same typed accessors a capability uses.
+     *
+     * ```chuks
+     * carousel.command("scrollTo", { index: 3 })
+     * player.command("seek", { seconds: 12 })
+     * rating.command("flash")
+     * ```
+     */
+    public command(name: string, args: any = null): void {
+        const payload: string = args == null ? "" : json.stringify(args)
+        if (this.id == "" || this.recon == null) {
+            if (this.queued.length < 8) { this.queued.push(name + "\t" + payload) }
+            return
+        }
+        const r: Reconciler = this.recon
+        r.emit("VC|" + this.id + "|" + name + "|" + payload)
+    }
+    // The line is VC|<id>|<name>|<json>. The arguments are JSON, so a pipe inside them is
+    // safe: every host rejoins everything after the third field, the way it already does
+    // for a capability's arguments.
+    /** Is this handle attached to a mounted view? */
+    public attached(): bool { return this.id != "" }
+
+    // Framework-internal: the reconciler binds the handle to a node as it mounts or
+    // re-renders it, and anything the app asked for before that goes out now, in order.
+    bindTo(nodeId: string, r: any): void {
+        this.id = nodeId
+        this.recon = r
+        if (this.queued.length == 0) { return }
+        const q: []string = this.queued
+        this.queued = []
+        const rc: Reconciler = r
+        var i: int = 0
+        while (i < q.length) {
+            const parts: []string = q[i].split("\t")
+            rc.emit("VC|" + nodeId + "|" + parts[0] + "|" + (parts.length > 1 ? parts[1] : ""))
+            i = i + 1
+        }
+    }
+    // The node no longer carries this handle. Dropping the id matters: node ids are
+    // structural paths and are reused across screens, so a handle left pointing at one
+    // would aim a later command at whatever holds that path now.
+    unbind(nodeId: string): void { if (this.id == nodeId) { this.id = ""; this.recon = null } }
+}
+
+/**
+ * A `ViewRef` that survives re-renders, like `useState`. Declare it in the component
+ * that renders the view, pass it as the view's `ref` prop, and call commands on it from
+ * anywhere that component reaches.
+ *
+ * ```chuks
+ * var carousel: ViewRef = useViewRef()
+ * ...
+ * Carousel({ ref: carousel, w: 320, h: 180 })
+ * Button({ onPress: function(): void { carousel.command("next") } }, "next")
+ * ```
+ */
+export function useViewRef(): ViewRef {
+    const c: Cell<ViewRef> = useState(new ViewRef())
+    return c.get()
+}
+
+/**
+ * Read a package view's event payload.
+ *
+ * A view's event carries more than one fact more often than not: which star and what it
+ * was before, which index and how far it was dragged, which region and at what zoom. The
+ * native half hands its host a payload, the host writes it as JSON, and this turns that
+ * back into a bag to read with `pvI`, `pvS`, `pvB` and `pvF`.
+ *
+ * It lives here rather than in the package for a reason that is not style: decoding it
+ * in the package means the package imports `std/json`, which is a permission its
+ * consumers have to consent to in their lockfile. A UI kit should not have to ask for a
+ * capability to describe a tap. A value that is not JSON (a plain string event) comes
+ * back as an empty bag, so a mixed package can read both without a guard.
+ *
+ * ```chuks
+ * { change: function(raw: string): void {
+ *       const d: any = eventData(raw)
+ *       p.onChange({ star: pvI(d, "star", 0), previous: pvI(d, "previous", 0) })
+ *   } }
+ * ```
+ */
+export function eventData(raw: string): any {
+    if (raw == "" || raw.slice(0, 1) != "{") { return {} }
+    return json.parse(raw)
+}
+
 /**
  * A view kind supplied by a package.
  *
@@ -1029,8 +1149,24 @@ dataType WebViewProps { ViewProps; url: string? }
  * ```
  *
  * A plain tap still needs no mechanism of its own: wrap the view in a `Pressable`.
+ *
+ * Commands: pass a sixth argument, a `ViewRef` the app owns, and the native side's
+ * `command(name, args)` runs when the app calls `ref.command(...)`. That is for the
+ * things a prop cannot say, because they are an INSTRUCTION rather than a state:
+ * scroll to this index, present this sheet, seek to this second, play it again. A prop
+ * cannot say "again", since setting it to the value it already holds changes nothing.
+ *
+ * ```chuks
+ * export function Carousel(p: CarouselProps): Node {
+ *     return nativeView("kit.carousel", { ... }, p, kids, null, p.ref)
+ * }
+ * // and in the app:
+ * var c: ViewRef = useViewRef()
+ * Carousel({ ref: c, ... })
+ * Button({ onPress: function(): void { c.command("scrollTo", { index: 3 }) } }, "next")
+ * ```
  */
-export function nativeView(kind: string, props: any, layout: any, kids: []Kid, events: any = null): Node {
+export function nativeView(kind: string, props: any, layout: any, kids: []Kid, events: any = null, ref: any = null): Node {
     const s: Style = new Style()
     applyLayoutV(s, layout)
     const n: Node = new Node(kind, s, json.stringify(props), flatKids(kids))
@@ -1042,6 +1178,7 @@ export function nativeView(kind: string, props: any, layout: any, kids: []Kid, e
         var i: int = 0
         while (i < names.length) { n.events[names[i]] = events[names[i]]; i = i + 1 }
     }
+    n.ref = ref
     return n
 }
 
@@ -2553,6 +2690,10 @@ export class Reconciler {
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
         if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
         if (n.onScroll != null) { this.handlers[id + ":scroll"] = n.onScroll; this.emit("SS|" + id) }
+        // A package view's handle learns which node it is. Nothing is emitted: a command
+        // is sent when the APP asks for one, not when the view mounts. Anything the app
+        // asked for before this point was queued on the handle and goes out now.
+        if (n.ref != null) { const r: ViewRef = n.ref; r.bindTo(id, this) }
     }
 
     // Rebind an event handler under `key` when present, or DROP a stale entry when the
@@ -2680,6 +2821,11 @@ export class Reconciler {
         // A package view's named events, rebound the same way: the new closure captures
         // this render's state, and a name the node no longer carries is dropped so a
         // recycled cell cannot fire the previous row's handler.
+        // The handle is re-bound on every pass for the same reason handlers are: the
+        // node at this id can be a different view than it was, and a handle still
+        // pointing here would aim the app's next command at the wrong instance.
+        if (next.ref != null) { const nr: ViewRef = next.ref; nr.bindTo(id, this) }
+        else if (p.ref != null) { const pr: ViewRef = p.ref; pr.unbind(id) }
         const nextEv: []string = next.events.keys()
         var ri: int = 0
         while (ri < nextEv.length) { this.handlers[id + ":" + nextEv[ri]] = next.events[nextEv[ri]]; ri = ri + 1 }

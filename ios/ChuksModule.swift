@@ -133,12 +133,58 @@ public protocol ChuksNativeView: AnyObject {
     /// The package's own props, already parsed. Layout and background are the
     /// framework's business and have been applied already.
     func apply(_ a: ChuksArgs)
+    /// Do something, once, because the app asked this instance to: scroll to an index,
+    /// present a sheet, seek to a second, play it again. Props cannot say those: setting
+    /// a prop to the value it already holds changes nothing, so "again" has no spelling.
+    /// The name is the package's own and the arguments arrive parsed, like a capability's.
+    func command(_ name: String, _ a: ChuksArgs)
     /// The node left the tree. Stop timers, close sessions, release what you hold.
     func destroy()
 }
 
 public extension ChuksNativeView {
+    func command(_ name: String, _ a: ChuksArgs) {}
     func destroy() {}
+}
+
+/// A package view that knows how big it wants to be.
+///
+/// Conform to this and the app can place the view with no `w`/`h` at all: the layout asks
+/// during its own pass, the way it asks a Text. A badge, a chip, a legend, an icon, a
+/// chart that is as tall as its rows, anything whose size is a property of its content
+/// rather than of the screen. An explicit `w`/`h` from the app still wins, as it does for
+/// every other view.
+public protocol ChuksMeasurableView: ChuksNativeView {
+    /// The size this view wants for the width it is offered. `maxWidth` is
+    /// `.greatestFiniteMagnitude` when the layout has not constrained it, so a view that
+    /// wants its natural width can ignore the argument entirely.
+    ///
+    /// Called during layout, possibly several times in one pass, so it must be cheap and
+    /// must not change the view tree. When the content changes and the answer would
+    /// differ, call `invalidateSize()` on the host rather than measuring eagerly.
+    func measure(maxWidth: CGFloat) -> CGSize
+}
+
+/// A package view that chooses which of its own layers holds the app's children.
+///
+/// By default a child goes straight into the view the package returned, which is right
+/// for a plain container. Implement this when the package's root is not where children
+/// belong: a card with its own decoration layer above them, a clipping or masking layer,
+/// a view that wraps someone else's SDK surface.
+///
+/// The framework still LAYS the children out and writes their frames, in the package
+/// root's coordinate space. So the layer you hand back must cover the root; use this to
+/// choose the layer, not to move the children. Moving them is the layout's job, and the
+/// app already controls it with ordinary layout props.
+public protocol ChuksContainerView: ChuksNativeView {
+    /// Put `child` at `index` among the children the app gave this view.
+    func insertChild(_ child: UIView, at index: Int)
+    /// Take it out again. Defaults to `child.removeFromSuperview()`.
+    func removeChild(_ child: UIView)
+}
+
+public extension ChuksContainerView {
+    func removeChild(_ child: UIView) { child.removeFromSuperview() }
 }
 
 /// What a view is handed. Deliberately small: a view draws, reports what the user did,
@@ -152,6 +198,32 @@ public protocol ChuksViewHost: AnyObject {
     /// A name nothing is listening for costs a dictionary miss and does nothing, so a
     /// view may report freely without knowing what the app subscribed to.
     func emit(_ name: String, _ value: String)
+    /// This view's content changed, and a self-sizing view would now answer `measure`
+    /// differently. Cheap and idempotent: the layout re-runs once, on the next pass.
+    /// Does nothing for a view that does not size itself.
+    func invalidateSize()
+}
+
+public extension ChuksViewHost {
+    /// Report an event that carries more than one thing: which star, which index, which
+    /// region, and what it was before.
+    ///
+    /// The payload crosses as JSON, the same way a command's arguments arrive, and the
+    /// package's Chuks half decodes it into a type it declares. Encoding it here rather
+    /// than leaving the view to build a string is the point: a view that joins its
+    /// values with a comma works until a value contains a comma, and every framework
+    /// that leaves this to the author collects one of those bugs per kit.
+    func emit(_ name: String, _ payload: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let d = try? JSONSerialization.data(withJSONObject: payload),
+              let s = String(data: d, encoding: .utf8) else {
+            // A value JSON cannot carry (a UIView, a Date, NaN) is a programming error in
+            // the package, and silence would make it a mystery in the app instead.
+            emit(name, "{\"error\":\"chuks: \(name) payload is not JSON-encodable\"}")
+            return
+        }
+        emit(name, s)
+    }
 }
 
 /// One package's native capability. `namespace` is the part before the dot in every

@@ -1672,6 +1672,30 @@ final class ChuksViewBinding: ChuksViewHost {
     init(vc: CardsVC, id: String) { self.vc = vc; self.id = id }
     var presenter: UIViewController { vc }
     func emit(_ name: String, _ value: String) { vc.fireValue("\(id):\(name)", value) }
+    func invalidateSize() { vc.remeasure(id) }
+}
+
+/// Holds the view a Yoga measure callback belongs to. Yoga's context is a raw pointer, so
+/// it needs one concrete class to point at; the reference is weak because the view is
+/// owned by the host's own table and outlives nothing here.
+final class ChuksMeasureBox {
+    weak var view: AnyObject?
+    init(_ v: AnyObject) { view = v }
+}
+
+// Yoga measure callback for a package view that sizes itself. Mirrors measureText, but
+// asks the package rather than a UILabel.
+let measurePackageView: YGMeasureFunc = { node, width, widthMode, _, _ in
+    guard let node = node, let ctx = YGNodeGetContext(node) else { return YGSize(width: 0, height: 0) }
+    let box = Unmanaged<ChuksMeasureBox>.fromOpaque(ctx).takeUnretainedValue()
+    guard let v = box.view as? ChuksMeasurableView else { return YGSize(width: 0, height: 0) }
+    let maxW = (widthMode == YGMeasureMode.undefined || width.isNaN) ? CGFloat.greatestFiniteMagnitude : CGFloat(width)
+    let sz = v.measure(maxWidth: maxW)
+    // A package that answers with a nonsense number would abort Yoga rather than draw
+    // wrong, so clamp here: the view is a guest, and a guest's arithmetic is not trusted.
+    let w = sz.width.isFinite ? Swift.max(0, sz.width) : 0
+    let h = sz.height.isFinite ? Swift.max(0, sz.height) : 0
+    return YGSize(width: Float(ceil(w)), height: Float(ceil(h)))
 }
 
 final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost {
@@ -3141,6 +3165,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 imageOpChain[f[1]] = f[2...].joined(separator: "|")
                 if let iv = views[f[1]] as? UIImageView { applyOps(iv, f[1]) }
             case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
+            case "VC" where f.count >= 3:
+                // VC|<id>|<name>|<json>: the app told ONE package view to do something.
+                // The arguments are JSON, so a pipe inside them is safe: everything after
+                // the third field is joined back together, as a capability's args are.
+                if let pv = packageViews[f[1]] {
+                    let raw = f.count >= 4 ? f[3...].joined(separator: "|") : ""
+                    pv.command(f[2], ChuksArgs(raw, type(of: pv).kind + "." + f[2], "0", self))
+                }
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
             // LV|<id>: the engine names the LIVE list, i.e. the one on the screen that is
@@ -3296,6 +3328,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return m
     }()
     var packageViews: [String: ChuksNativeView] = [:]
+    /// Measure boxes for the self-sizing package views, kept alive as long as the node is.
+    var measureBoxes: [String: ChuksMeasureBox] = [:]
+    /// Children a package view placed itself: child id -> the package view's id, so the
+    /// same package takes it out again.
+    var containerPlaced: [String: String] = [:]
     var packageViewHosts: [String: ChuksViewBinding] = [:]
 
     var mediaCoord: MediaCoordinator? = nil   // retains the picker/camera delegate while presented
@@ -4999,6 +5036,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 packageViewHosts[id] = binding
                 packageViews[id] = pv
                 v = pv.view
+                // A view that sizes itself is measured by Yoga during layout, exactly like
+                // a Text. Only a LEAF may carry a measure func, which is also true of the
+                // framework's own Text, and insert() clears it if the node gains children.
+                if pv is ChuksMeasurableView {
+                    let box = ChuksMeasureBox(pv)
+                    measureBoxes[id] = box
+                    YGNodeSetContext(n, Unmanaged.passUnretained(box).toOpaque())
+                    YGNodeSetMeasureFunc(n, measurePackageView)
+                }
             } else {
                 v = HitSlopView()   // a plain container that can also carry a Pressable hitSlop
             }
@@ -5657,12 +5703,21 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // horizontal list is itself a scroll), and only one of them can be the "live list".
         if views[parent] is UIScrollView, scrollContentIds[parent] == nil { scrollContentIds[parent] = id }
         guard let pv = views[parent], let pn = ynodes[parent] else { return }
+        // A package view may own where its children go: its root can be a decoration layer,
+        // a mask, or someone else's SDK surface, and a child dropped straight into it lands
+        // in the wrong layer. Only the layer is the package's to choose; the frame is still
+        // the framework's, computed in the package root's coordinate space.
+        if let cv = packageViews[parent] as? ChuksContainerView {
+            cv.insertChild(child, at: index)
+            containerPlaced[id] = parent
+        } else {
         // Skip every decoration already sitting at the back (bg image, glass, gradient), or
         // the child lands underneath it. Counting the tagged prefix rather than testing one
         // dictionary keeps this correct as decorations are added.
         let base = pv.subviews.prefix { $0.tag == CHUKS_DECOR_TAG }.count
         let i = min(index + base, pv.subviews.count)
         pv.insertSubview(child, at: i)
+        }
         // A node id can be reused across a kind change (e.g. a Text becomes a container via
         // conditional rendering / hot reload). Yoga aborts if you add a child to a node that
         // still has a text measure func, so clear it first.
@@ -5681,8 +5736,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // and must stay a dictionary miss -- never the O(views) prefix sweep below.
         if views[id] == nil && ynodes[id] == nil { return }
         if let pv = packageViews.removeValue(forKey: id) { pv.destroy() }
+        measureBoxes[id] = nil
         packageViewHosts[id] = nil
         if let v = views[id] {
+            // A package that chose where this child went takes it out the same way, so a
+            // view held in a layer of its own (a stack's arranged subviews, an SDK's
+            // surface) is released rather than orphaned.
+            if let ownerId = containerPlaced.removeValue(forKey: id),
+               let cv = packageViews[ownerId] as? ChuksContainerView {
+                cv.removeChild(v)
+            }
             for g in v.gestureRecognizers ?? [] {
                 if let t = g as? UITapGestureRecognizer { taps[t] = nil }
                 if let lp = g as? UILongPressGestureRecognizer { pressGestures[lp] = nil }
@@ -6163,6 +6226,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         headerText("action \(action)")
     }
     // A native event carrying a value (onProgress time, etc.) -> the engine, then apply.
+    /// A self-sizing package view says its content changed. Yoga only accepts a dirty
+    /// mark on a node that actually has a measure func, so this is a no-op for a view that
+    /// does not size itself, and the relayout is the same one every other change goes
+    /// through.
+    func remeasure(_ id: String) {
+        guard let n = ynodes[id], YGNodeHasMeasureFunc(n) else { return }
+        YGNodeMarkDirty(n)
+        relayout()
+    }
+
     func fireValue(_ action: String, _ value: String) {
         guard let s = eInput(action, value) else { connected = false; return }
         apply(s); relayout()

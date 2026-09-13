@@ -624,6 +624,11 @@ class MainActivity : Activity(), ChuksModuleHost {
                 }
                 "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
                 "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
+                // VC|<id>|<name>|<json>: the app told ONE package view to do something.
+                // The arguments are JSON, so a pipe inside them is safe: everything after
+                // the third field is joined back together, as a capability's args are.
+                "VC" -> if (f.size >= 3) packageViews[f[1]]?.command(
+                    f[2], ChuksArgs(if (f.size >= 4) f.drop(3).joinToString("|") else "", "view." + f[2], "0", this))
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
                 "R" -> if (f.size >= 2) remove(f[1])
                 // LV|<id>: the engine names the LIVE list (the one on the top screen).
@@ -1115,6 +1120,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     inner class ViewBinding(private val id: String) : ChuksViewHost {
         override val activity: Activity get() = this@MainActivity
         override fun emit(name: String, value: String) { hostInput("$id:$name", value) }
+        override fun invalidateSize() { remeasure(id) }
     }
     private val streamTeardown = mutableMapOf<String, () -> Unit>()
     private val appStateTokens = mutableSetOf<String>()   // tokens watching foreground/background
@@ -2634,6 +2640,10 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val pv = factory(binding)
                     packageViewHosts[id] = binding
                     packageViews[id] = pv
+                    // A view that sizes itself is measured by Yoga during layout, exactly
+                    // like a Text. Only a LEAF may carry a measure func, which is also true
+                    // of the framework's own Text.
+                    if (pv is ChuksMeasurableView) { measureViews[n] = pv; N.ySetTextMeasure(n) }
                     pv.view
                 } else FrameLayout(this)
             }
@@ -2645,6 +2655,12 @@ class MainActivity : Activity(), ChuksModuleHost {
     }
 
     private val textNodes = HashMap<Long, TextView>()
+    /** Self-sizing package views, keyed by Yoga node exactly as textNodes is: one measure
+     *  callback comes back from Yoga and it asks whichever table owns the node. */
+    private val measureViews = HashMap<Long, ChuksMeasurableView>()
+    /** Children a package view placed itself: child id -> the package view's id, so the
+     *  same package takes it out again. */
+    private val containerPlaced = HashMap<String, String>()
 
     // pending visual state per view (bg color + radius) -> a GradientDrawable
     private val bgColor = HashMap<String, Int>()
@@ -3498,9 +3514,29 @@ class MainActivity : Activity(), ChuksModuleHost {
         N.yMarkDirty(n)
     }
 
+    /** A self-sizing package view says its content changed. yMarkDirty is a no-op on a
+     *  node with no measure func, so this costs nothing for a view that does not size
+     *  itself, and the relayout is the one every other change goes through. */
+    private fun remeasure(id: String) {
+        val n = ynodes[id] ?: return
+        N.yMarkDirty(n)
+        relayout()
+    }
+
     // Yoga measure callback (from jni.cpp during layout): measure the TextView at the width
     // Yoga resolved, so text wraps to its container. wmode: 0 undefined, 1 exactly, 2 at-most.
     private fun measureTextNode(node: Long, width: Float, wmode: Int): Long {
+        measureViews[node]?.let { mv ->
+            // Unconstrained arrives as mode 0 (undefined); tell the package with a
+            // negative width rather than a NaN it has to test for.
+            val sz = mv.measure(if (wmode == 0) -1f else width)
+            // A package that answers with a nonsense number would abort Yoga rather than
+            // draw wrong, so clamp: the view is a guest, and a guest's arithmetic is not
+            // trusted.
+            val w = if (sz.width.isFinite()) maxOf(0f, sz.width) else 0f
+            val h = if (sz.height.isFinite()) maxOf(0f, sz.height) else 0f
+            return (w.toInt().toLong() shl 32) or (h.toInt().toLong() and 0xffffffffL)
+        }
         val tv = textNodes[node] ?: return 0L
         val wSpec = when (wmode) {
             1 -> View.MeasureSpec.makeMeasureSpec(width.toInt(), View.MeasureSpec.EXACTLY)
@@ -3606,10 +3642,20 @@ class MainActivity : Activity(), ChuksModuleHost {
         if (parent == "root") { root.addView(child); return }
         if (modalIds.contains(id)) { root.addView(child); return }   // Modal overlays mount on root, above the app
         if (parent == scrollId) contentId = id
-        val pv = views[parent] as? ViewGroup ?: return
         val pn = ynodes[parent] ?: return
-        val base = if (bgImageViews.containsKey(parent)) 1 else 0   // keep an ImageBackground's bg image at the back
-        pv.addView(child, minOf(index + base, pv.childCount))
+        // A package view may own where its children go: its root can be a decoration layer,
+        // a mask, or someone else's SDK surface, and a child dropped straight into it lands
+        // in the wrong layer. Only the layer is the package's to choose; the frame is still
+        // the framework's, computed in the package root's coordinate space.
+        val container = packageViews[parent] as? ChuksContainerView
+        if (container != null) {
+            container.insertChild(child, index)
+            containerPlaced[id] = parent
+        } else {
+            val pv = views[parent] as? ViewGroup ?: return
+            val base = if (bgImageViews.containsKey(parent)) 1 else 0   // keep an ImageBackground's bg image at the back
+            pv.addView(child, minOf(index + base, pv.childCount))
+        }
         val cn = ynodes[id]!!
         // Yoga aborts if `cn` still has an owner (a hot reload can re-emit an insert for a
         // node already parented). Detach it from its old owner first (reconciler re-parent).
@@ -4165,8 +4211,14 @@ class MainActivity : Activity(), ChuksModuleHost {
         if (!views.containsKey(id) && !ynodes.containsKey(id)) return
         packageViews.remove(id)?.destroy()
         packageViewHosts.remove(id)
-        views[id]?.let { (it.parent as? ViewGroup)?.removeView(it) }
-        ynodes[id]?.let { textNodes.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
+        // A package that chose where this child went takes it out the same way, so a view
+        // held in a layer of its own is released rather than orphaned.
+        views[id]?.let { v ->
+            val owner = containerPlaced.remove(id)
+            val cv = if (owner != null) packageViews[owner] as? ChuksContainerView else null
+            if (cv != null) cv.removeChild(v) else (v.parent as? ViewGroup)?.removeView(v)
+        }
+        ynodes[id]?.let { textNodes.remove(it); measureViews.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
