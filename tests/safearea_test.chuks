@@ -1,0 +1,99 @@
+// SafeAreaView: a Column whose padding includes the safe-area insets.
+//
+// The insets are what the host reports for the notch, the status bar and the home
+// indicator. A screen that ignores them puts its first row under the notch, which is
+// what the scaffolded home screen did. These tests set the insets the way the host
+// does and read the resolved padding back out of the mutation stream, where a style
+// serialises as `pt=N;pb=N;...`.
+//
+// Run:  chuks run tests/safearea_test.chuks   (exits non-zero on failure)
+import { Node, SafeAreaView, Scroll, Text, Column, setSafeInsets, setConsumedTop } from "../core/ui.chuks";
+import { render, Screen } from "../core/testing.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+/** The root view's style line, `S|app|d=col;...`, which is the SafeAreaView itself. */
+function rootStyle(s: Screen): string {
+    const lines: []string = s.mutations()
+    var i: int = 0
+    while (i < lines.length) {
+        if (lines[i].startsWith("S|app|")) { return lines[i] }
+        i = i + 1
+    }
+    return ""
+}
+function has(style: string, key: string, v: int): bool { return style.contains(key + "=" + string(v) + ";") }
+
+function main(): void {
+    println("safearea_test")
+    // An iPhone with a Dynamic Island: 59 above, 34 below, nothing at the sides.
+    setSafeInsets(59, 0, 34, 0)
+
+    // ---- every edge, no padding of its own ----
+    var st: string = rootStyle(render(function(): Node { return SafeAreaView({}, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 59), "top inset becomes top padding")
+    check(has(st, "pb", 34), "bottom inset becomes bottom padding")
+    check(has(st, "pl", 0) && has(st, "pr", 0), "sides are 0 when the host reports none")
+
+    // ---- padding ADDS to the inset ----
+    st = rootStyle(render(function(): Node { return SafeAreaView({ pad: 14 }, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 73), "pad: 14 is fourteen inside the top inset (59 + 14)")
+    check(has(st, "pb", 48), "and fourteen inside the bottom one (34 + 14)")
+    check(has(st, "pl", 14) && has(st, "pr", 14), "and fourteen on the sides, which have no inset")
+
+    // ---- precedence: per-side beats axis beats pad, the same as Style ----
+    st = rootStyle(render(function(): Node { return SafeAreaView({ pad: 14, pt: 0 }, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 59), "pt: 0 with pad: 14 is the bare inset at the top")
+    check(has(st, "pb", 48), "while the bottom still gets pad")
+    st = rootStyle(render(function(): Node { return SafeAreaView({ py: 10, px: 20 }, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 69) && has(st, "pb", 44), "py adds to both vertical insets")
+    check(has(st, "pl", 20) && has(st, "pr", 20), "px sets the sides")
+
+    // ---- edges ----
+    st = rootStyle(render(function(): Node { return SafeAreaView({ edges: "top" }, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 59), "edges: \"top\" applies the top")
+    check(has(st, "pb", 0), "and not the bottom, for a screen whose bottom a tab bar owns")
+    st = rootStyle(render(function(): Node { return SafeAreaView({ edges: "bottom" }, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 0) && has(st, "pb", 34), "edges: \"bottom\" is the reverse")
+
+    // ---- landscape: a notch on the side ----
+    setSafeInsets(0, 59, 21, 59)
+    st = rootStyle(render(function(): Node { return SafeAreaView({}, [ Text({}, "x") ]) }))
+    check(has(st, "pl", 59) && has(st, "pr", 59) && has(st, "pt", 0), "a landscape notch pads the sides, not the top")
+    setSafeInsets(59, 0, 34, 0)
+
+    // ---- composes inside a tab whose header cleared the top ----
+    setConsumedTop(59)
+    st = rootStyle(render(function(): Node { return SafeAreaView({ pad: 14 }, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 14), "inside a consumed top the SafeAreaView adds only its own padding")
+    setConsumedTop(0)
+
+    // ---- content form: SafeAreaView([...]) with no props ----
+    st = rootStyle(render(function(): Node { return SafeAreaView([ Text({}, "x") ]) }))
+    check(has(st, "pt", 59), "the props-less form pads too")
+
+    // ---- fills the space by default, so a Scroll inside it has a height ----
+    st = rootStyle(render(function(): Node { return SafeAreaView({}, [ Scroll({ dir: "col", grow: 1 }, [ Text({}, "x") ]) ]) }))
+    check(st.contains("g=1;"), "grows by default, as a screen-level wrapper")
+    st = rootStyle(render(function(): Node { return SafeAreaView({ grow: 0 }, [ Text({}, "x") ]) }))
+    check(!st.contains("g=1;"), "grow: 0 opts out, for a content-sized bar")
+
+    // ---- "all" is the default and the word ----
+    st = rootStyle(render(function(): Node { return SafeAreaView({ edges: "all" }, [ Text({}, "x") ]) }))
+    check(has(st, "pt", 59) && has(st, "pb", 34), "edges: \"all\" is every side")
+
+    // ---- it is a Column: stacks, and the children are there ----
+    const s: Screen = render(function(): Node { return SafeAreaView({ gap: 4 }, [ Text({}, "one"), Text({}, "two") ]) })
+    check(s.has("one") && s.has("two"), "children render")
+    check(rootStyle(s).contains("d=col;"), "it stacks vertically like a Column")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("safearea_test failed") }
+}
+main()

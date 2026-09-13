@@ -1,0 +1,77 @@
+// Text on the wire keeps every character.
+//
+// A string position is a byte. escText/packField/unesc used to walk a string with
+// slice(i, i + 1) one byte at a time, which under byte positions returns "" on every
+// byte of a multi-byte character: "café 😀" typed into a controlled TextInput reached
+// the host as "caf  ", and a contact named "Zoë" came back from the host as "Zo".
+// This drives the real reconciler and the real unescaper on text where a byte and a
+// character differ, and asserts the text crosses whole in both directions.
+//
+// Run:  chuks run tests/wire_text_test.chuks   (exits non-zero on failure)
+
+import { Node, Column, Text, TextInput, Select, Reconciler } from "../core/ui.chuks";
+import { wireUnesc, wireFields } from "../core/native.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+// The payload of the first wire line that starts with `op|`, with the op and id cut off.
+function payloadOf(stream: string, op: string): string {
+    const lines: []string = stream.split("\n")
+    var i: int = 0
+    while (i < lines.length) {
+        const l: string = lines[i]
+        i = i + 1
+        if (l.startsWith(op + "|")) {
+            const rest: string = l.slice(op.length + 1)
+            const bar: int = rest.indexOf("|")
+            return bar >= 0 ? rest.slice(bar + 1) : ""
+        }
+    }
+    return ""
+}
+
+function main(): void {
+    const sample: string = "café 😀 Zoë ★ line\\end"
+
+    // A Text node: the P| channel.
+    const r: Reconciler = new Reconciler()
+    r.drain(); r.renderRoot(Column({}, [ Text({}, sample) ]))
+    const p: string = payloadOf(r.drain(), "P")
+    check(p == "café 😀 Zoë ★ line\\\\end", "Text crosses with every character and the backslash doubled (got [" + p + "])")
+
+    // A controlled TextInput: the V| channel.
+    const r2: Reconciler = new Reconciler()
+    r2.drain(); r2.renderRoot(Column({}, [ TextInput({ value: sample }) ]))
+    const v: string = payloadOf(r2.drain(), "V")
+    check(v == "café 😀 Zoë ★ line\\\\end", "controlled value crosses with every character (got [" + v + "])")
+
+    // A newline is written as the two characters \ and n, around non-ASCII neighbours.
+    const r3: Reconciler = new Reconciler()
+    r3.drain(); r3.renderRoot(Column({}, [ Text({}, "é\nü") ]))
+    check(payloadOf(r3.drain(), "P") == "é\\nü", "a newline between accented characters is escaped, the characters kept")
+
+    // Packed fields (Select options): a tab is protected, the characters kept.
+    const r4: Reconciler = new Reconciler()
+    r4.drain(); r4.renderRoot(Column({}, [ Select({ value: 0 }, ["Zoë", "a\tb", "😀"]) ]))
+    const s4: string = payloadOf(r4.drain(), "P")
+    check(s4.indexOf("Zoë") >= 0 && s4.indexOf("😀") >= 0 && s4.indexOf("a\\\\tb") >= 0,
+        "packed options keep their characters and protect a tab (got [" + s4 + "])")
+
+    // The other direction: a host payload unescaped in Chuks.
+    check(wireUnesc("Zo\\u00eb") == "Zo\\u00eb", "an unknown escape is left alone")
+    check(wireUnesc("Zoë\;Ünal\\\\") == "Zoë;Ünal\\", "unescape keeps accented characters around escapes")
+    check(wireUnesc("😀\\nü") == "😀\nü", "unescape keeps an emoji before an escape")
+    const fs: []string = wireFields("café\tZoë\t😀")
+    check(fs.length == 3 && fs[0] == "café" && fs[1] == "Zoë" && fs[2] == "😀", "fields split on tabs keep their characters")
+
+    println("")
+    println("wire text: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("wire text tests failed") }
+}
+
+main();

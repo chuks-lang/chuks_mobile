@@ -110,11 +110,19 @@ MANIFEST = {
     "slmax": (PERSISTENT, "slider max (controlled)"), "slstep": (PERSISTENT, "slider step (controlled)"),
     "rfsh": (PERSISTENT, "pull-to-refresh (controlled)"), "seli": (PERSISTENT, "select index (controlled)"),
     "mvis": (PERSISTENT, "modal visible (driven every render)"), "mpos": (PERSISTENT, "modal position"),
+    "panc": (PERSISTENT, "popover anchor (with the popover)"), "pplc": (PERSISTENT, "popover placement (with the popover)"),
+    "pgap": (PERSISTENT, "popover gap (with the popover)"), "parw": (PERSISTENT, "popover arrow (with the popover)"),
     "swtc": (PERSISTENT, "switch thumb color (with the switch)"), "paging": (PERSISTENT, "scroll paging (with the scroll)"),
     "stick": (PERSISTENT, "scroll stick-bottom (with the scroll)"), "horiz": (PERSISTENT, "horizontal list (with the scroll)"),
     "dp": (PERSISTENT, "date-picker mode"), "dpd": (PERSISTENT, "date-picker display"),
     "img": (PERSISTENT, "systemName icon (with the image)"),
     "sel": (RESET, "text selectable (iOS reset; Android sets each present)"),
+    # Accessibility: any of the six marks the id (a11yIds) and both hosts' reset paths
+    # restore the class default (element-ness, traits/delegate, label, hint, value,
+    # hidden, live region) for a marked id before the next role is applied.
+    "al": (RESET, "a11y label: resetA11y on both hosts"), "ah": (RESET, "a11y hint: resetA11y on both hosts"),
+    "ar": (RESET, "a11y role: resetA11y on both hosts"), "as": (RESET, "a11y state: resetA11y on both hosts"),
+    "ax": (RESET, "a11y hidden: resetA11y on both hosts"), "av": (RESET, "a11y live region: resetA11y on both hosts"),
 
     # ---- App-singleton (status bar): not per-node reuse state -------------------
     "sbh": (GLOBAL, "status bar hidden"), "sbstyle": (GLOBAL, "status bar style"),

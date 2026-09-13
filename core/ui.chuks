@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty, useState, Cell } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
@@ -136,6 +136,19 @@ export class Style {
     var selectable: int // Text: 1 = user can select/copy the text (-1 = no)
     var hitSlop: int    // Pressable: extra tappable px beyond the visual bounds (-1 = none)
     var spinner: int    // Image: 1 = show a loading spinner until the image loads (-1 = no)
+    // Accessibility: what a screen reader says and how it treats the node. Every value
+    // crosses as a style key so a reused node is reset with the rest (style_reset_coverage).
+    var a11yLabel: string   // what it is ("" = the host's default: a label's text, a button's title)
+    var a11yHint: string    // what it does ("Adds the item to your cart")
+    var a11yRole: string    // button|link|image|header|switch|checkbox|radio|tab|search|adjustable|alert|text|none
+    var a11yState: string   // comma-joined tokens: dis, sel, chk, unchk, mixed, exp, col, busy
+    var a11yHidden: int     // 1 = decoration, skipped by the screen reader (with its subtree)
+    var a11yLive: string    // "polite" | "assertive": announce this node's text when it changes
+    // Popover: anchored overlay. The anchor is a mounted node's id; the host measures it.
+    var pAnchor: string     // node id of the anchor ("" = none: the content is centered)
+    var pPlace: string      // "auto" | "top" | "bottom" | "left" | "right"
+    var pGap: int           // points between the anchor and the content (-1 = default 8)
+    var pArrow: int         // 1 = draw an arrow pointing at the anchor (-1 = none)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
@@ -165,6 +178,8 @@ export class Style {
         this.tint = ""; this.imgFilter = ""; this.seekTo = -1; this.vidCtrls = -1
         this.vidVol = -1; this.vidRate = -1; this.blur = -1; this.longDelay = -1
         this.selectable = -1; this.hitSlop = -1; this.spinner = -1
+        this.a11yLabel = ""; this.a11yHint = ""; this.a11yRole = ""; this.a11yState = ""; this.a11yHidden = -1; this.a11yLive = ""
+        this.pAnchor = ""; this.pPlace = ""; this.pGap = -1; this.pArrow = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -270,6 +285,14 @@ export class Style {
         if (this.selectable >= 0) { s = s + "sel=" + string(this.selectable) + ";" }
         if (this.hitSlop >= 0) { s = s + "hitslop=" + string(this.hitSlop) + ";" }
         if (this.spinner >= 0) { s = s + "spin=" + string(this.spinner) + ";" }
+        // Free text is percent-escaped: a label may hold ";", "=", "|" or a newline, each of
+        // which is a separator somewhere between here and the host (styleEsc).
+        if (this.a11yLabel != "") { s = s + "al=" + styleEsc(this.a11yLabel) + ";" }
+        if (this.a11yHint != "") { s = s + "ah=" + styleEsc(this.a11yHint) + ";" }
+        if (this.a11yRole != "") { s = s + "ar=" + this.a11yRole + ";" }
+        if (this.a11yState != "") { s = s + "as=" + this.a11yState + ";" }
+        if (this.a11yHidden >= 0) { s = s + "ax=" + string(this.a11yHidden) + ";" }
+        if (this.a11yLive != "") { s = s + "av=" + this.a11yLive + ";" }
         if (this.swOn >= 0) { s = s + "on=" + string(this.swOn) + ";" }
         if (this.swThumb != "") { s = s + "swtc=" + this.swThumb + ";" }
         if (this.press >= 0) { s = s + "press=" + string(this.press) + ";" }
@@ -280,6 +303,12 @@ export class Style {
         if (this.sbNavColor != "") { s = s + "sbnavcolor=" + this.sbNavColor + ";" }
         if (this.mvis >= 0) { s = s + "mvis=" + string(this.mvis) + ";" }
         if (this.mpos != "") { s = s + "mpos=" + this.mpos + ";" }
+        // Popover placement rides with mvis: re-sent while the popover is active, so the
+        // host re-measures the anchor on every render it is visible for.
+        if (this.pAnchor != "") { s = s + "panc=" + this.pAnchor + ";" }
+        if (this.pPlace != "") { s = s + "pplc=" + this.pPlace + ";" }
+        if (this.pGap >= 0) { s = s + "pgap=" + string(this.pGap) + ";" }
+        if (this.pArrow >= 0) { s = s + "parw=" + string(this.pArrow) + ";" }
         if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
             s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
             s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
@@ -335,12 +364,24 @@ export class Node {
     // Slider: fires once when the drag gesture ENDS (RN onSlidingComplete), with
     // the final value; distinct from onChange which streams during the drag.
     var onSlideDone: any
+    // Any node: onLayout fires with the node's frame (x, y relative to its parent, w, h;
+    // points) after the host lays it out, and again whenever that frame changes.
+    var onLayout: any
     // Scroll container: onScroll streams the scroll offset (logical points) as the
     // user scrolls; scrollTo imperatively scrolls to an offset (>= 0 = active).
     var onScroll: any
     var scrollTo: int
     // Image GPU op-chain (a JSON op list from effects.chain); the host runs it on the GPU.
     var opsChain: string
+    // A package view's own events, by name: "scan" -> the closure the app passed. The
+    // framework's events are fixed fields above because it knows them all; a package's
+    // are not knowable here, so they are a map. Each is registered under "<id>:<name>"
+    // and the host fires it by calling emit(name, value) on the view's host object.
+    var events: map[string]any
+    // A package view's handle, when the app asked for one. The reconciler writes this
+    // node's id into it at mount, which is what lets the app call a command on THIS
+    // instance rather than on "the last one rendered".
+    var ref: any
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
@@ -348,7 +389,9 @@ export class Node {
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
-        this.onSlideDone = null; this.onScroll = null; this.scrollTo = -1; this.opsChain = ""
+        this.onSlideDone = null; this.onScroll = null; this.onLayout = null; this.scrollTo = -1; this.opsChain = ""
+        this.events = {}
+        this.ref = null
     }
     // Give a Comp an explicit identity key (chainable): new Counter().key(item.id)
     // (or Comp(Counter).key(id)). Use it when a slot is reused or a loop reorders.
@@ -434,6 +477,9 @@ function mkStatusBar(style: Style): Node { return new Node("StatusBar", style, "
 // Build a modal node. The host renders its children in an OVERLAY layer (scrim +
 // content) on top of everything when mvis=1; renders nothing inline.
 function mkModal(style: Style, kids: []Node): Node { return new Node("Modal", style, "", kids) }
+// Build a popover node: an overlay like a Modal, whose content the host places beside the
+// anchor node named in the style (measured at layout time), flipping to fit the screen.
+function mkPopover(style: Style, kids: []Node): Node { return new Node("Popover", style, "", kids) }
 // Build an alert node: the host presents a NATIVE alert when avis=1. Title / message /
 // button labels ride the text field (tab-joined). Renders nothing inline.
 function mkAlert(style: Style, joined: string): Node { return new Node("Alert", style, joined, []) }
@@ -618,7 +664,7 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
 // caller imports nothing but the component. Inside, a builder hands the props
 // (as `any`) to the shared applyLayoutV/applyEventsV, which read fields BY KEY (a
 // dataType is map-backed), so one pair of helpers serves every typed builder.
-dataType LayoutProps {
+export dataType LayoutProps {
     gap: int?; pad: int?; px: int?; py: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
     align: string?; justify: string?; bg: string?; color: string?; size: int?;
     weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
@@ -638,12 +684,29 @@ dataType LayoutProps {
     // Typography extras, box overflow, self-align, hidden/italic toggles.
     tracking: int?; leading: int?; deco: string?; transform: string?; fontFamily: string?;
     overflow: string?; self: string?; hidden: bool?; italic: bool?;
+    // Accessibility (see applyA11y): what a screen reader says and how it treats the node.
+    a11yLabel: string?; a11yHint: string?; a11yRole: string?; a11yState: A11yState?;
+    a11yHidden: bool?; a11yLive: string?;
 }
+/**
+ * The state a screen reader announces for a control. Only the fields you set are spoken:
+ * a checkbox with `checked: false` says "unchecked", one with no `checked` says nothing
+ * about it. `expanded` reads "expanded" / "collapsed" the same way.
+ */
+export dataType A11yState { disabled: bool?; selected: bool?; checked: bool?; expanded: bool?; busy: bool? }
 dataType EventProps {
     onPress: (function(): void)?; onChange: (function(v: string): void)?;
     onLongPress: (function(): void)?; onPressIn: (function(): void)?; onPressOut: (function(): void)?;
+    onLayout: (function(e: LayoutBox): void)?;
 }
-export dataType ViewProps { LayoutProps; EventProps }
+/**
+ * The frame the host gave a node: `x`, `y` relative to its parent, `w`, `h`, in points.
+ * Delivered by `onLayout` after the first layout and again whenever the frame changes.
+ */
+export dataType LayoutBox { x: int; y: int; w: int; h: int }
+// `ref` is a useViewRef() handle: the node's id is written into it when it mounts, so
+// the view can be named to something else (a Popover's anchor) or sent a command.
+export dataType ViewProps { LayoutProps; EventProps; ref: ViewRef? }
 export dataType TextProps { ViewProps; numberOfLines: int?; ellipsizeMode: string?; selectable: bool? }
 
 // By-key field readers over an `any` (a map-backed dataType), mirroring pInt/pStr/pBool.
@@ -716,6 +779,27 @@ function applyLayoutV(s: Style, p: any): void {
     s.scl = pvI(p, "scale", s.scl)
     s.animMs = pvI(p, "anim", s.animMs)
     s.animEz = pvS(p, "easing", s.animEz)
+    applyA11y(s, p)
+}
+// Accessibility props onto the style. The state is a typed bag of optional bools and
+// crosses as tokens, one per field that was SET, so "checked: false" (say "unchecked")
+// and "no checked at all" (say nothing) stay different on the host.
+function applyA11y(s: Style, p: any): void {
+    s.a11yLabel = pvS(p, "a11yLabel", s.a11yLabel)
+    s.a11yHint = pvS(p, "a11yHint", s.a11yHint)
+    s.a11yRole = pvS(p, "a11yRole", s.a11yRole)
+    s.a11yLive = pvS(p, "a11yLive", s.a11yLive)
+    if (p["a11yHidden"] != null) { s.a11yHidden = pvB(p, "a11yHidden", false) ? 1 : 0 }
+    const st: any = p["a11yState"]
+    if (st != null) {
+        var toks: []string = []
+        if (st["disabled"] != null) { if (pvB(st, "disabled", false)) { toks.push("dis") } }
+        if (st["selected"] != null) { if (pvB(st, "selected", false)) { toks.push("sel") } }
+        if (st["checked"] != null) { toks.push(pvB(st, "checked", false) ? "chk" : "unchk") }
+        if (st["expanded"] != null) { toks.push(pvB(st, "expanded", false) ? "exp" : "col") }
+        if (st["busy"] != null) { if (pvB(st, "busy", false)) { toks.push("busy") } }
+        s.a11yState = toks.join(",")
+    }
 }
 // The typed-props twin of applyEvents: wire onPress/onChange/onLongPress/onPressIn/onPressOut
 // closures from a typed props bag (read by key) onto a node.
@@ -725,6 +809,15 @@ function applyEventsV(n: Node, p: any): void {
     const c: any = p["onLongPress"]; if (c != null) { n.onLongPress = c }
     const d: any = p["onPressIn"]; if (d != null) { n.onPressIn = d }
     const e: any = p["onPressOut"]; if (e != null) { n.onPressOut = e }
+    const rf: any = p["ref"]; if (rf != null) { n.ref = rf }
+    // The host reports "x,y,w,h"; the app gets a LayoutBox.
+    const l: any = p["onLayout"]
+    if (l != null) { n.onLayout = function(v: string): void { l(decodeLayoutBox(v)) } }
+}
+function decodeLayoutBox(v: string): LayoutBox {
+    const f: []string = v.split(",")
+    return { x: f.length > 0 ? int(f[0]) : 0, y: f.length > 1 ? int(f[1]) : 0,
+             w: f.length > 2 ? int(f[2]) : 0, h: f.length > 3 ? int(f[3]) : 0 }
 }
 // The typed-props twin of applyMediaEvents: wire onLoad/onError/onEnd/onProgress (Image/Video)
 // from a typed props bag (read by key) onto a node.
@@ -918,7 +1011,7 @@ dataType ImageProps {
  * bytes asynchronously and shows them; give it a size (`w`/`h`) and optional
  * `radius`. `resize`: "cover" (fill, crop, the default), "contain" (fit), "center".
  * (For a local SF Symbol icon use `Icon`/`name` instead.) The URL rides the text
- * channel, so it may not contain a newline or "|".
+ * channel, which escapes newlines and rejoins pipes, so any URL is safe.
  *
  * Props: `src` (URL), `w`, `h`, `radius`, `resize`, `bg` (placeholder color),
  *   `tintColor`, `blurRadius`, `spinner`, and `filter`, a GPU photo-filter preset
@@ -968,8 +1061,8 @@ dataType WebViewProps { ViewProps; url: string? }
 /**
  * A native web view (WKWebView on iOS, android.webkit.WebView on Android) that
  * loads a URL. Give it a size (`w`/`h`) or let it `grow` to fill, plus optional
- * `radius`. The URL rides the text channel, so it may not contain a newline or
- * "|" (fine for normal URLs). (Inline HTML can be added later via encoding.)
+ * `radius`. The URL rides the text channel, which escapes newlines and rejoins pipes,
+ * so any URL is safe. (Inline HTML can be added later via encoding.)
  *
  * Props: `url`, `w`, `h`, `grow`, `radius`, `bg`.
  *
@@ -977,6 +1070,121 @@ dataType WebViewProps { ViewProps; url: string? }
  * WebView({ url: "https://chuks.dev", grow: 1, radius: 12 })
  * ```
  */
+// ---- A handle to one mounted view ------------------------------------------
+//
+// Props say what a view IS. A command says what it should DO, once: scroll to this
+// index, present this sheet, seek to this second, play it again. The difference is not
+// style. A prop cannot say "again", because setting it to the value it already holds
+// changes nothing, and the workaround a framework without commands ends up with is a
+// counter prop meaning "I have now asked N times", a state the app has to carry and the
+// view has to remember.
+//
+// The app owns the handle and hands it to the view; the reconciler writes that node's
+// id into it as it mounts. So a command reaches THAT instance and not the last one
+// rendered, for the same reason an event binding is per node.
+export class ViewRef {
+    var id: string
+    // The reconciler that bound this handle, so a command goes out on the same stream as
+    // the mutations it belongs with. Holding it here rather than reaching for the global
+    // host is what lets a screen test observe a command at all.
+    var recon: any
+    // Commands issued before the view existed. A handle is made during a render and an
+    // effect can fire before the host has created anything, so this queue is the
+    // difference between working and silently dropping the first call. Bounded, because
+    // a handle never attached to a view must not grow forever.
+    var queued: []string
+    constructor() { this.id = ""; this.recon = null; this.queued = [] }
+
+    /**
+     * Tell this view to do something. `name` is the package's own; `args` crosses as
+     * JSON, so the native half reads it with the same typed accessors a capability uses.
+     *
+     * ```chuks
+     * carousel.command("scrollTo", { index: 3 })
+     * player.command("seek", { seconds: 12 })
+     * rating.command("flash")
+     * ```
+     */
+    public command(name: string, args: any = null): void {
+        const payload: string = args == null ? "" : json.stringify(args)
+        if (this.id == "" || this.recon == null) {
+            if (this.queued.length < 8) { this.queued.push(name + "\t" + payload) }
+            return
+        }
+        const r: Reconciler = this.recon
+        r.emit("VC|" + this.id + "|" + name + "|" + payload)
+    }
+    // The line is VC|<id>|<name>|<json>. The arguments are JSON, so a pipe inside them is
+    // safe: every host rejoins everything after the third field, the way it already does
+    // for a capability's arguments.
+    /** Is this handle attached to a mounted view? */
+    public attached(): bool { return this.id != "" }
+
+    // Framework-internal: the reconciler binds the handle to a node as it mounts or
+    // re-renders it, and anything the app asked for before that goes out now, in order.
+    bindTo(nodeId: string, r: any): void {
+        this.id = nodeId
+        this.recon = r
+        if (this.queued.length == 0) { return }
+        const q: []string = this.queued
+        this.queued = []
+        const rc: Reconciler = r
+        var i: int = 0
+        while (i < q.length) {
+            const parts: []string = q[i].split("\t")
+            rc.emit("VC|" + nodeId + "|" + parts[0] + "|" + (parts.length > 1 ? parts[1] : ""))
+            i = i + 1
+        }
+    }
+    // The node no longer carries this handle. Dropping the id matters: node ids are
+    // structural paths and are reused across screens, so a handle left pointing at one
+    // would aim a later command at whatever holds that path now.
+    unbind(nodeId: string): void { if (this.id == nodeId) { this.id = ""; this.recon = null } }
+}
+
+/**
+ * A `ViewRef` that survives re-renders, like `useState`. Declare it in the component
+ * that renders the view, pass it as the view's `ref` prop, and call commands on it from
+ * anywhere that component reaches.
+ *
+ * ```chuks
+ * var carousel: ViewRef = useViewRef()
+ * ...
+ * Carousel({ ref: carousel, w: 320, h: 180 })
+ * Button({ onPress: function(): void { carousel.command("next") } }, "next")
+ * ```
+ */
+export function useViewRef(): ViewRef {
+    const c: Cell<ViewRef> = useState(new ViewRef())
+    return c.get()
+}
+
+/**
+ * Read a package view's event payload.
+ *
+ * A view's event carries more than one fact more often than not: which star and what it
+ * was before, which index and how far it was dragged, which region and at what zoom. The
+ * native half hands its host a payload, the host writes it as JSON, and this turns that
+ * back into a bag to read with `pvI`, `pvS`, `pvB` and `pvF`.
+ *
+ * It lives here rather than in the package for a reason that is not style: decoding it
+ * in the package means the package imports `std/json`, which is a permission its
+ * consumers have to consent to in their lockfile. A UI kit should not have to ask for a
+ * capability to describe a tap. A value that is not JSON (a plain string event) comes
+ * back as an empty bag, so a mixed package can read both without a guard.
+ *
+ * ```chuks
+ * { change: function(raw: string): void {
+ *       const d: any = eventData(raw)
+ *       p.onChange({ star: pvI(d, "star", 0), previous: pvI(d, "previous", 0) })
+ *   } }
+ * ```
+ */
+export function eventData(raw: string): any {
+    if (raw == "" || raw.slice(0, 1) != "{") { return {} }
+    return json.parse(raw)
+}
+
 /**
  * A view kind supplied by a package.
  *
@@ -996,8 +1204,8 @@ dataType WebViewProps { ViewProps; url: string? }
  *
  * ```chuks
  * export dataType RingProps {
- *     progress: float?; color: string?;
- *     w: int?; h: int?; grow: int?; pad: int?; bg: string?; radius: int?; tw: string?;
+ *     LayoutProps;                          // w, h, grow, pad, bg, radius, tw and the rest
+ *     progress: float?; color: string?;     // the package's own
  * }
  *
  * export function Ring(p: RingProps): Node {
@@ -1008,15 +1216,55 @@ dataType WebViewProps { ViewProps; url: string? }
  * }
  * ```
  *
- * The layout half of that type is listed rather than inherited because a dataType cannot
- * embed a type from another module yet, so `ViewProps` is out of reach from a package.
+ * Embed `LayoutProps`, not `ViewProps`. ViewProps also carries the framework's own
+ * event props, and its `onChange` means "the value changed" and is bound under the
+ * node's id, so a tap on the view would call a package's differently-typed onChange
+ * with nothing. A package's events go through the events map below, where the payload
+ * is the package's own type.
  *
- * Taps need no new mechanism: wrap it in a `Pressable` the way you would any other view.
+ * Events: pass a fifth argument, a map of name to closure, and the native side calls
+ * `emit("<name>", value)` on its view host to fire one. The names are yours; the
+ * framework does not need to know them.
+ *
+ * ```chuks
+ * export function Rating(p: RatingProps): Node {
+ *     return nativeView("kit.rating", { value: p.value ?? 0 }, p, [],
+ *                       { change: p.onChange })
+ * }
+ * ```
+ *
+ * A plain tap still needs no mechanism of its own: wrap the view in a `Pressable`.
+ *
+ * Commands: pass a sixth argument, a `ViewRef` the app owns, and the native side's
+ * `command(name, args)` runs when the app calls `ref.command(...)`. That is for the
+ * things a prop cannot say, because they are an INSTRUCTION rather than a state:
+ * scroll to this index, present this sheet, seek to this second, play it again. A prop
+ * cannot say "again", since setting it to the value it already holds changes nothing.
+ *
+ * ```chuks
+ * export function Carousel(p: CarouselProps): Node {
+ *     return nativeView("kit.carousel", { ... }, p, kids, null, p.ref)
+ * }
+ * // and in the app:
+ * var c: ViewRef = useViewRef()
+ * Carousel({ ref: c, ... })
+ * Button({ onPress: function(): void { c.command("scrollTo", { index: 3 }) } }, "next")
+ * ```
  */
-export function nativeView(kind: string, props: any, layout: any, kids: []Kid): Node {
+export function nativeView(kind: string, props: any, layout: any, kids: []Kid, events: any = null, ref: any = null): Node {
     const s: Style = new Style()
     applyLayoutV(s, layout)
-    return new Node(kind, s, json.stringify(props), flatKids(kids))
+    const n: Node = new Node(kind, s, json.stringify(props), flatKids(kids))
+    // The view's own events, by name. The native side calls emit("<name>", value) and
+    // the closure registered here runs, with the value it sent. Names are the package's
+    // to choose; nothing in the framework needs to know them.
+    if (events != null) {
+        const names: []string = events.keys()
+        var i: int = 0
+        while (i < names.length) { n.events[names[i]] = events[names[i]]; i = i + 1 }
+    }
+    n.ref = ref
+    return n
 }
 
 export function WebView(p: WebViewProps): Node {
@@ -1125,36 +1373,64 @@ export function TextInput(p: TextInputProps): Node {
     n.onBlur = p["onBlur"]
     applyEventsV(n, p); return n
 }
-dataType SafeAreaViewProps { ViewProps; edges: string? }
+export dataType SafeAreaViewProps { ViewProps; edges: string? }
 /**
- * Insets its children clear of the device safe area (notch/status bar, home
- * indicator). Composed from the host-reported insets, so it's cross-platform and
- * needs no host code. Use it for EDGE-TO-EDGE content: a full-bleed screen, or an
- * overlay/modal that spans the whole window. (Regular screens are already inset by
- * the app root, so a SafeAreaView there is a no-op.)
+ * A `Column` that keeps its children inside the safe area: below the notch and the
+ * status bar, above the home indicator, clear of a landscape notch on either side.
  *
- * Props: `edges` ("top,bottom" default; "all" | "top" | "bottom" | any combination),
- * plus any layout/style prop.
+ * Every `ViewProps` field works as it does on `Column`, and padding ADDS to the inset:
+ * `pt: 14` is fourteen points below the safe edge, `pad: 14` is fourteen inside it on
+ * every side. `edges` picks which sides count: `"all"` (the default), or any of
+ * `"top"`, `"bottom"`, `"left"`, `"right"` joined with commas; `edges: "top"` for a
+ * screen whose bottom a tab bar owns.
+ *
+ * It fills the available space by default, so a `Scroll` inside it has a height to size
+ * into; `grow: 0` makes it content-sized, for a bottom bar or a sheet. Where it sits
+ * decides how a scrolling screen behaves, and both are right somewhere:
  *
  * ```chuks
- * SafeAreaView({ edges: "bottom" }, [ ...sheet content... ])
+ * // content scrolls UNDER the notch and status bar, the way Settings and Mail do
+ * Scroll({ dir: "col", grow: 1, bg: tk("bg") }, [
+ *     SafeAreaView({ pad: 14, gap: 18 }, kids),
+ * ])
+ * // content is clipped at the safe edge; the band under the notch stays empty
+ * SafeAreaView({ bg: tk("bg") }, [
+ *     Scroll({ dir: "col", grow: 1 }, kids),
+ * ])
  * ```
+ *
+ * Inside a tab whose header has already cleared the top, `safeTop()` is 0 and this adds
+ * nothing there, so one screen lays out correctly pushed full-screen or inside a tab.
+ * `safeTop()` and its siblings stay available for what a container cannot express: a
+ * floating bar's gap, a header measuring itself.
  */
 export function SafeAreaView(first: SafeAreaViewProps | []Kid, kids: []Kid = []): Node {
-    if (typeof(first) == "array") { return SafeAreaView({}, first) }   // content-only (default edges)
-    const p: SafeAreaViewProps = first
-    const edges: string = pvS(p, "edges", "top,bottom")
+    var p: any = {}
+    var c: []Kid = kids
+    if (typeof(first) == "array") { const arr: []Kid = first; c = arr } else { p = first }
+    const edges: string = p["edges"] != null ? string(p["edges"]) : "all"
     const all: bool = edges.contains("all")
-    var out: []Node = []
-    if ((all || edges.contains("top")) && _safeTop > 0) { out.push(vSpacer(_safeTop)) }
-    const inner: []Node = flatKids(kids)
-    for (var i: int = 0; i < inner.length; i = i + 1) { out.push(inner[i]) }
-    if ((all || edges.contains("bottom")) && _safeBottom > 0) { out.push(vSpacer(_safeBottom)) }
-    // Fill the available space by default (a screen-level wrapper), so a grow child
-    // like a Scroll has a bounded height to size into on the Yoga hosts (UIKit/Android).
-    // Overridable with grow:0 for a content-sized safe inset (e.g. a bottom bar).
-    const s: Style = new Style(); s.dir = "col"; s.grow = 1; applyLayoutV(s, p)
-    return mkView(s, out)
+    // The inset joins whatever padding was asked for on that side. Per-side beats the
+    // axis beats `pad`, the same precedence Style itself applies, so `pad: 14` with a
+    // `pt: 0` is fourteen everywhere but the top.
+    var q: map[string]any = {}
+    const keys: []string = p.keys()
+    var i: int = 0
+    while (i < keys.length) { q[keys[i]] = p[keys[i]]; i = i + 1 }
+    q["pt"] = safeSide(p, "pt", "py") + ((all || edges.contains("top")) ? safeTop() : 0)
+    q["pb"] = safeSide(p, "pb", "py") + ((all || edges.contains("bottom")) ? safeBottom() : 0)
+    q["pl"] = safeSide(p, "pl", "px") + ((all || edges.contains("left")) ? safeLeft() : 0)
+    q["pr"] = safeSide(p, "pr", "px") + ((all || edges.contains("right")) ? safeRight() : 0)
+    const s: Style = new Style(); s.dir = "col"; s.grow = 1
+    applyLayoutV(s, q)
+    const n: Node = mkView(s, flatKids(c)); applyEventsV(n, q); return n
+}
+// The padding a caller asked for on one side, before the inset is added.
+function safeSide(p: any, side: string, axis: string): int {
+    if (p[side] != null) { return int(p[side]) }
+    if (p[axis] != null) { return int(p[axis]) }
+    if (p["pad"] != null) { return int(p["pad"]) }
+    return 0
 }
 dataType LinearGradientProps {
     ViewProps;
@@ -1232,7 +1508,6 @@ export function Blur(p: BlurProps, kids: []Kid = []): Node {
 }
 
 // A fixed-height empty row (a safe-area spacer).
-function vSpacer(h: int): Node { const s: Style = new Style(); s.h = h; return mkView(s, []) }
 
 dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
@@ -1437,6 +1712,48 @@ export function Modal(first: ModalProps | []Kid, kids: []Kid = []): Node {
     if (od != null) { n.onPress = od }
     return n
 }
+dataType PopoverProps {
+    ViewProps; visible: bool?; anchor: ViewRef; placement: string?; offset: int?; arrow: bool?;
+    onDismiss: (function(): void)?
+}
+/**
+ * An anchored overlay: `kids` render on top of everything, beside the view that holds
+ * `anchor`, when `visible`. The host measures the anchor at layout time and places the
+ * content on the `placement` side ("auto" default, "top", "bottom", "left", "right"),
+ * flips to the other side when it would leave the screen, and keeps it inside the safe
+ * area. `offset` is the gap to the anchor in points (8); `arrow: true` draws a pointer
+ * on the content's own background colour. Tapping anywhere outside the content fires
+ * `onDismiss`; tapping the content does not.
+ *
+ * The anchor is a `useViewRef()` handle passed to the anchored view as `ref`. It is
+ * bound when that view mounts, so a popover opened from a tap on its anchor always
+ * finds it; a popover visible on the very first render, before its anchor exists, is
+ * centred like a dialog.
+ *
+ * ```chuks
+ * const more: ViewRef = useViewRef()
+ * Row({ ref: more, onPress: function(): void { open.set(true) } }, [ Text({}, "More") ])
+ * Popover({ visible: open.get(), anchor: more, placement: "bottom", arrow: true,
+ *           onDismiss: function(): void { open.set(false) } }, [
+ *     Card({ children: [ Text({}, "Rename"), Text({}, "Delete") ] }),
+ * ])
+ * ```
+ */
+export function Popover(p: PopoverProps, kids: []Kid): Node {
+    const vis: bool = pvB(p, "visible", false)
+    const s: Style = new Style()
+    s.mvis = vis ? 1 : 0
+    const r: ViewRef = p.anchor
+    s.pAnchor = r.id
+    s.pPlace = pvS(p, "placement", "auto")
+    s.pGap = pvI(p, "offset", 8)
+    s.pArrow = pvB(p, "arrow", false) ? 1 : 0
+    applyLayoutV(s, p)
+    const n: Node = mkPopover(s, vis ? flatKids(kids) : [])
+    const od: any = p["onDismiss"]           // an outside tap fires onDismiss (wired as onPress)
+    if (od != null) { n.onPress = od }
+    return n
+}
 dataType AlertProps {
     visible: bool?; title: string?; message: string?;
     confirmText: string?; cancelText: string?; destructive: bool?;
@@ -1453,14 +1770,15 @@ dataType AlertProps {
  *  - Simple confirm: `confirmText` is the primary button; a non-empty `cancelText`
  *    adds a cancel button; `destructive: true` reddens the confirm button.
  *    `onConfirm` / `onCancel` fire on tap.
- *  - Multi-button: pass `buttons` as a pipe-separated string ("Save|Discard|Cancel").
+ *  - Multi-button: pass `buttons` as a TAB-separated string ("Save\tDiscard\tCancel"),
+ *    so a label may itself contain a "|".
  *    Prefix a label with `!` for a destructive (red) button or `~` for a cancel-style
  *    button. `onButton` fires with the tapped index (as a string; parse with int()).
  *  - Prompt: `prompt: true` adds a text field (`placeholder`, `promptValue` seed the
  *    it); on confirm, `onSubmit` fires with the entered text.
  *
  * Props: `visible` (bool), `title`, `message`, `confirmText` ("OK"), `cancelText`
- * ("" = single-button), `destructive` (bool), `buttons` (pipe string), `prompt` (bool),
+ * ("" = single-button), `destructive` (bool), `buttons` (tab-separated string), `prompt` (bool),
  * `placeholder`, `promptValue`, `onConfirm` (() -> void), `onCancel` (() -> void),
  * `onButton` ((string) -> void), `onSubmit` ((string) -> void).
  *
@@ -1481,15 +1799,18 @@ export function Alert(p: AlertProps): Node {
     const promptValue: string = pvS(p, "promptValue", "")
     const buttonsProp: string = pvS(p, "buttons", "")
     // Build the button list in tap-index order. The user API takes `buttons` as a
-    // pipe-separated string; internally each button is its own trailing TAB field (the
-    // mutation protocol splits ops on '|', so a '|' in the text truncates it). Multi-
-    // button: index -> onButton. Simple: [~cancel, confirm] or [confirm], so index
-    // 0/last map to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
+    // TAB-separated string, and internally each button is its own trailing tab field.
+    // It used to be pipe-separated, on the belief that a pipe in the mutation stream
+    // truncates the op; it does not (the hosts rejoin everything after the last fixed
+    // field), but a pipe in a LABEL did split one button into two. A tab cannot appear
+    // in a button label typed into a dialog, which a pipe can. Multi-button:
+    // index -> onButton. Simple: [~cancel, confirm] or [confirm], so index 0/last map
+    // to onCancel/onConfirm. `!`=destructive, `~`=cancel style.
     var buttonList: []string = []
     var confirmIdx: int = -1
     var cancelIdx: int = -1
     if (buttonsProp != "") {
-        buttonList = buttonsProp.split("|")
+        buttonList = buttonsProp.split("\t")
     } else {
         const confirm: string = pvS(p, "confirmText", "OK")
         const cancel: string = pvS(p, "cancelText", "")
@@ -1497,8 +1818,8 @@ export function Alert(p: AlertProps): Node {
         if (cancel != "") { buttonList = ["~" + cancel, confirmLabel]; cancelIdx = 0; confirmIdx = 1 }
         else { buttonList = [confirmLabel]; confirmIdx = 0 }
     }
-    var joined: string = title + "\t" + message + "\t" + (isPrompt ? "1" : "0") + "\t" + placeholder + "\t" + promptValue
-    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + buttonList[bi] }
+    var joined: string = packField(title) + "\t" + packField(message) + "\t" + (isPrompt ? "1" : "0") + "\t" + packField(placeholder) + "\t" + packField(promptValue)
+    for (var bi: int = 0; bi < buttonList.length; bi = bi + 1) { joined = joined + "\t" + packField(buttonList[bi]) }
     const n: Node = mkAlert(s, joined)
     // The host reports the tapped button INDEX ("0","1",...), plus "\t<text>" for a
     // prompt. routeAlert (top-level, so its locals don't sit inside the captured
@@ -1607,7 +1928,7 @@ export function Select(p: SelectProps, options: []string): Node {
     s.fg = pvS(p, "color", "111318")
     s.radius = pvI(p, "radius", 10)
     applyLayoutV(s, p)
-    const n: Node = mkSelect(s, options.join("\t"))   // options in the text channel
+    const n: Node = mkSelect(s, packList(options))   // options in the text channel
     applyEventsV(n, p)                                // onChange(index) fires on pick
     return n
 }
@@ -1702,7 +2023,7 @@ export function Menu(p: MenuProps, items: []string): Node {
     s.radius = pvI(p, "radius", 10)
     applyLayoutV(s, p)
     const label: string = pvS(p, "label", "Menu")
-    const n: Node = mkMenu(s, label + "\t" + items.join("\t"))   // parts[0]=label, rest=items
+    const n: Node = mkMenu(s, packField(label) + "\t" + packList(items))   // parts[0]=label, rest=items
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
@@ -1721,7 +2042,7 @@ export function Menu(p: MenuProps, items: []string): Node {
 export function ContextMenu(p: ViewProps, items: []string, kids: []Kid): Node {
     const s: Style = new Style()
     applyLayoutV(s, p)
-    const n: Node = mkContextMenu(s, items.join("\t"), flatKids(kids))     // items in the text channel
+    const n: Node = mkContextMenu(s, packList(items), flatKids(kids))     // items in the text channel
     applyEventsV(n, p)                                           // onChange(index) fires on pick
     return n
 }
@@ -2147,20 +2468,64 @@ export class Component extends Node {
 // app did not write, a chat message, a server field, a contact's name, could carry
 // "\nR|app" and remove the root view. Escaped here, unescaped by both hosts.
 //
-// The pipe needs no escape: the host rejoins everything after the third one, which is
-// why a label may contain "|" and always could.
+// The pipe needs no escape, and this is a property of the parser rather than luck:
+// free text is always the LAST field of an op, and both hosts read it by rejoining
+// everything after the fixed fields (P, V, IF, X). A label, a controlled value, a URL
+// and a capability's JSON arguments may all contain "|". Verified on device, not
+// assumed: a label "a|b|c" renders whole, and "\nR|app" does not remove the root.
+// A style value that may be free text. The style string is split on ";" and "=", the
+// wire line on "|" and the stream on newlines, so those five (and "%" itself) are
+// percent-encoded here and decoded by the host (chuksUnescapeStyle). Anything else,
+// including every non-ASCII character, crosses as it is.
+function styleEsc(s: string): string {
+    var out: string = ""
+    for (var c of s) {
+        if (c == "%") { out = out + "%25" }
+        else if (c == ";") { out = out + "%3B" }
+        else if (c == "=") { out = out + "%3D" }
+        else if (c == "|") { out = out + "%7C" }
+        else if (c == "\n") { out = out + "%0A" }
+        else if (c == "\r") { out = out + "%0D" }
+        else if (c == "\t") { out = out + "%09" }
+        else { out = out + c }
+    }
+    return out
+}
 function escText(s: string): string {
     var out: string = ""
-    var i: int = 0
-    while (i < s.length) {
-        const c: string = s.slice(i, i + 1)
-        i = i + 1
+    // Walk CHARACTERS: a string position is a byte, so a byte-stepping slice(i, i + 1)
+    // returns "" on every byte of "é" or an emoji and the character vanishes from the
+    // wire (a typed "café" reached the host as "caf ").
+    for (var c of s) {
         if (c == "\\") { out = out + "\\\\" }
         else if (c == "\n") { out = out + "\\n" }
         else if (c == "\r") { out = out + "\\r" }
         else { out = out + c }
     }
     return out
+}
+
+// A field of a TAB-packed text payload (Alert, Select, Menu, ContextMenu). Those pack
+// several strings into one node's text and the host splits them on a tab, and escText
+// does not escape tabs, so a tab inside a label used to shift every field after it: an
+// alert's message became its placeholder. A real tab is written as the two characters
+// "\" and "t", which survives the text channel (escText doubles the backslash, the
+// host halves it again) and cannot split. It shows as \t in the label, which is a
+// visible oddity rather than a scrambled dialog. Tabs cannot be typed on either
+// keyboard, but they arrive by paste and from server data.
+function packField(s: string): string {
+    if (!s.contains("\t")) { return s }
+    var out: string = ""
+    for (var c of s) { out = out + (c == "\t" ? "\\t" : c) }   // by character, not byte (see escText)
+    return out
+}
+
+// Pack a list of strings into one tab-separated field, each protected (see packField).
+function packList(items: []string): string {
+    var out: []string = []
+    var i: int = 0
+    while (i < items.length) { out.push(packField(items[i])); i = i + 1 }
+    return out.join("\t")
 }
 
 export class Reconciler {
@@ -2453,12 +2818,23 @@ export class Reconciler {
         if (n.onLongPress != null) { this.handlers[id + ":longpress"] = n.onLongPress; this.emit("TL|" + id) }
         if (n.onPressIn != null) { this.handlers[id + ":pressin"] = n.onPressIn; this.emit("TPI|" + id) }
         if (n.onPressOut != null) { this.handlers[id + ":pressout"] = n.onPressOut; this.emit("TPO|" + id) }
+        // A package view's named events. No op is emitted: the host tags an event
+        // "<id>:<name>" by the same convention, and a name the app did not register
+        // simply finds no handler and does nothing.
+        const evNames: []string = n.events.keys()
+        var ei: int = 0
+        while (ei < evNames.length) { this.handlers[id + ":" + evNames[ei]] = n.events[evNames[ei]]; ei = ei + 1 }
         if (n.onLoad != null) { this.handlers[id + ":load"] = n.onLoad; this.emit("ML|" + id) }
         if (n.onError != null) { this.handlers[id + ":error"] = n.onError; this.emit("ME|" + id) }
         if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
         if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
         if (n.onScroll != null) { this.handlers[id + ":scroll"] = n.onScroll; this.emit("SS|" + id) }
+        if (n.onLayout != null) { this.handlers[id + ":layout"] = n.onLayout; this.emit("LY|" + id + "|1") }
+        // A package view's handle learns which node it is. Nothing is emitted: a command
+        // is sent when the APP asks for one, not when the view mounts. Anything the app
+        // asked for before this point was queued on the handle and goes out now.
+        if (n.ref != null) { const r: ViewRef = n.ref; r.bindTo(id, this) }
     }
 
     // Rebind an event handler under `key` when present, or DROP a stale entry when the
@@ -2583,6 +2959,27 @@ export class Reconciler {
         this.rebindOrDrop(id + ":progress", next.onProgress)
         this.rebindOrDrop(id + ":slidedone", next.onSlideDone)
         this.rebindOrDrop(id + ":scroll", next.onScroll)
+        // onLayout is bound on the host too, so gaining or losing it on an update must
+        // reach the host (the same rule as T|: a binding made at mount is re-diffed).
+        this.rebindOrDrop(id + ":layout", next.onLayout)
+        if ((p.onLayout == null) != (next.onLayout == null)) { this.emit("LY|" + id + "|" + (next.onLayout != null ? "1" : "0")) }
+        // A package view's named events, rebound the same way: the new closure captures
+        // this render's state, and a name the node no longer carries is dropped so a
+        // recycled cell cannot fire the previous row's handler.
+        // The handle is re-bound on every pass for the same reason handlers are: the
+        // node at this id can be a different view than it was, and a handle still
+        // pointing here would aim the app's next command at the wrong instance.
+        if (next.ref != null) { const nr: ViewRef = next.ref; nr.bindTo(id, this) }
+        else if (p.ref != null) { const pr: ViewRef = p.ref; pr.unbind(id) }
+        const nextEv: []string = next.events.keys()
+        var ri: int = 0
+        while (ri < nextEv.length) { this.handlers[id + ":" + nextEv[ri]] = next.events[nextEv[ri]]; ri = ri + 1 }
+        const prevEv: []string = p.events.keys()
+        var di: int = 0
+        while (di < prevEv.length) {
+            if (next.events[prevEv[di]] == null) { this.rebindOrDrop(id + ":" + prevEv[di], null) }
+            di = di + 1
+        }
         // scrollTo: imperatively scroll when the target changes (reuses the List LS op).
         if (next.scrollTo >= 0 && next.scrollTo != this.scrollToPos.getOr(id, -1)) {
             this.scrollToPos[id] = next.scrollTo

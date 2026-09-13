@@ -1,0 +1,104 @@
+// A handle to one mounted view: what it is bound to, and what it does before it is.
+//
+// The bug class this guards is the one every ref-shaped API has: a command that reaches
+// the wrong instance, or one issued before the view existed and silently dropped. Node
+// ids here are structural paths, which makes both easy to get wrong, so each is asserted
+// against the mutation stream rather than against a screenshot.
+import { Node, Column, Text, ViewRef, nativeView } from "../core/ui.chuks";
+import { render, Screen } from "../core/testing.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(c: bool, name: string): void {
+    if (c) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+function has(s: string, sub: string): bool { return s.indexOf(sub) >= 0 }
+
+// A line the reconciler emitted this frame, if any starts with this prefix.
+function lineWith(s: Screen, prefix: string): string {
+    const ls: []string = s.lines
+    var i: int = 0
+    while (i < ls.length) {
+        if (ls[i].length >= prefix.length && ls[i].slice(0, prefix.length) == prefix) { return ls[i] }
+        i = i + 1
+    }
+    return ""
+}
+function countWith(s: Screen, prefix: string): int {
+    const ls: []string = s.lines
+    var n: int = 0
+    var i: int = 0
+    while (i < ls.length) {
+        if (ls[i].length >= prefix.length && ls[i].slice(0, prefix.length) == prefix) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+var A: ViewRef = new ViewRef()
+var B: ViewRef = new ViewRef()
+var WITH_REF: bool = true
+
+function screen(): Node {
+    return Column({ dir: "col" }, [
+        Text({ size: 12 }, "header"),
+        nativeView("test.thing", { n: 1 }, {}, [], null, WITH_REF ? A : null),
+        nativeView("test.thing", { n: 2 }, {}, [], null, B),
+    ])
+}
+
+function main(): void {
+    println("viewref_test")
+
+    // Before anything is rendered there is no node to aim at. The command must survive
+    // rather than vanish: an effect on the first render is exactly this case.
+    A.command("early", { k: 1 })
+    check(!A.attached(), "a fresh handle is not attached")
+
+    const s: Screen = render(function(): Node { return screen() })
+
+    // The queued command went out on the first frame, aimed at the node that mounted.
+    const early: string = lineWith(s, "VC|")
+    check(early != "", "a command issued before mount is queued, not dropped")
+    check(has(early, "|early|"), "and it is the command that was queued")
+    check(A.attached(), "the handle is attached once its view mounts")
+
+    // Two handles on two instances of the same kind must not resolve to one id.
+    s.frame()
+    A.command("go", { k: 1 })
+    B.command("go", { k: 2 })
+    s.frame()
+    const both: int = countWith(s, "VC|")
+    check(both == 2, "two handles emit two commands (got " + string(both) + ")")
+
+    // The ids differ, which is the whole point: a command reaches THAT instance.
+    var aLine: string = ""
+    var bLine: string = ""
+    const ls: []string = s.lines
+    var i: int = 0
+    while (i < ls.length) {
+        if (has(ls[i], "\"k\":1")) { aLine = ls[i] }
+        if (has(ls[i], "\"k\":2")) { bLine = ls[i] }
+        i = i + 1
+    }
+    check(aLine != "" && bLine != "" && aLine != bLine, "each command carries its own node id")
+    check(has(aLine, A.id) && has(bLine, B.id), "and it is the id its handle is bound to")
+    check(A.id != B.id, "two instances of one kind get different ids")
+
+    // A node that no longer carries the handle releases it, so a later command is not
+    // aimed at whatever now holds that path. Node ids are reused across screens.
+    WITH_REF = false
+    s.frame()
+    check(!A.attached(), "a node that drops its handle unbinds it")
+    A.command("late", {})
+    s.frame()
+    check(countWith(s, "VC|") == 0, "and a command on the released handle reaches nothing")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "viewref_test failed" }
+}
+
+main();

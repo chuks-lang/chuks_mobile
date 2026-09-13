@@ -101,6 +101,7 @@ echo "5. Linking resources"
 cp "$PKGDIR/AndroidManifest.xml" "$OUT/AndroidManifest.xml"
 sed -i '' "s#android:label=\"Chuks\"#android:label=\"$DISPLAY\"#" "$OUT/AndroidManifest.xml"
 chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" patch-manifest "$OUT/AndroidManifest.xml" 2>/dev/null || true
+sed -i '' "s#__APP_ID__#$APPID#g" "$OUT/AndroidManifest.xml"   # the file provider's authority
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
     --rename-manifest-package "$APPID" --min-sdk-version 24 --target-sdk-version 34
 

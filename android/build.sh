@@ -53,9 +53,12 @@ rm -rf "$OUT"; chuks_clear_build_cache; mkdir -p "$OUT"
 OUTABS="$(cd "$OUT" && pwd)"   # absolute; the .so is compiled inside the cache dir, so its -o must be absolute
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
-BDSTAMP="$OUT/.build-started"; : > "$BDSTAMP"   # only cache dirs newer than this are ours
-( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )   # --c-archive emits the chuks_* C-ABI bridge
-BD="$(chuks_latest_build_dir "$BDSTAMP")"        # generated sources, under ~/.chuks/cache
+# The compiler names its build dir in the file CHUKS_EMIT_BUILD_DIR points at. Picking
+# "the newest cache dir since we started" instead raced with any other chuks build
+# running at the same time (a test battery, another app) and picked up ITS sources.
+BDFILE="$OUT/.build-dir"; rm -f "$BDFILE"
+( cd "$PROJDIR" && CHUKS_EMIT_BUILD_DIR="$BDFILE" chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )   # --c-archive emits the chuks_* C-ABI bridge
+BD="$(cat "$BDFILE" 2>/dev/null)"                 # generated sources, under ~/.chuks/cache
 [ -n "$BD" ] && [ -f "$BD/go.mod" ] || {
     echo "  the Chuks build produced no Go sources in $CHUKS_BUILD_CACHE"; exit 1; }
 # Stage the JNI bridge + cgo link flags + Yoga (from the PACKAGE) next to the generated Go.
@@ -168,6 +171,8 @@ SPV
         echo "   launch assets compiled"
     fi
 fi
+# The file provider's authority must be unique per installed app: the app id.
+sed -i '' "s#__APP_ID__#$APPID#g" "$OUT/AndroidManifest.xml"
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$AJAR" --manifest "$OUT/AndroidManifest.xml" \
     $RESZIP --rename-manifest-package "$APPID" \
     --min-sdk-version 24 --target-sdk-version 34

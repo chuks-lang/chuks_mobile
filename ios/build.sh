@@ -79,9 +79,12 @@ YOGA="$PKGDIR/yoga"; [ "$IOS_TARGET" = "device" ] && YOGA="$PKGDIR/yoga-device"
 YOGA_INC="$SDKROOT/core/yoga/include"     # shared Yoga headers (in the package)
 
 echo "1. Compiling your Chuks app to native (via @chuks/mobile)"
-BDSTAMP="$OUT/.build-started"; : > "$BDSTAMP"   # only cache dirs newer than this are ours
-( cd "$PROJDIR" && chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )
-BD="$(chuks_latest_build_dir "$BDSTAMP")"        # generated sources, under ~/.chuks/cache
+# The compiler names its build dir in the file CHUKS_EMIT_BUILD_DIR points at. Picking
+# "the newest cache dir since we started" instead raced with any other chuks build
+# running at the same time (a test battery, another app) and picked up ITS sources.
+BDFILE="$OUT/.build-dir"; rm -f "$BDFILE"
+( cd "$PROJDIR" && CHUKS_EMIT_BUILD_DIR="$BDFILE" chuks build --c-archive "$ENTRY" -o "$OUT/e" >/dev/null )
+BD="$(cat "$BDFILE" 2>/dev/null)"                 # generated sources, under ~/.chuks/cache
 [ -n "$BD" ] && [ -f "$BD/go.mod" ] || {
     echo "  the Chuks build produced no Go sources in $CHUKS_BUILD_CACHE"
     echo "  (rerun without >/dev/null on the chuks build above to see why)"; exit 1; }

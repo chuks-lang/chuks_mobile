@@ -1,0 +1,78 @@
+// Popover and onLayout on the wire.
+//
+// A Popover is an overlay like a Modal whose style names its anchor node, so the host
+// can measure it; the anchor is a ViewRef bound when the anchored view mounts. onLayout
+// is a host binding (LY|) that must be re-diffed on update like T|, and its payload is
+// decoded into a LayoutBox before the app's closure sees it.
+//
+// Run:  chuks run tests/popover_test.chuks   (exits non-zero on failure)
+
+import { Node, Column, Row, Text, Popover, ViewRef, useViewRef, LayoutBox, Reconciler } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function lines(stream: string, prefix: string): []string {
+    var out: []string = []
+    for (var l of stream.split("\n")) { if (l.startsWith(prefix)) { out.push(l) } }
+    return out
+}
+function has(s: string, sub: string): bool { return s.indexOf(sub) >= 0 }
+
+function main(): void {
+    const anchor: ViewRef = new ViewRef()
+    const tree: function(open: bool): Node = function(open: bool): Node {
+        return Column({}, [
+            Row({ ref: anchor, w: 80, h: 40 }, [ Text({}, "More") ]),
+            Popover({ visible: open, anchor: anchor, placement: "top", offset: 12, arrow: true }, [ Text({}, "inside") ]),
+        ])
+    }
+
+    println("popover")
+    const r: Reconciler = new Reconciler()
+    r.drain(); r.renderRoot(tree(false))
+    const first: string = r.drain()
+    const pops: []string = lines(first, "C|app.1|Popover")
+    check(pops.length == 1, "a Popover node mounts as its own kind")
+    check(anchor.id == "app.0", "the anchor handle is bound to the anchored row on mount (got " + anchor.id + ")")
+    const s0: []string = lines(first, "S|app.1|")
+    check(s0.length == 1 && has(s0[0], "mvis=0;") && !has(s0[0], "panc="), "hidden on the first render, and no anchor yet (the ref was unbound when the style was built)")
+    check(lines(first, "C|app.1.0|").length == 0, "a hidden popover mounts no content")
+
+    r.renderRoot(tree(true))
+    const second: string = r.drain()
+    const s1: []string = lines(second, "S|app.1|")
+    check(s1.length == 1 && has(s1[0], "mvis=1;"), "visible on the second render")
+    check(has(s1[0], "panc=app.0;"), "the style names the anchor node (" + s1[0] + ")")
+    check(has(s1[0], "pplc=top;") && has(s1[0], "pgap=12;") && has(s1[0], "parw=1;"), "placement, gap and arrow cross as keys")
+    check(lines(second, "C|app.1.0|").length == 1, "the content mounts when visible")
+
+    r.renderRoot(tree(true))
+    check(r.drain() == "", "an unchanged visible popover emits nothing")
+
+    println("onLayout")
+    var got: string = ""
+    const cb: function(e: LayoutBox): void = function(e: LayoutBox): void { got = string(e.x) + "/" + string(e.y) + "/" + string(e.w) + "/" + string(e.h) }
+    const r2: Reconciler = new Reconciler()
+    r2.drain(); r2.renderRoot(Column({}, [ Row({ w: 10, onLayout: cb }, []) ]))
+    const m: string = r2.drain()
+    check(lines(m, "LY|app.0|1").length == 1, "onLayout binds on mount (LY|id|1)")
+    r2.fireValue("app.0:layout", "3,4,50,60")
+    check(got == "3/4/50/60", "the host's x,y,w,h reaches the closure as a LayoutBox (got " + got + ")")
+    r2.renderRoot(Column({}, [ Row({ w: 10 }, []) ]))
+    check(lines(r2.drain(), "LY|app.0|0").length == 1, "dropping onLayout on an update tells the host (LY|id|0)")
+    got = ""
+    r2.fireValue("app.0:layout", "1,1,1,1")
+    check(got == "", "and the closure is gone")
+    r2.renderRoot(Column({}, [ Row({ w: 10, onLayout: cb }, []) ]))
+    check(lines(r2.drain(), "LY|app.0|1").length == 1, "gaining onLayout on an update tells the host again")
+
+    println("")
+    println("popover: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("popover tests failed") }
+}
+
+main();

@@ -52,11 +52,8 @@ class ChuksLocationService : Service() {
 
         val manager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         lm = manager
-        val provider = when {
-            manager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
-            manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
-            else -> null
-        }
+        val acc = intent?.getStringExtra("acc") ?: "navigation"
+        val provider = ChuksGeo.provider(manager, acc)
         if (provider == null) {
             deliverError("location unavailable")
             stopSelf()
@@ -71,7 +68,7 @@ class ChuksLocationService : Service() {
         }
         listener = l
         try {
-            manager.requestLocationUpdates(provider, 1000L, 0f, l, Looper.getMainLooper())
+            ChuksGeo.requestUpdates(manager, provider, acc, intent?.getFloatExtra("dist", 0f) ?: 0f, intent?.getLongExtra("interval", 1000L) ?: 1000L, l)
         } catch (e: SecurityException) {
             deliverError("location permission denied")
             stopSelf()
@@ -91,10 +88,9 @@ class ChuksLocationService : Service() {
     }
 
     private fun deliverFix(loc: Location) {
-        // Same six fields as location.watch, so app code parsing a fix does not care
-        // which of the two produced it.
-        val s = "${loc.latitude},${loc.longitude},${loc.accuracy},${loc.altitude},${loc.speed},${loc.bearing}"
-        ChuksLocation.deliver?.invoke(ChuksLocation.token, s)
+        // The same fix string as location.watch, so app code parsing a fix does not
+        // care which of the two produced it.
+        ChuksLocation.deliver?.invoke(ChuksLocation.token, ChuksGeo.fixString(loc))
     }
     private fun deliverError(msg: String) {
         Log.w("chuks-location", msg)
