@@ -7444,27 +7444,34 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 final class FrameStatsRun {
     var link: CADisplayLink?
     var last: CFTimeInterval = 0
+    var lastTarget: CFTimeInterval = 0
     var intervals: [Double] = []
-    var done: (([Double]) -> Void)?
+    var janky = 0
+    var done: ((FrameStatsRun) -> Void)?
+    // A frame is janky when the link fires after the previous frame's target time:
+    // the main thread was still busy when the display wanted the next frame. An
+    // interval alone cannot say that on a ProMotion panel, which idles to a lower rate
+    // when nothing draws.
     @objc func tick(_ l: CADisplayLink) {
-        if last > 0 { intervals.append((l.timestamp - last) * 1000) }
-        last = l.timestamp
+        if last > 0 {
+            intervals.append((l.timestamp - last) * 1000)
+            if lastTarget > 0 && l.timestamp > lastTarget + 0.0005 { janky += 1 }
+        }
+        last = l.timestamp; lastTarget = l.targetTimestamp
     }
-    func finish() { link?.invalidate(); link = nil; done?(intervals); done = nil }
+    func finish() { link?.invalidate(); link = nil; done?(self); done = nil }
 }
 extension CardsVC {
     func frameStats(_ token: String, _ ms: Double) {
         let run = FrameStatsRun()
         let l = CADisplayLink(target: run, selector: #selector(FrameStatsRun.tick(_:)))
         l.add(to: .main, forMode: .common); run.link = l
-        run.done = { [weak self] iv in
-            // The steady cadence is the 10th-percentile interval (the display's period,
-            // whatever rate it runs at); a frame is janky past one and a half of it.
+        run.done = { [weak self] r in
+            let iv = r.intervals
             let s = iv.sorted()
             func pct(_ p: Double) -> Double { s.isEmpty ? 0 : s[Swift.min(s.count - 1, Int(Double(s.count) * p))] }
             let period = pct(0.1)
-            let janky = iv.filter { $0 > period * 1.5 }.count
-            self?.resolve(token, String(format: "hz=%d frames=%d janky=%d p50=%.1f p95=%.1f max=%.1f", period > 0 ? Int((1000 / period).rounded()) : 0, iv.count, janky, pct(0.5), pct(0.95), s.last ?? 0))
+            self?.resolve(token, String(format: "hz=%d frames=%d janky=%d p50=%.1f p95=%.1f max=%.1f", period > 0 ? Int((1000 / period).rounded()) : 0, iv.count, r.janky, pct(0.5), pct(0.95), s.last ?? 0))
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + ms / 1000) { run.finish() }
     }

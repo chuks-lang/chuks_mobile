@@ -336,7 +336,27 @@ class MainActivity : Activity(), ChuksModuleHost {
                 if (!r.contains(ev.rawX.toInt(), ev.rawY.toInt())) { hideKeyboard(ed); ed.clearFocus() }
             }
         }
+        warmFrames()
         return super.dispatchTouchEvent(ev)
+    }
+
+    // Keep frames flowing while a finger is on the screen and for a short tail after it
+    // lifts. This app draws only when something moves, so between two swipes the panel
+    // drops to its idle rate and the GPU clocks down, and the first frame of the next
+    // swipe pays ~10ms to wake them: the one frame per gesture a finger still felt.
+    // A frame a beat costs 1-2ms of GPU while it runs, nothing once the tail ends.
+    private var warmUntil = 0L
+    private var warmArmed = false
+    private val warmTick = object : Runnable {
+        override fun run() {
+            if (System.nanoTime() >= warmUntil) { warmArmed = false; return }
+            root.invalidate()
+            root.postOnAnimation(this)
+        }
+    }
+    private fun warmFrames() {
+        warmUntil = System.nanoTime() + 700_000_000L
+        if (!warmArmed) { warmArmed = true; root.postOnAnimation(warmTick) }
     }
 
     override fun onCreate(b: Bundle?) {
@@ -5182,24 +5202,30 @@ class MainActivity : Activity(), ChuksModuleHost {
     // Choreographer frames for `ms`; each frame's interval is recorded. The same metric
     // the RN bench measures with reanimated's useFrameCallback.
     private fun frameStats(token: String, ms: Double) {
-        val intervals = ArrayList<Double>()
-        var last = 0L
-        val endAt = System.nanoTime() + (ms * 1e6).toLong()
-        val ch = android.view.Choreographer.getInstance()
-        ch.postFrameCallback(object : android.view.Choreographer.FrameCallback {
-            override fun doFrame(t: Long) {
-                if (last > 0) intervals.add((t - last) / 1e6)
-                last = t
-                if (t < endAt) { ch.postFrameCallback(this); return }
-                // The steady cadence is the 10th-percentile interval (the display's period,
-                // whatever rate it runs at); a frame is janky past one and a half of it.
-                val s = intervals.sorted()
-                fun pct(p: Double): Double = if (s.isEmpty()) 0.0 else s[Math.min(s.size - 1, (s.size * p).toInt())]
-                val period = pct(0.1)
-                val janky = intervals.count { it > period * 1.5 }
-                resolve(token, String.format(java.util.Locale.US, "hz=%d frames=%d janky=%d p50=%.1f p95=%.1f max=%.1f", if (period > 0) Math.round(1000.0 / period) else 0, intervals.size, janky, pct(0.5), pct(0.95), s.lastOrNull() ?: 0.0))
-            }
-        })
+        // Rendered frames against their real deadline, from the window's FrameMetrics (the
+        // source `dumpsys gfxinfo` reads). A Choreographer cadence cannot tell jank from an
+        // adaptive panel dropping to 24Hz while nothing draws: on a Galaxy S23 it reported
+        // a swipe scene as 58 janky where no frame had missed its vsync. Here a frame is
+        // janky when it finished after the deadline the system gave it, and the duration
+        // percentiles are of frames the app actually drew.
+        val durations = ArrayList<Double>()
+        var janky = 0
+        val hz = Math.round(windowManager.defaultDisplay.refreshRate)
+        val listener = android.view.Window.OnFrameMetricsAvailableListener { _, m, _ ->
+            val total = m.getMetric(android.view.FrameMetrics.TOTAL_DURATION) / 1e6
+            durations.add(total)
+            // DEADLINE is the time the frame was allowed (one or two vsyncs, in ns), not a timestamp.
+            if (android.os.Build.VERSION.SDK_INT >= 31) {
+                if (m.getMetric(android.view.FrameMetrics.TOTAL_DURATION) > m.getMetric(android.view.FrameMetrics.DEADLINE)) janky++
+            } else if (total > 1000.0 / hz) janky++
+        }
+        window.addOnFrameMetricsAvailableListener(listener, handler)
+        handler.postDelayed({
+            window.removeOnFrameMetricsAvailableListener(listener)
+            val s = durations.sorted()
+            fun pct(p: Double): Double = if (s.isEmpty()) 0.0 else s[Math.min(s.size - 1, (s.size * p).toInt())]
+            resolve(token, String.format(java.util.Locale.US, "hz=%d frames=%d janky=%d p50=%.1f p95=%.1f max=%.1f", hz, durations.size, janky, pct(0.5), pct(0.95), s.lastOrNull() ?: 0.0))
+        }, ms.toLong())
     }
 
     // ---- Shared values: motion the host drives (docs/shared-values.md) ------------
