@@ -1,0 +1,55 @@
+// A tab that owns its history: navigate() pushes inside it, popTo unwinds inside it
+// when the page is there, and falls through to the app stack when it is not.
+import { Node, Column, Text, Route, NavStack, Reconciler, navigate, back, popTo, popToRoot, currentRoute } from "../core/ui.chuks";
+import { TabView, Tab, TabSpec, resetTabStack } from "../core/nav.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) } else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function icon(name: string, color: string, size: int): Node { return Text({ size: size, color: color }, name) }
+function shell(_: Route): Node {
+    return TabView({ active: 0, onSelect: function(i: int): void { }, iconFor: icon },
+                   [ Tab({ name: "feed", screen: function(): Node { return Text({}, "feed root") }, stack: true }) ])
+}
+function page(label: string): function(r: Route): Node {
+    return function(r: Route): Node { return Text({}, label + (r.result != null ? " " + string(r.result) : "")) }
+}
+
+function main(): void {
+    var routes: map[string]function(r: Route): Node = {}
+    routes["shell"] = shell
+    routes["list"] = page("list"); routes["pick"] = page("pick"); routes["confirm"] = page("confirm")
+    routes["modal"] = page("modal")
+    const nv: NavStack = new NavStack(routes, "shell")
+    const rc: Reconciler = new Reconciler()
+    rc.setViewport(0, 600, 400); rc.drain(); rc.renderRoot(nv.render())   // the tab claims navigate()
+    navigate("list", null, null); rc.drain(); rc.renderRoot(nv.render())
+    navigate("pick", null, null); rc.drain(); rc.renderRoot(nv.render())
+    navigate("confirm", null, null); rc.drain(); rc.renderRoot(nv.render())
+    check(nv.depth() == 1, "pushes inside a tab with history do not grow the app stack")
+    const t1: Route? = currentRoute()
+    check(t1 != null && t1.name == "confirm", "the tab's top is the visible route")
+    check(popTo("list", "chosen") == true, "popTo a page in the tab's history unwinds the tab")
+    rc.drain(); rc.renderRoot(nv.render())
+    const t2: Route? = currentRoute()
+    check(t2 != null && t2.name == "list" && t2.result != null && string(t2.result) == "chosen", "and lands there with the result")
+    check(rc.drain().indexOf("list chosen") >= 0, "which the page renders")
+    check(popTo("nowhere", null) == false, "a name in neither history is a no-op")
+    popToRoot(null); rc.drain(); rc.renderRoot(nv.render())
+    const t3: Route? = currentRoute()
+    check(t3 != null && t3.name == "shell" && rc.drain().indexOf("feed root") >= 0, "popToRoot inside a tab returns to the tab's root")
+    check(nv.depth() == 1 && nv.top().name == "shell", "and leaves the app stack alone")
+    // A page pushed over the shell (the app stack) while the tab has history of its own:
+    // popTo a page on the app stack unwinds the app stack.
+    navigate("pick", null, null); rc.drain(); rc.renderRoot(nv.render())
+    nv.push("modal", null, null); rc.drain(); rc.renderRoot(nv.render())
+    check(nv.depth() == 2, "a push on the app stack covers the shell")
+    check(popTo("shell", "back-home") == true && nv.depth() == 1, "popTo the shell pops the app stack")
+    check(nv.top().result != null && string(nv.top().result) == "back-home", "with the result on the shell's route")
+    resetTabStack("feed")
+    println("tabnav: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "tabnav_test failed" }
+}
+main()

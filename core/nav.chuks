@@ -337,9 +337,22 @@ export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
                 const cur: []Route = tabStack(spec.name)
                 if (cur.length == 0) { return null }       // at the tab's root screen
                 return cur[cur.length - 1]
+            },
+            function(name: string, result: any?): bool {
+                // Unwind the tab's history to the nearest `name` below its top. A name
+                // the tab does not hold is not ours: the app stack is searched next.
+                var cur: []Route = tabStack(spec.name)
+                var at: int = -1
+                for (var i: int = cur.length - 2; i >= 0; i = i - 1) { if (cur[i].name == name) { at = i; break } }
+                if (at < 0) { return false }
+                var out: []Route = []
+                for (var i: int = 0; i <= at; i = i + 1) { out.push(cur[i]) }
+                TAB_STACKS[spec.name] = out
+                if (result != null) { out[at].result = result }
+                return true
             })
     } else {
-        setNestedNavigator(null, null, null, null)
+        setNestedNavigator(null, null, null, null, null)
     }
     var kids: []Node = []
     if (p.header != null) { kids.push(p.header) }                                    // top bar (optional)

@@ -8,7 +8,7 @@
 //
 // Run:  chuks run tests/route_test.chuks   (exits non-zero on failure)
 
-import { Node, Column, Row, Text, List, SectionList, Route, NavStack, Reconciler } from "../core/ui.chuks";
+import { Node, Column, Row, Text, List, SectionList, Route, NavStack, Reconciler, popTo, popToRoot, back } from "../core/ui.chuks";
 import { useState, Cell } from "../core/state.chuks";
 
 function has(s: string, sub: string): bool {
@@ -385,6 +385,42 @@ function main(): void {
     var lowA: int = 99999
     for (var y: int = 0; y < SEC_ROWS.length; y = y + 1) { if (SEC_ROWS[y] < lowA) { lowA = SEC_ROWS[y] } }
     check(lowA == 0, "and starts from the top, first row " + string(lowA))
+
+    // 16. A FLOW ENDS WHERE IT STARTED. pick -> confirm -> done is three pushes; the
+    //     screen that started it gets the result in one step, and the pages between are
+    //     gone. A name that is not stacked changes nothing.
+    var fr: map[string]function(r: Route): Node = {}
+    fr["home"] = function(r: Route): Node { return Text({}, "home " + (r.result != null ? string(r.result) : "-")) }
+    fr["pick"] = function(_: Route): Node { return Text({}, "pick") }
+    fr["confirm"] = function(_: Route): Node { return Text({}, "confirm") }
+    fr["done"] = function(_: Route): Node { return Text({}, "done") }
+    const nvF: NavStack = new NavStack(fr, "home")
+    nvF.push("pick", null, null); nvF.push("confirm", null, null); nvF.push("done", null, null)
+    check(nvF.depth() == 4, "three pushes stack four deep")
+    check(popTo("nowhere", "x") == false && nvF.depth() == 4, "popTo a name that is not stacked is a no-op")
+    check(popTo("home", "walk-7") == true, "popTo a stacked name unwinds")
+    check(nvF.depth() == 1 && nvF.top().name == "home", "and lands on it (" + nvF.top().name + ", depth " + string(nvF.depth()) + ")")
+    check(nvF.top().result != null && string(nvF.top().result) == "walk-7", "with the result on its route")
+    const rcF: Reconciler = new Reconciler()
+    rcF.setViewport(0, 600, 400); rcF.drain(); rcF.renderRoot(nvF.render())
+    check(rcF.drain().indexOf("home walk-7") >= 0, "and the screen renders the result")
+    nvF.push("pick", null, null); nvF.push("confirm", null, null)
+    check(popTo("pick", null) && nvF.depth() == 2 && nvF.top().name == "pick", "popTo the nearest match below the top")
+    nvF.push("confirm", null, null); nvF.push("done", null, null)
+    popToRoot("again")
+    check(nvF.depth() == 1 && string(nvF.top().result) == "again", "popToRoot returns to the first page with the result")
+    back(null)
+    check(nvF.depth() == 1, "back at the root is a no-op")
+
+    // 17. A SNAPSHOT NAMING A ROUTE THIS BUILD DOES NOT HAVE. The route is dropped, the
+    //     rest restores; the host already refuses another build's snapshot, this is the
+    //     check behind it.
+    const nvS: NavStack = new NavStack(fr, "home")
+    nvS.loadState("{\"stack\":[{\"n\":\"home\",\"p\":{}},{\"n\":\"renamed\",\"p\":{}},{\"n\":\"pick\",\"p\":{}}]}\n{}")
+    check(nvS.depth() == 2 && nvS.top().name == "pick", "an unknown route in a snapshot is skipped, the rest restores (depth " + string(nvS.depth()) + ", top " + nvS.top().name + ")")
+    const nvS2: NavStack = new NavStack(fr, "home")
+    nvS2.loadState("{\"stack\":[{\"n\":\"gone\",\"p\":{}}]}\n{}")
+    check(nvS2.depth() == 1 && nvS2.top().name == "home", "a snapshot with nothing this build knows leaves the app at its first page")
 
     println("route_test: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "route_test failed" }

@@ -2290,7 +2290,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     /// iOS does not promise to run anything when it kills a suspended app.
     func persistState() {
         guard restoreWindow > 0, let s = eSaveState(), !s.isEmpty else { return }
-        let doc = ["at": Int(Date().timeIntervalSince1970), "state": s] as [String: Any]
+        let doc = ["at": Int(Date().timeIntervalSince1970), "build": buildId, "state": s] as [String: Any]
         if let data = try? JSONSerialization.data(withJSONObject: doc) {
             try? data.write(to: stateFile)
         }
@@ -2322,6 +2322,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if age > restoreWindow {
             try? FileManager.default.removeItem(at: stateFile)
             return                                     // stale: start fresh
+        }
+        // Written by another build of the code: its routes and cells may not exist here,
+        // or mean something else. Only the build that wrote a snapshot reads it.
+        if (doc["build"] as? String ?? "") != buildId {
+            try? FileManager.default.removeItem(at: stateFile)
+            NSLog("chuks-state: not restoring, the state was saved by a different build")
+            return
         }
         eLoadState(saved)
     }
@@ -3203,6 +3210,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var restoreWindow: Int {
         (Bundle.main.object(forInfoDictionaryKey: "ChuksStateRestoreWindow") as? Int) ?? 1800
     }
+    /// A hash of every Chuks source this build compiled (ios/build.sh). See persistState.
+    var buildId: String { (Bundle.main.object(forInfoDictionaryKey: "ChuksBuildId") as? String) ?? "" }
 
     // ---- Background tasks ---------------------------------------------------
     //

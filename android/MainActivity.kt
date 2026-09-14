@@ -1072,6 +1072,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         if (st.isEmpty()) return
         val doc = org.json.JSONObject()
         doc.put("at", System.currentTimeMillis() / 1000)
+        doc.put("build", ChuksBuild.BUILD_ID)
         doc.put("state", st)
         try { stateFile.writeText(doc.toString()); runMarker.delete() } catch (e: Throwable) {}
     }
@@ -1095,6 +1096,13 @@ class MainActivity : Activity(), ChuksModuleHost {
             val doc = org.json.JSONObject(stateFile.readText())
             val age = System.currentTimeMillis() / 1000 - doc.getLong("at")
             if (age > restoreWindow) { stateFile.delete(); return }   // stale: start fresh
+            // Written by another build of the code: its routes and cells may not exist
+            // here, or mean something else. Only the build that wrote a snapshot reads it.
+            if (doc.optString("build", "") != ChuksBuild.BUILD_ID) {
+                stateFile.delete()
+                android.util.Log.w("chuks-state", "not restoring, the state was saved by a different build")
+                return
+            }
             N.loadState(doc.getString("state"))
         } catch (e: Throwable) { stateFile.delete() }
     }

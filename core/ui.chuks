@@ -4622,6 +4622,7 @@ var NESTED_PUSH: (function(name: string, params: (map[string]any)?, body: any?):
 var NESTED_POP: (function(result: any?): bool)? = null
 var NESTED_REPLACE: (function(name: string, params: (map[string]any)?, body: any?): bool)? = null
 var NESTED_TOP: (function(): Route?)? = null
+var NESTED_POP_TO: (function(name: string, result: any?): bool)? = null
 
 /**
  * Framework-internal: a nested navigator claims the navigation functions while it is
@@ -4635,11 +4636,13 @@ var NESTED_TOP: (function(): Route?)? = null
 export function setNestedNavigator(push: (function(name: string, params: (map[string]any)?, body: any?): bool)?,
                                    pop: (function(result: any?): bool)?,
                                    replace: (function(name: string, params: (map[string]any)?, body: any?): bool)?,
-                                   top: (function(): Route?)?): void {
+                                   top: (function(): Route?)?,
+                                   popTo: (function(name: string, result: any?): bool)? = null): void {
     NESTED_PUSH = push
     NESTED_POP = pop
     NESTED_REPLACE = replace
     NESTED_TOP = top
+    NESTED_POP_TO = popTo
 }
 
 /**
@@ -4706,6 +4709,30 @@ export class NavStack extends App {
             this.stack = s
             if (result != null) { this.stack[this.stack.length - 1].result = result }
         }
+    }
+    /**
+     * Pop every route above the nearest `name` below the top, so that screen is on
+     * screen again with `result` as its `r.result`. False when no such route is
+     * stacked (nothing changes). Prefer the `popTo()` free function.
+     */
+    public popTo(name: string, result: any?): bool {
+        var at: int = -1
+        for (var i: int = this.stack.length - 2; i >= 0; i = i - 1) { if (this.stack[i].name == name) { at = i; break } }
+        if (at < 0) { return false }
+        const s: []Route = []
+        for (var i: int = 0; i <= at; i = i + 1) { s.push(this.stack[i]) }
+        this.stack = s
+        if (result != null) { this.stack[at].result = result }
+        return true
+    }
+    /**
+     * Pop every route above the first one, so the app is back at the screen it opened
+     * with, with `result` as its `r.result`. Prefer the `popToRoot()` free function.
+     */
+    public popToRoot(result: any?): void {
+        if (this.stack.length <= 1) { return }
+        this.stack = [this.stack[0]]
+        if (result != null) { this.stack[0].result = result }
     }
     /**
      * The entry on top of the stack: the route on screen right now, with its params,
@@ -4848,6 +4875,10 @@ export class NavStack extends App {
         for (var j: int = 0; j < arr.length; j = j + 1) {
             const e: any = arr[j]
             if (e == null || e["n"] == null) { continue }
+            // A route this build does not register is not restored: the snapshot was
+            // written by other code. The host refuses a snapshot from another build
+            // outright; this is the check for anything that gets past it.
+            if (this.routes[string(e["n"])] == null) { continue }
             var pm: map[string]any = {}
             const raw: any = e["p"]
             if (raw != null) { pm = raw }
@@ -4990,6 +5021,44 @@ export function back(result: any?): void {
     if (nested != null && nested(result)) { return }
     const nv: NavStack? = NAV
     if (nv != null) { nv.popStack(result) }
+}
+/**
+ * Pop every page above the nearest `name` below the top, so that page is on screen
+ * again, with `result` as its `r.result`. This is how a flow of several pushed
+ * screens (pick, then confirm, then done) ends: it returns to the page that started
+ * it in one step, and the pages between are gone. Inside a tab that owns its history
+ * the tab's pages are searched first, then the app's. False, and nothing changes,
+ * when no page of that name is stacked.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { popTo("home", walk.id) } }, "Done")
+ * ```
+ */
+export function popTo(name: string, result: any?): bool {
+    const nested: any = NESTED_POP_TO
+    if (nested != null && nested(name, result)) { return true }
+    const nv: NavStack? = NAV
+    if (nv == null) { return false }
+    return nv.popTo(name, result)
+}
+/**
+ * Pop every page above the first one, with `result` as its `r.result`. Inside a tab
+ * that owns its history this returns to the tab's root page (which takes no Route, so
+ * a result is not delivered there); otherwise to the app's first page.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { popToRoot(null) } }, "Start over")
+ * ```
+ */
+export function popToRoot(result: any?): void {
+    const nested: any = NESTED_POP
+    if (nested != null) {
+        var popped: bool = false
+        while (nested(null)) { popped = true }             // unwind the tab's own history
+        if (popped) { return }
+    }
+    const nv: NavStack? = NAV
+    if (nv != null) { nv.popToRoot(result) }
 }
 
 /**

@@ -150,6 +150,9 @@ ICON_SRC="$APP_ICON"
 # refuses to run one at all without the matching UIBackgroundModes. Both come from the
 # app.json list, so an app declares its tasks once.
 RESTORE_WINDOW="$(AJ state-restore-window)"; [ -n "$RESTORE_WINDOW" ] || RESTORE_WINDOW=1800
+# The identity of this build's code (see android/native-packages.sh chuks_build_id): saved
+# state is restored only by the build that wrote it.
+BUILD_ID="$(cd "$PROJDIR" && find . -type f -name '*.chuks' -not -path '*/node_modules/*' -not -path './.chuks/cache/*' -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | cut -c1-16)"
 BGTASK_PLIST=""
 BG_IDS="$(AJ background-tasks)"
 if [ -n "$BG_IDS" ]; then
@@ -211,6 +214,7 @@ $IOS_PLIST_EXTRA
   </array>
   <key>UILaunchScreen</key><dict/>
   <key>ChuksStateRestoreWindow</key><integer>$RESTORE_WINDOW</integer>
+  <key>ChuksBuildId</key><string>$BUILD_ID</string>
 $BGTASK_PLIST
   $ICONNAME_PLIST
   <key>UIAppFonts</key><array>$FONT_PLIST</array>
