@@ -489,7 +489,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             val ticker = object : Runnable {
                 override fun run() {
                     frame++
-                    N.tick(); applyDrain(); relayout()
+                    N.tick(); val st = N.drain(); if (st.isNotEmpty()) { applyStream(st); relayout() }
                     handler.postDelayed(this, 400)
                 }
             }
@@ -1078,8 +1078,10 @@ class MainActivity : Activity(), ChuksModuleHost {
             N.loadState(doc.getString("state"))
         } catch (e: Throwable) { stateFile.delete() }
     }
-    private fun hostEvent(a: String) { applyStream(engEvent(a)); relayout() }
-    private fun hostInput(a: String, v: String) { applyStream(engInput(a, v)); relayout() }
+    // An empty reply changed nothing: no apply, no layout. A value's end or settle whose
+    // handler only queued a spring, or a gesture nobody bound, comes back empty.
+    private fun hostEvent(a: String) { val st = engEvent(a); if (st.isEmpty()) return; applyStream(st); relayout() }
+    private fun hostInput(a: String, v: String) { val st = engInput(a, v); if (st.isEmpty()) return; applyStream(st); relayout() }
 
     // Deliver a native capability result back to the engine and apply the re-render.
     // Public because a package's module answers through the same channel the framework's
@@ -1087,7 +1089,8 @@ class MainActivity : Activity(), ChuksModuleHost {
     // Token "0" is a call without a callback: nothing is waiting, so nothing to render.
     override fun resolve(token: String, payload: String) {
         if (token == "0") return
-        applyStream(engResolve(token, payload)); relayout()
+        val st = engResolve(token, payload); if (st.isEmpty()) return
+        applyStream(st); relayout()
     }
     // Report a capability failure back to the engine (fires the request's onErr).
     // Token "0" means the caller passed no callback, so the engine allocated nothing and
@@ -5043,6 +5046,12 @@ class MainActivity : Activity(), ChuksModuleHost {
             }
         }
         val pendingLayout = ArrayList<Pair<String, String>>()   // onLayout reports, delivered after this pass
+        // Whether any view's frame moved. Only then does Android get asked for a layout
+        // pass: a pass over this tree costs 13-15ms on a 20-row screen (every TextView
+        // measures again), and it used to be requested unconditionally, after every
+        // engine event and every heartbeat, with nothing to lay out. A finger swiping a
+        // row made a gesture, an end and a settle event per swipe, so three passes.
+        var moved = false
         for ((id, node) in ynodes) {
             if (modalIds.contains(id) || sheetIds.contains(id)) continue   // overlay roots are placed explicitly below
             val v = views[id] ?: continue
@@ -5059,7 +5068,8 @@ class MainActivity : Activity(), ChuksModuleHost {
             val lp = FrameLayout.LayoutParams(wd, ht)
             lp.leftMargin = left
             lp.topMargin = top
-            v.layoutParams = lp
+            v.layoutParams = lp                                  // requests a layout pass by itself
+            moved = true
             lastFrame[id] = intArrayOf(left, top, wd, ht)
             // now that the frame is known, decode the image to its display size.
             if (imageSrc.containsKey(id)) ensureSizedImage(id, maxOf(wd, ht))
@@ -5074,8 +5084,11 @@ class MainActivity : Activity(), ChuksModuleHost {
         // onLayout: the frame changed for a node that asked. Delivered after this pass
         // returns, because a handler re-renders and re-enters relayout.
         if (pendingLayout.isNotEmpty()) root.post { for ((id, key) in pendingLayout) if (layoutIds.contains(id)) hostInput("$id:layout", key) }
-        // place the whole Chuks app just below the top inset
-        (views["app"]?.layoutParams as? FrameLayout.LayoutParams)?.let { it.leftMargin = 0; it.topMargin = topY }
+        // place the whole Chuks app just below the top inset (a change here is edited in
+        // place, so it asks for the pass itself)
+        (views["app"]?.layoutParams as? FrameLayout.LayoutParams)?.let {
+            if (it.leftMargin != 0 || it.topMargin != topY) { it.leftMargin = 0; it.topMargin = topY; moved = true }
+        }
         // Sheets: on top of the app, at their current point (a drag or animation in flight
         // keeps its position; a layout never fights the finger).
         for (sid in sheetIds) {
@@ -5097,7 +5110,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 } else clearSheetChrome()
             }
         } else clearSheetChrome()
-        root.requestLayout()
+        if (moved) root.requestLayout()
         // stickBottom (chat): after layout settles, keep the transcript pinned to the newest
         // message if the user was already at the bottom (new message, or the keyboard shrinking).
         if (stickBottomOn) (listScroll as? ScrollView)?.let { sc -> sc.post {
