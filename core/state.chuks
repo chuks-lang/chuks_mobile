@@ -40,21 +40,56 @@ var _effects: map[string]Effect = {}    // identity -> { depsKey, cleanup }
 var _fxSeen: map[string]bool = {}       // effect keys touched this render
 var _pendingFx: []PendingFx = []        // effects to run after this render pass
 
+// The hook keys (cells, effects) the component now rendering has touched, in order.
+// A component the reconciler skips (nothing of its own changed) does not run, so it
+// touches nothing; the reconciler keeps the list from its last run and re-marks the
+// keys, or the sweep would take a skipped component for an unmounted one.
+var _touched: []string = []
 // Framework-internal: called before a component renders to set its identity.
-export function hookEnter(path: string): void { _path = path; _slot = 0; _fxSlot = 0 }
+export function hookEnter(path: string): void { _path = path; _slot = 0; _fxSlot = 0; var t: []string = []; _touched = t }
+/** Framework-internal: the hook keys touched since hookEnter ("c:" cells, "f:" effects). */
+export function hookTouched(): []string { return _touched }
+/** Framework-internal: a skipped component's keys count as visited this pass. */
+export function hookRetain(keys: []string): void {
+    for (var k of keys) {
+        if (k.slice(0, 2) == "c:") { _seen[k.slice(2)] = true } else { _fxSeen[k.slice(2)] = true }
+    }
+}
 
-// Set by any state write, cleared after a render. The heartbeat reads it to decide
-// whether an idle beat needs a render at all: without it the only way to answer that
-// question was to render and diff, which is what made a scrolling app drop frames
+// Set by any state write, cleared when a render pass begins. The heartbeat reads it to
+// decide whether an idle beat needs a render at all: without it the only way to answer
+// that question was to render and diff, which is what made a scrolling app drop frames
 // twice a second.
+//
+// A write through a Cell also names the component it belongs to (the path in the cell
+// key), so a pass re-runs only the components whose own state changed and reuses
+// what every other component produced last time, the way React re-renders the
+// component that called setState and not its siblings. A write that names no
+// component (`markDirty()`, a keyed cell) re-runs everything, and so does a pass in
+// which nothing was marked at all: an event handler that mutated module state and
+// relied on the render that follows every event still gets that render.
 var _dirty: bool = false
+var _dirtyAll: bool = false
+var _dirtyPaths: map[string]bool = {}
+var _passAll: bool = true                // this pass: every component runs
+var _passPaths: map[string]bool = {}     // this pass: the components that run (when not all)
 /**
- * Framework-internal: mark that state changed, so the next beat renders. `Cell.set`
- * calls this for you; call it by hand only when you hold state OUTSIDE the cell
- * system (a module-level store) and need the heartbeat to notice a change to it.
- * `requestRender()` in core/ui.chuks is the app-facing form.
+ * Framework-internal: mark that state changed, so the next beat renders, and that
+ * EVERY component must re-run (the change belongs to no one component). `Cell.set`
+ * marks its own component instead; call this by hand only when you hold state OUTSIDE
+ * the cell system (a module-level store) and need the heartbeat to notice a change to
+ * it. `requestRender()` in core/ui.chuks is the app-facing form.
  */
-export function markDirty(): void { _dirty = true }
+export function markDirty(): void { _dirty = true; _dirtyAll = true }
+// A cell changed: its component re-runs on the next pass. The key is "<path>#<slot>"
+// (a keyed component's path is "key:<k>", still a path). A useKeyedState cell has no
+// slot and belongs to whichever component asked for it, so it re-runs everything.
+function markDirtyCell(k: string): void {
+    _dirty = true
+    const hash: int = k.indexOf("#")
+    if (hash < 0) { _dirtyAll = true; return }
+    _dirtyPaths[k.slice(0, hash)] = true
+}
 /**
  * Framework-internal: whether a state write has landed since the last render. The
  * host's idle beat asks this to skip rendering entirely when nothing changed.
@@ -62,6 +97,10 @@ export function markDirty(): void { _dirty = true }
 export function isDirty(): bool { return _dirty }
 /** Framework-internal: clear the dirty flag, called by the render pass once it commits. */
 export function clearDirty(): void { _dirty = false }
+/** Framework-internal: does every component run this pass? */
+export function passRunsAll(): bool { return _passAll }
+/** Framework-internal: does the component at `path` run this pass? */
+export function passRuns(path: string): bool { return _passAll || _passPaths.getOr(path, false) }
 
 /**
  * A typed handle to one piece of component state, returned by `useState`.
@@ -91,7 +130,7 @@ export class Cell<T> {
     // is a no-op instead of resurrecting a dead cell. This makes a late async/stream
     // callback firing into an unmounted component harmless (React's "setState on an
     // unmounted component is a no-op"): the fire-after-unmount race lands here.
-    public set(v: T): void { if (_cells.has(this.k)) { _cells[this.k] = v; markDirty() } }
+    public set(v: T): void { if (_cells.has(this.k)) { _cells[this.k] = v; markDirtyCell(this.k) } }
 }
 
 /**
@@ -108,7 +147,7 @@ export class Cell<T> {
 export function useState<T>(initial: T): Cell<T> {
     var k: string = _path + "#" + string(_slot)
     _slot = _slot + 1
-    _seen[k] = true
+    _seen[k] = true; _touched.push("c:" + k)
     if (!_cells.has(k)) { _cells[k] = initial }
     return new Cell<T>(k)
 }
@@ -124,7 +163,7 @@ export function useState<T>(initial: T): Cell<T> {
  */
 export function useKeyedState<T>(key: string, initial: T): Cell<T> {
     var k: string = "key:" + key
-    _seen[k] = true
+    _seen[k] = true; _touched.push("c:" + k)
     if (!_cells.has(k)) { _cells[k] = initial }
     return new Cell<T>(k)
 }
@@ -166,6 +205,13 @@ export function hookBegin(): void {
     var e2: map[string]bool = {}; _fxSeen = e2
     var e3: []PendingFx = []; _pendingFx = e3
     var e4: []string = []; _parked = e4
+    // Take the pending writes as this pass's plan, and start collecting the next
+    // pass's: a write during this pass (an effect that sets state) lands in the next
+    // one instead of being cleared with it. Nothing marked means everything runs.
+    _passAll = _dirtyAll || _dirtyPaths.keys().length == 0
+    _passPaths = _dirtyPaths
+    var e5: map[string]bool = {}; _dirtyPaths = e5
+    _dirtyAll = false; _dirty = false
 }
 
 // Framework-internal: after a render, drop cells whose identity was not visited
@@ -218,7 +264,7 @@ function depsKeyOf(deps: []any): string {
 export function useEffect(fn: any, deps: []any): void {
     var key: string = _path + "!" + string(_fxSlot)
     _fxSlot = _fxSlot + 1
-    _fxSeen[key] = true
+    _fxSeen[key] = true; _touched.push("f:" + key)
     var dk: string = depsKeyOf(deps)
     var prev: Effect? = _effects.get(key)
     if (prev == null || prev.depsKey != dk) {

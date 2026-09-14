@@ -3,9 +3,9 @@
 // bare offset change must render NOTHING: a full render per fling frame of a 200-row
 // Scroll cost 29ms on a Galaxy S23. A size change still renders (viewportHeight() and
 // viewportWidth() are app-visible), and so does a continuation that dirtied state.
-import { Node, Column, Text, Scroll, List, Gesture, App, SharedValue, Comp, viewportHeight } from "../core/ui.chuks";
+import { Node, Column, Text, Scroll, List, Gesture, App, SharedValue, Comp, KeyedComp, viewportHeight, requestRender } from "../core/ui.chuks";
 import { useSharedValue } from "../core/motion.chuks";
-import { markDirty, useState, Cell } from "../core/state.chuks";
+import { markDirty, useState, useEffect, Cell } from "../core/state.chuks";
 
 var passed: int = 0
 var failed: int = 0
@@ -108,5 +108,71 @@ check(RENDERS == rb + 1, "a settle handler that set a cell renders once")
 ra.tick(); ra.drain()
 check(RENDERS == rb + 1, "and the heartbeat after it stays quiet")
 check(SETTLED != null && SETTLED.get() == 1, "the settle reached the cell")
+
+// Only the component whose state changed re-runs. A screen of rows, each with its
+// own cell: a row's change runs that row, not its siblings and not the screen; the
+// screen's own change runs the screen and every row under it (they were made fresh,
+// with whatever the screen passed them); module state announced with requestRender
+// runs everything; a pass in which nothing was marked runs everything too.
+var RUNS: map[string]int = {}
+function ran(name: string): void { RUNS[name] = RUNS.getOr(name, 0) + 1 }
+function runsOf(name: string): int { return RUNS.getOr(name, 0) }
+var ROW_CELLS: map[string]Cell<int> = {}
+var SCREEN_CELL: Cell<int>? = null
+var EFFECT_CLEANUPS: int = 0
+var MODULE_TITLE: string = "rows"
+function row(n: int): Node {
+    return KeyedComp("r" + string(n), function(): Node {
+        ran("row" + string(n))
+        const hits: Cell<int> = useState(0)
+        ROW_CELLS["row" + string(n)] = hits
+        useEffect(function(): any { return function(): void { EFFECT_CLEANUPS = EFFECT_CLEANUPS + 1 } }, [])
+        return Text({ h: 40 }, "row " + string(n) + " x" + string(hits.get()))
+    })
+}
+class RowsApp extends App {
+    override public render(): Node {
+        return Comp(function(): Node {
+            ran("screen")
+            const title: Cell<int> = useState(0)
+            SCREEN_CELL = title
+            var rows: []Node = []
+            for (var i: int = 0; i < 5; i = i + 1) { rows.push(row(i)) }
+            return Column({ grow: 1 }, [ Text({}, MODULE_TITLE + " " + string(title.get())), Column({}, rows) ])
+        })
+    }
+}
+const ra2: RowsApp = new RowsApp()
+ra2.mount(); ra2.drain(); ra2.tick(); ra2.drain()   // the tick flushes the previous app's value drop (the hook store is shared)
+check(runsOf("screen") == 1 && runsOf("row0") == 1 && runsOf("row4") == 1, "mount runs everything once")
+var c2: Cell<int>? = ROW_CELLS.get("row2")
+if (c2 != null) { c2.set(7) }
+const n2: int = ra2.tick()
+const out2: string = ra2.drain()
+check(runsOf("row2") == 2, "a row's own state change runs that row")
+check(runsOf("screen") == 1 && runsOf("row0") == 1 && runsOf("row3") == 1, "and not the screen or its siblings (screen " + string(runsOf("screen")) + ", row0 " + string(runsOf("row0")) + ")")
+check(n2 == 1 && out2.indexOf("row 2 x7") >= 0, "the diff is that row's one line: " + out2)
+check(EFFECT_CLEANUPS == 0, "a skipped row keeps its effect (no cleanup ran)")
+ra2.tick(); ra2.drain()
+check(runsOf("row2") == 2, "the beat after it runs nothing")
+var c3: Cell<int>? = ROW_CELLS.get("row3")
+if (c3 != null) { c3.set(1) }
+ra2.tick(); ra2.drain()
+var c2b: Cell<int>? = ROW_CELLS.get("row2")
+check(c2b != null && c2b.get() == 7, "a skipped row's state survives the sweep")
+if (SCREEN_CELL != null) { SCREEN_CELL.set(1) }
+ra2.tick(); const out3: string = ra2.drain()
+check(runsOf("screen") == 2 && runsOf("row0") == 2 && runsOf("row4") == 2, "the screen's own change runs the screen and every row it made")
+check(out3.indexOf("rows 1") >= 0, "and its text updates")
+MODULE_TITLE = "places"
+requestRender()
+ra2.tick(); const out4: string = ra2.drain()
+check(runsOf("screen") == 3 && runsOf("row1") == 3, "requestRender runs everything")
+check(out4.indexOf("places 1") >= 0, "and module state shows")
+MODULE_TITLE = "spots"
+ra2.dispatch("app"); const out5: string = ra2.drain()
+check(runsOf("screen") == 4, "an event that marked nothing runs everything (the render every event had)")
+check(out5.indexOf("spots 1") >= 0, "so module state changed in its handler still shows")
+check(EFFECT_CLEANUPS == 0, "no row unmounted through any of it")
 
 print("render: " + string(passed) + " passed, " + string(failed) + " failed")

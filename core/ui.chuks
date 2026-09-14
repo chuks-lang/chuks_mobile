@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty, useState, Cell } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, Cell } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
@@ -379,6 +379,7 @@ export class Node {
     var kids: []Node
     var comp: any        // kind=="Comp": the component render fn () -> Node (lazy)
     var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
+    var hookKeys: []string   // kind=="Comp": the cells and effects its last run touched (kept alive when it is skipped)
     var ckey: string     // explicit identity key (.key(...)); "" = identify by position
     // Controlled TextInput: `hasVal` marks the field controlled, `val` is its text.
     // onSubmit/onFocus/onBlur are the extra input events (kept `any` like onPress).
@@ -420,7 +421,7 @@ export class Node {
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
-        this.comp = null; this.produced = null; this.ckey = ""
+        this.comp = null; this.produced = null; this.ckey = ""; var hk: []string = []; this.hookKeys = hk
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
@@ -2773,6 +2774,7 @@ export class Reconciler {
     // list is the one the user is scrolling: without this, a list on a COVERED screen
     // would claim the viewport, and the host's scroll reports would move it.
     var topScope: string
+    var ranDepth: int               // > 0 while inside a component that ran this pass: its children run too
     var liveListId: string          // the list the host is currently reporting scroll for
     var lastListId: string
     var lastListParent: string
@@ -2806,7 +2808,7 @@ export class Reconciler {
         this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
         this.lastList = null; this.lastListId = ""; this.lastListParent = ""; this.lastListIndex = 0
         this.lastStackId = ""; this.stackHostId = ""
-        this.topScope = ""; this.liveListId = ""
+        this.topScope = ""; this.liveListId = ""; this.ranDepth = 0
         this.lists = {}
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
         this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
@@ -2872,6 +2874,7 @@ export class Reconciler {
         // claim the viewport) kept the PREVIOUS screen's list named as live -- so the host
         // went on sizing a list that was covered, or destroyed.
         this.lastList = null; this.lastListId = ""
+        this.ranDepth = 0
         // Cleared each pass: a nested stack that emptied (or a tab switched away from)
         // must stop claiming the gesture, or the host would drag a container that no
         // longer holds two screens.
@@ -3108,8 +3111,10 @@ export class Reconciler {
             const path: string = n.ckey != "" ? "key:" + n.ckey : id
             hookEnter(path)
             const produced: Node = n.render()
-            n.produced = produced
+            n.produced = produced; n.hookKeys = hookTouched()
+            this.ranDepth = this.ranDepth + 1
             this.mountNode(produced, id, parent, index)
+            this.ranDepth = this.ranDepth - 1
             return
         }
         // A mount must DESTROY whatever holds this id. Node ids are structural paths
@@ -3151,17 +3156,23 @@ export class Reconciler {
         if (next.kind == "StackHost") { this.lastStackId = id }
         if (prev == null) { this.mountNode(next, id, parent, index); return }
         const p: Node = prev
-        if (p == next) { return }              // memoized + unchanged: whole subtree bails
+        if (p == next) { this.revisit(next, id, parent, index); return }   // the same subtree as last pass: only a changed component inside it has work
         // component at this position: run it (setting its identity) and diff what it
-        // produced against what it produced last render.
+        // produced against what it produced last render. Unless nothing of its own
+        // changed and no component above it ran this pass: then what it produced last
+        // time still stands, and only a changed component inside it has work. This is
+        // what makes a state change in one row cost that row, not the screen.
         if (next.kind == "Comp") {
             const path: string = next.ckey != "" ? "key:" + next.ckey : id
-            hookEnter(path)
-            const produced: Node = next.render()
-            next.produced = produced
-            var prevProduced: Node? = null
-            if (p.kind == "Comp") { prevProduced = p.produced } else { this.emit("R|" + id) }
-            this.reconcile(prevProduced, produced, id, parent, index)
+            if (p.kind == "Comp" && p.produced != null && this.ranDepth == 0 && !passRuns(path)) {
+                next.produced = p.produced; next.hookKeys = p.hookKeys
+                hookRetain(p.hookKeys)
+                const kept: Node = p.produced
+                this.revisit(kept, id, parent, index)
+                return
+            }
+            if (p.kind != "Comp") { this.emit("R|" + id) }
+            this.runComp(next, p.kind == "Comp" ? p.produced : null, path, id, parent, index)
             return
         }
         // prev was a component here, next is a plain node: drop the old subtree, mount fresh.
@@ -3284,6 +3295,43 @@ export class Reconciler {
             if (p.kids[i].kind == "None") { continue }
             const slot: string = this.childSlot(p.kids[i], i)
             if (!seen.getOr(slot, false)) { this.emit("R|" + id + "." + slot) }
+        }
+    }
+
+    // Run a component at `path`, then diff what it produced against `prevProduced`.
+    // Everything under a component that ran runs too: it made its children fresh, with
+    // whatever it passed them, and a closure's inputs cannot be compared.
+    runComp(n: Node, prevProduced: Node?, path: string, id: string, parent: string, index: int): void {
+        hookEnter(path)
+        const produced: Node = n.render()
+        n.produced = produced; n.hookKeys = hookTouched()
+        this.ranDepth = this.ranDepth + 1
+        this.reconcile(prevProduced, produced, id, parent, index)
+        this.ranDepth = this.ranDepth - 1
+    }
+    // Walk a subtree kept from the last pass, looking for the components in it that
+    // changed. Nothing here is diffed: the nodes ARE last pass's nodes. A changed
+    // component runs and diffs what it made against what it had; a list re-windows
+    // (its rows are rebuilt by its own path, and a row component that did not change
+    // is kept the same way); everything else is walked through.
+    revisit(n: Node, id: string, parent: string, index: int): void {
+        if (n.kind == "StackHost") { this.lastStackId = id }
+        if (n.kind == "Comp") {
+            const path: string = n.ckey != "" ? "key:" + n.ckey : id
+            if (passRuns(path)) { this.runComp(n, n.produced, path, id, parent, index); return }
+            hookRetain(n.hookKeys)
+            const kept: Node? = n.produced
+            if (kept != null) { this.revisit(kept, id, parent, index) }
+            return
+        }
+        if (n.kind == "List") { this.reconcileList(n, n, id, parent, index); return }
+        if (n.kind == "SectionList") { this.reconcileSectionList(n, n, id, parent, index); return }
+        var live: int = 0
+        for (var i: int = 0; i < n.kids.length; i = i + 1) {
+            const k: Node = n.kids[i]
+            if (k.kind == "None") { continue }
+            this.revisit(k, id + "." + this.childSlot(k, i), id, live)
+            live = live + 1
         }
     }
 
@@ -4139,8 +4187,11 @@ export class App {
         // app that does not override it never pays for a render here.
         const ticks: bool = this.ticksOnBeat()
         if (!ran && active == 0 && !flipped && !ticks && !isDirty()) { this.recon.flushHostOps(); return this.recon.count() }
-        hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
-        clearDirty()
+        // onTick before hookBegin: what it writes belongs to THIS pass's plan. hookBegin
+        // takes the pending writes as the plan and clears the flag, so a write during the
+        // pass (an effect setting state) is the next pass's, not lost.
+        this.onTick()
+        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
         return this.recon.count()
     }
     // Override alongside onTick to say "my onTick changes state every beat", so the
@@ -4170,7 +4221,6 @@ export class App {
     // every tap and every gesture end.
     paint(): void {
         hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
-        clearDirty()
     }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
