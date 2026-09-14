@@ -197,6 +197,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$APP_BUILD</string>
   <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
   <key>LSRequiresIPhoneOS</key><true/>
+  <key>CADisableMinimumFrameDurationOnPhone</key><true/>
   <key>MinimumOSVersion</key><string>15.0</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
   <key>NSLocalNetworkUsageDescription</key><string>Chuks dev-server hot reload.</string>

@@ -1977,6 +1977,8 @@ struct MotionBinding {
 }
 
 final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost {
+    var warmLink: CADisplayLink?          // see warmFrames
+    var warmUntil: CFTimeInterval = 0
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
@@ -2424,6 +2426,11 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         dismissTap.cancelsTouchesInView = false
         dismissTap.delegate = self
         view.addGestureRecognizer(dismissTap)
+        // Every touch keeps the frames warm (see warmFrames); the observer never recognises.
+        let warm = TouchObserver(); warm.onTouch = { [weak self] in self?.warmFrames() }
+        warm.cancelsTouchesInView = false; warm.delaysTouchesBegan = false; warm.delaysTouchesEnded = false
+        warm.delegate = self
+        view.addGestureRecognizer(warm)
 
         eSetup()
         ePlatform()                                                 // report platform + device info
@@ -7441,6 +7448,34 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 // A display link on the main run loop for `ms`; each tick's interval is recorded.
 // The same metric the RN bench measures with reanimated's useFrameCallback: did the
 // main thread service the display link on time while a gesture ran.
+// A recogniser that only watches: it reports every touch and never claims one.
+final class TouchObserver: UIGestureRecognizer {
+    var onTouch: (() -> Void)?
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?() }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?() }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?(); state = .failed }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?(); state = .failed }
+}
+// Keep the display awake while a finger is on the screen and for a short tail after it
+// lifts. The app draws only when something moves, so between two swipes an adaptive
+// (ProMotion) panel drops to its idle rate and the first frame of the next swipe pays
+// to wake it. A live display link that asks for the panel's top rate holds it there;
+// nothing is drawn, and once the tail ends the link goes away and the panel idles.
+extension CardsVC {
+    func warmFrames() {
+        warmUntil = CACurrentMediaTime() + 0.7
+        if warmLink != nil { return }
+        let l = CADisplayLink(target: self, selector: #selector(warmTick(_:)))
+        if #available(iOS 15.0, *) {
+            let top = Float(UIScreen.main.maximumFramesPerSecond)
+            l.preferredFrameRateRange = CAFrameRateRange(minimum: Swift.min(top, 80), maximum: top, preferred: top)
+        }
+        l.add(to: .main, forMode: .common); warmLink = l
+    }
+    @objc func warmTick(_ l: CADisplayLink) {
+        if CACurrentMediaTime() >= warmUntil { l.invalidate(); warmLink = nil }
+    }
+}
 final class FrameStatsRun {
     var link: CADisplayLink?
     var last: CFTimeInterval = 0
