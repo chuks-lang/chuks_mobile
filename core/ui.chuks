@@ -3313,11 +3313,12 @@ export class Reconciler {
         const d0: map[string]ListProp = next.data
         if (lpBool(d0, "horizontal", false)) { this.reconcileHList(prev, next, id, parent, index); return }
         const d: map[string]ListProp = next.data
-        const count: int = lpInt(d, "count", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
         const gap: int = lpInt(d, "gap", 0)
         const pad: int = lpInt(d, "pad", 0)
-        const stride: int = rowH + gap
+        const sized: bool = listStrideOk(rowH + gap, id, "rowHeight", "List")
+        const stride: int = sized ? rowH + gap : 1
+        const count: int = sized ? lpInt(d, "count", 0) : 0
         const buffer: int = lpInt(d, "buffer", 3)
         const itemFn: any = d.get("item")
         const contentId: string = id + ".0"
@@ -3630,11 +3631,12 @@ export class Reconciler {
     // reconciler places each at its x (left) with a fixed `itemWidth`.
     reconcileHList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
         const d: map[string]ListProp = next.data
-        const count: int = lpInt(d, "count", 0)
         const itemW: int = lpInt(d, "itemWidth", 0)
         const gap: int = lpInt(d, "gap", 0)
         const pad: int = lpInt(d, "pad", 0)
-        const stride: int = itemW + gap
+        const sized: bool = listStrideOk(itemW + gap, id, "itemWidth", "horizontal List")
+        const stride: int = sized ? itemW + gap : 1
+        const count: int = sized ? lpInt(d, "count", 0) : 0
         const buffer: int = lpInt(d, "buffer", 3)
         const itemFn: any = d.get("item")
         const contentId: string = id + ".0"
@@ -3753,12 +3755,13 @@ export class Reconciler {
             this.lastList = next; this.lastListId = id; this.lastListParent = parent; this.lastListIndex = index
         }
         const d: map[string]ListProp = next.data
-        const sectionCount: int = lpInt(d, "sectionCount", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
         const headerH: int = lpInt(d, "headerHeight", 0)
         const gap: int = lpInt(d, "gap", 0)
         const pad: int = lpInt(d, "pad", 0)
-        const stride: int = rowH + gap
+        const sized: bool = listStrideOk(rowH + gap, id, "rowHeight", "SectionList")
+        const stride: int = sized ? rowH + gap : 1
+        const sectionCount: int = sized ? lpInt(d, "sectionCount", 0) : 0
         const buffer: int = lpInt(d, "buffer", 3)
         const rowsFn: any = d.get("rows")
         const keyFn: any = d.get("key")
@@ -4262,6 +4265,14 @@ export function devWarn(key: string, message: string): void {
 
 /** Every distinct warning raised so far, in the order they first happened. */
 export function devWarnings(): []string { return WARN_LOG }
+// A windowed list positions rows by rank * stride, so a stride of zero (the size prop
+// missing, or zero) is not a layout: it was a division by zero deep in the windowing
+// math. Say which prop the list needs, once, and treat the list as empty until it has it.
+function listStrideOk(stride: int, id: string, prop: string, kind: string): bool {
+    if (stride > 0) { return true }
+    devWarn("liststride:" + id, kind + " " + id + " has no " + prop + ": the rows are positioned by it, so nothing is mounted until it is set")
+    return false
+}
 
 /** How many times a given warning key has fired, including the ones not printed. */
 export function devWarnCount(key: string): int { return WARNED.getOr(key, 0) }
