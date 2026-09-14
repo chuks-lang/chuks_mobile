@@ -132,7 +132,9 @@ function row(n: int): Node {
 }
 class RowsApp extends App {
     override public render(): Node {
-        return Comp(function(): Node {
+        // keyed: the earlier apps in this file also put a component at path "app", and the
+        // cell store is shared across App instances in one process
+        return KeyedComp("rows-screen", function(): Node {
             ran("screen")
             const title: Cell<int> = useState(0)
             SCREEN_CELL = title
@@ -163,7 +165,7 @@ check(c2b != null && c2b.get() == 7, "a skipped row's state survives the sweep")
 if (SCREEN_CELL != null) { SCREEN_CELL.set(1) }
 ra2.tick(); const out3: string = ra2.drain()
 check(runsOf("screen") == 2 && runsOf("row0") == 2 && runsOf("row4") == 2, "the screen's own change runs the screen and every row it made")
-check(out3.indexOf("rows 1") >= 0, "and its text updates")
+check(out3.indexOf("rows 1") >= 0, "and its text updates: " + out3.split("\n").join(" / "))
 MODULE_TITLE = "places"
 requestRender()
 ra2.tick(); const out4: string = ra2.drain()

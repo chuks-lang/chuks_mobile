@@ -10,7 +10,7 @@
 
 import { Node, Column, Row, Text, Scroll, Gesture, Comp, Reconciler, SharedValue } from "../core/ui.chuks";
 import { useSharedValue, interpolate, clamp, add, sub, mul, neg, minOf, maxOf, absOf, num } from "../core/motion.chuks";
-import { hookSweep, runEffects, hookBegin } from "../core/state.chuks";
+import { hookSweep, runEffects, hookBegin, serializeCells, restoreCells } from "../core/state.chuks";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -113,6 +113,36 @@ function main(): void {
     r.renderRoot(Column({}, [ Text({}, "gone") ]))
     const gone: string = r.drain()
     check(lines(gone, "MX|").length == 2, "unmounting the Comp drops both values (got " + string(lines(gone, "MX|").length) + ")")
+
+    // A relaunch restores the cells from the JSON the last run saved. A value's object
+    // cannot come back that way (it did, as a map, and the engine died reading it as a
+    // value); the component must get a FRESH value, created on this host.
+    var RESTORED: SharedValue? = null
+    const screen2: Node = Column({}, [ Comp(function(): Node {
+        const v: SharedValue = useSharedValue(0.0)
+        RESTORED = v
+        return Row({ motion: { tx: v } }, [ Text({}, "card") ])
+    }) ])
+    const r2: Reconciler = new Reconciler()
+    hookBegin(); r2.renderRoot(screen2); runEffects(); hookSweep()
+    const firstOut: string = r2.drain()
+    const firstId: int = RESTORED != null ? RESTORED.id : -1
+    check(lines(firstOut, "MV|").length == 1, "the first render creates the value")
+    const saved: string = serializeCells()
+    // the process ends: the component is gone with its value; a new process restores the
+    // cells from the JSON and mounts the same screen
+    hookBegin(); r2.renderRoot(Column({}, [ Text({}, "gone") ])); runEffects(); hookSweep(); r2.drain()
+    restoreCells(saved)
+    const r3: Reconciler = new Reconciler()
+    hookBegin(); r3.renderRoot(Column({}, [ Comp(function(): Node {
+        const v: SharedValue = useSharedValue(0.0)
+        RESTORED = v
+        return Row({ motion: { tx: v } }, [ Text({}, "card") ])
+    }) ])); runEffects(); hookSweep()
+    const restoredOut: string = r3.drain()
+    check(RESTORED != null && RESTORED.id != firstId, "after a restore the component holds a fresh value (id " + string(RESTORED != null ? RESTORED.id : -1) + " vs " + string(firstId) + ")")
+    check(lines(restoredOut, "MV|").length == 1, "and the new host is told to create it")
+    check(restoredOut.indexOf("mo=") >= 0 || restoredOut.indexOf("tx") >= 0, "and the binding names it: " + restoredOut.split("\n").join(" / "))
 
     println("")
     println("motion: " + string(PASS) + " passed, " + string(FAIL) + " failed")

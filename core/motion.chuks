@@ -25,13 +25,28 @@ import { useState, useEffect, Cell } from "./state.chuks";
  * component unmounts.
  */
 export function useSharedValue(initial: float): SharedValue {
-    const cell: Cell<any> = useState(null)
-    var sv: any = cell.get()
-    if (sv == null) { sv = new SharedValue(initial); cell.set(sv) }
-    const held: SharedValue = sv
-    useEffect(function(): any { return function(): void { held.drop() } }, [])
+    const held: SharedValue = heldValue(initial, false)
+    useEffect(function(): any { return function(): void { forget(held) } }, [])
     return held
 }
+// The values alive in this process, by id. A cell holds only the id: cells are
+// serialised when the app goes to the background and restored on the next launch, and
+// a value's object does not survive that (it came back as a map, and reading it as a
+// value killed the engine). An id from a previous process names nothing here, so the
+// component gets a fresh value, created on this host.
+var _live: map[int]SharedValue = {}
+function heldValue(initial: float, keyboard: bool): SharedValue {
+    const cell: Cell<int> = useState(0)
+    const id: int = cell.get()
+    const have: SharedValue? = id > 0 ? _live.get(id) : null
+    if (have != null) { return have }
+    const made: SharedValue = new SharedValue(initial)
+    if (keyboard) { queueHostOp("MK|" + string(made.id)) }
+    _live[made.id] = made
+    cell.set(made.id)
+    return made
+}
+function forget(sv: SharedValue): void { sv.drop(); _live.delete(sv.id) }
 
 /**
  * A shared value the host feeds with the keyboard's height, in points: 0 when it is
@@ -44,11 +59,8 @@ export function useSharedValue(initial: float): SharedValue {
  * ```
  */
 export function useKeyboardHeight(): SharedValue {
-    const cell: Cell<any> = useState(null)
-    var sv: any = cell.get()
-    if (sv == null) { sv = new SharedValue(0.0); cell.set(sv); const made: SharedValue = sv; queueHostOp("MK|" + string(made.id)) }
-    const held: SharedValue = sv
-    useEffect(function(): any { return function(): void { held.drop() } }, [])
+    const held: SharedValue = heldValue(0.0, true)
+    useEffect(function(): any { return function(): void { forget(held) } }, [])
     return held
 }
 
