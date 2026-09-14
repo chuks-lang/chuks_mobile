@@ -2500,6 +2500,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             "Canvas" -> DrawCanvas(this)                                 // vector drawing (iOS: Core Graphics)
             "Gesture" -> FrameLayout(this).also { g ->                   // swipe / double-tap / long-press + continuous pan/pinch/rotate
                 gestureIds.add(id)
+                g.setTag(GTAG, "$id:gesture")                            // its own event; a T| on it is an onPress like any view's
                 val detector = android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
                     override fun onDown(e: MotionEvent) = true
                     override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
@@ -2509,6 +2510,9 @@ class MainActivity : Activity(), ChuksModuleHost {
                     }
                     override fun onDoubleTap(e: MotionEvent): Boolean { dispatchGesture(g, "doubletap"); return true }
                     override fun onLongPress(e: MotionEvent) { dispatchGesture(g, "longpress") }
+                    // The Gesture's onPress (its T| binding, kept in TAG): the view's own touch
+                    // listener owns the touches, so the tap is recognised here, not by a click listener.
+                    override fun onSingleTapUp(e: MotionEvent): Boolean { (g.getTag(TAG) as? String)?.let { if (!disabledIds.contains(id)) fire(it) }; return true }
                 })
                 // Continuous state, per Gesture view (physical px -> logical via /density, matching tx units).
                 var panSX = 0f; var panSY = 0f
@@ -2532,7 +2536,9 @@ class MainActivity : Activity(), ChuksModuleHost {
                     if (cont.isNotEmpty()) {
                         when (ev.actionMasked) {
                             MotionEvent.ACTION_DOWN -> {
-                                g.parent?.requestDisallowInterceptTouchEvent(true)   // win over a parent Scroll
+                                // A pan feeding shared values on one axis (a swipeable row's panX) decides
+                                // its direction on the first moves; the other kinds win over a parent Scroll now.
+                                if (!motionPanOneAxis(id)) g.parent?.requestDisallowInterceptTouchEvent(true)
                                 panSX = ev.x; panSY = ev.y
                                 vt = android.view.VelocityTracker.obtain(); vt?.addMovement(ev)
                                 if (cont.contains("pan") && !motionPan(id, 0, 0f, 0f, 0f, 0f)) dispatchGesture(g, "pan:0,0,0,0,0")
@@ -2542,6 +2548,15 @@ class MainActivity : Activity(), ChuksModuleHost {
                             }
                             MotionEvent.ACTION_MOVE -> {
                                 vt?.addMovement(ev)
+                                if (motionPanOneAxis(id) && !motionPanLocked(id)) {
+                                    // Past the slop: along our axis it is ours (the Scroll may not take it any more);
+                                    // across it the Scroll intercepts and cancels this touch.
+                                    val dx = Math.abs(ev.x - panSX); val dy = Math.abs(ev.y - panSY)
+                                    if (Math.max(dx, dy) < dp(8)) return@setOnTouchListener true
+                                    val ours = if (mPan[id]?.get(0) ?: -1 >= 0) dx >= dy else dy >= dx
+                                    if (!ours) return@setOnTouchListener true
+                                    motionPanLock(id); g.parent?.requestDisallowInterceptTouchEvent(true)
+                                }
                                 if (cont.contains("pan") && ev.pointerCount == 1 && !motionPan(id, 1, ev.x - panSX, ev.y - panSY, 0f, 0f)) {
                                     val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
                                     dispatchGesture(g, "pan:1,$dx,$dy,0,0")
@@ -3693,7 +3708,7 @@ class MainActivity : Activity(), ChuksModuleHost {
 
     // A recognized gesture -> the engine (via the wrapper's action tag).
     private fun dispatchGesture(v: View, g: String) {
-        (v.getTag(TAG) as? String)?.let { hostInput(it, g) }
+        (v.getTag(GTAG) as? String)?.let { hostInput(it, g) }   // the Gesture's own event; its T| binding, if any, is an onPress
     }
 
     private fun selectLabel(id: String): String {
@@ -4501,6 +4516,7 @@ class MainActivity : Activity(), ChuksModuleHost {
 
     private fun bindAction(id: String, action: String) {
         val v = views[id] ?: return
+        if (gestureIds.contains(id)) { v.setTag(TAG, action); return }   // a Gesture's press: its own detector fires it (the touch listener stays)
         if (modalIds.contains(id)) modalActions[id] = action   // onDismiss: scrim tap AND sheet drag
         if (modalIds.contains(id) && !sheetModals.contains(id)) {
             // A tap on the overlay's content is the content's; only a tap on the scrim
@@ -4527,7 +4543,6 @@ class MainActivity : Activity(), ChuksModuleHost {
         }
         if (alertIds.contains(id)) { alertActions[id] = action; return }   // alert buttons dispatch this
         if (contextMenuIds.contains(id)) { v.setTag(TAG, action); return }  // long-press PopupMenu reads this
-        if (gestureIds.contains(id)) { v.setTag(TAG, action); return }      // GestureDetector reads this
         if (v is ScrollView) { setupPullToRefresh(v, action); return }      // Scroll onRefresh -> pull-to-refresh
         when (v) {
             is Button -> v.setTag(TAG, action)
@@ -5349,6 +5364,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         val dx = (dxPx / density).toDouble(); val dy = (dyPx / density).toDouble()
         when (phase) {
             0 -> {
+                mPanLocked.remove(id)
                 val bx = if (ids[0] >= 0) (mValues[ids[0]]?.cur ?: 0.0) else 0.0
                 val by = if (ids[1] >= 0) (mValues[ids[1]]?.cur ?: 0.0) else 0.0
                 mPanBase[id] = doubleArrayOf(bx, by)
@@ -5361,17 +5377,22 @@ class MainActivity : Activity(), ChuksModuleHost {
                 motionFlush()
             }
             else -> {
+                if (motionPanOneAxis(id) && !mPanLocked.contains(id)) { mPanBase.remove(id); return true }   // the Scroll took this touch: nothing moved, nothing to report
                 val base = mPanBase[id] ?: doubleArrayOf(0.0, 0.0)
                 if (ids[0] >= 0) motionWrite(ids[0], base[0] + dx)
                 if (ids[1] >= 0) motionWrite(ids[1], base[1] + dy)
                 motionFlush()
-                mPanBase.remove(id)
+                mPanBase.remove(id); mPanLocked.remove(id)
                 if (ids[0] >= 0) hostInput("mv${ids[0]}:end", "${mValues[ids[0]]?.cur ?: 0.0},${(vxPx / density).toDouble()}")
                 if (ids[1] >= 0) hostInput("mv${ids[1]}:end", "${mValues[ids[1]]?.cur ?: 0.0},${(vyPx / density).toDouble()}")
             }
         }
         return true
     }
+    private val mPanLocked = HashSet<String>()                        // one-axis pans that claimed the current touch
+    private fun motionPanOneAxis(id: String): Boolean { val ids = mPan[id] ?: return false; return (ids[0] >= 0) != (ids[1] >= 0) }
+    private fun motionPanLocked(id: String): Boolean = mPanLocked.contains(id)
+    private fun motionPanLock(id: String) { mPanLocked.add(id) }
     /// A scroll that feeds a value: its offset along its axis, in points.
     private fun motionScrolled(id: String, offsetPx: Int) {
         val vid = mScroll[id] ?: return
@@ -5868,5 +5889,5 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun align(v: String) = when (v) {
         "center" -> 2f; "end" -> 3f; "stretch" -> 4f; else -> 1f }
 
-    companion object { const val TAG = 0x7f_00_00_01 }
+    companion object { const val TAG = 0x7f_00_00_01; const val GTAG = 0x7f_00_00_02 }   // GTAG: a Gesture's own event tag
 }

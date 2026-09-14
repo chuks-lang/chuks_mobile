@@ -3367,6 +3367,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         return !(touch.view is UITextField)
     }
+    // A pan that feeds shared values on one axis only (a swipeable row's panX) is a
+    // horizontal gesture: a drag that starts vertically is not its and fails, so the
+    // list around it scrolls. Both axes, or a plain onPan, take every direction.
+    func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+        guard let p = g as? UIPanGestureRecognizer, let gv = g.view, let id = mPanByView[ObjectIdentifier(gv)], let ids = mPan[id] else { return true }
+        let t = p.translation(in: gv.window)
+        if ids.x >= 0 && ids.y < 0 { return abs(t.x) >= abs(t.y) }
+        if ids.y >= 0 && ids.x < 0 { return abs(t.y) >= abs(t.x) }
+        return true
+    }
     // Let the dismiss tap coexist with node onPress taps and the scroll gestures.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         return true
@@ -6400,7 +6410,6 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let v = views[id] else { return }
         if modalIds.contains(id) { modalActions[id] = action }   // onDismiss: fired by scrim tap AND sheet drag
         if selectIds.contains(id) { selectActions[id] = action; rebuildSelectMenu(id); return }   // menu items dispatch this
-        if gestureIds.contains(id) { gestureActions[id] = action; return }                        // gestures dispatch this
         if menuIds.contains(id) { menuActions[id] = action; rebuildMenu(id); return }             // Menu items dispatch this
         if contextMenuIds.contains(id) { contextMenuActions[id] = action; return }                // ContextMenu items dispatch this
         if alertIds.contains(id) { alertActions[id] = action; return }                            // alert buttons dispatch this
@@ -6619,7 +6628,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // ---- Gesture ---------------------------------------------------------
     func gestureIdFor(_ view: UIView?) -> String? { views.first(where: { $0.value === view })?.key }
     func dispatchGesture(_ view: UIView?, _ g: String) {
-        guard let id = gestureIdFor(view), let action = gestureActions[id] else { return }
+        guard let id = gestureIdFor(view) else { return }
+        let action = id + ":gesture"   // the Gesture's own event; its T| binding, if any, is an onPress
         guard let s = eInput(action, g) else { connected = false; return }
         apply(s); relayout(); headerText("gesture \(action)=\(g)")
     }

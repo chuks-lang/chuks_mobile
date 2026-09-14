@@ -79,6 +79,16 @@ function main(): void {
     check(ss.length == 1 && has(ss[0], "msc=" + string(y.id + 1) + ";"), "the Scroll names the value its offset feeds")
     check(has(first, "mo=h:-(200,cl(v" + string(y.id + 1) + ",0,120));"), "a layout prop binds like a paint prop")
 
+    println("wire: a Gesture is a view too")
+    var pressed: bool = false
+    var swiped: string = ""
+    const rg: Reconciler = new Reconciler(); rg.drain()
+    rg.renderRoot(Gesture({ onPress: function(): void { pressed = true }, onGesture: function(g: string): void { swiped = g } }, [ Text({}, "g") ]))
+    const gw: string = rg.drain()
+    check(has(gw, "T|app|app"), "onPress on a Gesture binds a press like any view's")
+    rg.fire("app"); check(pressed, "and a press reaches it")
+    rg.fireValue("app:gesture", "swipe:left"); check(swiped == "swipe:left", "the gesture stream is the node's own event (id:gesture)")
+
     println("wire: the app moves a value")
     y.set(40.0); y.spring(0.0, -300.0); y.timing(10.0, 200, "linear"); y.decay(500.0, 0.0, 300.0)
     r.renderRoot(screen())

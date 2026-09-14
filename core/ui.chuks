@@ -2394,6 +2394,7 @@ export function Gesture(first: GestureProps | []Kid, kids: []Kid = []): Node {
     const s: Style = new Style()
     applyLayoutV(s, p)
     const n: Node = new Node("Gesture", s, "", flatKids(kids))
+    applyEventsV(n, p)   // onPress and the other view events: a Gesture is a view too
     const og: any = p["onGesture"]      // discrete: swipe/doubletap/longpress
     const onPan: any = p["onPan"]        // continuous, each a function(v: string): void
     const onPinch: any = p["onPinch"]
@@ -2412,8 +2413,10 @@ export function Gesture(first: GestureProps | []Kid, kids: []Kid = []): Node {
     // One value-channel binding routes every gesture string by its prefix to the right
     // callback. Continuous streams ("pan:..."/"pinch:..."/"rotate:...") and discrete
     // ("swipe:left"/"doubletap"/"longpress") all arrive here.
+    // Its own event ("<id>:gesture", which the hosts dispatch by convention), so a
+    // Gesture may also take onPress like any view: the node's press binding stays a press.
     if (og != null || onPan != null || onPinch != null || onRotate != null) {
-        n.onChange = function(v: string): void {
+        n.events["gesture"] = function(v: string): void {
             if (_prefix(v, "pan:")) { _callStr(onPan, v) }
             else if (_prefix(v, "pinch:")) { _callStr(onPinch, v) }
             else if (_prefix(v, "rotate:")) { _callStr(onRotate, v) }
