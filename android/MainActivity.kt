@@ -1720,6 +1720,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             "biometrics.authenticate" -> authenticateBiometric(token, args)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
             "debug.viewTree" -> resolve(token, viewTreeDump())
+            "debug.frames" -> frameStats(token, args.toDoubleOrNull() ?: 10000.0)
             "debug.fail" -> fail(token, "simulated native failure")
             "permission.status" -> {
                 val p = permString(args)
@@ -2516,8 +2517,14 @@ class MainActivity : Activity(), ChuksModuleHost {
                     override fun onSingleTapUp(e: MotionEvent): Boolean { (g.getTag(TAG) as? String)?.let { if (!disabledIds.contains(id)) fire(it) }; return true }
                 })
                 // Continuous state, per Gesture view (physical px -> logical via /density, matching tx units).
+                // The pan is tracked in RAW (screen) coordinates: a Gesture that moves itself under the
+                // finger (a swipeable row bound to its own panX) has its local ev.x shifted by its own
+                // translation on every move, and a pan read locally sawtooths (-30, -13, -35, -18 ...)
+                // and lags the finger. iOS reads the same pan in window space for the same reason.
                 var panSX = 0f; var panSY = 0f
                 var vt: android.view.VelocityTracker? = null
+                // The velocity tracker reads the event's own coordinates too: give it the raw ones.
+                fun track(ev: MotionEvent) { val c = MotionEvent.obtain(ev); c.setLocation(ev.rawX, ev.rawY); vt?.addMovement(c); c.recycle() }
                 var scaleAcc = 1f
                 var rotStart = 0f
                 val scaleDet = android.view.ScaleGestureDetector(this, object : android.view.ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -2540,26 +2547,26 @@ class MainActivity : Activity(), ChuksModuleHost {
                                 // A pan feeding shared values on one axis (a swipeable row's panX) decides
                                 // its direction on the first moves; the other kinds win over a parent Scroll now.
                                 if (!motionPanOneAxis(id)) g.parent?.requestDisallowInterceptTouchEvent(true)
-                                panSX = ev.x; panSY = ev.y
-                                vt = android.view.VelocityTracker.obtain(); vt?.addMovement(ev)
+                                panSX = ev.rawX; panSY = ev.rawY
+                                vt = android.view.VelocityTracker.obtain(); track(ev)
                                 if (cont.contains("pan") && !motionPan(id, 0, 0f, 0f, 0f, 0f)) dispatchGesture(g, "pan:0,0,0,0,0")
                             }
                             MotionEvent.ACTION_POINTER_DOWN -> if (cont.contains("rotate") && ev.pointerCount >= 2) {
                                 rotStart = Math.toDegrees(Math.atan2((ev.getY(1) - ev.getY(0)).toDouble(), (ev.getX(1) - ev.getX(0)).toDouble())).toFloat()
                             }
                             MotionEvent.ACTION_MOVE -> {
-                                vt?.addMovement(ev)
+                                track(ev)
                                 if (motionPanOneAxis(id) && !motionPanLocked(id)) {
                                     // Past the slop: along our axis it is ours (the Scroll may not take it any more);
                                     // across it the Scroll intercepts and cancels this touch.
-                                    val dx = Math.abs(ev.x - panSX); val dy = Math.abs(ev.y - panSY)
+                                    val dx = Math.abs(ev.rawX - panSX); val dy = Math.abs(ev.rawY - panSY)
                                     if (Math.max(dx, dy) < dp(8)) return@setOnTouchListener true
                                     val ours = if (mPan[id]?.get(0) ?: -1 >= 0) dx >= dy else dy >= dx
                                     if (!ours) return@setOnTouchListener true
                                     motionPanLock(id); g.parent?.requestDisallowInterceptTouchEvent(true)
                                 }
-                                if (cont.contains("pan") && ev.pointerCount == 1 && !motionPan(id, 1, ev.x - panSX, ev.y - panSY, 0f, 0f)) {
-                                    val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
+                                if (cont.contains("pan") && ev.pointerCount == 1 && !motionPan(id, 1, ev.rawX - panSX, ev.rawY - panSY, 0f, 0f)) {
+                                    val dx = ((ev.rawX - panSX) / density).toInt(); val dy = ((ev.rawY - panSY) / density).toInt()
                                     dispatchGesture(g, "pan:1,$dx,$dy,0,0")
                                 }
                                 if (cont.contains("rotate") && ev.pointerCount >= 2) {
@@ -2569,10 +2576,10 @@ class MainActivity : Activity(), ChuksModuleHost {
                             }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                                 if (cont.contains("pan")) {
-                                    vt?.addMovement(ev); vt?.computeCurrentVelocity(1000)
-                                    if (!motionPan(id, 2, ev.x - panSX, ev.y - panSY, vt?.xVelocity ?: 0f, vt?.yVelocity ?: 0f)) {
+                                    track(ev); vt?.computeCurrentVelocity(1000)
+                                    if (!motionPan(id, 2, ev.rawX - panSX, ev.rawY - panSY, vt?.xVelocity ?: 0f, vt?.yVelocity ?: 0f)) {
                                         val vx = ((vt?.xVelocity ?: 0f) / density).toInt(); val vy = ((vt?.yVelocity ?: 0f) / density).toInt()
-                                        val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
+                                        val dx = ((ev.rawX - panSX) / density).toInt(); val dy = ((ev.rawY - panSY) / density).toInt()
                                         dispatchGesture(g, "pan:2,$dx,$dy,$vx,$vy")
                                     }
                                 }
@@ -5157,6 +5164,30 @@ class MainActivity : Activity(), ChuksModuleHost {
         return false
     }
 
+
+    // ---- Frame cadence measurement (Debug.frames) -----------------------------------
+    // Choreographer frames for `ms`; each frame's interval is recorded. The same metric
+    // the RN bench measures with reanimated's useFrameCallback.
+    private fun frameStats(token: String, ms: Double) {
+        val intervals = ArrayList<Double>()
+        var last = 0L
+        val endAt = System.nanoTime() + (ms * 1e6).toLong()
+        val ch = android.view.Choreographer.getInstance()
+        ch.postFrameCallback(object : android.view.Choreographer.FrameCallback {
+            override fun doFrame(t: Long) {
+                if (last > 0) intervals.add((t - last) / 1e6)
+                last = t
+                if (t < endAt) { ch.postFrameCallback(this); return }
+                // The steady cadence is the 10th-percentile interval (the display's period,
+                // whatever rate it runs at); a frame is janky past one and a half of it.
+                val s = intervals.sorted()
+                fun pct(p: Double): Double = if (s.isEmpty()) 0.0 else s[Math.min(s.size - 1, (s.size * p).toInt())]
+                val period = pct(0.1)
+                val janky = intervals.count { it > period * 1.5 }
+                resolve(token, String.format(java.util.Locale.US, "hz=%d frames=%d janky=%d p50=%.1f p95=%.1f max=%.1f", if (period > 0) Math.round(1000.0 / period) else 0, intervals.size, janky, pct(0.5), pct(0.95), s.lastOrNull() ?: 0.0))
+            }
+        })
+    }
 
     // ---- Shared values: motion the host drives (docs/shared-values.md) ------------
     // A value the engine created with MV|; the host holds its number, animates it (MS|

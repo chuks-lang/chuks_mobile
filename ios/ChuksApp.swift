@@ -4537,6 +4537,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
         case "debug.activeStreams": resolve(token, String(activeStreams.count + streamTeardown.count))
         case "debug.viewTree": resolve(token, viewTreeDump())
+        case "debug.frames": frameStats(token, Double(args) ?? 10000)
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)
         case "permission.request": permRequest(args, token)
@@ -7433,6 +7434,39 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
         default: break
         }
+    }
+}
+
+// ---- Frame cadence measurement (Debug.frames) -----------------------------------
+// A display link on the main run loop for `ms`; each tick's interval is recorded.
+// The same metric the RN bench measures with reanimated's useFrameCallback: did the
+// main thread service the display link on time while a gesture ran.
+final class FrameStatsRun {
+    var link: CADisplayLink?
+    var last: CFTimeInterval = 0
+    var intervals: [Double] = []
+    var done: (([Double]) -> Void)?
+    @objc func tick(_ l: CADisplayLink) {
+        if last > 0 { intervals.append((l.timestamp - last) * 1000) }
+        last = l.timestamp
+    }
+    func finish() { link?.invalidate(); link = nil; done?(intervals); done = nil }
+}
+extension CardsVC {
+    func frameStats(_ token: String, _ ms: Double) {
+        let run = FrameStatsRun()
+        let l = CADisplayLink(target: run, selector: #selector(FrameStatsRun.tick(_:)))
+        l.add(to: .main, forMode: .common); run.link = l
+        run.done = { [weak self] iv in
+            // The steady cadence is the 10th-percentile interval (the display's period,
+            // whatever rate it runs at); a frame is janky past one and a half of it.
+            let s = iv.sorted()
+            func pct(_ p: Double) -> Double { s.isEmpty ? 0 : s[Swift.min(s.count - 1, Int(Double(s.count) * p))] }
+            let period = pct(0.1)
+            let janky = iv.filter { $0 > period * 1.5 }.count
+            self?.resolve(token, String(format: "hz=%d frames=%d janky=%d p50=%.1f p95=%.1f max=%.1f", period > 0 ? Int((1000 / period).rounded()) : 0, iv.count, janky, pct(0.5), pct(0.95), s.last ?? 0))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + ms / 1000) { run.finish() }
     }
 }
 

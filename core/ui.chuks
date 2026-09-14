@@ -723,8 +723,10 @@ export class Expr {
 // drop one). Queued here and emitted ahead of the next frame's diff, so a value
 // exists before a style line names it.
 var _hostOps: []string = []
-/** Queue a host line for the next frame. Framework use. */
-export function queueHostOp(line: string): void { _hostOps.push(line); markDirty(); host.wake() }
+/** Queue a host line for the next frame. Framework use. A host op is not app state:
+ * it goes out with the next batch (a render's, or on its own from a tick or a value
+ * event) without making the app re-render. */
+export function queueHostOp(line: string): void { _hostOps.push(line); host.wake() }
 // Handlers for events that belong to no node (a shared value's end/settle). Looked up
 // when a node handler is not found for the tag.
 var _hostHandlers: map[string]any = {}
@@ -2950,9 +2952,16 @@ export class Reconciler {
     }
     // Fire the onChange(value) closure bound to node `tag` (from an input), or the
     // handler of a host event that belongs to no node (a shared value's end/settle).
-    public fireValue(tag: string, value: string): void {
-        if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value) }
-        else if (_hostHandlers[tag] != null) { const f: any = _hostHandlers[tag]; f(value) }
+    // Returns who took it: 1 a node's handler, 2 a host handler (a value's end/settle),
+    // 0 nobody. The app decides from that whether the event is worth a render.
+    public fireValue(tag: string, value: string): int {
+        if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value); return 1 }
+        else if (_hostHandlers[tag] != null) { const f: any = _hostHandlers[tag]; f(value); return 2 }
+        return 0
+    }
+    // Emit the queued host ops on their own, when no render is going to carry them.
+    public flushHostOps(): void {
+        if (_hostOps.length > 0) { for (var l of _hostOps) { this.lines.push(l) }; _hostOps = [] }
     }
     // ---- async host->engine bridge (F3) --------------------------------------
     // Request a native capability. If `cb` is non-null it is registered under a
@@ -4056,7 +4065,7 @@ export class App {
         // and they would vanish without a trace.
         flushHostReady()
         this.flushAppearance()
-        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        this.paint()
         return this.recon.count()
     }
     // Full re-mount: re-emit the entire current tree (state preserved). The dev server
@@ -4071,7 +4080,9 @@ export class App {
     }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
     public setViewport(top: int, h: int, w: int): int {
-        runAsyncQueue()
+        const ran: bool = runAsyncQueue()
+        // The size is app-visible (viewportHeight()/viewportWidth()); the offset is not.
+        const resized: bool = (h > 0 && h != _vpH) || (w > 0 && w != _vpW)
         if (h > 0) { _vpH = h }   // expose the real viewport height (viewportHeight()) for full-screen feeds
         if (w > 0) { _vpW = w }   // expose the list width (viewportWidth()) for grid column sizing
         this.recon.begin()
@@ -4081,17 +4092,20 @@ export class App {
         // lifecycle is deliberately skipped on this path: nothing re-rendered, so there
         // is nothing to sweep (a sweep here would drop every cell). Effects still run,
         // because a row entering the window may have registered one. When the screen has
-        // no List there is nothing to re-window and we fall back to a full render.
+        // no List there is nothing to re-window, and nothing to render either unless the
+        // viewport's size changed or a continuation dirtied state: the host reports every
+        // scroll frame, and a full render per frame of a plain 200-row Scroll cost 29ms
+        // on a Galaxy S23, every frame of every fling janky.
         if (this.recon.rewindow()) {
             runEffects()
-        } else {
-            hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        } else if (ran || resized || isDirty()) {
+            this.paint()
         }
         // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
         // then re-render (WITHOUT begin, so the windowing mutations above are kept) so the newly
         // visible cell's state change (e.g. Video playing) lands in the same frame.
         if (this.recon.flushVisible()) {
-            hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+            this.paint()
         }
         return this.recon.count()
     }
@@ -4121,7 +4135,7 @@ export class App {
         // `onTick` is the app's hook; a default (empty) one cannot dirty anything, so an
         // app that does not override it never pays for a render here.
         const ticks: bool = this.ticksOnBeat()
-        if (!ran && active == 0 && !flipped && !ticks && !isDirty()) { return this.recon.count() }
+        if (!ran && active == 0 && !flipped && !ticks && !isDirty()) { this.recon.flushHostOps(); return this.recon.count() }
         hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
         clearDirty()
         return this.recon.count()
@@ -4139,14 +4153,22 @@ export class App {
         var handled: bool = runBackHandlers()
         if (!handled) { handled = this.popRoute() }
         if (!handled) { return 0 }
-        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
-        clearDirty()
+        this.paint()
         return 1
     }
     // A plain App has no route stack; NavStack overrides this to pop one.
     public popRoute(): bool { return false }
 
 
+    // One render of the app tree, with the hook lifecycle around it. Clears the dirty
+    // flag too: every entry point that renders goes through here, so the heartbeat
+    // never re-renders an app that the event before it already painted. It used to,
+    // and on a 200-row screen that second render cost 29ms on the main thread after
+    // every tap and every gesture end.
+    paint(): void {
+        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        clearDirty()
+    }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
         // The host's way of saying "the OS is taking the time back". Not a node id, so it
@@ -4156,27 +4178,37 @@ export class App {
             if (h != null) { h() }
             return 0
         }
-        this.recon.begin(); runAsyncQueue(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.fire(tag); this.paint(); return this.recon.count()
     }
     // A native input change arrived for node `tag`: fire its onChange(value), then re-render.
     public dispatchInput(tag: string, value: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin()
+        const ran: bool = runAsyncQueue()
+        const took: int = this.recon.fireValue(tag, value)
+        // A node's own handler renders, as every event does. A value event's handler is a
+        // native callback (the value ended or settled): it renders only when it marked
+        // state dirty, because its usual outcome is a host op (a spring), which goes out
+        // on its own. An event nobody bound renders nothing. Before this, a swipe row's
+        // fling, end and settle each cost a 13-31ms render of a 20-row screen on a
+        // Galaxy S23, for a diff of one line.
+        if (took == 1 || ran || isDirty()) { this.paint() } else { this.recon.flushHostOps() }
+        return this.recon.count()
     }
     // A native async result arrived for `token` (F3): fire the registered callback
     // with `payload`, then re-render. Mirrors dispatch, but keyed by an async token
     // rather than a UI node id.
     public resolve(token: string, payload: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.fireToken(token, payload); this.paint(); return this.recon.count()
     }
     // The host reports that `token` is dead (user dismissed the picker, native op
     // ended with no result). Drop it and re-render. Mirrors resolve, without a fire.
     public cancelToken(token: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.dropToken(token); this.paint(); return this.recon.count()
     }
     // The host reports a FAILURE for `token` (permission denied, hardware missing,
     // native error). Fire the request's error callback and re-render.
     public failToken(token: string, message: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.failToken(token, message); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.failToken(token, message); this.paint(); return this.recon.count()
     }
     // Return the pending mutation stream as text and hand it to the host.
     public drain(): string { return this.recon.drain() }
