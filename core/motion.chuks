@@ -1,0 +1,96 @@
+// Shared values: motion the host drives.
+//
+// A shared value is a number that lives on the host. The app says once what feeds it
+// and which props read it; after that the host moves the views every frame and the
+// engine is not involved. Where `Animated` (core/animated.chuks) hands the host a
+// target to tween to, a shared value hands it a relationship to keep: "this card's
+// translateY is the finger's travel", "this title's opacity is the scroll offset,
+// mapped", "this header's height is 200 minus that". See docs/shared-values.md.
+//
+//   const y: SharedValue = useSharedValue(0)
+//   y.onEnd(function(v: float, vel: float): void { y.spring(0, vel) })   // let go: spring back
+//   Gesture({ panY: y }, [
+//       Row({ motion: { ty: y, opacity: interpolate(y, [0, 200], [100, 40]) } }, [ card ]),
+//   ])
+//
+// Values are floats in the prop's own units: points for tx/ty/w/h/padding, percent for
+// opacity (0..100) and scale (100 = 1.0), degrees for rotate.
+
+import { Expr, SharedValue, queueHostOp } from "./ui.chuks";
+import { useState, useEffect, Cell } from "./state.chuks";
+
+/**
+ * A shared value that keeps its identity across renders. Call it inside a `Comp` like
+ * `useState`. The value is created on the host the first time and dropped when the
+ * component unmounts.
+ */
+export function useSharedValue(initial: float): SharedValue {
+    const cell: Cell<any> = useState(null)
+    var sv: any = cell.get()
+    if (sv == null) { sv = new SharedValue(initial); cell.set(sv) }
+    const held: SharedValue = sv
+    useEffect(function(): any { return function(): void { held.drop() } }, [])
+    return held
+}
+
+/**
+ * A shared value the host feeds with the keyboard's height, in points: 0 when it is
+ * down, rising and falling with its animation. Bind a composer's `pb` or a bar's `ty`
+ * to it and the view moves with the keyboard, on the host, every frame.
+ *
+ * ```chuks
+ * const kb: SharedValue = useKeyboardHeight()
+ * Row({ motion: { ty: neg(kb) } }, [ composer ])
+ * ```
+ */
+export function useKeyboardHeight(): SharedValue {
+    const cell: Cell<any> = useState(null)
+    var sv: any = cell.get()
+    if (sv == null) { sv = new SharedValue(0.0); cell.set(sv); const made: SharedValue = sv; queueHostOp("MK|" + string(made.id)) }
+    const held: SharedValue = sv
+    useEffect(function(): any { return function(): void { held.drop() } }, [])
+    return held
+}
+
+/** A constant inside an expression. */
+export function num(v: float): Expr { return new Expr(string(v)) }
+function ex(e: any): string {
+    // Accept an Expr or a plain number where an expression is expected.
+    if (typeof(e) == "int" || typeof(e) == "float") { return string(e) }
+    const x: Expr = e
+    return x.str()
+}
+function joinNums(xs: []float): string {
+    var parts: []string = []
+    for (var x of xs) { parts.push(string(x)) }
+    return parts.join(",")
+}
+/**
+ * Map `x` from the `inputs` range onto the `outputs` range, piecewise linear between
+ * the stops (both lists the same length, inputs ascending). `mode`: "extend" (default)
+ * keeps going past the ends, "clamp" stops at them.
+ *
+ * ```chuks
+ * interpolate(scrollY, [0, 120], [200, 80])            // a header from 200 to 80 points
+ * interpolate(scrollY, [80, 120], [0, 100], "clamp")   // a title fading in over the last 40
+ * ```
+ */
+export function interpolate(x: any, inputs: []float, outputs: []float, mode: string = "extend"): Expr {
+    return new Expr("i(" + ex(x) + "," + joinNums(inputs) + "," + joinNums(outputs) + "," + (mode == "clamp" ? "c" : "e") + ")")
+}
+/** `x` kept inside [lo, hi]. */
+export function clamp(x: any, lo: float, hi: float): Expr { return new Expr("cl(" + ex(x) + "," + string(lo) + "," + string(hi) + ")") }
+/** `a + b`. */
+export function add(a: any, b: any): Expr { return new Expr("+(" + ex(a) + "," + ex(b) + ")") }
+/** `a - b`. */
+export function sub(a: any, b: any): Expr { return new Expr("-(" + ex(a) + "," + ex(b) + ")") }
+/** `a * b`. */
+export function mul(a: any, b: any): Expr { return new Expr("*(" + ex(a) + "," + ex(b) + ")") }
+/** `-a`. */
+export function neg(a: any): Expr { return new Expr("neg(" + ex(a) + ")") }
+/** The smaller of `a` and `b`. */
+export function minOf(a: any, b: any): Expr { return new Expr("min(" + ex(a) + "," + ex(b) + ")") }
+/** The larger of `a` and `b`. */
+export function maxOf(a: any, b: any): Expr { return new Expr("max(" + ex(a) + "," + ex(b) + ")") }
+/** `|a|`. */
+export function absOf(a: any): Expr { return new Expr("abs(" + ex(a) + ")") }

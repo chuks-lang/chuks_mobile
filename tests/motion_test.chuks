@@ -1,0 +1,112 @@
+// Shared values on the wire.
+//
+// A shared value is created on the host (MV|), fed by a source named in a style key
+// (mpx/mpy/msc), read by props through bindings (mb=), moved by the app (MS|) and
+// dropped when its Comp goes (MX|). The host reports a gesture's end and a settle as
+// value events that reach the closures the app registered. This checks the encoding
+// in both directions, and that value ops go out AHEAD of the diff that names them.
+//
+// Run:  chuks run tests/motion_test.chuks   (exits non-zero on failure)
+
+import { Node, Column, Row, Text, Scroll, Gesture, Comp, Reconciler, SharedValue } from "../core/ui.chuks";
+import { useSharedValue, interpolate, clamp, add, sub, mul, neg, minOf, maxOf, absOf, num } from "../core/motion.chuks";
+import { hookSweep, runEffects, hookBegin } from "../core/state.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function lines(stream: string, prefix: string): []string {
+    var out: []string = []
+    for (var l of stream.split("\n")) { if (l.startsWith(prefix)) { out.push(l) } }
+    return out
+}
+function has(s: string, sub: string): bool { return s.indexOf(sub) >= 0 }
+function indexOfLine(all: []string, prefix: string): int {
+    for (var i: int = 0; i < all.length; i = i + 1) { if (all[i].startsWith(prefix)) { return i } }
+    return -1
+}
+
+function main(): void {
+    println("expressions")
+    const a: SharedValue = new SharedValue(5.0)
+    check(a.str() == "v" + string(a.id), "a value is an expression naming itself (" + a.str() + ")")
+    check(interpolate(a, [0.0, 120.0], [200.0, 80.0]).str() == "i(" + a.str() + ",0,120,200,80,e)", "interpolate: value, inputs, outputs, extend (" + interpolate(a, [0.0, 120.0], [200.0, 80.0]).str() + ")")
+    check(interpolate(a, [80.0, 120.0], [0.0, 100.0], "clamp").str().endsWith(",c)"), "interpolate clamp mode")
+    check(clamp(a, 0.0, 120.0).str() == "cl(" + a.str() + ",0,120)", "clamp")
+    check(add(a, 10.0).str() == "+(" + a.str() + ",10)" && sub(200.0, a).str() == "-(200," + a.str() + ")", "add and sub take a value or a number on either side")
+    check(mul(a, 2.0).str() == "*(" + a.str() + ",2)" && neg(a).str() == "neg(" + a.str() + ")", "mul and neg")
+    check(minOf(a, 1.0).str() == "min(" + a.str() + ",1)" && maxOf(a, 1.0).str() == "max(" + a.str() + ",1)" && absOf(a).str() == "abs(" + a.str() + ")", "min, max, abs")
+    check(num(3.5).str() == "3.5", "a constant")
+    check(add(clamp(a, 0.0, 1.0), interpolate(a, [0.0, 1.0], [1.0, 0.0])).str() == "+(cl(" + a.str() + ",0,1),i(" + a.str() + ",0,1,1,0,e))", "expressions nest")
+
+    println("wire: create, bind, feed")
+    var ended: string = ""
+    var settled: float = -1.0
+    var held: any = null
+    const r: Reconciler = new Reconciler()
+    r.drain()
+    const screen: function(): Node = function(): Node {
+        return Comp(function(): Node {
+            const y: SharedValue = useSharedValue(0.0)
+            const sy: SharedValue = useSharedValue(0.0)
+            held = y
+            y.onEnd(function(v: float, vel: float): void { ended = string(v) + "/" + string(vel) })
+            y.onSettle(function(v: float): void { settled = v })
+            return Column({}, [
+                Gesture({ panY: y }, [
+                    Row({ h: 80, motion: { ty: y, opacity: interpolate(y, [0.0, 200.0], [100.0, 40.0]) } }, [ Text({}, "card") ]),
+                ]),
+                Scroll({ scrollValue: sy }, [ Column({ motion: { h: sub(200.0, clamp(sy, 0.0, 120.0)) } }, [ Text({}, "header") ]) ]),
+            ])
+        })
+    }
+    hookBegin(); r.renderRoot(screen()); runEffects(); hookSweep()   // the app loop's bracket around a render
+    const first: string = r.drain()
+    const all: []string = first.split("\n")
+    const y: SharedValue = held
+    const mv: []string = lines(first, "MV|")
+    check(has(first, "MV|" + string(y.id) + "|0") && has(first, "MV|" + string(y.id + 1) + "|0"), "both values created, with their initial")
+    check(indexOfLine(all, "MV|" + string(y.id) + "|") < indexOfLine(all, "C|app|"), "value creation goes out before the diff that names it, though the Comp rendered inside the pass")
+    const gs: []string = lines(first, "S|app.0|")
+    check(gs.length == 1 && has(gs[0], "mpy=" + string(y.id) + ";") && !has(gs[0], "mpx="), "the Gesture names the value its pan feeds")
+    check(lines(first, "P|app.0|pan").length == 1, "a pan source attaches the pan recognizer")
+    const cs: []string = lines(first, "S|app.0.0|")
+    check(cs.length == 1 && has(cs[0], "mo=ty:" + y.str() + "%7Copacity:i(" + y.str() + ",0,200,100,40,e);"), "bindings cross as one escaped key, prop:expr pairs (" + (cs.length > 0 ? cs[0] : "") + ")")
+    const ss: []string = lines(first, "S|app.1|")
+    check(ss.length == 1 && has(ss[0], "msc=" + string(y.id + 1) + ";"), "the Scroll names the value its offset feeds")
+    check(has(first, "mo=h:-(200,cl(v" + string(y.id + 1) + ",0,120));"), "a layout prop binds like a paint prop")
+
+    println("wire: the app moves a value")
+    y.set(40.0); y.spring(0.0, -300.0); y.timing(10.0, 200, "linear"); y.decay(500.0, 0.0, 300.0)
+    r.renderRoot(screen())
+    const ops: []string = lines(r.drain(), "MS|")
+    check(ops.length == 4, "four moves, one line each (got " + string(ops.length) + ")")
+    check(ops.length == 4 && ops[0] == "MS|" + string(y.id) + "|40|", "set snaps (" + (ops.length > 0 ? ops[0] : "") + ")")
+    check(ops.length == 4 && ops[1] == "MS|" + string(y.id) + "|0|sp:180,22,-300", "spring carries stiffness, damping and the start velocity (" + (ops.length > 1 ? ops[1] : "") + ")")
+    check(ops.length == 4 && ops[2] == "MS|" + string(y.id) + "|10|tm:200,linear", "timing carries duration and easing")
+    check(ops.length == 4 && ops[3] == "MS|" + string(y.id) + "|40|dc:500,0,300", "decay carries velocity and the clamp, from the last known value")
+
+    println("wire: the host reports")
+    r.fireValue("mv" + string(y.id) + ":end", "132.5,-840")
+    check(ended == "132.5/-840", "a gesture's end reaches onEnd with value and velocity (got " + ended + ")")
+    check(y.latest() == 132.5, "and latest() is what the host said")
+    r.fireValue("mv" + string(y.id) + ":settle", "0")
+    check(settled == 0.0, "a settle reaches onSettle")
+
+    println("wire: rerender and unmount")
+    r.renderRoot(screen())
+    check(r.drain() == "", "an unchanged screen with bindings emits nothing (bindings are a style key like any other)")
+    hookBegin(); r.renderRoot(Column({}, [ Text({}, "gone") ])); runEffects(); hookSweep()   // the Comp is gone: its effect cleanup drops the values
+    r.renderRoot(Column({}, [ Text({}, "gone") ]))
+    const gone: string = r.drain()
+    check(lines(gone, "MX|").length == 2, "unmounting the Comp drops both values (got " + string(lines(gone, "MX|").length) + ")")
+
+    println("")
+    println("motion: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("motion tests failed") }
+}
+
+main();

@@ -682,6 +682,8 @@ class MainActivity : Activity(), ChuksModuleHost {
                     }
                 }
                 "FA" -> if (f.size >= 2) setFrameDriver(f[1] == "1")   // per-frame physics on/off
+                "MV", "MS", "MX" -> motionOp(f)                          // shared values (docs/shared-values.md)
+                "MK" -> if (f.size >= 2) f[1].toIntOrNull()?.let { mKeyboardValues.add(it) }
                 "X" -> if (f.size >= 3) {
                     // Async host->engine command: X|token|capability|args. Run AFTER this
                     // applyDrain() (main-looper post), so a sync capability's resolve()
@@ -2533,14 +2535,14 @@ class MainActivity : Activity(), ChuksModuleHost {
                                 g.parent?.requestDisallowInterceptTouchEvent(true)   // win over a parent Scroll
                                 panSX = ev.x; panSY = ev.y
                                 vt = android.view.VelocityTracker.obtain(); vt?.addMovement(ev)
-                                if (cont.contains("pan")) dispatchGesture(g, "pan:0,0,0,0,0")
+                                if (cont.contains("pan") && !motionPan(id, 0, 0f, 0f, 0f, 0f)) dispatchGesture(g, "pan:0,0,0,0,0")
                             }
                             MotionEvent.ACTION_POINTER_DOWN -> if (cont.contains("rotate") && ev.pointerCount >= 2) {
                                 rotStart = Math.toDegrees(Math.atan2((ev.getY(1) - ev.getY(0)).toDouble(), (ev.getX(1) - ev.getX(0)).toDouble())).toFloat()
                             }
                             MotionEvent.ACTION_MOVE -> {
                                 vt?.addMovement(ev)
-                                if (cont.contains("pan") && ev.pointerCount == 1) {
+                                if (cont.contains("pan") && ev.pointerCount == 1 && !motionPan(id, 1, ev.x - panSX, ev.y - panSY, 0f, 0f)) {
                                     val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
                                     dispatchGesture(g, "pan:1,$dx,$dy,0,0")
                                 }
@@ -2552,9 +2554,11 @@ class MainActivity : Activity(), ChuksModuleHost {
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                                 if (cont.contains("pan")) {
                                     vt?.addMovement(ev); vt?.computeCurrentVelocity(1000)
-                                    val vx = ((vt?.xVelocity ?: 0f) / density).toInt(); val vy = ((vt?.yVelocity ?: 0f) / density).toInt()
-                                    val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
-                                    dispatchGesture(g, "pan:2,$dx,$dy,$vx,$vy")
+                                    if (!motionPan(id, 2, ev.x - panSX, ev.y - panSY, vt?.xVelocity ?: 0f, vt?.yVelocity ?: 0f)) {
+                                        val vx = ((vt?.xVelocity ?: 0f) / density).toInt(); val vy = ((vt?.yVelocity ?: 0f) / density).toInt()
+                                        val dx = ((ev.x - panSX) / density).toInt(); val dy = ((ev.y - panSY) / density).toInt()
+                                        dispatchGesture(g, "pan:2,$dx,$dy,$vx,$vy")
+                                    }
                                 }
                                 if (cont.contains("rotate")) dispatchGesture(g, "rotate:2,0,0")
                                 vt?.recycle(); vt = null
@@ -2704,7 +2708,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             "Scroll" -> SnapScrollView(this).also { sc ->
                 N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full height
                 sc.isFillViewport = false
-                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
+                sc.viewTreeObserver.addOnScrollChangedListener { motionScrolled(id, sc.scrollY); if (pushViewport()) relayout(); updateVideoVisibility(); reportScroll(id, sc.scrollY) }
                 sc.viewTreeObserver.addOnGlobalLayoutListener { updateVideoVisibility() }   // attach on-screen videos on the initial (static) layout too
                 horizScrollIds.remove(id)
                 if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = false } }
@@ -2712,7 +2716,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 N.ySetF(n, 34, 2f)   // Yoga overflow:scroll so content is sized at its full width
                 sc.isFillViewport = false
                 sc.isHorizontalScrollBarEnabled = false
-                sc.viewTreeObserver.addOnScrollChangedListener { if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
+                sc.viewTreeObserver.addOnScrollChangedListener { motionScrolled(id, sc.scrollX); if (pushViewport()) relayout(); reportScroll(id, sc.scrollX) }
                 horizScrollIds.add(id)
                 if (listScroll == null) { listScroll = sc; scrollId = id; listHoriz = true } }
             "Modal" -> FrameLayout(this).also {         // full-screen dimmed scrim; content laid out inside
@@ -2747,7 +2751,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     // of the framework's own Text.
                     if (pv is ChuksMeasurableView) { measureViews[n] = pv; N.ySetTextMeasure(n) }
                     pv.view
-                } else FrameLayout(this)
+                } else FrameLayout(this).also { it.clipChildren = false }   // a child moved past the edge stays visible, as on iOS; `overflow: hidden` clips
             }
         }
         views[id] = v
@@ -2927,6 +2931,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         // one (e.g. a stray outline around a row that later holds a Switch).
         bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
         (views[id] as? SheetLayout)?.surfaceOverride = null   // a Sheet's bg is its surface; back to the platform's unless set again
+        motionUnbindNode(id)   // bindings and sources are style keys: absent means none
         borderStyleM.remove(id); bwSideM.remove(id)
         // Also drop stale LAYOUT geometry (Yoga width/height/grow/basis/padding/…): the visual
         // removes above didn't touch the Yoga node, so a reused node kept its previous role's
@@ -2957,6 +2962,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         v.elevation = 0f                                   // shadow
         v.translationZ = 0f                                // z
         v.clipToOutline = false                            // overflow / TextureView+ImageView radius outline
+        if (v.javaClass == FrameLayout::class.java) (v as FrameLayout).clipChildren = false   // overflow (a plain container; scrolls and sheets keep clipping)
         v.isEnabled = true                                 // dis / edit
         disabledIds.remove(id)                             // dis (alpha handled post-loop)
         if (a11yIds.contains(id)) resetA11y(id, v)         // al/ah/ar/as/ax/av
@@ -3064,6 +3070,10 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "bwb" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[2] = dpf(f)
                 "bwl" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[3] = dpf(f)
                 "opacity" -> opacity = f / 100f
+                "mo" -> motionBind(id, chuksUnescapeStyle(vl))
+                "mpx" -> mPan[id] = intArrayOf(vl.toIntOrNull() ?: -1, mPan[id]?.get(1) ?: -1)
+                "mpy" -> mPan[id] = intArrayOf(mPan[id]?.get(0) ?: -1, vl.toIntOrNull() ?: -1)
+                "msc" -> vl.toIntOrNull()?.let { mScroll[id] = it }
                 "tx" -> { tx = f; hasTransform = true }
                 "ty" -> { ty = f; hasTransform = true }
                 "rot" -> { rot = f; hasTransform = true }
@@ -3306,6 +3316,9 @@ class MainActivity : Activity(), ChuksModuleHost {
         if (hasA11y) applyA11y(id, v, a11y)
         // Apply transform + opacity, animated natively when `anim` is set (a
         // ViewPropertyAnimator interpolates off the main render loop). Visual only.
+        // A node with bindings keeps its own paint values under them: the bound props
+        // replace these, the rest stay (a static tx beside a bound ty).
+        if (mBindings.containsKey(id)) mStatic[id] = floatArrayOf(tx, ty, sc, rot, opacity ?: 1f) else mStatic.remove(id)
         if (hasTransform || animMs >= 0 || opacity != null) {
             if (animMs >= 0) {
                 val a = v.animate().setDuration(animMs.toLong())
@@ -3398,6 +3411,9 @@ class MainActivity : Activity(), ChuksModuleHost {
                 }
             }
         }
+        // Bound props win over the style line just applied: a re-render never resets
+        // what a shared value drives.
+        if (mBindings.containsKey(id)) motionApplyNode(id)
     }
 
     // Looping, muted video on a Video node's TextureView via the platform's
@@ -4143,6 +4159,11 @@ class MainActivity : Activity(), ChuksModuleHost {
         // asked to (it is off by default). A Sheet above a list needs the report for the
         // hand-off: the list scrolls at the top point, the sheet moves everywhere else.
         init { isNestedScrollingEnabled = true }
+        // A scroll clips itself, as a UIScrollView does. On Android a view's drawing is
+        // clipped by its PARENT's clipChildren, and a plain container does not clip (a
+        // child moved past its edge stays visible, as on iOS), so without this the rows
+        // scrolled above the top painted over whatever sits above the scroll.
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { super.onSizeChanged(w, h, oldw, oldh); clipBounds = android.graphics.Rect(0, 0, w, h) }
         private var lastY = -1
         private val settle = object : Runnable {
             override fun run() {
@@ -4170,6 +4191,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     // SnapScrollView, snapping by the viewport WIDTH instead of height.
     inner class SnapHScrollView(ctx: Context) : HorizontalScrollView(ctx) {
         var pageSnap = false
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { super.onSizeChanged(w, h, oldw, oldh); clipBounds = android.graphics.Rect(0, 0, w, h) }   // self-clip, see SnapScrollView
         private var lastX = -1
         private val settle = object : Runnable {
             override fun run() {
@@ -4473,7 +4495,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
         views.keys.filter { it == id || it.startsWith(prefix) }.forEach { sheetIds.remove(it); popoverIds.remove(it); popoverAnchor.remove(it); popoverPlace.remove(it); popoverGap.remove(it); popoverArrow.remove(it); popoverArrowViews.remove(it); layoutIds.remove(it); lastLayoutReport.remove(it) }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); motionForget(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
@@ -4907,12 +4929,14 @@ class MainActivity : Activity(), ChuksModuleHost {
     // scroll (a chat composer) shifts the tree by exactly the overlap; a field already
     // above the keyboard moves nothing. Mirrors the iOS host.
     private fun applyKeyboard(imeH: Int) {
+        motionKeyboard(Math.max(0, imeH))
         kbScroll?.let { it.setPadding(it.paddingLeft, it.paddingTop, it.paddingRight, 0) }
         kbScroll = null
         kbSheet?.let { sid -> if (imeH <= 0 || currentFocus?.let { sheetContaining(it)?.first } != sid) { kbSheet = null; (views[sid] as? SheetLayout)?.let { sheetKeyboard(sid, it, 0f) } } }
         if (imeH <= 0) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
         val f = currentFocus
         if (f == null) { if (kbShift != 0) { kbShift = 0; relayout() }; return }
+        if (motionKeyboardOwns(f)) { if (kbShift != 0) { kbShift = 0; relayout() }; return }   // a composer bound to the keyboard's height moves itself
         sheetContaining(f)?.let { (sid, sl) -> kbSheet = sid; sheetKeyboard(sid, sl, imeH.toFloat()); return }
         val loc = IntArray(2); f.getLocationInWindow(loc)
         val rootLoc = IntArray(2); root.getLocationInWindow(rootLoc)
@@ -5098,6 +5122,322 @@ class MainActivity : Activity(), ChuksModuleHost {
             if (sl.visibility == View.VISIBLE && !sl.closed && sl.backdrop) { sheetAnimate(sid, sl, -1); return true }
         }
         return false
+    }
+
+
+    // ---- Shared values: motion the host drives (docs/shared-values.md) ------------
+    // A value the engine created with MV|; the host holds its number, animates it (MS|
+    // with a spring/timing/decay), feeds it from a pan or a scroll, and re-evaluates the
+    // bindings that read it. The engine hears a gesture's end and a settle, nothing else.
+    // The expression vocabulary is fixed and identical to the iOS host's.
+    sealed class MExpr {
+        class Value(val id: Int) : MExpr()
+        class Const(val v: Double) : MExpr()
+        class Interp(val x: MExpr, val ins: DoubleArray, val outs: DoubleArray, val clampEnds: Boolean) : MExpr()
+        class Clamp(val x: MExpr, val lo: Double, val hi: Double) : MExpr()
+        class Bin(val op: String, val a: MExpr, val b: MExpr) : MExpr()
+        class Un(val op: String, val x: MExpr) : MExpr()
+        fun deps(out: HashSet<Int>) {
+            when (this) {
+                is Value -> out.add(id)
+                is Const -> {}
+                is Interp -> x.deps(out)
+                is Clamp -> x.deps(out)
+                is Bin -> { a.deps(out); b.deps(out) }
+                is Un -> x.deps(out)
+            }
+        }
+        fun eval(get: (Int) -> Double): Double = when (this) {
+            is Value -> get(id)
+            is Const -> v
+            is Clamp -> Math.min(hi, Math.max(lo, x.eval(get)))
+            is Bin -> { val l = a.eval(get); val r = b.eval(get); when (op) { "+" -> l + r; "-" -> l - r; "*" -> l * r; "min" -> Math.min(l, r); else -> Math.max(l, r) } }
+            is Un -> { val v = x.eval(get); if (op == "neg") -v else Math.abs(v) }
+            is Interp -> {
+                val xv = x.eval(get)
+                if (ins.size < 2 || ins.size != outs.size) (outs.firstOrNull() ?: 0.0)
+                else if (clampEnds && xv <= ins[0]) outs[0]
+                else if (clampEnds && xv >= ins[ins.size - 1]) outs[outs.size - 1]
+                else {
+                    // Piecewise linear between the stops; past the ends the end segment's line
+                    // continues (extend), so an over-drag keeps moving.
+                    var i = 0
+                    while (i < ins.size - 2 && xv > ins[i + 1]) i++
+                    val x0 = ins[i]; val x1 = ins[i + 1]; val y0 = outs[i]; val y1 = outs[i + 1]
+                    if (x1 - x0 == 0.0) y0 else y0 + (xv - x0) / (x1 - x0) * (y1 - y0)
+                }
+            }
+        }
+    }
+    /// Parse the engine's prefix text ("i(v3,0,120,200,80,e)"). null on a malformed
+    /// string: a binding that fails to parse is ignored, never a crash.
+    private fun parseMExpr(text: String): MExpr? {
+        var pos = 0
+        fun peek(): Char? = if (pos < text.length) text[pos] else null
+        fun token(): String { val sb = StringBuilder(); while (true) { val c = peek() ?: break; if (c == '(' || c == ')' || c == ',') break; sb.append(c); pos++ }; return sb.toString() }
+        fun num(e: MExpr): Double? = (e as? MExpr.Const)?.v
+        fun parse(): MExpr? {
+            val tok = token()
+            if (peek() != '(') {
+                if (tok == "c") return MExpr.Const(1.0)        // interpolate's mode letters
+                if (tok == "e") return MExpr.Const(0.0)
+                if (tok.startsWith("v")) tok.substring(1).toIntOrNull()?.let { return MExpr.Value(it) }
+                return tok.toDoubleOrNull()?.let { MExpr.Const(it) }
+            }
+            pos++
+            val args = ArrayList<MExpr>()
+            if (peek() == ')') pos++ else {
+                while (true) {
+                    args.add(parse() ?: return null)
+                    if (peek() == ',') { pos++; continue }
+                    if (peek() == ')') { pos++; break }
+                    return null
+                }
+            }
+            return when (tok) {
+                "i" -> {
+                    if (args.size < 6 || (args.size - 2) % 2 != 0) return null
+                    val mode = num(args[args.size - 1]) ?: return null
+                    val n = (args.size - 2) / 2
+                    val ins = DoubleArray(n); val outs = DoubleArray(n)
+                    for (k in 0 until n) { ins[k] = num(args[1 + k]) ?: return null; outs[k] = num(args[1 + n + k]) ?: return null }
+                    MExpr.Interp(args[0], ins, outs, mode == 1.0)
+                }
+                "cl" -> if (args.size == 3) MExpr.Clamp(args[0], num(args[1]) ?: return null, num(args[2]) ?: return null) else null
+                "+", "-", "*", "min", "max" -> if (args.size == 2) MExpr.Bin(tok, args[0], args[1]) else null
+                "neg", "abs" -> if (args.size == 1) MExpr.Un(tok, args[0]) else null
+                else -> null
+            }
+        }
+        val e = parse()
+        return if (pos == text.length) e else null
+    }
+    class MotionValue(var cur: Double) {
+        var velocity = 0.0                 // units per second
+        var anim: String = ""              // "" | "sp" | "tm" | "dc"
+        var target = 0.0; var stiffness = 180.0; var damping = 22.0
+        var from = 0.0; var startNs = 0L; var ms = 300.0; var easing = "ease"
+        var lo = -1e9; var hi = 1e9
+        var lastNs = 0L
+    }
+    class MotionBinding(val prop: String, val expr: MExpr)
+    private val mValues = HashMap<Int, MotionValue>()
+    private val mBindings = HashMap<String, List<MotionBinding>>()      // node id -> bindings
+    private val mDeps = HashMap<Int, HashSet<String>>()                // value id -> nodes bound to it
+    private val mPan = HashMap<String, IntArray>()                     // Gesture node -> [x id, y id] (-1 none)
+    private val mPanBase = HashMap<String, DoubleArray>()
+    private val mScroll = HashMap<String, Int>()                       // Scroll node -> value id
+    private val mStatic = HashMap<String, FloatArray>()                // a node's own paint values under its bindings: tx ty sc rot alpha
+    private val mAnimating = HashSet<Int>()
+    private val mKeyboardValues = HashSet<Int>()                       // values fed with the keyboard's height (MK|)
+    private val mKeyboardNodes = HashSet<String>()                     // nodes whose bindings read a keyboard value: they move themselves
+    private var mLayoutDirty = false
+    private var motionFrameArmed = false
+
+    /// MV|id|initial, MS|id|target|anim, MX|id.
+    private fun motionOp(f: List<String>) {
+        if (f.size < 2) return
+        val id = f[1].toIntOrNull() ?: return
+        when (f[0]) {
+            "MV" -> {
+                val initial = if (f.size >= 3) (f[2].toDoubleOrNull() ?: 0.0) else 0.0
+                val mv = mValues[id]
+                if (mv != null) { mv.cur = initial; mv.anim = "" } else mValues[id] = MotionValue(initial)
+                motionWrite(id, initial); motionFlush()
+            }
+            "MS" -> {
+                val mv = mValues[id] ?: return
+                val target = if (f.size >= 3) (f[2].toDoubleOrNull() ?: mv.cur) else mv.cur
+                val anim = if (f.size >= 4) f[3] else ""
+                val kind = anim.substringBefore(":")
+                val args = if (anim.contains(":")) anim.substringAfter(":").split(",") else emptyList()
+                fun arg(i: Int, d: Double): Double = args.getOrNull(i)?.toDoubleOrNull() ?: d
+                mv.lastNs = System.nanoTime()
+                when (kind) {
+                    "sp" -> { mv.anim = "sp"; mv.target = target; mv.stiffness = arg(0, 180.0); mv.damping = arg(1, 22.0); mv.velocity = arg(2, 0.0); motionStartAnimating(id) }
+                    "tm" -> { mv.anim = "tm"; mv.from = mv.cur; mv.target = target; mv.startNs = mv.lastNs; mv.ms = Math.max(1.0, arg(0, 300.0)); mv.easing = args.getOrNull(1) ?: "ease"; motionStartAnimating(id) }
+                    "dc" -> { mv.anim = "dc"; mv.velocity = arg(0, 0.0); mv.lo = arg(1, -1e9); mv.hi = arg(2, 1e9); motionStartAnimating(id) }
+                    else -> { mv.anim = ""; mv.velocity = 0.0; mAnimating.remove(id); motionWrite(id, target); motionFlush() }
+                }
+            }
+            "MX" -> {
+                mAnimating.remove(id); mValues.remove(id); mKeyboardValues.remove(id)
+                mDeps[id]?.forEach { nid -> mBindings[nid]?.let { bs -> mBindings[nid] = bs.filter { b -> val d = HashSet<Int>(); b.expr.deps(d); !d.contains(id) } } }
+                mDeps.remove(id)
+            }
+        }
+    }
+    /// The `mo` style key: "prop:expr|prop:expr". Replaces this node's bindings.
+    private fun motionBind(id: String, spec: String) {
+        motionUnbindNode(id)
+        val bs = ArrayList<MotionBinding>()
+        for (part in spec.split("|")) {
+            val i = part.indexOf(':'); if (i <= 0) continue
+            val e = parseMExpr(part.substring(i + 1)) ?: continue
+            bs.add(MotionBinding(part.substring(0, i), e))
+            val d = HashSet<Int>(); e.deps(d)
+            for (vid in d) mDeps.getOrPut(vid) { HashSet() }.add(id)
+        }
+        if (bs.isNotEmpty()) mBindings[id] = bs
+        if (bs.any { b -> val d = HashSet<Int>(); b.expr.deps(d); d.any { mKeyboardValues.contains(it) } }) mKeyboardNodes.add(id)
+    }
+    /// Is this view inside a node that moves itself with the keyboard? Then the host's
+    /// own keyboard avoidance leaves it alone (it would move twice).
+    private fun motionKeyboardOwns(v: View): Boolean {
+        if (mKeyboardNodes.isEmpty()) return false
+        var cur: View? = v
+        while (cur != null) {
+            val id = views.entries.firstOrNull { it.value === cur }?.key
+            if (id != null && mKeyboardNodes.contains(id)) return true
+            cur = cur.parent as? View
+        }
+        return false
+    }
+    /// Drop a node's bindings and sources (the style reset, before the keys re-add).
+    private fun motionUnbindNode(id: String) {
+        mKeyboardNodes.remove(id)
+        mBindings.remove(id)?.forEach { b -> val d = HashSet<Int>(); b.expr.deps(d); for (vid in d) mDeps[vid]?.remove(id) }
+        mPan.remove(id); mScroll.remove(id)
+    }
+    /// A node left the tree: forget everything of its own.
+    private fun motionForget(id: String) { motionUnbindNode(id); mStatic.remove(id); mPanBase.remove(id) }
+    /// A new number for a value: every node bound to it is re-evaluated.
+    private fun motionWrite(vid: Int, value: Double) {
+        val mv = mValues[vid] ?: return
+        mv.cur = value
+        mDeps[vid]?.forEach { motionApplyNode(it) }
+    }
+    /// Evaluate a node's bindings and set the props: paint props on the view (over the
+    /// style's own values, kept in mStatic), layout props on the Yoga node (laid out at
+    /// the next flush). Values are in points; the view takes pixels.
+    private fun motionApplyNode(id: String) {
+        val bs = mBindings[id] ?: return
+        val v = views[id] ?: return
+        val st = mStatic[id] ?: floatArrayOf(0f, 0f, 1f, 0f, 1f)
+        var tx = st[0]; var ty = st[1]; var sc = st[2]; var rot = st[3]; var alpha = st[4]
+        var xform = false; var alphaSet = false
+        val n = ynodes[id]
+        for (b in bs) {
+            val x = b.expr.eval { mValues[it]?.cur ?: 0.0 }.toFloat()
+            when (b.prop) {
+                "tx" -> { tx = x; xform = true }
+                "ty" -> { ty = x; xform = true }
+                "scale" -> { sc = x / 100f; xform = true }
+                "rotate" -> { rot = x; xform = true }
+                "opacity" -> { alpha = x / 100f; alphaSet = true }
+                "w" -> if (n != null) { N.ySetF(n, 5, dpf(x)); mLayoutDirty = true }
+                "h" -> if (n != null) { N.ySetF(n, 6, dpf(x)); mLayoutDirty = true }
+                "pt" -> if (n != null) { N.ySetF(n, 16, dpf(x)); mLayoutDirty = true }
+                "pr" -> if (n != null) { N.ySetF(n, 17, dpf(x)); mLayoutDirty = true }
+                "pb" -> if (n != null) { N.ySetF(n, 18, dpf(x)); mLayoutDirty = true }
+                "pl" -> if (n != null) { N.ySetF(n, 19, dpf(x)); mLayoutDirty = true }
+                "top" -> if (n != null) { N.ySetF(n, 10, dpf(x)); mLayoutDirty = true }
+                "left" -> if (n != null) { N.ySetF(n, 11, dpf(x)); mLayoutDirty = true }
+            }
+        }
+        if (xform) { v.translationX = dpf(tx); v.translationY = dpf(ty); v.scaleX = sc; v.scaleY = sc; v.rotation = rot }
+        if (alphaSet) v.alpha = Math.max(0f, Math.min(1f, alpha))
+    }
+    /// One layout pass for everything the frame's writes changed.
+    private fun motionFlush() { if (mLayoutDirty) { mLayoutDirty = false; relayout() } }
+
+    // ---- sources ----
+    /// A pan on a Gesture that feeds values: write base + travel (in points), and
+    /// report the end with the velocity. Returns false when the gesture is not one of ours.
+    private fun motionPan(id: String, phase: Int, dxPx: Float, dyPx: Float, vxPx: Float, vyPx: Float): Boolean {
+        val ids = mPan[id] ?: return false
+        val dx = (dxPx / density).toDouble(); val dy = (dyPx / density).toDouble()
+        when (phase) {
+            0 -> {
+                val bx = if (ids[0] >= 0) (mValues[ids[0]]?.cur ?: 0.0) else 0.0
+                val by = if (ids[1] >= 0) (mValues[ids[1]]?.cur ?: 0.0) else 0.0
+                mPanBase[id] = doubleArrayOf(bx, by)
+                for (vid in ids) if (vid >= 0) { mValues[vid]?.anim = ""; mAnimating.remove(vid) }   // the finger takes over from any animation
+            }
+            1 -> {
+                val base = mPanBase[id] ?: doubleArrayOf(0.0, 0.0)
+                if (ids[0] >= 0) motionWrite(ids[0], base[0] + dx)
+                if (ids[1] >= 0) motionWrite(ids[1], base[1] + dy)
+                motionFlush()
+            }
+            else -> {
+                val base = mPanBase[id] ?: doubleArrayOf(0.0, 0.0)
+                if (ids[0] >= 0) motionWrite(ids[0], base[0] + dx)
+                if (ids[1] >= 0) motionWrite(ids[1], base[1] + dy)
+                motionFlush()
+                mPanBase.remove(id)
+                if (ids[0] >= 0) hostInput("mv${ids[0]}:end", "${mValues[ids[0]]?.cur ?: 0.0},${(vxPx / density).toDouble()}")
+                if (ids[1] >= 0) hostInput("mv${ids[1]}:end", "${mValues[ids[1]]?.cur ?: 0.0},${(vyPx / density).toDouble()}")
+            }
+        }
+        return true
+    }
+    /// A scroll that feeds a value: its offset along its axis, in points.
+    private fun motionScrolled(id: String, offsetPx: Int) {
+        val vid = mScroll[id] ?: return
+        motionWrite(vid, (offsetPx / density).toDouble())
+        motionFlush()
+    }
+
+    /// The keyboard's height changed: every keyboard value eases to it (points), so a
+    /// bound composer arrives with the keyboard.
+    private fun motionKeyboard(heightPx: Int) {
+        for (vid in mKeyboardValues) {
+            val mv = mValues[vid] ?: continue
+            mv.lastNs = System.nanoTime(); mv.anim = "tm"; mv.from = mv.cur; mv.target = (heightPx / density).toDouble()
+            mv.startNs = mv.lastNs; mv.ms = 250.0; mv.easing = "out"
+            motionStartAnimating(vid)
+        }
+    }
+
+    // ---- host animations ----
+    private fun motionStartAnimating(vid: Int) {
+        mAnimating.add(vid)
+        if (!motionFrameArmed) { motionFrameArmed = true; android.view.Choreographer.getInstance().postFrameCallback(motionFrame) }
+    }
+    private val motionFrame = object : android.view.Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            motionFrameArmed = false
+            val settled = ArrayList<Int>()
+            for (vid in ArrayList(mAnimating)) {
+                val mv = mValues[vid]
+                if (mv == null || mv.anim == "") { settled.add(vid); continue }
+                val dt = Math.min(Math.max((frameTimeNanos - mv.lastNs) / 1e9, 0.0), 0.064)   // a stall must not fling a spring
+                mv.lastNs = frameTimeNanos
+                var done = false
+                when (mv.anim) {
+                    "sp" -> {
+                        // Semi-implicit Euler in sub-steps of at most 8 ms: stable for any stiffness an app would use.
+                        var remaining = dt
+                        while (remaining > 0) {
+                            val h = Math.min(remaining, 0.008); remaining -= h
+                            val a = -mv.stiffness * (mv.cur - mv.target) - mv.damping * mv.velocity
+                            mv.velocity += a * h; mv.cur += mv.velocity * h
+                        }
+                        if (Math.abs(mv.velocity) < 1 && Math.abs(mv.cur - mv.target) < 0.05) { mv.cur = mv.target; mv.velocity = 0.0; done = true }
+                    }
+                    "tm" -> {
+                        var t = Math.min(1.0, Math.max(0.0, (frameTimeNanos - mv.startNs) / 1e6 / mv.ms))
+                        t = when (mv.easing) { "linear" -> t; "in" -> t * t * t; "out" -> 1 - Math.pow(1 - t, 3.0); else -> if (t < 0.5) 4 * t * t * t else 1 - Math.pow(-2 * t + 2, 3.0) / 2 }
+                        mv.cur = mv.from + (mv.target - mv.from) * t
+                        if ((frameTimeNanos - mv.startNs) / 1e6 >= mv.ms) { mv.cur = mv.target; done = true }
+                    }
+                    "dc" -> {
+                        mv.velocity *= Math.exp(-3.5 * dt)
+                        mv.cur += mv.velocity * dt
+                        if (mv.cur < mv.lo || mv.cur > mv.hi) {
+                            // Past the edge: a rubber band, which is a spring to the edge carrying the velocity.
+                            mv.target = if (mv.cur < mv.lo) mv.lo else mv.hi; mv.stiffness = 180.0; mv.damping = 22.0; mv.anim = "sp"
+                        } else if (Math.abs(mv.velocity) < 4) done = true
+                    }
+                }
+                motionWrite(vid, mv.cur)
+                if (done) { mv.anim = ""; mv.velocity = 0.0; settled.add(vid) }
+            }
+            motionFlush()
+            for (vid in settled) { mAnimating.remove(vid); mValues[vid]?.let { hostInput("mv$vid:settle", "${it.cur}") } }
+            if (mAnimating.isNotEmpty() && !motionFrameArmed) { motionFrameArmed = true; android.view.Choreographer.getInstance().postFrameCallback(this) }
+        }
     }
 
     // ── Sheet: index and animation ─────────────────────────────────────────────

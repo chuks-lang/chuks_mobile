@@ -157,6 +157,11 @@ export class Style {
     var shPanClose: int     // 1 = dragging below the lowest point closes
     var shHandle: int       // 1 = draw the grab handle
     var shKeyboard: string  // "" | "interactive" | "extend" | "fillParent"
+    // Shared values (core/motion.chuks): props the host drives from values it holds.
+    var mBind: string       // "prop:expr|prop:expr" bindings on this node ("" = none)
+    var mPanX: int          // a Gesture's pan feeds this value id with its x (-1 = none)
+    var mPanY: int          // ... and this one with its y
+    var mScroll: int        // a Scroll/List feeds this value id with its offset (-1 = none)
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
@@ -189,6 +194,7 @@ export class Style {
         this.a11yLabel = ""; this.a11yHint = ""; this.a11yRole = ""; this.a11yState = ""; this.a11yHidden = -1; this.a11yLive = ""
         this.pAnchor = ""; this.pPlace = ""; this.pGap = -1; this.pArrow = -1
         this.shSnap = ""; this.shIdx = -2; this.shBackdrop = -1; this.shPanClose = -1; this.shHandle = -1; this.shKeyboard = ""
+        this.mBind = ""; this.mPanX = -1; this.mPanY = -1; this.mScroll = -1
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -325,6 +331,10 @@ export class Style {
             if (this.shHandle >= 0) { s = s + "shhdl=" + string(this.shHandle) + ";" }
             if (this.shKeyboard != "") { s = s + "shkb=" + this.shKeyboard + ";" }
         }
+        if (this.mBind != "") { s = s + "mo=" + styleEsc(this.mBind) + ";" }
+        if (this.mPanX >= 0) { s = s + "mpx=" + string(this.mPanX) + ";" }
+        if (this.mPanY >= 0) { s = s + "mpy=" + string(this.mPanY) + ";" }
+        if (this.mScroll >= 0) { s = s + "msc=" + string(this.mScroll) + ";" }
         if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
             s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
             s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
@@ -682,7 +692,114 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
 // caller imports nothing but the component. Inside, a builder hands the props
 // (as `any`) to the shared applyLayoutV/applyEventsV, which read fields BY KEY (a
 // dataType is map-backed), so one pair of helpers serves every typed builder.
+// ---- shared values: motion the host drives ---------------------------------
+// A shared value is a number that lives on the host. The app declares once what feeds
+// it (a pan, a scroll, the keyboard, or the app through set/spring/timing/decay) and
+// which props read it (the `motion` prop, an expression per prop); the host then moves
+// the views every frame without the engine. The API an app uses is core/motion.chuks
+// (useSharedValue, interpolate, clamp, ...); the types live here because LayoutProps
+// names them. See docs/shared-values.md.
+
+/**
+ * An expression the host evaluates each frame: a shared value, a constant, or an
+ * operation over other expressions. Build them with the functions in
+ * core/motion.chuks (`interpolate`, `clamp`, `add`, ...); a SharedValue is one too.
+ */
+export class Expr {
+    var s: string           // the host's prefix text: "v3", "12.5", "i(v3,0,120,100,60,c)"
+    constructor(s: string) { this.s = s }
+    public str(): string { return this.s }
+}
+// Lines for the host that belong to no node (MV| create a value, MS| set one, MX|
+// drop one). Queued here and emitted ahead of the next frame's diff, so a value
+// exists before a style line names it.
+var _hostOps: []string = []
+/** Queue a host line for the next frame. Framework use. */
+export function queueHostOp(line: string): void { _hostOps.push(line); markDirty(); host.wake() }
+// Handlers for events that belong to no node (a shared value's end/settle). Looked up
+// when a node handler is not found for the tag.
+var _hostHandlers: map[string]any = {}
+/** Bind a closure to a host event tag that is not a node's. Framework use. */
+export function registerHostHandler(tag: string, fn: any): void { _hostHandlers[tag] = fn }
+var _nextSharedId: int = 1
+/**
+ * A number the host holds and moves. Make one with `useSharedValue(initial)` from
+ * core/motion.chuks (it keeps its identity across renders); feed it from a
+ * `Gesture({ panX, panY })`, a `Scroll({ scrollValue })`, or from the app with
+ * `set` / `spring` / `timing` / `decay`; read it from a prop through `motion`.
+ *
+ * ```chuks
+ * const y: SharedValue = useSharedValue(0)
+ * Gesture({ panY: y, onPanEnd: function(): void { y.spring(0) } }, [
+ *     Row({ motion: { ty: y, opacity: interpolate(y, [0, 200], [100, 40]) } }, [ card ]),
+ * ])
+ * ```
+ */
+export class SharedValue extends Expr {
+    var id: int
+    var last: float          // the value the host last reported (a gesture's end, a settle)
+    constructor(initial: float) {
+        super("v" + string(_nextSharedId))
+        this.id = _nextSharedId; _nextSharedId = _nextSharedId + 1
+        this.last = initial
+        queueHostOp("MV|" + string(this.id) + "|" + string(initial))
+    }
+    /** The value the host last reported. Not a live read: bind a prop instead of rendering this. */
+    public latest(): float { return this.last }
+    /** Jump to `v` now. */
+    public set(v: float): void { this.last = v; queueHostOp("MS|" + string(this.id) + "|" + string(v) + "|") }
+    /** Spring to `to`. `velocity` is where it starts from (a gesture's, usually), units per second. */
+    public spring(to: float, velocity: float = 0.0, stiffness: float = 180.0, damping: float = 22.0): void {
+        queueHostOp("MS|" + string(this.id) + "|" + string(to) + "|sp:" + string(stiffness) + "," + string(damping) + "," + string(velocity))
+    }
+    /** Ease to `to` over `ms` milliseconds. `easing`: "ease" (default), "linear", "in", "out". */
+    public timing(to: float, ms: int, easing: string = "ease"): void {
+        queueHostOp("MS|" + string(this.id) + "|" + string(to) + "|tm:" + string(ms) + "," + easing)
+    }
+    /** Coast from `velocity` (units per second) to a stop, kept inside [lo, hi] with a rubber band. */
+    public decay(velocity: float, lo: float = -1000000.0, hi: float = 1000000.0): void {
+        queueHostOp("MS|" + string(this.id) + "|" + string(this.last) + "|dc:" + string(velocity) + "," + string(lo) + "," + string(hi))
+    }
+    /** Called when a gesture that fed this value lets go, with the value and its velocity (units per second). */
+    public onEnd(fn: function(value: float, velocity: float): void): void {
+        const sv: SharedValue = this
+        registerHostHandler("mv" + string(this.id) + ":end", function(v: string): void {
+            const parts: []string = v.split(",")
+            const value: float = float(parts[0]); const vel: float = parts.length > 1 ? float(parts[1]) : 0.0
+            sv.last = value; fn(value, vel)
+        })
+    }
+    /** Called when a host animation on this value (spring, timing, decay) comes to rest. */
+    public onSettle(fn: function(value: float): void): void {
+        const sv: SharedValue = this
+        registerHostHandler("mv" + string(this.id) + ":settle", function(v: string): void { sv.last = float(v); fn(sv.last) })
+    }
+    /** Tell the host to forget this value. Called for you when the Comp that made it unmounts. */
+    public drop(): void { queueHostOp("MX|" + string(this.id)) }
+}
+/**
+ * The props a node reads from shared values, one expression each. Paint props (tx,
+ * ty, scale, rotate, opacity) are set on the view directly; layout props (w, h, pt,
+ * pr, pb, pl, top, left) are set on the layout node and the tree is laid out again
+ * that frame. Units are the prop's own: points, percent for opacity and scale, degrees.
+ */
+export dataType MotionBindings {
+    tx: Expr?, ty: Expr?, scale: Expr?, rotate: Expr?, opacity: Expr?,
+    w: Expr?, h: Expr?, pt: Expr?, pr: Expr?, pb: Expr?, pl: Expr?, top: Expr?, left: Expr?,
+}
+var MOTION_PROPS: []string = ["tx", "ty", "scale", "rotate", "opacity", "w", "h", "pt", "pr", "pb", "pl", "top", "left"]
+// Encode a MotionBindings record as the host's "prop:expr|prop:expr" text.
+function encodeMotion(m: any): string {
+    var parts: []string = []
+    for (var k of MOTION_PROPS) {
+        const e: any = m[k]
+        if (e != null) { const ex: Expr = e; parts.push(k + ":" + ex.str()) }
+    }
+    return parts.join("|")
+}
+
 export dataType LayoutProps {
+    motion: MotionBindings?;
     gap: int?; pad: int?; px: int?; py: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
     align: string?; justify: string?; bg: string?; color: string?; size: int?;
     weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
@@ -745,6 +862,7 @@ export function pvF(p: any, k: string, d: float): float { const v: any = p[k]; r
 // props override it), then every layout field by key. Serves all typed builders.
 function applyLayoutV(s: Style, p: any): void {
     const tws: any = p["tw"]; if (tws != null) { applyLayout(s, tw(string(tws))) }
+    const mo: any = p["motion"]; if (mo != null) { s.mBind = encodeMotion(mo) }
     s.gap = pvI(p, "gap", s.gap)
     s.pad = pvI(p, "pad", s.pad)
     s.padX = pvI(p, "px", s.padX)
@@ -1530,6 +1648,7 @@ export function Blur(p: BlurProps, kids: []Kid = []): Node {
 dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
     onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
+    scrollValue: SharedValue?;   // the host feeds this with the offset along the scroll axis, in points, every scroll frame
 }
 // Android's ScrollView holds exactly ONE direct child; a Chuks Scroll may take several
 // (iOS UIScrollView allows many). Wrap multiple children in a single content container
@@ -1592,6 +1711,7 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
     if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
+    const svs: any = p["scrollValue"]; if (svs != null) { const sv: SharedValue = svs; s.mScroll = sv.id }
     const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", scrollContent(flatKids(kids), horizontal))
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
@@ -2249,6 +2369,10 @@ dataType GestureProps {
     ViewProps;
     onGesture: (function(v: string): void)?; onPan: (function(v: string): void)?;
     onPinch: (function(v: string): void)?; onRotate: (function(v: string): void)?;
+    // Shared values the host feeds with the pan directly, with no per-move event: each
+    // gets its value at the start of the gesture plus the finger's travel. Use
+    // `panX.onEnd` / `panY.onEnd` (value, velocity) to decide what happens on release.
+    panX: SharedValue?; panY: SharedValue?;
 }
 /**
  * Recognizes gestures beyond a tap on its children and reports them through one
@@ -2278,7 +2402,10 @@ export function Gesture(first: GestureProps | []Kid, kids: []Kid = []): Node {
     // Attaching only the requested ones avoids fighting a Scroll and skips the discrete
     // swipe recognizer when pan is on (they both track drags).
     var cont: string = ""
-    if (onPan != null) { cont = cont == "" ? "pan" : cont + ",pan" }
+    const px: any = p["panX"]; const py: any = p["panY"]
+    if (px != null) { const sv: SharedValue = px; s.mPanX = sv.id }
+    if (py != null) { const sv: SharedValue = py; s.mPanY = sv.id }
+    if (onPan != null || px != null || py != null) { cont = cont == "" ? "pan" : cont + ",pan" }
     if (onPinch != null) { cont = cont == "" ? "pinch" : cont + ",pinch" }
     if (onRotate != null) { cont = cont == "" ? "rotate" : cont + ",rotate" }
     n.text = cont
@@ -2714,6 +2841,10 @@ export class Reconciler {
     // Reconcile the whole app tree from the root; the app calls this after any
     // state change and the memoization makes everything unchanged bail.
     public renderRoot(next: Node): void {
+        // Value ops queued during the render (a new shared value, a set) go out ahead of
+        // the diff, so a style line that names a value never reaches the host first.
+        if (_hostOps.length > 0) { for (var l of _hostOps) { this.lines.push(l) }; _hostOps = [] }
+        const frameStart: int = this.lines.length   // a Comp renders lazily inside reconcile: its values are spliced in here
         // Both cleared: re-set by reconcileList if the screen on top has a List. Leaving
         // the id behind meant a screen with no list (or with a SectionList, which does not
         // claim the viewport) kept the PREVIOUS screen's list named as live -- so the host
@@ -2738,6 +2869,15 @@ export class Reconciler {
         if (this.lastStackId != this.stackHostId) {
             this.stackHostId = this.lastStackId
             this.emit("SK|" + this.stackHostId)
+        }
+        // Values made while a Comp rendered inside this pass: their creation goes out
+        // ahead of the diff lines that name them, never after.
+        if (_hostOps.length > 0) {
+            var merged: []string = []
+            for (var i: int = 0; i < frameStart; i = i + 1) { merged.push(this.lines[i]) }
+            for (var op of _hostOps) { merged.push(op) }
+            for (var j: int = frameStart; j < this.lines.length; j = j + 1) { merged.push(this.lines[j]) }
+            this.lines = merged; _hostOps = []
         }
     }
     // The navigator names the screen on top (its container's node id); "" means no
@@ -2786,10 +2926,13 @@ export class Reconciler {
     // node id) ever crosses the host boundary.
     public fire(tag: string): void {
         if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f() }
+        else if (_hostHandlers[tag] != null) { const f: any = _hostHandlers[tag]; f() }
     }
-    // Fire the onChange(value) closure bound to node `tag` (from an input).
+    // Fire the onChange(value) closure bound to node `tag` (from an input), or the
+    // handler of a host event that belongs to no node (a shared value's end/settle).
     public fireValue(tag: string, value: string): void {
         if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value) }
+        else if (_hostHandlers[tag] != null) { const f: any = _hostHandlers[tag]; f(value) }
     }
     // ---- async host->engine bridge (F3) --------------------------------------
     // Request a native capability. If `cb` is non-null it is registered under a
