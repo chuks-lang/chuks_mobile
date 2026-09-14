@@ -3540,6 +3540,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "P" where f.count >= 3: setText(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // rejoin: text may contain '|'
             case "V" where f.count >= 3: setFieldValue(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
+            case "TC" where f.count >= 2: bindChange(f[1])   // the node's value event: "<id>:change"
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
             case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }
             case "TB" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldBlur[tf] = f[1] + ":blur" }
@@ -6406,13 +6407,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     // A node with an action tag: Button/Input use their own targets; any other
     // View gets a tap recognizer.
-    func bindAction(_ id: String, action: String) {
+    // TC|id: the node reports a value (a field's text, a slider's number, a picked
+    // index or date, an alert's button) on "<id>:change". Which control it is decides
+    // where the tag is kept; the press binding below is separate and may coexist.
+    func bindChange(_ id: String) {
         guard let v = views[id] else { return }
-        if modalIds.contains(id) { modalActions[id] = action }   // onDismiss: fired by scrim tap AND sheet drag
+        let action = id + ":change"
         if selectIds.contains(id) { selectActions[id] = action; rebuildSelectMenu(id); return }   // menu items dispatch this
         if menuIds.contains(id) { menuActions[id] = action; rebuildMenu(id); return }             // Menu items dispatch this
         if contextMenuIds.contains(id) { contextMenuActions[id] = action; return }                // ContextMenu items dispatch this
         if alertIds.contains(id) { alertActions[id] = action; return }                            // alert buttons dispatch this
+        if let tf = v as? UITextField { fieldActions[tf] = action; return }
+        if let sl = v as? UISlider { sliderActions[sl] = action; return }
+        if let dp = v as? UIDatePicker { datePickerActions[dp] = action; return }
+        if let tv = v as? UITextView { textAreaActions[tv] = action; return }
+    }
+    // T|id|action: the node's press. A control that reports a value keeps that on its
+    // change binding (bindChange); here a press is a press on every kind of view.
+    func bindAction(_ id: String, action: String) {
+        guard let v = views[id] else { return }
+        if modalIds.contains(id) { modalActions[id] = action }   // onDismiss: fired by scrim tap AND sheet drag
         if let sc = v as? UIScrollView {                                                          // Scroll onRefresh -> pull-to-refresh control
             let rc = sc.refreshControl ?? {
                 let r = UIRefreshControl(); sc.refreshControl = r
@@ -6422,11 +6436,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             return
         }
         if let b = v as? UIButton { buttonActions[b] = action; return }
-        if let tf = v as? UITextField { fieldActions[tf] = action; return }
         if let sw = v as? UISwitch { switchActions[sw] = action; return }
-        if let sl = v as? UISlider { sliderActions[sl] = action; return }
-        if let dp = v as? UIDatePicker { datePickerActions[dp] = action; return }
-        if let tv = v as? UITextView { textAreaActions[tv] = action; return }
         v.isUserInteractionEnabled = true
         // Reset any tap/press recognizer WE previously attached to this view before
         // (re)binding. Node ids are reused when a screen swaps in place, so a tappable

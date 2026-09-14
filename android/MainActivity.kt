@@ -624,6 +624,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "P" -> if (f.size >= 3) setText(f[1], chuksUnescapeText(f.drop(2).joinToString("|")))   // rejoin: text may contain '|'
                 "V" -> if (f.size >= 3) setFieldValue(f[1], chuksUnescapeText(f.drop(2).joinToString("|")))   // controlled value (may contain '|')
                 "T" -> if (f.size >= 3) bindAction(f[1], f[2])
+                "TC" -> if (f.size >= 2) bindChange(f[1])   // the node's value event: "<id>:change"
                 "TS" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldSubmit[it] = f[1] + ":submit" }
                 "TF" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldFocus[it] = f[1] + ":focus" }
                 "TB" -> if (f.size >= 2) (views[f[1]] as? android.widget.EditText)?.let { fieldBlur[it] = f[1] + ":blur" }
@@ -2600,7 +2601,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     override fun beforeTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
                     override fun onTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {
                         if (fieldSelfSet) return   // a controlled value.set, not a user edit
-                        val action = ed.getTag(TAG) as? String ?: return
+                        val action = ed.getTag(CTAG) as? String ?: return
                         applyStream(engInput(action, ed.text.toString()))
                         relayout()
                     } })
@@ -2624,7 +2625,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     override fun afterTextChanged(s: Editable?) {}
                     override fun beforeTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
                     override fun onTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {
-                        val action = it.getTag(TAG) as? String ?: return
+                        val action = it.getTag(CTAG) as? String ?: return
                         hostInput(action, it.text.toString())   // keep scroll pos (no scrollTo)
                     } }) }
             "Spinner" -> ProgressBar(this).also { it.isIndeterminate = true }   // circular indeterminate; Yoga sizes it via w/h
@@ -2644,7 +2645,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val pm = PopupMenu(this, b)
                     opts.forEachIndexed { i, label -> pm.menu.add(0, i, i, label) }
                     pm.setOnMenuItemClickListener { mi ->
-                        (b.getTag(TAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }
+                        (b.getTag(CTAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }
                         true
                     }
                     pm.show()
@@ -2658,7 +2659,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val pm = PopupMenu(this, b)
                     items.forEachIndexed { i, t -> pm.menu.add(0, i, i, t) }
                     pm.setOnMenuItemClickListener { mi ->
-                        (b.getTag(TAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }; true
+                        (b.getTag(CTAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }; true
                     }
                     pm.show()
                 }
@@ -2670,7 +2671,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val pm = PopupMenu(this, c)
                     items.forEachIndexed { i, t -> pm.menu.add(0, i, i, t) }
                     pm.setOnMenuItemClickListener { mi ->
-                        (c.getTag(TAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }; true
+                        (c.getTag(CTAG) as? String)?.let { hostInput(it, mi.itemId.toString()) }; true
                     }
                     pm.show(); true
                 }
@@ -2679,7 +2680,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
                         if (!fromUser) return                       // ignore programmatic setProgress (the controlled sync)
-                        val action = sb.getTag(TAG) as? String ?: return
+                        val action = sb.getTag(CTAG) as? String ?: return
                         val min = sliderMin[id] ?: 0
                         val step = sliderStep[id] ?: 0
                         val p = if (step > 0) Math.round(progress.toFloat() / step) * step else progress
@@ -3764,7 +3765,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         val cal = dateCalendar(id)
         val fire = { picked: Calendar ->
             val iso = isoOf(id, picked)
-            (b.getTag(TAG) as? String)?.let { hostInput(it, iso) }
+            (b.getTag(CTAG) as? String)?.let { hostInput(it, iso) }
         }
         if (mode == "time") {
             TimePickerDialog(this, theme, { _, hh, mm ->
@@ -4514,6 +4515,17 @@ class MainActivity : Activity(), ChuksModuleHost {
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
+    // TC|id: the node reports a value (a field's text, a slider's number, a picked index
+    // or date, an alert's button) on "<id>:change". The value readers read CTAG; the
+    // press binding (TAG, bindAction) is separate and may coexist.
+    private fun bindChange(id: String) {
+        val v = views[id] ?: return
+        val action = "$id:change"
+        if (alertIds.contains(id)) { alertActions[id] = action; return }
+        v.setTag(CTAG, action)
+    }
+    // T|id|action: the node's press. A control that reports a value keeps that on its
+    // change binding (bindChange); here a press is a press on every kind of view.
     private fun bindAction(id: String, action: String) {
         val v = views[id] ?: return
         if (gestureIds.contains(id)) { v.setTag(TAG, action); return }   // a Gesture's press: its own detector fires it (the touch listener stays)
@@ -4541,13 +4553,9 @@ class MainActivity : Activity(), ChuksModuleHost {
             }
             return
         }
-        if (alertIds.contains(id)) { alertActions[id] = action; return }   // alert buttons dispatch this
-        if (contextMenuIds.contains(id)) { v.setTag(TAG, action); return }  // long-press PopupMenu reads this
         if (v is ScrollView) { setupPullToRefresh(v, action); return }      // Scroll onRefresh -> pull-to-refresh
         when (v) {
             is Button -> v.setTag(TAG, action)
-            is EditText -> v.setTag(TAG, action)
-            is SeekBar -> v.setTag(TAG, action)      // Slider: the change listener reads this
             else -> {
                 // Reset any prior interaction binding before (re)binding. Node ids are
                 // reused when a screen swaps in place, so a Pressable can become an inert
@@ -5889,5 +5897,5 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun align(v: String) = when (v) {
         "center" -> 2f; "end" -> 3f; "stretch" -> 4f; else -> 1f }
 
-    companion object { const val TAG = 0x7f_00_00_01; const val GTAG = 0x7f_00_00_02 }   // GTAG: a Gesture's own event tag
+    companion object { const val TAG = 0x7f_00_00_01; const val GTAG = 0x7f_00_00_02; const val CTAG = 0x7f_00_00_03 }   // TAG: press; GTAG: a Gesture's stream; CTAG: a value change
 }

@@ -3027,11 +3027,15 @@ export class Reconciler {
     // Host-initiated death (the user dismissed the picker / the native op ended with
     // no result): drop the token locally, no host command (the host already knows).
     public dropToken(token: string): void { this.forgetToken(token) }
-    // register a node's event closure (tag = the node id), and emit its T binding
+    // Register a node's event closures and emit their bindings. Every event is its own
+    // tag: a press is the node id (T|), a value change is "<id>:change" (TC|), and the
+    // rest are "<id>:<event>". They coexist, so any node may carry a press and a change
+    // (a Gesture that is also tapped, a field that is also pressed); a control that
+    // reports a value fires "<id>:change" on the host whatever else the node binds.
     bindEvents(n: Node, id: string): void {
         if (n.onPress != null) { this.handlers[id] = n.onPress; this.emit("T|" + id + "|" + id) }
-        else if (n.onChange != null) { this.handlers[id] = n.onChange; this.emit("T|" + id + "|" + id) }
         else if (n.action != "") { this.emit("T|" + id + "|" + n.action) }
+        if (n.onChange != null) { this.handlers[id + ":change"] = n.onChange; this.emit("TC|" + id) }
         // Extra TextInput events, each a separate binding keyed by "<id>:<event>".
         if (n.onSubmit != null) { this.handlers[id + ":submit"] = n.onSubmit; this.emit("TS|" + id) }
         if (n.onFocus != null) { this.handlers[id + ":focus"] = n.onFocus; this.emit("TF|" + id) }
@@ -3156,9 +3160,10 @@ export class Reconciler {
         // lose one. bindEvents (which emits T|) runs ONLY on mountNode, so re-emit
         // the tag here whenever the binding target changes — otherwise the host keeps
         // a stale (or empty) action and the tap never fires on ANY host.
-        const prevTag: string = (p.onPress != null || p.onChange != null) ? id : p.action
-        const nextTag: string = (next.onPress != null || next.onChange != null) ? id : next.action
+        const prevTag: string = p.onPress != null ? id : p.action
+        const nextTag: string = next.onPress != null ? id : next.action
         if (prevTag != nextTag) { this.emit("T|" + id + "|" + nextTag) }
+        if (p.onChange == null && next.onChange != null) { this.emit("TC|" + id) }   // gained a value handler: the host must route the value
         // The closure is recreated each render: rebind it when present, and DROP the
         // entry when this node no longer has that handler. A reused slot (a tappable
         // card becomes an inert stat row at the same id) must NOT keep a prior role's
@@ -3166,8 +3171,8 @@ export class Reconciler {
         // action. React Native drops a view's handler mapping when it unmounts / is
         // recycled; we do the same per binding.
         if (next.onPress != null) { this.handlers[id] = next.onPress }
-        else if (next.onChange != null) { this.handlers[id] = next.onChange }
         else if (this.handlers.has(id)) { this.handlers.delete(id) }
+        this.rebindOrDrop(id + ":change", next.onChange)
         this.rebindOrDrop(id + ":submit", next.onSubmit)
         this.rebindOrDrop(id + ":focus", next.onFocus)
         this.rebindOrDrop(id + ":blur", next.onBlur)
