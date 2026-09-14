@@ -1,0 +1,69 @@
+// Transitions on the wire.
+//
+// `entering`, `exiting` and `layout` are style keys (en=, ex=, lt=) the host reads at
+// mount, at removal and after a layout pass; the engine sends nothing per frame. What
+// the engine must get right is identity: a conditional child written as `null` keeps
+// its slot so the siblings after it keep their ids (and so move, rather than remount
+// and enter again), and a keyed child that changes position is MOVED (I|), not rebuilt.
+//
+// Run:  chuks run tests/transitions_test.chuks   (exits non-zero on failure)
+
+import { Node, Column, Row, Text, Reconciler, KeyedComp } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function lines(stream: string, prefix: string): []string {
+    var out: []string = []
+    for (var l of stream.split("\n")) { if (l.startsWith(prefix)) { out.push(l) } }
+    return out
+}
+function has(s: string, sub: string): bool { return s.indexOf(sub) >= 0 }
+function item(n: int): Node {
+    return KeyedComp("i" + string(n), function(): Node { return Row({ h: 48, entering: "slide-left 300", exiting: "fade 200", layout: "spring" }, [ Text({}, "item " + string(n)) ]) })
+}
+function screen(panel: bool, order: []int): Node {
+    var rows: []Node = []
+    for (var n of order) { rows.push(item(n)) }
+    return Column({}, [
+        Text({}, "head"),
+        panel ? Column({ entering: "zoom 250", exiting: "zoom 200" }, [ Text({}, "panel") ]) : null,
+        Column({}, rows),
+    ])
+}
+
+function main(): void {
+    println("transitions: keys")
+    const r: Reconciler = new Reconciler(); r.drain()
+    r.renderRoot(screen(false, [1, 2, 3]))
+    const first: string = r.drain()
+    check(has(first, "S|app.2.ki1|d=row;h=48;en=slide-left 300;ex=fade 200;lt=spring;"), "entering, exiting and layout cross as three keys")
+    check(lines(first, "C|app.2.ki").length >= 3 && has(first, "C|app.2.ki1|View") && has(first, "C|app.2.ki3|View"), "a keyed row's id is its key under its parent")
+
+    println("transitions: a conditional child keeps the slots after it")
+    r.renderRoot(screen(true, [1, 2, 3]))
+    const shown: string = r.drain()
+    check(has(shown, "C|app.1|View") && has(shown, "en=zoom 250;ex=zoom 200;"), "the panel mounts in its own slot with its transitions")
+    check(lines(shown, "C|app.2").length == 0 && lines(shown, "R|app.2").length == 0, "the rows after it are neither rebuilt nor removed: they keep their ids and move")
+    r.renderRoot(screen(false, [1, 2, 3]))
+    const hidden: string = r.drain()
+    check(lines(hidden, "R|app.1").length == 1 && lines(hidden, "C|app.2").length == 0, "hiding it removes only the panel (the host runs its exit) and the rows stay")
+
+    println("transitions: a keyed reorder moves, a keyed removal removes")
+    r.renderRoot(screen(false, [3, 2, 1]))
+    const rev: string = r.drain()
+    check(lines(rev, "I|app.2.ki3|app.2|0").length == 1 && lines(rev, "I|app.2.ki1|app.2|2").length == 1, "the rows that changed position are re-inserted at their new index")
+    check(lines(rev, "C|").length == 0 && lines(rev, "R|").length == 0, "nothing is rebuilt or removed")
+    r.renderRoot(screen(false, [3, 1]))
+    const rem: string = r.drain()
+    check(lines(rem, "R|app.2.ki2").length == 1 && lines(rem, "C|").length == 0, "removing the middle row removes exactly that node (its exit runs on the host)")
+
+    println("")
+    println("transitions: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("transitions tests failed") }
+}
+
+main();

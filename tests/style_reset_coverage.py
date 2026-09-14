@@ -120,6 +120,10 @@ MANIFEST = {
     "mpx": (RESET, "pan feeds value (x): dropped with the gesture source reset"),
     "mpy": (RESET, "pan feeds value (y): dropped with the gesture source reset"),
     "msc": (RESET, "scroll feeds value: dropped with the scroll source reset"),
+    # Transitions: the specs are per-node state the host reads at mount, removal and layout.
+    "en": (RESET, "entering transition spec: cleared in the reset block"),
+    "ex": (RESET, "exiting transition spec: cleared in the reset block"),
+    "lt": (RESET, "layout transition spec: cleared in the reset block"),
     "swtc": (PERSISTENT, "switch thumb color (with the switch)"), "paging": (PERSISTENT, "scroll paging (with the scroll)"),
     "stick": (PERSISTENT, "scroll stick-bottom (with the scroll)"), "horiz": (PERSISTENT, "horizontal list (with the scroll)"),
     "dp": (PERSISTENT, "date-picker mode"), "dpd": (PERSISTENT, "date-picker display"),

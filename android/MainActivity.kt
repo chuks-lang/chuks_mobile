@@ -2948,6 +2948,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         bgColor.remove(id); bgRadius.remove(id); borderW.remove(id); borderC.remove(id); pressOpacity.remove(id); textWidthPx.remove(id); explicitHeight.remove(id)
         (views[id] as? SheetLayout)?.surfaceOverride = null   // a Sheet's bg is its surface; back to the platform's unless set again
         motionUnbindNode(id)   // bindings and sources are style keys: absent means none
+        enterSpec.remove(id); exitSpec.remove(id); layoutSpec.remove(id)   // transitions: absent means none
         borderStyleM.remove(id); bwSideM.remove(id)
         // Also drop stale LAYOUT geometry (Yoga width/height/grow/basis/padding/…): the visual
         // removes above didn't touch the Yoga node, so a reused node kept its previous role's
@@ -3087,6 +3088,9 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "bwl" -> (bwSideM.getOrPut(id) { FloatArray(4) { -1f } })[3] = dpf(f)
                 "opacity" -> opacity = f / 100f
                 "mo" -> motionBind(id, chuksUnescapeStyle(vl))
+                "en" -> { val t = chuksUnescapeStyle(vl); enterSpec[id] = t; if (needsFrame.contains(id)) pendingEnter[id] = t }   // mounted this batch: enters once framed
+                "ex" -> exitSpec[id] = chuksUnescapeStyle(vl)
+                "lt" -> layoutSpec[id] = chuksUnescapeStyle(vl)
                 "mpx" -> mPan[id] = intArrayOf(vl.toIntOrNull() ?: -1, mPan[id]?.get(1) ?: -1)
                 "mpy" -> mPan[id] = intArrayOf(mPan[id]?.get(0) ?: -1, vl.toIntOrNull() ?: -1)
                 "msc" -> vl.toIntOrNull()?.let { mScroll[id] = it }
@@ -3931,6 +3935,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         } else {
             val pv = (views[parent] as? SheetLayout)?.panel ?: (views[parent] as? ViewGroup ?: return)   // a Sheet's content lives in its panel
             val base = if (bgImageViews.containsKey(parent)) 1 else 0   // keep an ImageBackground's bg image at the back
+            (child.parent as? ViewGroup)?.removeView(child)   // a MOVE (a keyed child at a new position): Android will not re-add a parented view
             pv.addView(child, minOf(index + base, pv.childCount))
         }
         val cn = ynodes[id]!!
@@ -4503,7 +4508,10 @@ class MainActivity : Activity(), ChuksModuleHost {
         views[id]?.let { v ->
             val owner = containerPlaced.remove(id)
             val cv = if (owner != null) packageViews[owner] as? ChuksContainerView else null
-            if (cv != null) cv.removeChild(v) else (v.parent as? ViewGroup)?.removeView(v)
+            // An exiting spec keeps the view (and its children) on screen until its
+            // animation ends; everything else about the node is torn down now.
+            val ex = exitSpec[id]
+            if (cv != null) cv.removeChild(v) else if (!(ex != null && runExit(v, ex))) (v.parent as? ViewGroup)?.removeView(v)
         }
         ynodes[id]?.let { textNodes.remove(it); measureViews.remove(it); val o = N.yOwner(it); if (o != 0L) N.yRemove(o, it); N.yFree(it) }
         val prefix = "$id."
@@ -4511,7 +4519,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
         views.keys.filter { it == id || it.startsWith(prefix) }.forEach { sheetIds.remove(it); popoverIds.remove(it); popoverAnchor.remove(it); popoverPlace.remove(it); popoverGap.remove(it); popoverArrow.remove(it); popoverArrowViews.remove(it); layoutIds.remove(it); lastLayoutReport.remove(it) }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); motionForget(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); motionForget(it); enterSpec.remove(it); exitSpec.remove(it); layoutSpec.remove(it); pendingEnter.remove(it); layoutLast.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
@@ -5053,6 +5061,8 @@ class MainActivity : Activity(), ChuksModuleHost {
                 if (lastLayoutReport[id] != key) { lastLayoutReport[id] = key; pendingLayout.add(Pair(id, key)) }
             }
         }
+        runLayoutTransitions()   // layout-spec views move from where they were (in absolute terms, so a moved parent counts)
+        runPendingEnters()       // mounted views enter once they have a frame
         needsFrame.clear()   // consumed for this pass
         // onLayout: the frame changed for a node that asked. Delivered after this pass
         // returns, because a handler re-renders and re-enters relayout.
@@ -5466,6 +5476,120 @@ class MainActivity : Activity(), ChuksModuleHost {
             motionFlush()
             for (vid in settled) { mAnimating.remove(vid); mValues[vid]?.let { hostInput("mv$vid:settle", "${it.cur}") } }
             if (mAnimating.isNotEmpty() && !motionFrameArmed) { motionFrameArmed = true; android.view.Choreographer.getInstance().postFrameCallback(this) }
+        }
+    }
+
+
+    // ---- Transitions: how a view arrives, leaves and moves ----------------------------
+    // Specs come as style keys (en=, ex=, lt=): a kind and, optionally, a duration in ms,
+    // an easing and a delay ("slide-up 300 out 50"). The host runs them: entering after
+    // the mounted view has its first frame, exiting on removal with the view kept in
+    // place and inert until it is done, layout as a move from the old frame to the new.
+    class TransitionSpec(text: String) {
+        val kind: String; val ms: Long; val easing: String; val delay: Long
+        init {
+            val parts = text.split(" ").filter { it.isNotEmpty() }
+            kind = parts.getOrNull(0) ?: "fade"
+            ms = parts.getOrNull(1)?.toLongOrNull() ?: (if (kind == "spring") 450L else 300L)
+            var ez = parts.getOrNull(2) ?: (if (kind == "spring") "spring" else "out")
+            if (kind == "spring") ez = "spring"
+            easing = ez
+            delay = parts.getOrNull(3)?.toLongOrNull() ?: 0L
+        }
+        fun interpolator(): android.animation.TimeInterpolator = when (easing) {
+            "linear" -> android.view.animation.LinearInterpolator()
+            "in" -> android.view.animation.AccelerateInterpolator()
+            "ease" -> android.view.animation.AccelerateDecelerateInterpolator()
+            "spring" -> android.view.animation.OvershootInterpolator(0.8f)
+            else -> android.view.animation.DecelerateInterpolator(1.6f)
+        }
+    }
+    private val enterSpec = HashMap<String, String>()
+    private val exitSpec = HashMap<String, String>()
+    private val layoutSpec = HashMap<String, String>()
+    private val pendingEnter = HashMap<String, String>()
+    private val layoutLast = HashMap<String, FloatArray>()            // a layout-spec node's absolute frame after the last pass
+    /// The state a view starts from (entering) or ends at (exiting): an offset by its own
+    /// size for the slides, a small scale for zoom, invisible for fade. [tx, ty, scale, alpha]
+    private fun transitionState(v: View, kind: String, entering: Boolean): FloatArray {
+        val w = Math.max(v.width, 1).toFloat(); val h = Math.max(v.height, 1).toFloat()
+        return when (kind) {
+            "slide-up" -> floatArrayOf(0f, if (entering) h else -h, 1f, 1f)
+            "slide-down" -> floatArrayOf(0f, if (entering) -h else h, 1f, 1f)
+            "slide-left" -> floatArrayOf(if (entering) w else -w, 0f, 1f, 1f)
+            "slide-right" -> floatArrayOf(if (entering) -w else w, 0f, 1f, 1f)
+            "zoom" -> floatArrayOf(0f, 0f, 0.6f, 0f)
+            else -> floatArrayOf(0f, 0f, 1f, 0f)
+        }
+    }
+    /// Mounted views with an entering spec, once they have a frame (the layout pass
+    /// just set it; the view measures on the next frame, so the start state is applied
+    /// from its LayoutParams size).
+    private fun runPendingEnters() {
+        if (pendingEnter.isEmpty()) return
+        val batch = HashMap(pendingEnter); pendingEnter.clear()
+        for ((id, text) in batch) {
+            val v = views[id] ?: continue
+            if (mBindings.containsKey(id)) continue   // a bound node's transform is the graph's
+            val spec = TransitionSpec(text)
+            val lp = v.layoutParams
+            val w = Math.max(lp?.width ?: v.width, 1).toFloat(); val h = Math.max(lp?.height ?: v.height, 1).toFloat()
+            val st = when (spec.kind) {
+                "slide-up" -> floatArrayOf(0f, h, 1f, 1f); "slide-down" -> floatArrayOf(0f, -h, 1f, 1f)
+                "slide-left" -> floatArrayOf(w, 0f, 1f, 1f); "slide-right" -> floatArrayOf(-w, 0f, 1f, 1f)
+                "zoom" -> floatArrayOf(0f, 0f, 0.6f, 0f); else -> floatArrayOf(0f, 0f, 1f, 0f)
+            }
+            val endAlpha = v.alpha
+            v.translationX = st[0]; v.translationY = st[1]; v.scaleX = st[2]; v.scaleY = st[2]; v.alpha = st[3]
+            v.animate().translationX(0f).translationY(0f).scaleX(1f).scaleY(1f).alpha(endAlpha)
+                .setDuration(spec.ms).setStartDelay(spec.delay).setInterpolator(spec.interpolator()).start()
+        }
+    }
+    /// A removed view with an exiting spec leaves on its own time: it stays in its parent
+    /// where it was, takes no touches, and is removed when the animation ends. Its node
+    /// is already gone, so a new node at the same id is unaffected.
+    private fun runExit(v: View, text: String): Boolean {
+        if (!v.isAttachedToWindow || (v.width == 0 && v.height == 0)) return false
+        val spec = TransitionSpec(text)
+        v.isEnabled = false; v.isClickable = false
+        if (v is ViewGroup) { v.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS }
+        v.bringToFront()   // out of the live children's order, so their insert indices stay right
+        val end = transitionState(v, spec.kind, false)
+        v.animate().translationX(end[0]).translationY(end[1]).scaleX(end[2]).scaleY(end[2]).alpha(end[3])
+            .setDuration(spec.ms).setStartDelay(spec.delay).setInterpolator(spec.interpolator())
+            .withEndAction { (v.parent as? ViewGroup)?.removeView(v) }.start()
+        return true
+    }
+    /// A node's frame in absolute terms: its Yoga frame summed up the owner chain, so a
+    /// child of a parent that moved has moved too. Scrolling does not change Yoga frames,
+    /// so a scroll never counts as a move. [x, y, w, h] in px.
+    private fun yogaAbsoluteFrame(id: String): FloatArray? {
+        val n = ynodes[id] ?: return null
+        var x = N.yGet(n, 0); var y = N.yGet(n, 1)
+        val w = N.yGet(n, 2); val h = N.yGet(n, 3)
+        var o = N.yOwner(n)
+        while (o != 0L) { x += N.yGet(o, 0); y += N.yGet(o, 1); o = N.yOwner(o) }
+        return floatArrayOf(x, y, w, h)
+    }
+    /// After a layout pass: every view with a layout spec whose absolute frame changed is
+    /// placed at the new frame and moves there from the old one (translate and scale
+    /// back to rest, pivot top-left). A view mounted this pass enters instead.
+    private fun runLayoutTransitions() {
+        if (layoutSpec.isEmpty()) return
+        for ((id, text) in layoutSpec) {
+            val v = views[id] ?: continue
+            val fr = yogaAbsoluteFrame(id) ?: continue
+            val old = layoutLast[id]
+            layoutLast[id] = fr
+            if (old == null || needsFrame.contains(id) || mBindings.containsKey(id)) continue
+            if (old[0] == fr[0] && old[1] == fr[1] && old[2] == fr[2] && old[3] == fr[3]) continue
+            if (fr[2] <= 0f || fr[3] <= 0f || old[2] <= 0f || old[3] <= 0f) continue
+            val spec = TransitionSpec(text)
+            v.pivotX = 0f; v.pivotY = 0f
+            v.translationX = old[0] - fr[0]; v.translationY = old[1] - fr[1]
+            v.scaleX = old[2] / fr[2]; v.scaleY = old[3] / fr[3]
+            v.animate().translationX(0f).translationY(0f).scaleX(1f).scaleY(1f)
+                .setDuration(spec.ms).setStartDelay(spec.delay).setInterpolator(spec.interpolator()).start()
         }
     }
 

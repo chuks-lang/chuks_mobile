@@ -2216,6 +2216,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var motionLink: CADisplayLink?
     var mLayoutDirty = false
     var mKeyboardValues: Set<Int> = []                                    // values fed with the keyboard's height (MK|)
+    // Transitions (en=/ex=/lt= style keys): per-node specs, and the mounted views
+    // waiting for a frame to enter with.
+    var enterSpec: [String: String] = [:]
+    var exitSpec: [String: String] = [:]
+    var layoutSpec: [String: String] = [:]
+    var pendingEnter: [String: String] = [:]
+    var layoutLast: [String: CGRect] = [:]                                // a layout-spec node's absolute frame after the last pass
     var mKeyboardNodes: Set<String> = []                                  // nodes whose bindings read a keyboard value: they move themselves
     var sheetPans: [UIPanGestureRecognizer: String] = [:]                 // sheet pan -> id
     var sheetTaps: [UITapGestureRecognizer: String] = [:]                 // sheet backdrop tap -> id
@@ -5799,6 +5806,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         resetLayoutStyle(n)
         resetPaintStyle(id, v)
         motionUnbindNode(id)   // bindings and sources are style keys: absent means none
+        enterSpec[id] = nil; exitSpec[id] = nil; layoutSpec[id] = nil   // transitions: absent means none
         // A leaf native control has no measure func; make() gave its Yoga node the
         // control's intrinsic size, and the reset above just cleared it. Put it back
         // before the incoming keys, so an explicit w/h still wins. Without this a
@@ -6158,6 +6166,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "tx": tx = CGFloat(f); hasTransform = true
             case "ty": ty = CGFloat(f); hasTransform = true
             case "mo": motionBind(id, chuksUnescapeStyle(val))
+            case "en": enterSpec[id] = chuksUnescapeStyle(val); if needsFrame.contains(id) { pendingEnter[id] = enterSpec[id]! }   // mounted this batch: enters once framed
+            case "ex": exitSpec[id] = chuksUnescapeStyle(val)
+            case "lt": layoutSpec[id] = chuksUnescapeStyle(val)
             case "mpx": motionSetPan(id, x: Int(val) ?? -1, y: mPan[id]?.y ?? -1)
             case "mpy": motionSetPan(id, x: mPan[id]?.x ?? -1, y: Int(val) ?? -1)
             case "msc": if let sc = v as? UIScrollView, let vid = Int(val) { mScroll[sc] = vid }
@@ -6354,7 +6365,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if let t = g as? UITapGestureRecognizer { taps[t] = nil }
                 if let lp = g as? UILongPressGestureRecognizer { pressGestures[lp] = nil }
             }
-            v.removeFromSuperview()
+            // An exiting spec keeps the view (and its subviews) on screen until its
+            // animation ends; everything else about the node is torn down now.
+            if let ex = exitSpec[id], runExit(v, ex) { } else { v.removeFromSuperview() }
         }
         if let n = ynodes[id] {
             if let owner = YGNodeGetOwner(n) { YGNodeRemoveChild(owner, n) }
@@ -6400,6 +6413,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if cameraController === cv.controller { cameraController = nil }
             }
             pillIds.remove(k); cornerRadii[k] = nil
+            enterSpec[k] = nil; exitSpec[k] = nil; layoutSpec[k] = nil; pendingEnter[k] = nil; layoutLast[k] = nil
             views[k] = nil
         }
         for k in ynodes.keys.filter({ $0 == id || $0.hasPrefix(prefix) }) { ynodes[k] = nil }
@@ -7059,6 +7073,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let gv = gradLayers[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the clamped rounding
             if let bv = blurViews[id] { bv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }
         }
+        runLayoutTransitions()   // layout-spec views move from where they were (in absolute terms, so a moved parent counts)
+        runPendingEnters()       // mounted views enter once they have a frame
         needsFrame.removeAll()   // consumed for this pass
         // onLayout: the frame changed for a node that asked. Delivered after this pass
         // returns, because a handler re-renders and re-enters relayout.
@@ -7640,5 +7656,104 @@ extension CardsVC {
             if let mv = mValues[vid] { fireValue("mv\(vid):settle", "\(mv.cur)") }
         }
         if mAnimating.isEmpty { motionLink?.invalidate(); motionLink = nil }
+    }
+}
+
+// ---- Transitions: how a view arrives, leaves and moves ----------------------------
+// Specs come as style keys (en=, ex=, lt=): a kind and, optionally, a duration in ms,
+// an easing and a delay ("slide-up 300 out 50"). The host runs them: entering after
+// the mounted view has its first frame, exiting on removal with the view kept in
+// place and inert until it is done, layout as a move from the old frame to the new.
+struct TransitionSpec {
+    let kind: String            // fade slide-up slide-down slide-left slide-right zoom ease spring linear
+    let ms: Double
+    let easing: String          // ease | out | in | linear | spring
+    let delay: Double
+    init?(_ text: String) {
+        let parts = text.split(separator: " ").map(String.init)
+        guard let k = parts.first, !k.isEmpty else { return nil }
+        kind = k
+        ms = parts.count > 1 ? (Double(parts[1]) ?? 300) : (k == "spring" ? 450 : 300)
+        var ez = parts.count > 2 ? parts[2] : (k == "spring" ? "spring" : "out")
+        if ez == "spring" || k == "spring" { ez = "spring" }
+        easing = ez
+        delay = parts.count > 3 ? (Double(parts[3]) ?? 0) : 0
+    }
+    func run(_ animations: @escaping () -> Void, completion: ((Bool) -> Void)? = nil) {
+        let d = ms / 1000
+        if easing == "spring" {
+            UIView.animate(withDuration: d, delay: delay / 1000, usingSpringWithDamping: 0.78, initialSpringVelocity: 0.4, options: [.allowUserInteraction, .beginFromCurrentState], animations: animations, completion: completion)
+        } else {
+            let curve: UIView.AnimationOptions = easing == "linear" ? .curveLinear : (easing == "in" ? .curveEaseIn : (easing == "ease" ? .curveEaseInOut : .curveEaseOut))
+            UIView.animate(withDuration: d, delay: delay / 1000, options: [curve, .allowUserInteraction, .beginFromCurrentState], animations: animations, completion: completion)
+        }
+    }
+}
+extension CardsVC {
+    /// The state a view starts from (entering) or ends at (exiting) for a kind: an
+    /// offset by its own size for the slides, a small scale for zoom, invisible for fade.
+    func transitionState(_ v: UIView, _ kind: String, entering: Bool) -> (transform: CGAffineTransform, alpha: CGFloat) {
+        let w = max(v.bounds.width, 1), h = max(v.bounds.height, 1)
+        switch kind {
+        case "slide-up":    return (CGAffineTransform(translationX: 0, y: entering ? h : -h), 1)
+        case "slide-down":  return (CGAffineTransform(translationX: 0, y: entering ? -h : h), 1)
+        case "slide-left":  return (CGAffineTransform(translationX: entering ? w : -w, y: 0), 1)
+        case "slide-right": return (CGAffineTransform(translationX: entering ? -w : w, y: 0), 1)
+        case "zoom":        return (CGAffineTransform(scaleX: 0.6, y: 0.6), 0)
+        default:            return (.identity, 0)
+        }
+    }
+    /// Mounted views with an entering spec, once they have a frame: start from the
+    /// kind's state and settle into place.
+    func runPendingEnters() {
+        if pendingEnter.isEmpty { return }
+        let batch = pendingEnter; pendingEnter = [:]
+        for (id, text) in batch {
+            guard let v = views[id], let spec = TransitionSpec(text), v.bounds.width > 0 || v.bounds.height > 0 else { continue }
+            if mBindings[id] != nil { continue }   // a bound node's transform is the graph's
+            let start = transitionState(v, spec.kind, entering: true)
+            let endAlpha = v.alpha
+            v.transform = start.transform; v.alpha = start.alpha
+            spec.run({ v.transform = .identity; v.alpha = endAlpha })
+        }
+    }
+    /// A removed view with an exiting spec leaves on its own time: it stays where it
+    /// was, takes no touches, and is dropped when the animation ends. Its node is
+    /// already gone, so a new node at the same id is unaffected.
+    func runExit(_ v: UIView, _ text: String) -> Bool {
+        guard let spec = TransitionSpec(text), v.window != nil, v.bounds.width > 0 || v.bounds.height > 0 else { return false }
+        v.isUserInteractionEnabled = false
+        v.superview?.bringSubviewToFront(v)   // out of the live children's order, so their insert indices stay right
+        let end = transitionState(v, spec.kind, entering: false)
+        spec.run({ v.transform = end.transform; v.alpha = end.alpha }, completion: { _ in v.removeFromSuperview() })
+        return true
+    }
+    /// A node's frame in absolute terms: its Yoga frame summed up the owner chain, so
+    /// a child of a parent that moved has moved too. Scrolling does not change Yoga
+    /// frames, so a scroll never counts as a move.
+    func yogaAbsoluteFrame(_ id: String) -> CGRect? {
+        guard let n = ynodes[id] else { return nil }
+        var x = CGFloat(YGNodeLayoutGetLeft(n)), y = CGFloat(YGNodeLayoutGetTop(n))
+        let w = CGFloat(YGNodeLayoutGetWidth(n)), h = CGFloat(YGNodeLayoutGetHeight(n))
+        var o = YGNodeGetOwner(n)
+        while let p = o { x += CGFloat(YGNodeLayoutGetLeft(p)); y += CGFloat(YGNodeLayoutGetTop(p)); o = YGNodeGetOwner(p) }
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+    /// After a layout pass: every view with a layout spec whose absolute frame changed
+    /// is placed at the new frame and moves there from the old one (translate and
+    /// scale back to identity). A view mounted this pass enters instead.
+    func runLayoutTransitions() {
+        if layoutSpec.isEmpty { return }
+        for (id, text) in layoutSpec {
+            guard let v = views[id], let fr = yogaAbsoluteFrame(id) else { continue }
+            let old = layoutLast[id]
+            layoutLast[id] = fr
+            guard let o = old, !needsFrame.contains(id), mBindings[id] == nil, o != fr, let spec = TransitionSpec(text) else { continue }
+            guard o.width > 0, o.height > 0, fr.width > 0, fr.height > 0 else { continue }
+            let sx = o.width / fr.width, sy = o.height / fr.height
+            let dx = o.midX - fr.midX, dy = o.midY - fr.midY
+            v.transform = CGAffineTransform(translationX: dx, y: dy).scaledBy(x: sx, y: sy)
+            spec.run({ v.transform = .identity })
+        }
     }
 }

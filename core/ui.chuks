@@ -162,6 +162,11 @@ export class Style {
     var mPanX: int          // a Gesture's pan feeds this value id with its x (-1 = none)
     var mPanY: int          // ... and this one with its y
     var mScroll: int        // a Scroll/List feeds this value id with its offset (-1 = none)
+    // Transitions (host-run): how a node arrives, leaves, and moves. Specs like
+    // "fade", "slide-up 300", "zoom 250 out", "spring"; "" = none.
+    var enter: string
+    var exit: string
+    var lay: string
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
@@ -195,6 +200,7 @@ export class Style {
         this.pAnchor = ""; this.pPlace = ""; this.pGap = -1; this.pArrow = -1
         this.shSnap = ""; this.shIdx = -2; this.shBackdrop = -1; this.shPanClose = -1; this.shHandle = -1; this.shKeyboard = ""
         this.mBind = ""; this.mPanX = -1; this.mPanY = -1; this.mScroll = -1
+        this.enter = ""; this.exit = ""; this.lay = ""
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -335,6 +341,9 @@ export class Style {
         if (this.mPanX >= 0) { s = s + "mpx=" + string(this.mPanX) + ";" }
         if (this.mPanY >= 0) { s = s + "mpy=" + string(this.mPanY) + ";" }
         if (this.mScroll >= 0) { s = s + "msc=" + string(this.mScroll) + ";" }
+        if (this.enter != "") { s = s + "en=" + styleEsc(this.enter) + ";" }
+        if (this.exit != "") { s = s + "ex=" + styleEsc(this.exit) + ";" }
+        if (this.lay != "") { s = s + "lt=" + styleEsc(this.lay) + ";" }
         if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
             s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
             s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
@@ -800,6 +809,13 @@ function encodeMotion(m: any): string {
 
 export dataType LayoutProps {
     motion: MotionBindings?;
+    // Transitions the host runs: `entering` when the view mounts, `exiting` when it
+    // leaves (the view stays until the animation ends), `layout` when its frame moves
+    // or resizes (from where it was to where it is). A spec is a kind and, optionally,
+    // a duration in ms, an easing and a delay: "fade", "slide-up 300", "zoom 250 out",
+    // "slide-left 300 ease 100". Kinds: fade, slide-up, slide-down, slide-left,
+    // slide-right, zoom; for `layout`: ease (default), spring, linear.
+    entering: string?; exiting: string?; layout: string?;
     gap: int?; pad: int?; px: int?; py: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
     align: string?; justify: string?; bg: string?; color: string?; size: int?;
     weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
@@ -863,6 +879,7 @@ export function pvF(p: any, k: string, d: float): float { const v: any = p[k]; r
 function applyLayoutV(s: Style, p: any): void {
     const tws: any = p["tw"]; if (tws != null) { applyLayout(s, tw(string(tws))) }
     const mo: any = p["motion"]; if (mo != null) { s.mBind = encodeMotion(mo) }
+    s.enter = pvS(p, "entering", s.enter); s.exit = pvS(p, "exiting", s.exit); s.lay = pvS(p, "layout", s.lay)
     s.gap = pvI(p, "gap", s.gap)
     s.pad = pvI(p, "pad", s.pad)
     s.padX = pvI(p, "px", s.padX)
