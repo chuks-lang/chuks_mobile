@@ -1432,6 +1432,14 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     }
     func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
         if (e as? CLError)?.code == .locationUnknown { return }  // transient: no fix yet, keep waiting
+        // kCLErrorDenied covers two different things, and Apple's text for both is
+        // "The operation couldn't be completed. (kCLErrorDomain error 1.)": the user
+        // refused this app, or Location Services are off for the whole phone. Say which,
+        // in the words Android uses, so an app can show one message on both.
+        if (e as? CLError)?.code == .denied {
+            onErr(CLLocationManager.locationServicesEnabled() ? "location permission denied" : "location services are off: turn them on in Settings")
+            return
+        }
         onErr(e.localizedDescription)
     }
 }

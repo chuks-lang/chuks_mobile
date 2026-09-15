@@ -1,0 +1,100 @@
+// A floating tab bar overlaps the screen, and the screen should not have to know.
+//
+// The contract used to be "screens must clear the bar themselves, by tabBarHeight()",
+// and a screen that forgot (walkSocials' Goals: content that just fit the window, so
+// nothing scrolled) hid its last section under the bar on every phone. Now the shell
+// hands the bar's height down as overlayBottom() and every vertical Scroll, List and
+// SectionList inside the tab ends its content above the bar on its own. A screen that
+// already pads by more keeps its own padding; a screen outside a floating bar sees 0.
+//
+// Run:  chuks run tests/overlay_test.chuks   (exits non-zero on failure)
+import { Node, Column, Row, Text, Scroll, List, Comp, Component, Route, NavStack, Reconciler, overlayBottom, setSafeInsets } from "../core/ui.chuks";
+import { TabView, Tab, tabBarHeight } from "../core/nav.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) } else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function icon(name: string, color: string, size: int): Node { return Text({ size: size, color: color }, name) }
+
+/** Every style line of the stream that carries `text` in its node's own line is hard to
+ *  tie back; instead find the line for the node whose text child is `label`, by walking
+ *  up: the content column is the parent of the row holding the text. Simplest: search
+ *  for the style line that contains the given key=value. */
+function anyStyleHas(lines: []string, key: string, v: int): bool {
+    for (var i: int = 0; i < lines.length; i = i + 1) {
+        if (lines[i].startsWith("S|") && lines[i].contains(key + "=" + string(v) + ";")) { return true }
+    }
+    return false
+}
+function lines(rc: Reconciler): []string { return rc.drain().split("\n") }
+
+// ---- screens ------------------------------------------------------------------
+var SEEN_IN_LAZY: int = -1
+function plainScroll(): Node {                      // the Goals shape: pad 16, no thought for the bar
+    return Scroll({ grow: 1 }, [ Column({ pad: 16, gap: 8 }, [ Text({}, "top"), Text({}, "bottom") ]) ])
+}
+function paddedScroll(): Node {                     // an app that already pads by more
+    return Scroll({ grow: 1 }, [ Column({ px: 16, pb: 500, gap: 8 }, [ Text({}, "padded") ]) ])
+}
+function twoKidScroll(): Node {                     // several children: the wrapper pads
+    return Scroll({ grow: 1 }, [ Text({}, "a"), Text({}, "b") ])
+}
+function lazyScreen(): Node {                       // the Scroll is built by a lazy component
+    return Column({ grow: 1 }, [ Comp(function(): Node { SEEN_IN_LAZY = overlayBottom(); return plainScroll() }) ])
+}
+function bareScroll(): Node { return Scroll([ Column({ pad: 4 }, [ Text({}, "bare") ]) ]) }
+var SEEN_IN_CLASS: int = -1
+class Panel extends Component {
+    override public render(): Node { SEEN_IN_CLASS = overlayBottom(); return plainScroll() }
+}
+function classScreen(): Node { return Column({ grow: 1 }, [ new Panel() ]) }
+function listScreen(): Node {                       // a windowed list: the clearance is in its content height
+    return List({ count: 3, rowHeight: 50, gap: 0, pad: 8,
+                  key: function(r: int): string { return string(r) },
+                  item: function(r: int, top: int): Node { return Row({ abs: true, top: top, h: 50 }, [ Text({}, "row") ]) } })
+}
+
+function shellFor(screen: function(): Node, glass: bool): function(r: Route): Node {
+    return function(_: Route): Node {
+        return TabView({ active: 0, onSelect: function(i: int): void { }, iconFor: icon, glass: glass },
+                       [ Tab({ name: "one", screen: screen }) ])
+    }
+}
+function run(screen: function(): Node, glass: bool): []string {
+    var routes: map[string]function(r: Route): Node = {}
+    routes["shell"] = shellFor(screen, glass)
+    const nv: NavStack = new NavStack(routes, "shell")
+    const rc: Reconciler = new Reconciler()
+    rc.setViewport(0, 600, 400); rc.drain(); rc.renderRoot(nv.render())
+    return lines(rc)
+}
+
+function main(): void {
+    setSafeInsets(0, 0, 34, 0)
+    const bar: int = tabBarHeight()
+    check(bar > 34, "the bar is taller than the inset it includes")
+
+    check(anyStyleHas(run(plainScroll, true), "pb", bar), "a scroll that did not pad ends its content above the floating bar")
+    check(!anyStyleHas(run(plainScroll, false), "pb", bar), "a bar in flow overlaps nothing: no padding added")
+    check(anyStyleHas(run(paddedScroll, true), "pb", 500) && !anyStyleHas(run(paddedScroll, true), "pb", bar), "a scroll that already pads by more keeps its own padding")
+    check(anyStyleHas(run(twoKidScroll, true), "pb", bar), "several children: their wrapper pads")
+    check(anyStyleHas(run(bareScroll, true), "pb", bar), "the bare Scroll([...]) form pads too")
+
+    SEEN_IN_LAZY = -1
+    const lz: []string = run(lazyScreen, true)
+    check(SEEN_IN_LAZY == bar, "a lazy component inside the tab sees the bar's height when it runs")
+    check(anyStyleHas(lz, "pb", bar), "and its scroll ends above the bar")
+    SEEN_IN_CLASS = -1
+    const cl: []string = run(classScreen, true)
+    check(SEEN_IN_CLASS == bar && anyStyleHas(cl, "pb", bar), "a class component inside the tab sees it too")
+    check(anyStyleHas(run(listScreen, true), "h", 8 + 3 * 50 + bar), "a list's content ends above the bar: pad in, bar out")
+    check(anyStyleHas(run(listScreen, false), "h", 8 + 3 * 50 + 8), "and keeps its own end pad when nothing floats")
+    check(overlayBottom() == 0, "outside any screen's render nothing floats")
+
+    println("")
+    println("overlay: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "overlay_test failed" }
+}
+main()

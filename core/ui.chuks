@@ -381,6 +381,9 @@ export class Node {
     var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
     var hookKeys: []string   // kind=="Comp": the cells and effects its last run touched (kept alive when it is skipped)
     var ckey: string     // explicit identity key (.key(...)); "" = identify by position
+    var ctxTop: int      // kind=="Comp": the inset context it was built in (consumed top,
+    var ctxOverlay: int  //   floating-bar bottom), restored around its render: a lazy
+                         //   component inside a tab sees the tab's insets, not the window's
     // Controlled TextInput: `hasVal` marks the field controlled, `val` is its text.
     // onSubmit/onFocus/onBlur are the extra input events (kept `any` like onPress).
     var hasVal: bool
@@ -422,6 +425,7 @@ export class Node {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
         this.comp = null; this.produced = null; this.ckey = ""; var hk: []string = []; this.hookKeys = hk
+        this.ctxTop = 0; this.ctxOverlay = 0
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
@@ -568,6 +572,41 @@ var _consumedTop: int = 0
 // Framework-internal: nested navigators bracket a screen's render with this.
 export function setConsumedTop(v: int): void { _consumedTop = v }
 export function consumedTop(): int { return _consumedTop }
+
+// A bar floating over the BOTTOM of the screen (a glass tab bar), in points. The other
+// half of the same idea: chrome that overlaps a screen is the screen's business to clear,
+// and the screen should not have to know the chrome exists. Every vertical Scroll, List
+// and SectionList keeps its last item clear of this on its own, so a page that just fits
+// the window still scrolls the last card out from under the bar (the Goals screen of an
+// app forgot to pad and its "Personal bests" lived under the bar, on every phone, until
+// someone noticed). Only a floating bar sets it; a bar in flow leaves it at 0.
+var _overlayBottom: int = 0
+// Framework-internal: a navigator whose bar floats brackets a screen's render with this.
+export function setOverlayBottom(v: int): void { _overlayBottom = v }
+/**
+ * How far a floating bar reaches up from the bottom of this screen, in points; 0 when
+ * nothing floats there. Scroll and List clear it for their content on their own. A
+ * screen that pins something to its bottom edge in flow (a Column with a button at the
+ * end) pads by this itself, the way it pads by safeBottom() at the window's edge.
+ */
+export function overlayBottom(): int { return _overlayBottom }
+// Run a component under the insets it was placed under, whatever is current when it
+// happens to run: a lazy component runs after its navigator's bracket has closed, and
+// without this it would see the window's insets instead of its tab's. The one path
+// for a first mount and a re-run alike.
+function renderInContext(n: Node): Node {
+    const pt: int = _consumedTop; const po: int = _overlayBottom
+    _consumedTop = n.ctxTop; _overlayBottom = n.ctxOverlay
+    const produced: Node = n.render()
+    _consumedTop = pt; _overlayBottom = po
+    return produced
+}
+// A subtree's own bottom padding, as the props gave it: pb, else py, else pad, else 0.
+function ownPadB(st: Style): int {
+    if (st.padB >= 0) { return st.padB }
+    if (st.padY >= 0) { return st.padY }
+    return st.pad >= 0 ? st.pad : 0
+}
 
 /**
  * The top safe-area inset to start below: the notch or status bar, in points, minus
@@ -1677,6 +1716,18 @@ dataType ScrollProps {
 // (like RN's contentContainer) so the host never gets >1 direct scroll child and can't
 // crash. A single child (the common Scroll([Column([...])]) pattern) passes through
 // unchanged, so existing screens and the List windowing path are untouched.
+// Clear a floating bar (overlayBottom): a vertical scroll's content ends above it. One
+// child keeps its own bottom padding when that already clears the bar, so an app that
+// padded by tabBarHeight() is not padded twice; several children share a wrapper, and
+// the wrapper pads. Nothing to do when nothing floats.
+function clearOverlay(content: []Node, kidCount: int, horizontal: bool): []Node {
+    const ob: int = _overlayBottom
+    if (horizontal || ob <= 0 || content.length != 1) { return content }
+    const c: Node = content[0]
+    if (kidCount > 1) { c.style.padB = ob }
+    else if (ownPadB(c.style) < ob) { c.style.padB = ob }
+    return content
+}
 function scrollContent(kids: []Node, horizontal: bool): []Node {
     if (kids.length <= 1) { return kids }
     const cs: Style = new Style(); cs.dir = horizontal ? "row" : "col"
@@ -1710,7 +1761,7 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") {
         const c: []Kid = first
         const s0: Style = new Style(); s0.dir = "col"; s0.grow = 1; s0.basis = 0
-        return new Node("Scroll", s0, "", scrollContent(flatKids(c), false))
+        return new Node("Scroll", s0, "", clearOverlay(scrollContent(flatKids(c), false), c.length, false))
     }
     const p: ScrollProps = first  // narrowed to the dataType arm: typed field access below
     // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
@@ -1740,7 +1791,7 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     // scrolled up to read history.
     if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
     const svs: any = p["scrollValue"]; if (svs != null) { const sv: SharedValue = svs; s.mScroll = sv.id }
-    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", scrollContent(flatKids(kids), horizontal))
+    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", clearOverlay(scrollContent(flatKids(kids), horizontal), kids.length, horizontal))
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
@@ -2600,6 +2651,7 @@ export function List(p: map[string]ListProp): Node {
     const s: Style = new Style(); s.grow = 1; s.basis = 0    // fills the remaining space
     const n: Node = new Node("List", s, "", [])
     n.data = p    // carries count, key, item, rowHeight, gap, pad
+    n.ctxOverlay = _overlayBottom   // a floating bar to keep the last row clear of (reconcileList)
     return n
 }
 /**
@@ -2629,6 +2681,7 @@ export function SectionList(p: map[string]ListProp): Node {
     const s: Style = new Style(); s.grow = 1; s.basis = 0
     const n: Node = new Node("SectionList", s, "", [])
     n.data = p
+    n.ctxOverlay = _overlayBottom   // as for List
     return n
 }
 
@@ -2644,7 +2697,7 @@ export function SectionList(p: map[string]ListProp): Node {
  */
 export function Comp(render: any): Node {
     const n: Node = new Node("Comp", new Style(), "", [])
-    n.comp = render
+    n.comp = render; n.ctxTop = _consumedTop; n.ctxOverlay = _overlayBottom
     return n
 }
 /**
@@ -2660,7 +2713,7 @@ export function Comp(render: any): Node {
  */
 export function KeyedComp(key: string, render: any): Node {
     const n: Node = new Node("Comp", new Style(), "", [])
-    n.comp = render; n.ckey = key
+    n.comp = render; n.ckey = key; n.ctxTop = _consumedTop; n.ctxOverlay = _overlayBottom
     return n
 }
 
@@ -2685,7 +2738,7 @@ export function KeyedComp(key: string, render: any): Node {
  * ```
  */
 export class Component extends Node {
-    constructor() { super("Comp", new Style(), "", []) }
+    constructor() { super("Comp", new Style(), "", []); this.ctxTop = _consumedTop; this.ctxOverlay = _overlayBottom }   // placed under these insets, like Comp()
     // Subclasses override this. The default is an empty view (so a Component that
     // forgets to override renders nothing rather than looping on itself).
     override public render(): Node { return mkView(new Style(), []) }
@@ -3118,7 +3171,7 @@ export class Reconciler {
             // Component subclass runs its overridden render().
             const path: string = n.ckey != "" ? "key:" + n.ckey : id
             hookEnter(path)
-            const produced: Node = n.render()
+            const produced: Node = renderInContext(n)
             n.produced = produced; n.hookKeys = hookTouched()
             this.ranDepth = this.ranDepth + 1
             this.mountNode(produced, id, parent, index)
@@ -3311,7 +3364,7 @@ export class Reconciler {
     // whatever it passed them, and a closure's inputs cannot be compared.
     runComp(n: Node, prevProduced: Node?, path: string, id: string, parent: string, index: int): void {
         hookEnter(path)
-        const produced: Node = n.render()
+        const produced: Node = renderInContext(n)
         n.produced = produced; n.hookKeys = hookTouched()
         this.ranDepth = this.ranDepth + 1
         this.reconcile(prevProduced, produced, id, parent, index)
@@ -3397,7 +3450,10 @@ export class Reconciler {
         const gridRows: int = (count + ncol - 1) / ncol   // rows of `ncol` cells; == count when ncol==1
         var colW: int = 0
         if (ncol > 1 && this.vpW > 0) { colW = (this.vpW - 2 * pad - (ncol - 1) * gap) / ncol }
-        const contentH: int = rowsTop + gridRows * stride + footerH + pad
+        // The end pad, or the floating bar's height when that is more: the last row
+        // scrolls out from under the bar (see overlayBottom).
+        const endPad: int = next.ctxOverlay > pad ? next.ctxOverlay : pad
+        const contentH: int = rowsTop + gridRows * stride + footerH + endPad
         const invBase: int = contentH - pad - footerH - rowH
 
         if (prev == null) {
@@ -3834,7 +3890,7 @@ export class Reconciler {
             totalRows = totalRows + nr0
             total = total + headerH + nr0 * stride
         }
-        total = total + pad
+        total = total + (next.ctxOverlay > pad ? next.ctxOverlay : pad)   // the end pad, or the floating bar's height (see overlayBottom)
         // Nothing to show: give the empty state the viewport to fill, the way a plain
         // List does. Without this a sectioned list with no sections rendered LITERALLY
         // NOTHING -- a blank screen where the app had asked for an empty state, which is

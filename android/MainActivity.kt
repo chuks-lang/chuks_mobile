@@ -2215,10 +2215,18 @@ class MainActivity : Activity(), ChuksModuleHost {
         pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "calendar permission denied") }
         enqueuePermissionRequest(need, code)
     }
+    // Permission, then the device-wide switch. Location Services off means no provider
+    // will ever answer, and a watch that starts anyway waits forever with nothing to say:
+    // a two-minute walk recorded from the step counter alone, with "Finding your
+    // position" on screen the whole way. Refuse up front, in the words iOS uses.
     private fun withLocationPerm(token: String, run: () -> Unit) {
-        if (hasLocationPerm()) { run(); return }
+        val gated = {
+            val lm = getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+            if (ChuksGeo.enabled(lm)) run() else fail(token, "location services are off: turn them on in Settings")
+        }
+        if (hasLocationPerm()) { gated(); return }
         val code = ++permSeq
-        pendingPermActions[code] = { ok -> if (ok) run() else fail(token, "location permission denied") }
+        pendingPermActions[code] = { ok -> if (ok) gated() else fail(token, "location permission denied") }
         enqueuePermissionRequest(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), code)
     }
 
@@ -2906,7 +2914,19 @@ class MainActivity : Activity(), ChuksModuleHost {
     private val gradAngle = HashMap<String, Int>()         // id -> angle in degrees (0 = top to bottom)
     private val gradStops = HashMap<String, FloatArray>()  // id -> 0..1 positions matching the colors
     private var appAppearance: String = "auto"   // the app's own light/dark choice
-    private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a translucent frosted panel
+    private val glassIds = HashSet<String>()   // Liquid Glass: no backdrop blur on Android views, so a frosted panel over the bg
+
+    // What a glass surface is painted with here. Android has no backdrop blur inside a
+    // window, and a scrim that is truly translucent shows the content under it crisp:
+    // a floating tab bar at 22% white had the page's last lines running straight
+    // through its labels. iOS already has the rule for a device without the material:
+    // the `bg` the app gave the surface is the fallback. Same rule here, nearly opaque
+    // (a hint of what scrolls under it, never legible), and theme-aware when the app
+    // gave no bg, since a white haze on a dark screen is a bug of its own.
+    private fun glassSurface(id: String): Int {
+        val base = bgColor[id] ?: (if (osDark()) Color.parseColor("#1C1C1E") else Color.WHITE)
+        return Color.argb(240, Color.red(base), Color.green(base), Color.blue(base))
+    }
     private val pressOpacity = HashMap<String, Float>()   // id -> Pressable active alpha (0-1)
     private val longPressActions = HashMap<String, String>()   // id -> onLongPress action
     private val pressInActions = HashMap<String, String>()     // id -> onPressIn action
@@ -3500,7 +3520,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             val gd = GradientDrawable()
             gd.setColor(when {
                 blurAmt.containsKey(id) -> blurScrim(id)                       // Blur -> tinted scrim
-                glassIds.contains(id) -> Color.argb(56, 255, 255, 255)         // frosted translucent
+                glassIds.contains(id) -> glassSurface(id)                      // frosted panel over the app's own bg
                 else -> bgColor[id] ?: Color.TRANSPARENT
             })
             if (hasPerCorner) {   // rounded-t-*, rounded-bl-*, … : per-corner radii (tl, tr, br, bl x2)
@@ -3517,7 +3537,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     else -> gd.setStroke(bw.toInt(), bc)
                 }
             }
-            else if (glassIds.contains(id)) gd.setStroke(dpf(1f).toInt(), Color.argb(40, 255, 255, 255))   // subtle glass rim
+            else if (glassIds.contains(id)) gd.setStroke(dpf(1f).toInt(), if (osDark()) Color.argb(40, 255, 255, 255) else Color.argb(18, 0, 0, 0))   // subtle glass rim
             if (v !is TextureView) v.background = gd   // TextureView rejects a background drawable (rounded below via outline)
         } else if (v !is Switch && v !is TextureView && !modalIds.contains(id)) {
             v.background = null   // the new style has no bg/border: clear a stale drawable on a reused view
