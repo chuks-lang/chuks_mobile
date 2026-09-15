@@ -124,6 +124,7 @@ extern int chuks_fail(char* token, char* message);
 extern char* chuks_saveState(void);
 extern void chuks_loadState(char* data);
 extern void chuks_set_wake(void* cb);
+extern void chuks_set_timezone(char* id, int offsetSeconds);
 extern char* cmr_version(void);
 extern uint64_t cmr_create(void);
 extern void cmr_destroy(uint64_t h);

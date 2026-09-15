@@ -2247,11 +2247,23 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let s = String(cString: c); chuks_free_str(c); return s
     }
     func eSetup() {
+        eTimezone()   // before anything runs in the engine: module-level code may read the date
         #if CMR
         if !cmrDevBoot() { cmrBootBundle() }   // dev: fetch bundle over HTTP + hot reload; else the baked bundle
         #endif
         if !DEV_MODE { chuks_set_count(N) }
     }   // chuks_* bridge auto-runs chuks_init; dev server self-inits on boot
+    // Hand the engine the device's time zone: its IANA id (Europe/London), and the
+    // offset now as the fallback for an id the engine's zone database lacks. Go
+    // leaves time.Local at UTC on iOS, so without this every time.format /
+    // date.today in the app is off by the device's offset.
+    func eTimezone() {
+        if DEV_MODE { return }
+        let tz = TimeZone.current
+        tz.identifier.withCString { id in
+            chuks_set_timezone(UnsafeMutablePointer(mutating: id), Int32(tz.secondsFromGMT()))
+        }
+    }
     func eMount() -> String? {
         if DEV_MODE { return devHTTP("/mount", "") }
         _ = chuks_mount(); return drainStr()
@@ -2440,6 +2452,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         view.addGestureRecognizer(warm)
 
         eSetup()
+        NotificationCenter.default.addObserver(self, selector: #selector(systemTimeZoneDidChange),
+                                               name: .NSSystemTimeZoneDidChange, object: nil)
         ePlatform()                                                 // report platform + device info
         eColorScheme(traitCollection.userInterfaceStyle == .dark)   // open in the OS appearance
         // Report the safe-area insets BEFORE the first mount. They are normally pushed
@@ -2485,6 +2499,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if BENCHMARK_MODE {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in self?.startPerfScroll() }
         }
+    }
+
+    // The device moved to another time zone (Settings, or the carrier): the engine's
+    // clock follows it and the screen is rebuilt with the new local times.
+    @objc func systemTimeZoneDidChange() {
+        eTimezone()
+        if let s = eTick() { apply(s); relayout() }
     }
 
     // The OS appearance changed (Settings, Control Center, or automatic day/night):

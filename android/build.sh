@@ -203,9 +203,11 @@ fi
 for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
 # Media assets keep their path relative to assets/ (organize in subfolders, reference
 # as src:"sub/dir/name.ext"; basenames no longer collide across folders).
-find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.png" -o -name "*.jpg" \) 2>/dev/null | while IFS= read -r f; do
+# A project without assets/ is fine: find would exit 1 on the missing directory and,
+# under pipefail, end the build silently right after "Bundling".
+[ -d "$PROJDIR/assets" ] && find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.png" -o -name "*.jpg" \) 2>/dev/null | while IFS= read -r f; do
     rel="${f#"$PROJDIR/assets/"}"; mkdir -p "$OUT/assets/$(dirname "$rel")"; cp "$f" "$OUT/assets/$rel"
-done
+done || true
 ( cd "$OUT" && zip -qj base.apk classes.dex && zip -q base.apk lib/arm64-v8a/libapp.so lib/arm64-v8a/libc++_shared.so \
     && { [ -e assets/chuks-dev.txt ] && zip -q base.apk assets/chuks-dev.txt || true; } \
     && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \

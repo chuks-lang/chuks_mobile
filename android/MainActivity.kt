@@ -83,6 +83,7 @@ object N {
     external fun resolve(token: String, payload: String): Int   // F3: async capability result
     external fun fail(token: String, message: String): Int      // F3: capability failure (error channel)
     external fun setColorScheme(dark: Int)
+    external fun setTimezone(id: String, offsetSeconds: Int)       // the device zone; Go's own default on Android is UTC
     external fun colorSchemeFollows(): Int
     external fun setInsets(top: Int, right: Int, bottom: Int, left: Int)
     external fun setPlatform(os: String, version: String, model: String, isTablet: Int)
@@ -302,6 +303,21 @@ class MainActivity : Activity(), ChuksModuleHost {
         }
     }
 
+    private var zoneReceiver: android.content.BroadcastReceiver? = null
+
+    override fun onDestroy() {
+        zoneReceiver?.let { try { unregisterReceiver(it) } catch (e: Exception) {} }
+        zoneReceiver = null
+        super.onDestroy()
+    }
+
+    // Hand the engine the device's time zone: its IANA id (Europe/London), and the
+    // offset now as the fallback for an id the engine's zone database lacks.
+    private fun pushTimezone() {
+        val tz = java.util.TimeZone.getDefault()
+        N.setTimezone(tz.id, tz.getOffset(System.currentTimeMillis()) / 1000)
+    }
+
     // Is the OS currently in night (dark) mode?
     private fun osDark(): Boolean =
         (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
@@ -407,6 +423,18 @@ class MainActivity : Activity(), ChuksModuleHost {
         // bundled one, so one generic host can point at any `chuks dev`.
         getSharedPreferences("chuks.preview", MODE_PRIVATE).getString("host", "")?.let {
             if (it.isNotEmpty()) devBase = "http://$it"
+        }
+
+        // The engine's clock zone. Go leaves time.Local at UTC on Android, so without
+        // this every time.format / date.today in the app is off by the device's offset.
+        // It has to land before the engine boots (module-level code may read the date)
+        // and again whenever the user or the network moves the device to another zone.
+        if (!devMode) {
+            pushTimezone()
+            zoneReceiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) { pushTimezone(); N.tick(); applyDrain(); relayout() }
+            }
+            registerReceiver(zoneReceiver, android.content.IntentFilter(Intent.ACTION_TIMEZONE_CHANGED))
         }
 
         // CMR boot. Two sources for the source bundle the on-device VM (libcmr) runs:
@@ -5111,6 +5139,18 @@ class MainActivity : Activity(), ChuksModuleHost {
             lp.leftMargin = left
             lp.topMargin = top
             v.layoutParams = lp                                  // requests a layout pass by itself
+            // A scroll's content is what iOS sizes from the content node's frame. Android's
+            // ScrollView ignores its child's layout height and measures it UNSPECIFIED, so
+            // a FrameLayout content reports the extent of its children and nothing else:
+            // a content column's own bottom padding (the space a screen keeps clear of a
+            // floating tab bar) fell out of the scroll range, and a page whose children
+            // just fit the window would not scroll at all. The Yoga size is the floor the
+            // platform measure may report. (Set here, in the branch that already asks for
+            // a layout pass, so it costs no extra one; a reused node is reset in applyStyle.)
+            when (v.parent) {
+                is ScrollView -> if (v.minimumHeight != ht) v.minimumHeight = ht
+                is android.widget.HorizontalScrollView -> if (v.minimumWidth != wd) v.minimumWidth = wd
+            }
             moved = true
             lastFrame[id] = intArrayOf(left, top, wd, ht)
             // now that the frame is known, decode the image to its display size.
