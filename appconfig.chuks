@@ -728,7 +728,8 @@ var HAS_BG_TASKS: bool = false
 // service needs permissions no ordinary location read does.
 var HAS_BG_LOCATION: bool = false
 
-const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "exactAlarms", "systemBrightness", "bluetooth", "nfc", "activity", "bodySensors", "health"]
+const KINDS: []string = ["camera", "microphone", "location", "photos", "photosAdd", "contacts", "calendar", "faceId", "notifications", "exactAlarms", "systemBrightness", "bluetooth", "nfc", "activity", "bodySensors", "health",
+                         "tracking", "appleSignIn", "appAttest"]   // the identity kinds @chuks/mobile-id declares
 
 // permission kind -> iOS Info.plist usage-description key(s)
 function iosKeysFor(kind: string): []string {
@@ -744,6 +745,7 @@ function iosKeysFor(kind: string): []string {
     if (kind == "nfc") { return ["NFCReaderUsageDescription"] }
     if (kind == "activity") { return ["NSMotionUsageDescription"] }   // pedometer / altimeter
     if (kind == "health") { return ["NSHealthShareUsageDescription", "NSHealthUpdateUsageDescription"] }
+    if (kind == "tracking") { return ["NSUserTrackingUsageDescription"] }   // App Tracking Transparency
     var empty: []string = []          // notifications / bodySensors need no iOS plist string
     return empty
 }
@@ -771,6 +773,9 @@ function iosEntitlementFor(kind: string): string {
     if (kind == "nfc") {
         return "com.apple.developer.nfc.readersession.formats\t<array><string>NDEF</string></array>\n"
     }
+    // Sign in with Apple and App Attest are both capabilities on the App ID, signed in.
+    if (kind == "appleSignIn") { return "com.apple.developer.applesignin\t<array><string>Default</string></array>\n" }
+    if (kind == "appAttest") { return "com.apple.developer.devicecheck.appattest-environment\t<string>production</string>\n" }
     return ""
 }
 
@@ -809,6 +814,7 @@ function androidPermsFor(kind: string): []string {
     if (kind == "activity") { return ["ACTIVITY_RECOGNITION"] }   // step counter, API 29+
     if (kind == "bodySensors") { return ["BODY_SENSORS"] }       // heart-rate sensor
     if (kind == "health") { return ["BODY_SENSORS"] }            // Android health = heart sensor
+    if (kind == "tracking") { return ["com.google.android.gms.permission.AD_ID"] }   // the advertising id, API 33+
     var empty: []string = []          // photosAdd (MediaStore) needs no permission on API 29+
     return empty
 }
@@ -893,7 +899,12 @@ function androidPermsStr(perms: any): string {
     }
     var out: string = ""
     var k: int = 0
-    while (k < names.length) { out = out + "    <uses-permission android:name=\"android.permission." + names[k] + "\" />\n" k = k + 1 }
+    while (k < names.length) {
+        // A name with a dot is already fully qualified (a Google Play services permission).
+        const full: string = names[k].contains(".") ? names[k] : "android.permission." + names[k]
+        out = out + "    <uses-permission android:name=\"" + full + "\" />\n"
+        k = k + 1
+    }
     return out
 }
 

@@ -1,0 +1,47 @@
+// The theme's roles are the app's to define.
+//
+// Every builtin, the kit and every `tw` class resolve colours through tk(role), and
+// until now the roles came from two fixed maps the app could not touch: a blue app
+// got indigo buttons from the kit, or kept a parallel palette of its own and used
+// the kit for nothing that has a colour. setPalette lays the app's colours over the
+// defaults, per mode, and everything that resolves a role follows.
+//
+// Run:  chuks run tests/theme_test.chuks   (exits non-zero on failure)
+import { ThemeMode, setTheme, setPalette, tk, currentTheme } from "../core/theme.chuks";
+import { tw } from "../core/tw.chuks";
+import { Node, Column } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) } else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+function main(): void {
+    setTheme(ThemeMode.Light)
+    const stockPrimary: string = tk("primary")
+    const stockBg: string = tk("bg")
+    check(stockPrimary != "" && stockBg != "", "the defaults resolve")
+
+    setPalette({ "primary": "0D47CF", "bg": "F3F3F2" }, { "primary": "3D7AF2" })
+    check(tk("primary") == "0D47CF", "a role the app set resolves to the app's colour")
+    check(tk("bg") == "F3F3F2", "so does a second one")
+    check(tk("text") == tk("text") && tk("text") != "" && tk("surface") != "", "roles the app left out keep their defaults")
+    check(tk("nosuchrole") == "", "a name that is not a role is still not a role")
+
+    const box: Node = Column({ tw: "bg-primary" }, [])
+    check(box.style.bg == "0D47CF", "a tw class resolves through the app's palette")
+
+    setTheme(ThemeMode.Dark)
+    check(tk("primary") == "3D7AF2", "dark mode has its own map")
+    check(tk("bg") != "F3F3F2" && tk("bg") != "", "a role set for light only falls back to the dark default")
+
+    setPalette({}, {})
+    setTheme(ThemeMode.Light)
+    check(tk("primary") == stockPrimary && tk("bg") == stockBg, "an empty palette restores the defaults")
+
+    println("")
+    println("theme: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "theme_test failed" }
+}
+main()

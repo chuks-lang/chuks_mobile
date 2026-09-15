@@ -364,6 +364,128 @@ final class SelectableLabel: UILabel {
 }
 
 // A view that also accepts touches within `hitSlop` px beyond its bounds (Pressable `hitSlop`).
+// ── Sheet ──────────────────────────────────────────────────────────────────
+// A bottom sheet the host drives between snap points with the finger. The overlay
+// fills the window; the sheet's Yoga root is that window with a top padding of
+// (window - highest snap height + handle strip), so the app's children are laid out
+// once, in the sheet's tallest box, and the whole panel (surface, handle, children) is
+// translated by (position - highestPosition) while it moves. A position is the y of
+// the sheet's top edge: the highest snap point is the smallest position, closed is the
+// window height. The design is the one @gorhom/react-native-bottom-sheet arrived at:
+// drag settles on the nearest point by distance plus a fifth of the velocity, a
+// scrollable inside hands off (the sheet moves until it is at its highest point, then
+// the list scrolls, and pulling the list past its top moves the sheet again), the
+// backdrop's opacity follows the position, and closing is just another point.
+final class SheetOverlay: UIView {
+    let surface = UIView()                 // the rounded panel behind the children
+    let handle = UIView()
+    var backdrop = true                    // scrim behind, dismiss on tap; false = the app under it stays live
+    var panToClose = true
+    var showHandle = true
+    var keyboard = "interactive"
+    var heights: [CGFloat] = []            // snap heights, lowest first (resolved from the spec against the window)
+    var snapSpec: [String] = []            // "25p" | "320" | "c"
+    var index = -1                         // the point it sits at (-1 closed); what the app was last told
+    var position: CGFloat = 0              // current top edge, in the overlay's coordinates
+    var contentHeight: CGFloat = 0         // measured children height, for a "c" snap point
+    var closed: Bool { return index < 0 }
+    var onSettle: ((Int) -> Void)?         // reports every settle (index, -1 for closed)
+    var animating = false
+    let handleStrip: CGFloat = 22
+    // The keyboard, while a field inside the sheet has it (see CardsVC.kbShow). The
+    // `keyboard` prop picks one: "interactive" lifts the sheet by the keyboard's height
+    // (kbLift), "extend" goes to the highest point and pads the content bottom by it
+    // (kbPad), "fillParent" takes the whole window (kbFill) and pads.
+    var kbLift: CGFloat = 0
+    var kbPad: CGFloat = 0
+    var kbFill = false
+    var topInset: CGFloat = 0              // the window's safe-area top: no point sits above it
+    var bottomInset: CGFloat = 0           // the safe-area bottom (home indicator): the content clears it
+    // Bottom padding for the children: the keyboard when it pads, nothing when the sheet
+    // is lifted onto the keyboard (its bottom edge is above it), else the safe area.
+    var bottomPad: CGFloat { return kbPad > 0 ? kbPad : (kbLift > 0 ? 0 : bottomInset) }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        surface.backgroundColor = .secondarySystemBackground
+        surface.layer.cornerRadius = 20
+        surface.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        surface.layer.shadowColor = UIColor.black.cgColor; surface.layer.shadowOpacity = 0.12
+        surface.layer.shadowRadius = 12; surface.layer.shadowOffset = CGSize(width: 0, height: -2)
+        surface.tag = CHUKS_DECOR_TAG
+        handle.backgroundColor = UIColor.gray.withAlphaComponent(0.4); handle.layer.cornerRadius = 2.5
+        handle.tag = CHUKS_DECOR_TAG
+        addSubview(surface); addSubview(handle)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    var highestHeight: CGFloat { return heights.max() ?? 0 }
+    var closedPosition: CGFloat { return bounds.height }
+    var highestPosition: CGFloat { return bounds.height - highestHeight }
+    // Where the children are laid out from (the top of the tallest box), and the
+    // highest the top edge may go: the same point, unless the keyboard changed them.
+    var layoutTop: CGFloat { return kbFill ? topInset : highestPosition }
+    var minPosition: CGFloat { return kbFill ? topInset : max(topInset, highestPosition - kbLift) }
+    func positionFor(index i: Int) -> CGFloat {
+        if i < 0 || i >= heights.count { return closedPosition }
+        if kbFill { return topInset }
+        return max(topInset, bounds.height - heights[i] - kbLift)
+    }
+    // The snap positions a drag may settle on: every point, and closed when allowed.
+    var settlePositions: [CGFloat] {
+        var ps = heights.indices.map { positionFor(index: $0) }
+        if panToClose { ps.append(closedPosition) }
+        return ps
+    }
+    func indexFor(position p: CGFloat) -> Int {
+        for i in heights.indices where abs(positionFor(index: i) - p) < 0.5 { return i }
+        return -1
+    }
+    // Resolve the spec against the window: "25p" is a quarter of it, "320" is points,
+    // "c" is the children's measured height (until measured, the tallest other point).
+    func resolveHeights() {
+        let H = bounds.height
+        heights = snapSpec.map { spec -> CGFloat in
+            if spec == "c" { return contentHeight > 0 ? min(contentHeight + handleStrip + bottomInset, H) : 0 }
+            if spec.hasSuffix("p") { return H * (CGFloat(Double(spec.dropLast()) ?? 50) / 100) }
+            return CGFloat(Double(spec) ?? 300)
+        }
+        if let mx = heights.max(), mx > 0 { heights = heights.map { $0 == 0 ? mx : $0 } }
+        heights = heights.map { min(max($0, handleStrip + 1), H) }
+    }
+    // Lay the panel out for the current position: the surface covers from the top edge
+    // to well below the window (over-drag shows surface, never a gap); the children are
+    // translated as a block so their frames (laid out at the highest point) stay valid.
+    func apply() {
+        let W = bounds.width, H = bounds.height
+        let top = layoutTop
+        let ty = position - top
+        surface.transform = .identity
+        surface.frame = CGRect(x: 0, y: top, width: W, height: (H - top) + H)
+        handle.transform = .identity
+        handle.frame = CGRect(x: (W - 40) / 2, y: top + 8, width: 40, height: 5)
+        handle.isHidden = !showHandle
+        for sub in subviews { sub.transform = CGAffineTransform(translationX: 0, y: ty) }
+        let openness = highestHeight > 0 ? max(0, min(1, (closedPosition - position) / highestHeight)) : 0
+        backgroundColor = backdrop ? UIColor(white: 0, alpha: 0.5 * openness) : .clear
+        isHidden = false
+    }
+    // A persistent sheet must not eat the touches beside it: outside the panel the app
+    // underneath is live. With a backdrop, the overlay owns the whole window.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        if isHidden || alpha == 0 { return nil }
+        if !backdrop && point.y < position { return nil }
+        return super.hitTest(point, with: event)
+    }
+    // The nearest settle point to where the finger would coast: gorhom's rule.
+    func destination(from p: CGFloat, velocity v: CGFloat) -> CGFloat {
+        let target = p + 0.2 * v
+        var best = settlePositions.first ?? closedPosition, bestD = CGFloat.greatestFiniteMagnitude
+        for sp in settlePositions { let d = abs(target - sp); if d < bestD { bestD = d; best = sp } }
+        return best
+    }
+}
+
 final class HitSlopView: UIView {
     var hitSlop: CGFloat = 0
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
@@ -1310,6 +1432,14 @@ final class LocFix: NSObject, CLLocationManagerDelegate {
     }
     func locationManager(_ m: CLLocationManager, didFailWithError e: Error) {
         if (e as? CLError)?.code == .locationUnknown { return }  // transient: no fix yet, keep waiting
+        // kCLErrorDenied covers two different things, and Apple's text for both is
+        // "The operation couldn't be completed. (kCLErrorDomain error 1.)": the user
+        // refused this app, or Location Services are off for the whole phone. Say which,
+        // in the words Android uses, so an app can show one message on both.
+        if (e as? CLError)?.code == .denied {
+            onErr(CLLocationManager.locationServicesEnabled() ? "location permission denied" : "location services are off: turn them on in Settings")
+            return
+        }
         onErr(e.localizedDescription)
     }
 }
@@ -1728,7 +1858,135 @@ let measurePackageView: YGMeasureFunc = { node, width, widthMode, _, _ in
     return YGSize(width: Float(ceil(w)), height: Float(ceil(h)))
 }
 
+// ---- Shared values: motion the host drives (docs/shared-values.md) ------------
+// A value the engine created with MV|; the host holds its number, animates it (MS|
+// with a spring/timing/decay), feeds it from a pan or a scroll, and re-evaluates the
+// bindings that read it. The engine hears a gesture's end and a settle, nothing else.
+
+/// An expression over shared values, parsed from the engine's prefix text
+/// ("i(v3,0,120,200,80,e)"). The vocabulary is fixed and identical on both hosts.
+indirect enum MExpr {
+    case value(Int)
+    case const(Double)
+    case interp(MExpr, [Double], [Double], Bool)    // x, inputs, outputs, clamp the ends
+    case clamp(MExpr, Double, Double)
+    case add(MExpr, MExpr), sub(MExpr, MExpr), mul(MExpr, MExpr)
+    case neg(MExpr), minOf(MExpr, MExpr), maxOf(MExpr, MExpr), absOf(MExpr)
+
+    /// The value ids this expression reads.
+    var deps: Set<Int> {
+        switch self {
+        case .value(let i): return [i]
+        case .const: return []
+        case .interp(let x, _, _, _), .clamp(let x, _, _), .neg(let x), .absOf(let x): return x.deps
+        case .add(let a, let b), .sub(let a, let b), .mul(let a, let b), .minOf(let a, let b), .maxOf(let a, let b): return a.deps.union(b.deps)
+        }
+    }
+    func eval(_ get: (Int) -> Double) -> Double {
+        switch self {
+        case .value(let i): return get(i)
+        case .const(let c): return c
+        case .clamp(let x, let lo, let hi): return Swift.min(hi, Swift.max(lo, x.eval(get)))
+        case .add(let a, let b): return a.eval(get) + b.eval(get)
+        case .sub(let a, let b): return a.eval(get) - b.eval(get)
+        case .mul(let a, let b): return a.eval(get) * b.eval(get)
+        case .neg(let x): return -x.eval(get)
+        case .minOf(let a, let b): return Swift.min(a.eval(get), b.eval(get))
+        case .maxOf(let a, let b): return Swift.max(a.eval(get), b.eval(get))
+        case .absOf(let x): return abs(x.eval(get))
+        case .interp(let xe, let ins, let outs, let clampEnds):
+            let x = xe.eval(get)
+            guard ins.count >= 2, ins.count == outs.count else { return outs.first ?? 0 }
+            if clampEnds {
+                if x <= ins[0] { return outs[0] }
+                if x >= ins[ins.count - 1] { return outs[outs.count - 1] }
+            }
+            // Piecewise linear between the stops; past the ends the end segment's line
+            // continues (extend), so an over-drag keeps moving.
+            var i = 0
+            while i < ins.count - 2 && x > ins[i + 1] { i += 1 }
+            let x0 = ins[i], x1 = ins[i + 1], y0 = outs[i], y1 = outs[i + 1]
+            if x1 - x0 == 0 { return y0 }
+            return y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+        }
+    }
+}
+
+/// Parse the engine's prefix text into an MExpr. nil on a malformed string: a binding
+/// that fails to parse is ignored, never a crash.
+func parseMExpr(_ text: String) -> MExpr? {
+    let chars = Array(text)
+    var pos = 0
+    func peek() -> Character? { pos < chars.count ? chars[pos] : nil }
+    func token() -> String { var s = ""; while let c = peek(), c != "(", c != ")", c != "," { s.append(c); pos += 1 }; return s }
+    func num(_ e: MExpr) -> Double? { if case .const(let d) = e { return d }; return nil }
+    func parse() -> MExpr? {
+        let tok = token()
+        if peek() != "(" {
+            if tok == "c" { return .const(1) }        // interpolate's mode letters
+            if tok == "e" { return .const(0) }
+            if tok.hasPrefix("v"), let id = Int(tok.dropFirst()) { return .value(id) }
+            if let d = Double(tok) { return .const(d) }
+            return nil
+        }
+        pos += 1
+        var args: [MExpr] = []
+        if peek() == ")" { pos += 1 } else {
+            while true {
+                guard let e = parse() else { return nil }
+                args.append(e)
+                if peek() == "," { pos += 1; continue }
+                if peek() == ")" { pos += 1; break }
+                return nil
+            }
+        }
+        switch tok {
+        case "i":
+            // i(x, in0..inN, out0..outN, mode)
+            guard args.count >= 6, (args.count - 2) % 2 == 0, let mode = num(args[args.count - 1]) else { return nil }
+            let n = (args.count - 2) / 2
+            var ins: [Double] = [], outs: [Double] = []
+            for k in 0..<n { guard let a = num(args[1 + k]), let b = num(args[1 + n + k]) else { return nil }; ins.append(a); outs.append(b) }
+            return .interp(args[0], ins, outs, mode == 1)
+        case "cl": guard args.count == 3, let lo = num(args[1]), let hi = num(args[2]) else { return nil }; return .clamp(args[0], lo, hi)
+        case "+": guard args.count == 2 else { return nil }; return .add(args[0], args[1])
+        case "-": guard args.count == 2 else { return nil }; return .sub(args[0], args[1])
+        case "*": guard args.count == 2 else { return nil }; return .mul(args[0], args[1])
+        case "neg": guard args.count == 1 else { return nil }; return .neg(args[0])
+        case "min": guard args.count == 2 else { return nil }; return .minOf(args[0], args[1])
+        case "max": guard args.count == 2 else { return nil }; return .maxOf(args[0], args[1])
+        case "abs": guard args.count == 1 else { return nil }; return .absOf(args[0])
+        default: return nil
+        }
+    }
+    let e = parse()
+    return pos == chars.count ? e : nil
+}
+
+/// A host animation on a shared value: the engine sends a target and how to get there.
+enum MotionAnim {
+    case spring(target: Double, stiffness: Double, damping: Double)
+    case timing(from: Double, to: Double, start: CFTimeInterval, ms: Double, easing: String)
+    case decay(lo: Double, hi: Double)
+}
+
+final class MotionValue {
+    var cur: Double
+    var velocity: Double = 0            // units per second (a spring's, a decay's)
+    var anim: MotionAnim? = nil
+    var lastT: CFTimeInterval = 0
+    init(_ v: Double) { cur = v }
+}
+
+/// One binding: a view prop that reads an expression.
+struct MotionBinding {
+    let prop: String                    // tx ty scale rotate opacity w h pt pr pb pl top left
+    let expr: MExpr
+}
+
 final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate, UITextViewDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate, MKMapViewDelegate, ChuksModuleHost {
+    var warmLink: CADisplayLink?          // see warmFrames
+    var warmUntil: CFTimeInterval = 0
     let N: Int32 = 1000
 
     // The two lockstep trees, keyed by Chuks node id.
@@ -1953,6 +2211,33 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var popoverGap: [String: CGFloat] = [:]                               // popover id -> gap to the anchor (pt)
     var popoverArrow: Set<String> = []                                    // popovers that draw a pointer
     var popoverArrowLayers: [String: CAShapeLayer] = [:]                  // popover id -> its pointer
+    var sheetIds: Set<String> = []                                        // Sheet overlays (host-driven bottom sheets)
+    // Shared values (docs/shared-values.md): values the host holds, the bindings that
+    // read them, and the sources that feed them. Methods in the CardsVC extension below.
+    var mValues: [Int: MotionValue] = [:]
+    var mBindings: [String: [MotionBinding]] = [:]                        // node id -> bindings
+    var mDeps: [Int: Set<String>] = [:]                                   // value id -> nodes bound to it
+    var mPan: [String: (x: Int, y: Int)] = [:]                            // Gesture node -> value ids (-1 none)
+    var mPanByView: [ObjectIdentifier: String] = [:]
+    var mPanBase: [String: (x: Double, y: Double)] = [:]                  // the values when the finger came down
+    var mScroll: [UIScrollView: Int] = [:]                                // scroll view -> value id
+    var mStatic: [String: (tx: CGFloat, ty: CGFloat, sc: CGFloat, rot: CGFloat, alpha: CGFloat)] = [:]   // a node's own paint values, under its bindings
+    var mAnimating: Set<Int> = []
+    var motionLink: CADisplayLink?
+    var mLayoutDirty = false
+    var mKeyboardValues: Set<Int> = []                                    // values fed with the keyboard's height (MK|)
+    // Transitions (en=/ex=/lt= style keys): per-node specs, and the mounted views
+    // waiting for a frame to enter with.
+    var enterSpec: [String: String] = [:]
+    var exitSpec: [String: String] = [:]
+    var layoutSpec: [String: String] = [:]
+    var pendingEnter: [String: String] = [:]
+    var layoutLast: [String: CGRect] = [:]                                // a layout-spec node's absolute frame after the last pass
+    var mKeyboardNodes: Set<String> = []                                  // nodes whose bindings read a keyboard value: they move themselves
+    var sheetPans: [UIPanGestureRecognizer: String] = [:]                 // sheet pan -> id
+    var sheetTaps: [UITapGestureRecognizer: String] = [:]                 // sheet backdrop tap -> id
+    var sheetDrag: (id: String, initial: CGFloat, owns: Bool, scroll: UIScrollView?)? = nil   // the drag in progress
+    var sheetPinnedScrolls = Set<UIScrollView>()                          // scrolls held at their top under a sheet drag
     var layoutIds = Set<String>()                                         // ids whose node has onLayout
     var lastLayoutReport: [String: String] = [:]                          // id -> last "x,y,w,h" reported
     var sheetBg: UIView? = nil                                            // host-drawn sheet surface (rounded top, behind content)
@@ -1970,11 +2255,23 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let s = String(cString: c); chuks_free_str(c); return s
     }
     func eSetup() {
+        eTimezone()   // before anything runs in the engine: module-level code may read the date
         #if CMR
         if !cmrDevBoot() { cmrBootBundle() }   // dev: fetch bundle over HTTP + hot reload; else the baked bundle
         #endif
         if !DEV_MODE { chuks_set_count(N) }
     }   // chuks_* bridge auto-runs chuks_init; dev server self-inits on boot
+    // Hand the engine the device's time zone: its IANA id (Europe/London), and the
+    // offset now as the fallback for an id the engine's zone database lacks. Go
+    // leaves time.Local at UTC on iOS, so without this every time.format /
+    // date.today in the app is off by the device's offset.
+    func eTimezone() {
+        if DEV_MODE { return }
+        let tz = TimeZone.current
+        tz.identifier.withCString { id in
+            chuks_set_timezone(UnsafeMutablePointer(mutating: id), Int32(tz.secondsFromGMT()))
+        }
+    }
     func eMount() -> String? {
         if DEV_MODE { return devHTTP("/mount", "") }
         _ = chuks_mount(); return drainStr()
@@ -2013,7 +2310,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     /// iOS does not promise to run anything when it kills a suspended app.
     func persistState() {
         guard restoreWindow > 0, let s = eSaveState(), !s.isEmpty else { return }
-        let doc = ["at": Int(Date().timeIntervalSince1970), "state": s] as [String: Any]
+        let doc = ["at": Int(Date().timeIntervalSince1970), "build": buildId, "state": s] as [String: Any]
         if let data = try? JSONSerialization.data(withJSONObject: doc) {
             try? data.write(to: stateFile)
         }
@@ -2046,6 +2343,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             try? FileManager.default.removeItem(at: stateFile)
             return                                     // stale: start fresh
         }
+        // Written by another build of the code: its routes and cells may not exist here,
+        // or mean something else. Only the build that wrote a snapshot reads it.
+        if (doc["build"] as? String ?? "") != buildId {
+            try? FileManager.default.removeItem(at: stateFile)
+            NSLog("chuks-state: not restoring, the state was saved by a different build")
+            return
+        }
         eLoadState(saved)
     }
 
@@ -2058,7 +2362,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if DEV_MODE { return (devHTTP("/back", "") ?? "").isEmpty == false }
         let handled = chuks_back() > 0
         let s = drainStr()               // drainStr returns "" when there is nothing
-        if !s.isEmpty { apply(s); relayout() }
+        applyReply(s)
         return handled
     }
     func eViewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String? {
@@ -2149,8 +2453,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         dismissTap.cancelsTouchesInView = false
         dismissTap.delegate = self
         view.addGestureRecognizer(dismissTap)
+        // Every touch keeps the frames warm (see warmFrames); the observer never recognises.
+        let warm = TouchObserver(); warm.onTouch = { [weak self] in self?.warmFrames() }
+        warm.cancelsTouchesInView = false; warm.delaysTouchesBegan = false; warm.delaysTouchesEnded = false
+        warm.delegate = self
+        view.addGestureRecognizer(warm)
 
         eSetup()
+        NotificationCenter.default.addObserver(self, selector: #selector(systemTimeZoneDidChange),
+                                               name: .NSSystemTimeZoneDidChange, object: nil)
         ePlatform()                                                 // report platform + device info
         eColorScheme(traitCollection.userInterfaceStyle == .dark)   // open in the OS appearance
         // Report the safe-area insets BEFORE the first mount. They are normally pushed
@@ -2198,6 +2509,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
     }
 
+    // The device moved to another time zone (Settings, or the carrier): the engine's
+    // clock follows it and the screen is rebuilt with the new local times.
+    @objc func systemTimeZoneDidChange() {
+        eTimezone()
+        if let s = eTick() { applyReply(s) }
+    }
+
     // The OS appearance changed (Settings, Control Center, or automatic day/night):
     // report it and re-render. The engine follows it unless the user has overridden.
     override func traitCollectionDidChange(_ previous: UITraitCollection?) {
@@ -2205,7 +2523,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let now = traitCollection.userInterfaceStyle
         if now != previous?.userInterfaceStyle {
             eColorScheme(now == .dark)
-            if let s = eTick() { apply(s); relayout() }
+            if let s = eTick() { applyReply(s) }
         }
     }
 
@@ -2329,6 +2647,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
 
     func scrollViewDidScroll(_ sv: UIScrollView) {
+        motionScrolled(sv)   // a scroll that feeds a shared value: written and applied here, no engine
         // relayout() below can nudge contentSize/offset and re-enter this delegate synchronously.
         // Skip the re-entrant call: the outer relayout already positioned for the current offset,
         // and the next real scroll frame picks up any newer offset. Prevents unbounded recursion.
@@ -2341,7 +2660,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let pts = Int((horiz ? sv.contentOffset.x : sv.contentOffset.y).rounded())
             if scrollLastPos[sv] != pts {
                 scrollLastPos[sv] = pts
-                if let s = eInput(tag, String(pts)) { apply(s); relayout() } else { connected = false }
+                if let s = eInput(tag, String(pts)) { applyReply(s) } else { connected = false }
             }
         }
     }
@@ -2503,7 +2822,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         frame += 1
         guard let s = eTick() else { connected = false; headerText("dev server down — reloading…"); return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("frame \(frame): live")
     }
 
@@ -2513,7 +2832,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func pumpWake() {
         if DEV_MODE && !connected { return }   // let step() own the reconnect path
         guard let s = eTick() else { return }
-        if !s.isEmpty { apply(s); relayout() }
+        applyReply(s)
     }
 
     // Start/stop the per-frame animation driver (FA|1 / FA|0). While on, a CADisplayLink
@@ -2679,7 +2998,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // in viewDidLayoutSubviews (ins == lastInsets) would skip re-sending them, so the new
         // VM would lay out edge-to-edge (content under the status bar, tab bar under the home
         // indicator). Force-resend the current insets to the fresh VM before mounting.
+        // Everything the host told the old VM at launch, again for the fresh one: the
+        // insets, the platform info and the OS appearance (without it the fresh VM opens
+        // in the engine's default theme, dark, on a phone in light mode after the first save).
         let ins = view.safeAreaInsets; lastInsets = ins; eInsets(ins)
+        ePlatform()
+        eColorScheme(traitCollection.userInterfaceStyle == .dark)
         if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
     }
     var cmrPendingState = ""   // app state kept across a failed reload, restored on the fix
@@ -2920,6 +3244,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var restoreWindow: Int {
         (Bundle.main.object(forInfoDictionaryKey: "ChuksStateRestoreWindow") as? Int) ?? 1800
     }
+    /// A hash of every Chuks source this build compiled (ios/build.sh). See persistState.
+    var buildId: String { (Bundle.main.object(forInfoDictionaryKey: "ChuksBuildId") as? String) ?? "" }
 
     // ---- Background tasks ---------------------------------------------------
     //
@@ -3070,6 +3396,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let t = g as? UITapGestureRecognizer, taps[t] != nil, let ov = g.view, let oid = views.first(where: { $0.value === ov })?.key, modalIds.contains(oid) {
             return overlayTouchIsOutsideContent(g, touch)
         }
+        if let t = g as? UITapGestureRecognizer, sheetTaps[t] != nil, let sv = g.view as? SheetOverlay {
+            return touch.location(in: sv).y < sv.position   // the backdrop, not the panel
+        }
+        if let p = g as? UIPanGestureRecognizer, sheetPans[p] != nil, let sv = g.view as? SheetOverlay {
+            return touch.location(in: sv).y >= sv.position - 1   // a drag starts on the panel
+        }
         // The deepest handler wins. A tap recognizer on a container also receives a
         // touch that landed on a child with a handler of its own (a Switch inside a
         // labelled row, a button inside a tappable card), and both fired: the row's
@@ -3092,6 +3424,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         return !(touch.view is UITextField)
     }
+    // A pan that feeds shared values on one axis only (a swipeable row's panX) is a
+    // horizontal gesture: a drag that starts vertically is not its and fails, so the
+    // list around it scrolls. Both axes, or a plain onPan, take every direction.
+    func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+        guard let p = g as? UIPanGestureRecognizer, let gv = g.view, let id = mPanByView[ObjectIdentifier(gv)], let ids = mPan[id] else { return true }
+        let t = p.translation(in: gv.window)
+        if ids.x >= 0 && ids.y < 0 { return abs(t.x) >= abs(t.y) }
+        if ids.y >= 0 && ids.x < 0 { return abs(t.y) >= abs(t.x) }
+        return true
+    }
     // Let the dismiss tap coexist with node onPress taps and the scroll gestures.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         return true
@@ -3101,9 +3443,22 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // instead of scrolling (a drag elsewhere never involves ours, so the scroll is normal).
     // Delegate-driven (called at recognition time), so no attach-order race.
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldBeRequiredToFailBy other: UIGestureRecognizer) -> Bool {
+        // A Sheet's pan runs BESIDE the pans of the scrolls inside it, never ahead of
+        // them: the hand-off is decided per frame in handleSheetDrag (who owns the
+        // finger), so a scroll that had to wait for the sheet pan to fail would never
+        // scroll at all (the sheet pan begins on the first move and does not fail).
+        if let p = g as? UIPanGestureRecognizer, sheetPans[p] != nil { return false }
         // g is one of OUR Gesture recognizers (delegate === self). If `other` is an
         // enclosing scroll's pan, return true so the scroll must wait for ours to fail.
         return (g is UIPanGestureRecognizer) && (other.view is UIScrollView)
+    }
+    // A scroll the sheet held still under a drag it owned must not fling when the
+    // finger lifts: its pan ran beside the sheet's and carries the sheet's velocity.
+    func scrollViewWillEndDragging(_ sv: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+        if sheetPinnedScrolls.contains(sv) {
+            sheetPinnedScrolls.remove(sv)
+            targetContentOffset.pointee = CGPoint(x: sv.contentOffset.x, y: 0)
+        }
     }
 
     // Keyboard avoidance. The keyboard OVERLAYS the app; it does not resize it. Shrinking
@@ -3120,15 +3475,43 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     //   - focused field already above the keyboard: nothing moves at all.
     var kbHeight: CGFloat = 0            // the SHIFT applied to the tree, not the keyboard height
     var kbScroll: UIScrollView?          // the scroll we inset, to undo on hide
+    var kbSheet: String?                 // the Sheet holding the focused field, to restore on hide
+    // The Sheet a view sits in, if any.
+    func sheetContaining(_ v: UIView) -> (String, SheetOverlay)? {
+        var p: UIView? = v.superview
+        while let cur = p {
+            if let sv = cur as? SheetOverlay, let sid = views.first(where: { $0.value === sv })?.key { return (sid, sv) }
+            p = cur.superview
+        }
+        return nil
+    }
+    // A field inside a Sheet: the sheet makes room the way its `keyboard` prop says, and
+    // the app tree under it does not move.
+    func sheetKeyboard(_ sid: String, _ sv: SheetOverlay, height kbH: CGFloat) {
+        let mode = kbH > 0 ? sv.keyboard : ""
+        let lift: CGFloat = mode == "interactive" ? kbH : 0
+        let pad: CGFloat = (mode == "extend" || mode == "fillParent") ? kbH : 0
+        let fill = mode == "fillParent"
+        if sv.kbLift == lift && sv.kbPad == pad && sv.kbFill == fill { return }
+        sv.kbLift = lift; sv.kbPad = pad; sv.kbFill = fill
+        // Animate first (so the layout pass below does not snap the position), then
+        // re-lay the children out for the new padding.
+        if mode == "extend" { sheetAnimate(sid, sv, to: sv.heights.count - 1) }
+        else { sheetAnimate(sid, sv, to: sv.index, report: false) }
+        relayout()
+    }
     @objc func kbShow(_ n: Notification) {
         guard let end = (n.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue else { return }
         let kbTop = view.bounds.height - max(0, end.height)          // keyboard's top edge, in view coords
         let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        motionKeyboard(height: max(0, view.bounds.height - kbTop), duration: dur)
         // The focused field: we own every input view, so find it rather than reaching for
         // a private first-responder API.
         var field: UIView? = nil
         for (_, v) in views where (v is UITextField || v is UITextView) && v.isFirstResponder { field = v; break }
         guard let f = field else { return }
+        if motionKeyboardOwns(f) { return }   // a composer bound to the keyboard's height moves itself
+        if let (sid, sv) = sheetContaining(f) { kbSheet = sid; sheetKeyboard(sid, sv, height: max(0, end.height)); return }
         // Measure against the UNLIFTED layout: the tree is already shifted by kbHeight, so
         // add it back. The keyboard sends several notifications (show, then frame changes
         // as it settles or as focus moves), and without this each pass would measure the
@@ -3156,6 +3539,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     @objc func kbHide(_ n: Notification) {
         let dur = (n.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+        motionKeyboard(height: 0, duration: dur)
+        if let sid = kbSheet { kbSheet = nil; if let sv = views[sid] as? SheetOverlay { sheetKeyboard(sid, sv, height: 0) } }
         if let sc = kbScroll {
             kbScroll = nil
             UIView.animate(withDuration: dur) { sc.contentInset.bottom = 0; sc.verticalScrollIndicatorInsets.bottom = 0 }
@@ -3212,6 +3597,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "P" where f.count >= 3: setText(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // rejoin: text may contain '|'
             case "V" where f.count >= 3: setFieldValue(f[1], chuksUnescapeText(f[2...].joined(separator: "|")))   // controlled value (may contain '|')
             case "T" where f.count >= 3: bindAction(f[1], action: f[2])
+            case "TC" where f.count >= 2: bindChange(f[1])   // the node's value event: "<id>:change"
             case "TS" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldSubmit[tf] = f[1] + ":submit" }
             case "TF" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldFocus[tf] = f[1] + ":focus" }
             case "TB" where f.count >= 2: if let tf = views[f[1]] as? UITextField { fieldBlur[tf] = f[1] + ":blur" }
@@ -3237,6 +3623,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if let pv = packageViews[f[1]] {
                     let raw = f.count >= 4 ? f[3...].joined(separator: "|") : ""
                     pv.command(f[2], ChuksArgs(raw, type(of: pv).kind + "." + f[2], "0", self))
+                } else if sheetIds.contains(f[1]), let sv = views[f[1]] as? SheetOverlay {
+                    let raw = f.count >= 4 ? f[3...].joined(separator: "|") : ""
+                    let a = ChuksArgs(raw, "sheet." + f[2], "0", self)
+                    switch f[2] {
+                    case "snapTo": sheetAnimate(f[1], sv, to: a.int("index") ?? 0)
+                    case "expand": sheetAnimate(f[1], sv, to: sv.heights.count - 1)
+                    case "collapse": sheetAnimate(f[1], sv, to: 0)
+                    case "close": sheetAnimate(f[1], sv, to: -1)
+                    default: break
+                    }
                 }
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -3261,6 +3657,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     listHoriz = horizScrollIds.contains(lid)
                 }
             case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
+            case "MV", "MS", "MX": motionOp(f)                           // shared values (docs/shared-values.md)
+            case "MK" where f.count >= 2: if let vid = Int(f[1]) { mKeyboardValues.insert(vid) }
             case "X" where f.count >= 3:
                 // Async host->engine command: X|token|capability|args. Run AFTER this
                 // apply() finishes (main.async), so a sync capability's resolve() doesn't
@@ -3314,9 +3712,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func onCancel(_ token: String, _ teardown: @escaping () -> Void) { streamTeardown[token] = teardown }
 
     // Token "0" is a call without a callback: nothing is waiting, so nothing to render.
+    // Apply what the engine replied and lay the tree out, unless it replied nothing.
+    // An empty reply used to run a full Yoga pass over the whole tree and reset every
+    // scroll's contentSize anyway, on every capability result: each location fix, each
+    // pedometer event, each two-second Health poll. Under a finger on a scroll that was
+    // a hitch every time one landed. The Android host skips an empty reply the same way.
+    func applyReply(_ s: String) {
+        if s.isEmpty { return }
+        apply(s); relayout()
+    }
     func resolve(_ token: String, _ payload: String) {
         if token == "0" { return }
-        if let s = eResolve(token, payload) { apply(s); relayout() }
+        if let s = eResolve(token, payload) { applyReply(s) }
     }
     // Report a capability failure back to the engine (fires the request's onErr).
     // Token "0" means the caller passed no callback, so the engine allocated nothing and
@@ -3331,7 +3738,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                    "chuks warning: \(dispatchingCap.isEmpty ? "a capability" : dispatchingCap) failed and nothing is listening: \"\(message)\". It was called without a callback, so nothing could be told.")
             return
         }
-        if let s = eFail(token, message) { apply(s); relayout() }
+        if let s = eFail(token, message) { applyReply(s) }
     }
     // The capability currently being dispatched, so a failure can name itself.
     var dispatchingCap: String = ""
@@ -3405,7 +3812,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var notifTokens = Set<String>()   // Notifications.onResponse subscribers
     var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
     // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
-    func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
+    func receiveURL(_ u: String) {
+        if packageModules.onUrl(u) { return }   // a package waiting on this URL (an OAuth redirect) takes it
+        lastURL = u; for t in urlTokens { resolve(t, u) }
+    }
     // Audio: one ChuksAudioPlayer per Chuks AudioPlayer, watch tokens per player, and
     // the interruption observers installed on the first create. Capped, because a
     // player holds a decoder and a screen that forgets release() would otherwise find
@@ -3524,6 +3934,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             var line = "\(pad)\(id)  \(cls)  \(Int(f.origin.x)),\(Int(f.origin.y)) \(Int(f.size.width))x\(Int(f.size.height))"
             if v.isHidden { line += "  hidden" }
             if f.size.width == 0 || f.size.height == 0 { line += "  ZERO-SIZED" }
+            // The same drift field Android prints. Here a frame is assigned from the Yoga
+            // node directly, so the two agree by construction; a DRIFT on iOS means the
+            // host placed the view itself after layout (a popover) and reports as much.
+            if !v.isHidden, let yn = ynodes[id] {
+                let yx = Int(YGNodeLayoutGetLeft(yn)), yy = Int(YGNodeLayoutGetTop(yn))
+                let yw = Int(YGNodeLayoutGetWidth(yn)), yh = Int(YGNodeLayoutGetHeight(yn))
+                if abs(Int(f.origin.x) - yx) > 1 || abs(Int(f.origin.y) - yy) > 1 || abs(Int(f.size.width) - yw) > 1 || abs(Int(f.size.height) - yh) > 1 {
+                    line += "  yoga=\(yx),\(yy) \(yw)x\(yh) DRIFT"
+                }
+            }
             if let t = (v as? UILabel)?.text, !t.isEmpty {
                 line += "  \"" + (t.count > 30 ? String(t.prefix(30)) + "…" : t) + "\""
             }
@@ -4189,6 +4609,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             }
         case "debug.activeStreams": resolve(token, String(activeStreams.count + streamTeardown.count))
         case "debug.viewTree": resolve(token, viewTreeDump())
+        case "debug.frames": frameStats(token, Double(args) ?? 10000)
         case "debug.fail": fail(token, "simulated native failure")
         case "permission.status": permStatus(args, token)
         case "permission.request": permRequest(args, token)
@@ -5121,6 +5542,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let mv = UIView(); mv.backgroundColor = UIColor(white: 0, alpha: 0.5)   // scrim
             mv.isHidden = true                     // shown when mvis=1
             modalIds.insert(id); v = mv
+        case "Sheet":
+            let sv = SheetOverlay(frame: view.bounds)
+            sv.isHidden = true
+            sv.onSettle = { [weak self] idx in self?.fireValue(id + ":change", String(idx)) }
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleSheetDrag(_:)))
+            pan.delegate = self
+            sv.addGestureRecognizer(pan); sheetPans[pan] = id
+            let tap = UITapGestureRecognizer(target: self, action: #selector(handleSheetBackdropTap(_:)))
+            tap.delegate = self
+            sv.addGestureRecognizer(tap); sheetTaps[tap] = id
+            YGNodeStyleSetJustifyContent(n, YGJustify.flexStart); YGNodeStyleSetAlignItems(n, YGAlign.stretch)
+            sheetIds.insert(id); v = sv
         case "Popover":
             // An anchored Modal: the same overlay root, transparent, whose content is laid
             // out at its natural size at the origin and then moved beside the anchor by
@@ -5368,6 +5801,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             v.backgroundColor = .clear
             v.clipsToBounds = false
         }
+        if let sv = v as? SheetOverlay { sv.surface.backgroundColor = .secondarySystemBackground }   // a Sheet's bg is its surface; back to the platform's unless set again
         // Text properties are neither layout nor the paint props above, but they too must
         // be reset on a reused node: Style.str() omits defaults, so a role that relies on
         // default alignment/font/lines would otherwise inherit the previous role's values
@@ -5444,6 +5878,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // here is safe.
         resetLayoutStyle(n)
         resetPaintStyle(id, v)
+        motionUnbindNode(id)   // bindings and sources are style keys: absent means none
+        enterSpec[id] = nil; exitSpec[id] = nil; layoutSpec[id] = nil   // transitions: absent means none
         // A leaf native control has no measure func; make() gave its Yoga node the
         // control's intrinsic size, and the reset above just cleared it. Put it back
         // before the incoming keys, so an explicit w/h still wins. Without this a
@@ -5568,6 +6004,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if vis { activeModal = id } else if activeModal == id { activeModal = nil }
                 if !vis, let al = popoverArrowLayers[id] { al.removeFromSuperlayer(); popoverArrowLayers[id] = nil }
                 view.setNeedsLayout()
+            case "shsnap": if let sv = v as? SheetOverlay { sv.snapSpec = val.split(separator: ",").map(String.init) }
+            case "shidx":  if let sv = v as? SheetOverlay { sheetSetIndex(id, sv, Int(f)) }
+            case "shbd":   if let sv = v as? SheetOverlay { sv.backdrop = (val == "1") }
+            case "shptc":  if let sv = v as? SheetOverlay { sv.panToClose = (val == "1") }
+            case "shhdl":  if let sv = v as? SheetOverlay { sv.showHandle = (val == "1") }
+            case "shkb":   if let sv = v as? SheetOverlay { sv.keyboard = val }
             case "panc": popoverAnchor[id] = val                       // Popover: the anchor node
             case "pplc": popoverPlace[id] = val                        // Popover: preferred side
             case "pgap": popoverGap[id] = CGFloat(f)                   // Popover: gap to the anchor
@@ -5604,7 +6046,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                           }
             case "avis":  if val == "1" { presentAlert(id) } else { dismissAlert(id) }
             case "bg":
-                if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) }
+                if let sv = v as? SheetOverlay { sv.surface.backgroundColor = hexColor(val) }   // the panel's surface, not the backdrop
+                else if let sw = v as? UISwitch { sw.onTintColor = hexColor(val) }
                 else if glassViews[id] != nil || glassPending.contains(id) {
                     // A glass surface's `bg` is what it falls back to, not what sits
                     // behind it: an opaque colour behind the material is exactly what the
@@ -5795,6 +6238,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "opacity": opacity = CGFloat(f) / 100.0
             case "tx": tx = CGFloat(f); hasTransform = true
             case "ty": ty = CGFloat(f); hasTransform = true
+            case "mo": motionBind(id, chuksUnescapeStyle(val))
+            case "en": enterSpec[id] = chuksUnescapeStyle(val); if needsFrame.contains(id) { pendingEnter[id] = enterSpec[id]! }   // mounted this batch: enters once framed
+            case "ex": exitSpec[id] = chuksUnescapeStyle(val)
+            case "lt": layoutSpec[id] = chuksUnescapeStyle(val)
+            case "mpx": motionSetPan(id, x: Int(val) ?? -1, y: mPan[id]?.y ?? -1)
+            case "mpy": motionSetPan(id, x: mPan[id]?.x ?? -1, y: Int(val) ?? -1)
+            case "msc": if let sc = v as? UIScrollView, let vid = Int(val) { mScroll[sc] = vid }
             case "rot": rot = CGFloat(f); hasTransform = true
             case "sc": sc = CGFloat(f) / 100.0; hasTransform = true
             case "anim": animMs = Int(val) ?? 0
@@ -5813,6 +6263,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if hasA11y { applyA11y(id, v, a11y) }
         // Apply transform + opacity, animated natively when `anim` is set (no per-frame
         // round-trip: Core Animation interpolates). Transforms are visual, not layout.
+        // A node with bindings keeps its own paint values under them: the bound props
+        // replace these, the rest stay (a static tx beside a bound ty).
+        if mBindings[id] != nil { mStatic[id] = (tx: tx, ty: ty, sc: sc, rot: rot, alpha: opacity ?? 1) } else { mStatic[id] = nil }
         if hasTransform || animMs >= 0 || opacity != nil {
             let t = CGAffineTransform(translationX: tx, y: ty).scaledBy(x: sc, y: sc).rotated(by: rot * .pi / 180)
             let apply = { if hasTransform || animMs >= 0 { v.transform = t }; if let o = opacity { v.alpha = o } }
@@ -5881,6 +6334,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // Draw immediately if the node is already laid out; otherwise the relayout that
         // follows every apply() draws it (see relayout -> updateBorderLayers).
         if (dashBorders[id] != nil || sideBorders[id] != nil), v.bounds != .zero { updateBorderLayers(id, v) }
+        // Bound props win over the style line just applied: a re-render never resets
+        // what a shared value drives.
+        if mBindings[id] != nil { motionApplyNode(id) }
     }
 
     // Draw dashed/dotted and per-side borders as sublayers, sized to the laid-out frame.
@@ -5925,7 +6381,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             view.addSubview(child)
             return
         }
-        if modalIds.contains(id) {                           // a Modal is a full-screen overlay on the
+        if modalIds.contains(id) || sheetIds.contains(id) {  // a Modal or Sheet is a full-screen overlay on the
             view.addSubview(child)                           // ROOT, not inline; its Yoga node stays a
             return                                           // separate root (laid out in relayout)
         }
@@ -5982,7 +6438,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if let t = g as? UITapGestureRecognizer { taps[t] = nil }
                 if let lp = g as? UILongPressGestureRecognizer { pressGestures[lp] = nil }
             }
-            v.removeFromSuperview()
+            // An exiting spec keeps the view (and its subviews) on screen until its
+            // animation ends; everything else about the node is torn down now.
+            if let ex = exitSpec[id], runExit(v, ex) { } else { v.removeFromSuperview() }
         }
         if let n = ynodes[id] {
             if let owner = YGNodeGetOwner(n) { YGNodeRemoveChild(owner, n) }
@@ -6000,6 +6458,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
             if gestureIds.contains(k) { gestureIds.remove(k); gestureActions[k] = nil; gestureContAttached.remove(k) }
+            if mBindings[k] != nil || mPan[k] != nil || mStatic[k] != nil { motionForget(k) }
             if menuIds.contains(k) { menuIds.remove(k); menuData[k] = nil; menuActions[k] = nil }
             if contextMenuIds.contains(k) { contextMenuIds.remove(k); contextMenuData[k] = nil; contextMenuActions[k] = nil }
             if alertIds.contains(k) { alertIds.remove(k); alertData[k] = nil; alertActions[k] = nil; if presentedAlert == k { presentedAlert = nil } }
@@ -6008,6 +6467,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             pressOpacity[k] = nil
             modalIds.remove(k); if activeModal == k { activeModal = nil }
             if popoverIds.contains(k) { popoverIds.remove(k); popoverAnchor[k] = nil; popoverPlace[k] = nil; popoverGap[k] = nil; popoverArrow.remove(k); popoverArrowLayers[k]?.removeFromSuperlayer(); popoverArrowLayers[k] = nil }
+            if sheetIds.contains(k) { sheetIds.remove(k); for (g, sid) in sheetPans where sid == k { sheetPans[g] = nil }; for (g, sid) in sheetTaps where sid == k { sheetTaps[g] = nil } }
             layoutIds.remove(k); lastLayoutReport[k] = nil
             if let p = videoPlayers[k] {                     // recycle: pool the player, keep it primed
                 p.pause()
@@ -6026,6 +6486,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if cameraController === cv.controller { cameraController = nil }
             }
             pillIds.remove(k); cornerRadii[k] = nil
+            enterSpec[k] = nil; exitSpec[k] = nil; layoutSpec[k] = nil; pendingEnter[k] = nil; layoutLast[k] = nil
             views[k] = nil
         }
         for k in ynodes.keys.filter({ $0 == id || $0.hasPrefix(prefix) }) { ynodes[k] = nil }
@@ -6033,14 +6494,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     // A node with an action tag: Button/Input use their own targets; any other
     // View gets a tap recognizer.
-    func bindAction(_ id: String, action: String) {
+    // TC|id: the node reports a value (a field's text, a slider's number, a picked
+    // index or date, an alert's button) on "<id>:change". Which control it is decides
+    // where the tag is kept; the press binding below is separate and may coexist.
+    func bindChange(_ id: String) {
         guard let v = views[id] else { return }
-        if modalIds.contains(id) { modalActions[id] = action }   // onDismiss: fired by scrim tap AND sheet drag
+        let action = id + ":change"
         if selectIds.contains(id) { selectActions[id] = action; rebuildSelectMenu(id); return }   // menu items dispatch this
-        if gestureIds.contains(id) { gestureActions[id] = action; return }                        // gestures dispatch this
         if menuIds.contains(id) { menuActions[id] = action; rebuildMenu(id); return }             // Menu items dispatch this
         if contextMenuIds.contains(id) { contextMenuActions[id] = action; return }                // ContextMenu items dispatch this
         if alertIds.contains(id) { alertActions[id] = action; return }                            // alert buttons dispatch this
+        if let tf = v as? UITextField { fieldActions[tf] = action; return }
+        if let sl = v as? UISlider { sliderActions[sl] = action; return }
+        if let dp = v as? UIDatePicker { datePickerActions[dp] = action; return }
+        if let tv = v as? UITextView { textAreaActions[tv] = action; return }
+    }
+    // T|id|action: the node's press. A control that reports a value keeps that on its
+    // change binding (bindChange); here a press is a press on every kind of view.
+    func bindAction(_ id: String, action: String) {
+        guard let v = views[id] else { return }
+        if modalIds.contains(id) { modalActions[id] = action }   // onDismiss: fired by scrim tap AND sheet drag
         if let sc = v as? UIScrollView {                                                          // Scroll onRefresh -> pull-to-refresh control
             let rc = sc.refreshControl ?? {
                 let r = UIRefreshControl(); sc.refreshControl = r
@@ -6050,11 +6523,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             return
         }
         if let b = v as? UIButton { buttonActions[b] = action; return }
-        if let tf = v as? UITextField { fieldActions[tf] = action; return }
         if let sw = v as? UISwitch { switchActions[sw] = action; return }
-        if let sl = v as? UISlider { sliderActions[sl] = action; return }
-        if let dp = v as? UIDatePicker { datePickerActions[dp] = action; return }
-        if let tv = v as? UITextView { textAreaActions[tv] = action; return }
         v.isUserInteractionEnabled = true
         // Reset any tap/press recognizer WE previously attached to this view before
         // (re)binding. Node ids are reused when a screen swaps in place, so a tappable
@@ -6169,7 +6638,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         let val = String(Int(sl.value.rounded()))
         guard let s = eInput(action, val) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
     }
 
     // A native value event from a DatePicker -> the engine, as an ISO string; the
@@ -6178,7 +6647,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let action = datePickerActions[dp] else { return }
         let val = Self.formatISO(dp.date, mode: datePickerModes[dp] ?? "date")
         guard let s = eInput(action, val) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("date \(action)=\(val)")
     }
 
@@ -6215,7 +6684,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func selectPick(_ id: String, _ i: Int) {
         guard let action = selectActions[id] else { return }
         guard let s = eInput(action, String(i)) else { connected = false; return }
-        apply(s); relayout(); headerText("select \(action)=\(i)")
+        applyReply(s); headerText("select \(action)=\(i)")
     }
 
     // (Re)build a Menu button: a fixed label + one-shot action items (no selection state).
@@ -6232,7 +6701,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func menuPick(_ id: String, _ i: Int) {
         guard let action = menuActions[id] else { return }
         guard let s = eInput(action, String(i)) else { connected = false; return }
-        apply(s); relayout(); headerText("menu \(action)=\(i)")
+        applyReply(s); headerText("menu \(action)=\(i)")
     }
 
     // Long-press context menu: build the UIMenu for the interaction's view on demand.
@@ -6250,15 +6719,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func contextMenuPick(_ id: String, _ i: Int) {
         guard let action = contextMenuActions[id] else { return }
         guard let s = eInput(action, String(i)) else { connected = false; return }
-        apply(s); relayout(); headerText("ctxmenu \(action)=\(i)")
+        applyReply(s); headerText("ctxmenu \(action)=\(i)")
     }
 
     // ---- Gesture ---------------------------------------------------------
     func gestureIdFor(_ view: UIView?) -> String? { views.first(where: { $0.value === view })?.key }
     func dispatchGesture(_ view: UIView?, _ g: String) {
-        guard let id = gestureIdFor(view), let action = gestureActions[id] else { return }
+        guard let id = gestureIdFor(view) else { return }
+        let action = id + ":gesture"   // the Gesture's own event; its T| binding, if any, is an onPress
         guard let s = eInput(action, g) else { connected = false; return }
-        apply(s); relayout(); headerText("gesture \(action)=\(g)")
+        applyReply(s); headerText("gesture \(action)=\(g)")
     }
     @objc func handleSwipe(_ g: UISwipeGestureRecognizer) {
         let dir = g.direction == .left ? "left" : (g.direction == .right ? "right" : (g.direction == .up ? "up" : "down"))
@@ -6287,6 +6757,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     }
     private func gPhase(_ s: UIGestureRecognizer.State) -> Int { s == .began ? 0 : (s == .changed ? 1 : 2) }
     @objc func handlePan(_ g: UIPanGestureRecognizer) {
+        if motionPan(g) { return }   // a pan that feeds shared values never crosses to the engine per move
         // Measure in the window, not g.view: inside a Scroll the view's own coordinate
         // space can shift and zero out translation(in: g.view).
         let t = g.translation(in: g.view?.window), v = g.velocity(in: g.view?.window)
@@ -6305,7 +6776,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         textAreaPlaceholders[tv]?.isHidden = !tv.text.isEmpty
         guard let action = textAreaActions[tv] else { return }
         guard let s = eInput(action, tv.text) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("textarea \(action)")
     }
 
@@ -6347,7 +6818,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func alertDispatch(_ id: String, _ v: String) {
         guard let action = alertActions[id] else { return }
         guard let s = eInput(action, v) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("alert \(action)=\(v)")
     }
 
@@ -6473,7 +6944,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     func fireValue(_ action: String, _ value: String) {
         guard let s = eInput(action, value) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
     }
     // Video seek: jump to `seconds` when it changes (a controlled prop). Tracked per id so a
     // style re-emit that didn't change the seek target doesn't re-seek.
@@ -6615,11 +7086,37 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             YGNodeStyleSetWidth(mn, fw); YGNodeStyleSetHeight(mn, fh)
             YGNodeCalculateLayout(mn, fw, fh, YGDirection.LTR)
         }
+        // Every Sheet is its own window-sized root too, padded at the top so its children
+        // fill the tallest snap box; the overlay translates them to the current point.
+        for sid in sheetIds {
+            guard let sn = ynodes[sid], let sv = views[sid] as? SheetOverlay else { continue }
+            sv.frame = view.bounds
+            sv.topInset = view.safeAreaInsets.top
+            sv.bottomInset = view.safeAreaInsets.bottom
+            sv.resolveHeights()
+            let fw = Float(view.bounds.width), fh = Float(view.bounds.height)
+            YGNodeStyleSetWidth(sn, fw); YGNodeStyleSetHeight(sn, fh)
+            YGNodeStyleSetPadding(sn, YGEdge.top, Float(sv.layoutTop + sv.handleStrip))
+            YGNodeStyleSetPadding(sn, YGEdge.bottom, Float(sv.bottomPad))
+            YGNodeCalculateLayout(sn, fw, fh, YGDirection.LTR)
+            // A "content" point wants the children's natural height: the sum of the direct
+            // children's laid-out heights is that, once they have been laid out.
+            if sv.snapSpec.contains("c") {
+                var total: CGFloat = 0
+                let n = YGNodeGetChildCount(sn)
+                for i in 0..<n { if let c = YGNodeGetChild(sn, i) { total += CGFloat(YGNodeLayoutGetHeight(c)) } }
+                if total > 0 && abs(total - sv.contentHeight) > 0.5 {
+                    sv.contentHeight = total; sv.resolveHeights()
+                    YGNodeStyleSetPadding(sn, YGEdge.top, Float(sv.layoutTop + sv.handleStrip))
+                    YGNodeCalculateLayout(sn, fw, fh, YGDirection.LTR)
+                }
+            }
+        }
         let _ta = layoutTiming ? CACurrentMediaTime() : 0
         var _applied = 0
         var pendingLayout: [(String, String)] = []   // onLayout reports, delivered after this pass
         for (id, n) in ynodes {
-            if modalIds.contains(id) { continue }   // modal overlay node has no app-tree layout (placed below)
+            if modalIds.contains(id) || sheetIds.contains(id) { continue }   // overlay roots are placed below
             // Incremental apply: skip nodes Yoga did not re-lay-out this pass (unless the view
             // was just created). Yoga sets HasNewLayout on every node it recomputes (a fresh
             // insert dirties it), so an unchanged subtree costs nothing here.
@@ -6649,6 +7146,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             if let gv = gradLayers[id] { gv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }   // match the clamped rounding
             if let bv = blurViews[id] { bv.layer.cornerRadius = views[id]?.layer.cornerRadius ?? 0 }
         }
+        runLayoutTransitions()   // layout-spec views move from where they were (in absolute terms, so a moved parent counts)
+        runPendingEnters()       // mounted views enter once they have a frame
         needsFrame.removeAll()   // consumed for this pass
         // onLayout: the frame changed for a node that asked. Delivered after this pass
         // returns, because a handler re-renders and re-enters relayout.
@@ -6662,6 +7161,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         // place the whole Chuks app edge-to-edge (below the diagnostics header if shown)
         views["app"]?.frame = CGRect(x: 0, y: topY, width: CGFloat(W), height: CGFloat(H))
+        // Sheets: on top of the app, at their current point (a drag or animation in
+        // flight keeps its position; a layout never fights the finger).
+        for sid in sheetIds {
+            guard let sv = views[sid] as? SheetOverlay else { continue }
+            if sv.closed && !sv.animating { sv.isHidden = true; continue }
+            view.bringSubviewToFront(sv)
+            if !sv.animating && sheetDrag?.id != sid { sv.position = sv.positionFor(index: sv.index) }
+            sv.apply()
+        }
         // a visible modal fills the window and sits on top (its children were laid out above)
         if let mid = activeModal, let mv = views[mid], !mv.isHidden {
             mv.frame = CGRect(x: 0, y: 0, width: view.bounds.width, height: view.bounds.height)
@@ -6824,6 +7332,117 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         return true
     }
 
+    // ── Sheet: index, animation, drag ──────────────────────────────────────────
+    // The app's index arrived (a render): animate to that point unless the sheet is
+    // already there or the finger has it.
+    func sheetSetIndex(_ id: String, _ sv: SheetOverlay, _ idx: Int) {
+        let target = max(-1, min(idx, max(sv.heights.count - 1, 0)))
+        if sheetDrag?.id == id { sv.index = target; return }
+        if sv.isHidden && target < 0 { sv.index = -1; return }
+        if sv.isHidden {
+            // Opening from closed: place it closed, then slide to the point.
+            sv.index = -1; sv.resolveHeights(); sv.position = sv.closedPosition; sv.apply()
+            view.bringSubviewToFront(sv)
+        }
+        if sv.index != target { sheetAnimate(id, sv, to: target, report: false) } else { sv.index = target }
+    }
+    // Spring to a point. `report` tells the app through onChange when the point is not
+    // the one it last set (a drag, a command, the backdrop); an index the app itself
+    // sent is not echoed back.
+    func sheetAnimate(_ id: String, _ sv: SheetOverlay, to idx: Int, velocity: CGFloat = 0, report: Bool = true) {
+        let target = max(-1, min(idx, max(sv.heights.count - 1, 0)))
+        if sv.heights.isEmpty { sv.resolveHeights() }
+        let dest = sv.positionFor(index: target)
+        let reported = sv.index
+        sv.index = target
+        sv.animating = true
+        sv.isHidden = false
+        view.bringSubviewToFront(sv)
+        let distance = max(1, abs(dest - sv.position))
+        let iv = min(4, abs(velocity) / distance)   // initial spring velocity in units of distance
+        UIView.animate(withDuration: 0.42, delay: 0, usingSpringWithDamping: 0.86, initialSpringVelocity: iv, options: [.allowUserInteraction, .beginFromCurrentState], animations: {
+            sv.position = dest
+            sv.apply()
+        }, completion: { _ in
+            sv.animating = false
+            if sv.closed { sv.isHidden = true }
+            if report && reported != target { sv.onSettle?(target) }
+        })
+    }
+    // The scroll view the finger is over, if any, inside this sheet: the one the
+    // hand-off is negotiated with.
+    func scrollUnder(_ sv: SheetOverlay, _ g: UIGestureRecognizer) -> UIScrollView? {
+        var v = sv.hitTest(g.location(in: sv), with: nil)
+        while let cur = v, cur !== sv {
+            if let s = cur as? UIScrollView, !(s is UITextView) { return s }
+            v = cur.superview
+        }
+        return nil
+    }
+    @objc func handleSheetDrag(_ g: UIPanGestureRecognizer) {
+        guard let id = sheetPans[g], let sv = views[id] as? SheetOverlay else { return }
+        let dy = g.translation(in: view).y
+        switch g.state {
+        case .began:
+            sv.layer.removeAllAnimations(); for sub in sv.subviews { sub.layer.removeAllAnimations() }
+            sv.animating = false
+            let sc = scrollUnder(sv, g)
+            // The sheet owns the drag unless it is at its highest point with a scrollable
+            // under the finger that is scrolled down or being scrolled up: then the list owns.
+            let atTop = abs(sv.position - sv.minPosition) < 0.5
+            let listOwns = sc != nil && atTop
+            sheetDrag = (id: id, initial: sv.position, owns: !listOwns, scroll: sc)
+        case .changed:
+            guard var d = sheetDrag, d.id == id else { return }
+            let vy = g.velocity(in: view).y
+            if let sc = d.scroll {
+                let atTop = abs(sv.position - sv.minPosition) < 0.5
+                if d.owns {
+                    // Reached the highest point while dragging up over a list: the sheet stops
+                    // there and the list takes the rest of the finger (its pan has run beside
+                    // ours all along, so letting go of its offset is enough).
+                    if (atTop || d.initial + dy <= sv.minPosition) && vy < 0 {
+                        sv.position = sv.minPosition; sv.apply()
+                        d.owns = false; sheetDrag = d; sheetPinnedScrolls.remove(sc)
+                        // The sheet has arrived: make the top point its index now (and tell the
+                        // app), or the next layout pass would put it back where its index was.
+                        sheetAnimate(id, sv, to: sv.indexFor(position: sv.minPosition))
+                        return
+                    }
+                    sc.contentOffset = CGPoint(x: sc.contentOffset.x, y: 0)   // the list holds still under a moving sheet
+                    sheetPinnedScrolls.insert(sc)
+                } else {
+                    // The list is scrolled to its top and the finger pulls down: the sheet takes it.
+                    if sc.contentOffset.y <= 0 && vy > 0 {
+                        sc.contentOffset = CGPoint(x: sc.contentOffset.x, y: 0)
+                        sheetPinnedScrolls.insert(sc)
+                        d.owns = true; d.initial = sv.position; sheetDrag = d
+                        g.setTranslation(.zero, in: view)
+                    }
+                    return
+                }
+            }
+            let lowest = sv.panToClose ? sv.closedPosition : (sv.settlePositions.max() ?? sv.closedPosition)
+            var p = d.initial + g.translation(in: view).y
+            if p < sv.minPosition { p = sv.minPosition - sqrt(1 + (sv.minPosition - p)) * 2.5 }   // over-drag, with resistance
+            else if p > lowest { p = lowest + sqrt(1 + (p - lowest)) * 2.5 }
+            sv.position = p
+            sv.apply()
+        case .ended, .cancelled, .failed:
+            guard let d = sheetDrag, d.id == id else { return }
+            sheetDrag = nil
+            if !d.owns { return }   // the list had it; nothing to settle
+            let vy = g.velocity(in: view).y
+            let dest = sv.destination(from: sv.position, velocity: vy)
+            sheetAnimate(id, sv, to: sv.indexFor(position: dest), velocity: vy)
+        default: break
+        }
+    }
+    @objc func handleSheetBackdropTap(_ g: UITapGestureRecognizer) {
+        guard let id = sheetTaps[g], let sv = views[id] as? SheetOverlay, sv.backdrop else { return }
+        if g.location(in: sv).y < sv.position { sheetAnimate(id, sv, to: -1) }
+    }
+
     func clearSheetChrome() {
         sheetBg?.removeFromSuperview(); sheetHandle?.removeFromSuperview()
         if let p = sheetPan { p.view?.removeGestureRecognizer(p); sheetPan = nil }
@@ -6886,6 +7505,396 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 }
             }
         default: break
+        }
+    }
+}
+
+// ---- Frame cadence measurement (Debug.frames) -----------------------------------
+// A display link on the main run loop for `ms`; each tick's interval is recorded.
+// The same metric the RN bench measures with reanimated's useFrameCallback: did the
+// main thread service the display link on time while a gesture ran.
+// A recogniser that only watches: it reports every touch and never claims one.
+final class TouchObserver: UIGestureRecognizer {
+    var onTouch: (() -> Void)?
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?() }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?() }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?(); state = .failed }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { onTouch?(); state = .failed }
+}
+// Keep the display awake while a finger is on the screen and for a short tail after it
+// lifts. The app draws only when something moves, so between two swipes an adaptive
+// (ProMotion) panel drops to its idle rate and the first frame of the next swipe pays
+// to wake it. A live display link that asks for the panel's top rate holds it there;
+// nothing is drawn, and once the tail ends the link goes away and the panel idles.
+extension CardsVC {
+    func warmFrames() {
+        warmUntil = CACurrentMediaTime() + 0.7
+        if warmLink != nil { return }
+        let l = CADisplayLink(target: self, selector: #selector(warmTick(_:)))
+        if #available(iOS 15.0, *) {
+            let top = Float(UIScreen.main.maximumFramesPerSecond)
+            l.preferredFrameRateRange = CAFrameRateRange(minimum: Swift.min(top, 80), maximum: top, preferred: top)
+        }
+        l.add(to: .main, forMode: .common); warmLink = l
+    }
+    @objc func warmTick(_ l: CADisplayLink) {
+        if CACurrentMediaTime() >= warmUntil { l.invalidate(); warmLink = nil }
+    }
+}
+final class FrameStatsRun {
+    var link: CADisplayLink?
+    var last: CFTimeInterval = 0
+    var lastTarget: CFTimeInterval = 0
+    var intervals: [Double] = []
+    var janky = 0
+    var done: ((FrameStatsRun) -> Void)?
+    // A frame is janky when the link fires after the previous frame's target time:
+    // the main thread was still busy when the display wanted the next frame. An
+    // interval alone cannot say that on a ProMotion panel, which idles to a lower rate
+    // when nothing draws.
+    @objc func tick(_ l: CADisplayLink) {
+        if last > 0 {
+            intervals.append((l.timestamp - last) * 1000)
+            if lastTarget > 0 && l.timestamp > lastTarget + 0.0005 { janky += 1 }
+        }
+        last = l.timestamp; lastTarget = l.targetTimestamp
+    }
+    func finish() { link?.invalidate(); link = nil; done?(self); done = nil }
+}
+extension CardsVC {
+    func frameStats(_ token: String, _ ms: Double) {
+        let run = FrameStatsRun()
+        let l = CADisplayLink(target: run, selector: #selector(FrameStatsRun.tick(_:)))
+        l.add(to: .main, forMode: .common); run.link = l
+        run.done = { [weak self] r in
+            let iv = r.intervals
+            let s = iv.sorted()
+            func pct(_ p: Double) -> Double { s.isEmpty ? 0 : s[Swift.min(s.count - 1, Int(Double(s.count) * p))] }
+            let period = pct(0.1)
+            self?.resolve(token, String(format: "hz=%d frames=%d janky=%d p50=%.1f p95=%.1f max=%.1f", period > 0 ? Int((1000 / period).rounded()) : 0, iv.count, r.janky, pct(0.5), pct(0.95), s.last ?? 0))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + ms / 1000) { run.finish() }
+    }
+}
+
+// ---- Shared values on the host (docs/shared-values.md) ------------------------
+extension CardsVC {
+    /// MV|id|initial, MS|id|target|anim, MX|id.
+    func motionOp(_ f: [String]) {
+        guard f.count >= 2, let id = Int(f[1]) else { return }
+        switch f[0] {
+        case "MV":
+            let initial = f.count >= 3 ? (Double(f[2]) ?? 0) : 0
+            if let mv = mValues[id] { mv.cur = initial; mv.anim = nil } else { mValues[id] = MotionValue(initial) }
+            motionWrite(id, initial); motionFlush()
+        case "MS":
+            guard f.count >= 3, let mv = mValues[id] else { return }
+            let target = Double(f[2]) ?? mv.cur
+            let anim = f.count >= 4 ? f[3] : ""
+            let parts = anim.split(separator: ":", maxSplits: 1).map(String.init)
+            let args = parts.count > 1 ? parts[1].split(separator: ",").map { Double($0) ?? 0 } : []
+            mv.lastT = CACurrentMediaTime()
+            switch parts.first ?? "" {
+            case "sp":
+                mv.anim = .spring(target: target, stiffness: args.count > 0 ? args[0] : 180, damping: args.count > 1 ? args[1] : 22)
+                mv.velocity = args.count > 2 ? args[2] : 0
+                motionStartAnimating(id)
+            case "tm":
+                mv.anim = .timing(from: mv.cur, to: target, start: mv.lastT, ms: Swift.max(1, args.count > 0 ? args[0] : 300), easing: parts.count > 1 ? String(parts[1].split(separator: ",").last ?? "ease") : "ease")
+                motionStartAnimating(id)
+            case "dc":
+                mv.velocity = args.count > 0 ? args[0] : 0
+                mv.anim = .decay(lo: args.count > 1 ? args[1] : -1e9, hi: args.count > 2 ? args[2] : 1e9)
+                motionStartAnimating(id)
+            default:
+                mv.anim = nil; mv.velocity = 0; mAnimating.remove(id)
+                motionWrite(id, target); motionFlush()
+            }
+        case "MX":
+            mAnimating.remove(id); mValues[id] = nil; mKeyboardValues.remove(id)
+            for nid in mDeps[id] ?? [] { mBindings[nid] = mBindings[nid]?.filter { !$0.expr.deps.contains(id) } }
+            mDeps[id] = nil
+        default: break
+        }
+    }
+    /// The `mo` style key: "prop:expr|prop:expr". Replaces this node's bindings.
+    func motionBind(_ id: String, _ spec: String) {
+        motionUnbindNode(id)
+        var bs: [MotionBinding] = []
+        for part in spec.split(separator: "|") {
+            let kv = part.split(separator: ":", maxSplits: 1)
+            guard kv.count == 2, let e = parseMExpr(String(kv[1])) else { continue }
+            bs.append(MotionBinding(prop: String(kv[0]), expr: e))
+            for d in e.deps { mDeps[d, default: []].insert(id) }
+        }
+        if !bs.isEmpty { mBindings[id] = bs }
+        if bs.contains(where: { !$0.expr.deps.isDisjoint(with: mKeyboardValues) }) { mKeyboardNodes.insert(id) }
+    }
+    /// Is this view inside a node that moves itself with the keyboard? Then the host's
+    /// own keyboard avoidance leaves it alone (it would move twice).
+    func motionKeyboardOwns(_ v: UIView) -> Bool {
+        if mKeyboardNodes.isEmpty { return false }
+        var cur: UIView? = v
+        while let c = cur {
+            if let id = views.first(where: { $0.value === c })?.key, mKeyboardNodes.contains(id) { return true }
+            cur = c.superview
+        }
+        return false
+    }
+    /// Drop a node's bindings and sources (the style reset, before the keys re-add).
+    func motionUnbindNode(_ id: String) {
+        mKeyboardNodes.remove(id)
+        if let bs = mBindings.removeValue(forKey: id) {
+            for b in bs { for d in b.expr.deps { mDeps[d]?.remove(id) } }
+        }
+        if mPan.removeValue(forKey: id) != nil, let v = views[id] { mPanByView[ObjectIdentifier(v)] = nil }
+        if let sc = views[id] as? UIScrollView { mScroll[sc] = nil }
+    }
+    /// A node left the tree: forget everything of its own.
+    func motionForget(_ id: String) { motionUnbindNode(id); mStatic[id] = nil; mPanBase[id] = nil }
+    /// A new number for a value: every node bound to it is re-evaluated.
+    func motionWrite(_ vid: Int, _ value: Double) {
+        guard let mv = mValues[vid] else { return }
+        mv.cur = value
+        for nid in mDeps[vid] ?? [] { motionApplyNode(nid) }
+    }
+    /// Evaluate a node's bindings and set the props: paint props on the view (over the
+    /// style's own values, kept in mStatic), layout props on the Yoga node (laid out at
+    /// the next flush).
+    func motionApplyNode(_ id: String) {
+        guard let bs = mBindings[id], let v = views[id] else { return }
+        let st = mStatic[id] ?? (tx: 0, ty: 0, sc: 1, rot: 0, alpha: 1)
+        var tx = st.tx, ty = st.ty, sc = st.sc, rot = st.rot, alpha = st.alpha
+        var xform = false, alphaSet = false
+        let n = ynodes[id]
+        for b in bs {
+            let x = b.expr.eval { self.mValues[$0]?.cur ?? 0 }
+            switch b.prop {
+            case "tx": tx = CGFloat(x); xform = true
+            case "ty": ty = CGFloat(x); xform = true
+            case "scale": sc = CGFloat(x) / 100; xform = true
+            case "rotate": rot = CGFloat(x); xform = true
+            case "opacity": alpha = CGFloat(x) / 100; alphaSet = true
+            case "w": if let n = n { YGNodeStyleSetWidth(n, Float(x)); mLayoutDirty = true }
+            case "h": if let n = n { YGNodeStyleSetHeight(n, Float(x)); mLayoutDirty = true }
+            case "pt": if let n = n { YGNodeStyleSetPadding(n, YGEdge.top, Float(x)); mLayoutDirty = true }
+            case "pr": if let n = n { YGNodeStyleSetPadding(n, YGEdge.right, Float(x)); mLayoutDirty = true }
+            case "pb": if let n = n { YGNodeStyleSetPadding(n, YGEdge.bottom, Float(x)); mLayoutDirty = true }
+            case "pl": if let n = n { YGNodeStyleSetPadding(n, YGEdge.left, Float(x)); mLayoutDirty = true }
+            case "top": if let n = n { YGNodeStyleSetPosition(n, YGEdge.top, Float(x)); mLayoutDirty = true }
+            case "left": if let n = n { YGNodeStyleSetPosition(n, YGEdge.left, Float(x)); mLayoutDirty = true }
+            default: break
+            }
+        }
+        if xform { v.transform = CGAffineTransform(translationX: tx, y: ty).scaledBy(x: sc, y: sc).rotated(by: rot * .pi / 180) }
+        if alphaSet { v.alpha = Swift.max(0, Swift.min(1, alpha)) }
+    }
+    /// One layout pass for everything the frame's writes changed.
+    func motionFlush() { if mLayoutDirty { mLayoutDirty = false; relayout() } }
+
+    // ---- sources ----
+    /// The `mpx`/`mpy` keys on a Gesture: its pan feeds these values.
+    func motionSetPan(_ id: String, x: Int, y: Int) {
+        mPan[id] = (x: x, y: y)
+        if let v = views[id] { mPanByView[ObjectIdentifier(v)] = id }
+    }
+    /// A pan on a Gesture that feeds values: write base + travel, and report the end
+    /// with the velocity. Returns false when the gesture is not one of ours.
+    func motionPan(_ g: UIPanGestureRecognizer) -> Bool {
+        guard let gv = g.view, let id = mPanByView[ObjectIdentifier(gv)], let ids = mPan[id] else { return false }
+        let t = g.translation(in: gv.window), vel = g.velocity(in: gv.window)
+        switch g.state {
+        case .began:
+            let bx = ids.x >= 0 ? (mValues[ids.x]?.cur ?? 0) : 0, by = ids.y >= 0 ? (mValues[ids.y]?.cur ?? 0) : 0
+            mPanBase[id] = (x: bx, y: by)
+            for vid in [ids.x, ids.y] where vid >= 0 { mValues[vid]?.anim = nil; mAnimating.remove(vid) }   // the finger takes over from any animation
+        case .changed:
+            let base = mPanBase[id] ?? (x: 0, y: 0)
+            if ids.x >= 0 { motionWrite(ids.x, base.x + Double(t.x)) }
+            if ids.y >= 0 { motionWrite(ids.y, base.y + Double(t.y)) }
+            motionFlush()
+        case .ended, .cancelled, .failed:
+            let base = mPanBase[id] ?? (x: 0, y: 0)
+            if ids.x >= 0 { motionWrite(ids.x, base.x + Double(t.x)) }
+            if ids.y >= 0 { motionWrite(ids.y, base.y + Double(t.y)) }
+            motionFlush()
+            mPanBase[id] = nil
+            if ids.x >= 0 { fireValue("mv\(ids.x):end", "\(mValues[ids.x]?.cur ?? 0),\(Double(vel.x))") }
+            if ids.y >= 0 { fireValue("mv\(ids.y):end", "\(mValues[ids.y]?.cur ?? 0),\(Double(vel.y))") }
+        default: break
+        }
+        return true
+    }
+    /// A scroll that feeds a value: its offset along its axis, in points.
+    func motionScrolled(_ sv: UIScrollView) {
+        guard let vid = mScroll[sv] else { return }
+        let horiz = sv.contentSize.width > sv.bounds.width + 1 && sv.contentSize.height <= sv.bounds.height + 1
+        motionWrite(vid, Double(horiz ? sv.contentOffset.x : sv.contentOffset.y))
+        motionFlush()
+    }
+
+    /// The keyboard's frame is changing: every keyboard value eases to the new height
+    /// over the keyboard's own animation, so a bound composer arrives with it.
+    func motionKeyboard(height: CGFloat, duration: Double) {
+        for vid in mKeyboardValues {
+            guard let mv = mValues[vid] else { continue }
+            mv.lastT = CACurrentMediaTime()
+            mv.anim = .timing(from: mv.cur, to: Double(height), start: mv.lastT, ms: Swift.max(1, duration * 1000), easing: "out")
+            motionStartAnimating(vid)
+        }
+    }
+
+    // ---- host animations ----
+    func motionStartAnimating(_ vid: Int) {
+        mAnimating.insert(vid)
+        if motionLink == nil {
+            let l = CADisplayLink(target: self, selector: #selector(motionTick(_:)))
+            l.add(to: .main, forMode: .common); motionLink = l
+        }
+    }
+    @objc func motionTick(_ link: CADisplayLink) {
+        let now = link.timestamp
+        var settled: [Int] = []
+        for vid in mAnimating {
+            guard let mv = mValues[vid], let anim = mv.anim else { settled.append(vid); continue }
+            let dt = Swift.min(Swift.max(now - mv.lastT, 0), 0.064)   // a stall must not fling a spring
+            mv.lastT = now
+            var done = false
+            switch anim {
+            case .spring(let target, let k, let c):
+                // Semi-implicit Euler in sub-steps of at most 8 ms: stable for any stiffness an app would use.
+                var remaining = dt
+                while remaining > 0 {
+                    let h = Swift.min(remaining, 0.008); remaining -= h
+                    let a = -k * (mv.cur - target) - c * mv.velocity
+                    mv.velocity += a * h; mv.cur += mv.velocity * h
+                }
+                if abs(mv.velocity) < 1 && abs(mv.cur - target) < 0.05 { mv.cur = target; mv.velocity = 0; done = true }
+            case .timing(let from, let to, let start, let ms, let easing):
+                var t = Swift.min(1, Swift.max(0, (now - start) * 1000 / ms))
+                switch easing {
+                case "linear": break
+                case "in": t = t * t * t
+                case "out": t = 1 - pow(1 - t, 3)
+                default: t = t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
+                }
+                mv.cur = from + (to - from) * t
+                if now - start >= ms / 1000 { mv.cur = to; done = true }
+            case .decay(let lo, let hi):
+                mv.velocity *= exp(-3.5 * dt)
+                mv.cur += mv.velocity * dt
+                if mv.cur < lo || mv.cur > hi {
+                    // Past the edge: a rubber band, which is a spring to the edge carrying the velocity.
+                    mv.anim = .spring(target: mv.cur < lo ? lo : hi, stiffness: 180, damping: 22)
+                } else if abs(mv.velocity) < 4 { done = true }
+            }
+            motionWrite(vid, mv.cur)
+            if done { mv.anim = nil; mv.velocity = 0; settled.append(vid) }
+        }
+        motionFlush()
+        for vid in settled {
+            mAnimating.remove(vid)
+            if let mv = mValues[vid] { fireValue("mv\(vid):settle", "\(mv.cur)") }
+        }
+        if mAnimating.isEmpty { motionLink?.invalidate(); motionLink = nil }
+    }
+}
+
+// ---- Transitions: how a view arrives, leaves and moves ----------------------------
+// Specs come as style keys (en=, ex=, lt=): a kind and, optionally, a duration in ms,
+// an easing and a delay ("slide-up 300 out 50"). The host runs them: entering after
+// the mounted view has its first frame, exiting on removal with the view kept in
+// place and inert until it is done, layout as a move from the old frame to the new.
+struct TransitionSpec {
+    let kind: String            // fade slide-up slide-down slide-left slide-right zoom ease spring linear
+    let ms: Double
+    let easing: String          // ease | out | in | linear | spring
+    let delay: Double
+    init?(_ text: String) {
+        let parts = text.split(separator: " ").map(String.init)
+        guard let k = parts.first, !k.isEmpty else { return nil }
+        kind = k
+        ms = parts.count > 1 ? (Double(parts[1]) ?? 300) : (k == "spring" ? 450 : 300)
+        var ez = parts.count > 2 ? parts[2] : (k == "spring" ? "spring" : "out")
+        if ez == "spring" || k == "spring" { ez = "spring" }
+        easing = ez
+        delay = parts.count > 3 ? (Double(parts[3]) ?? 0) : 0
+    }
+    func run(_ animations: @escaping () -> Void, completion: ((Bool) -> Void)? = nil) {
+        let d = ms / 1000
+        if easing == "spring" {
+            UIView.animate(withDuration: d, delay: delay / 1000, usingSpringWithDamping: 0.78, initialSpringVelocity: 0.4, options: [.allowUserInteraction, .beginFromCurrentState], animations: animations, completion: completion)
+        } else {
+            let curve: UIView.AnimationOptions = easing == "linear" ? .curveLinear : (easing == "in" ? .curveEaseIn : (easing == "ease" ? .curveEaseInOut : .curveEaseOut))
+            UIView.animate(withDuration: d, delay: delay / 1000, options: [curve, .allowUserInteraction, .beginFromCurrentState], animations: animations, completion: completion)
+        }
+    }
+}
+extension CardsVC {
+    /// The state a view starts from (entering) or ends at (exiting) for a kind: an
+    /// offset by its own size for the slides, a small scale for zoom, invisible for fade.
+    func transitionState(_ v: UIView, _ kind: String, entering: Bool) -> (transform: CGAffineTransform, alpha: CGFloat) {
+        let w = max(v.bounds.width, 1), h = max(v.bounds.height, 1)
+        switch kind {
+        case "slide-up":    return (CGAffineTransform(translationX: 0, y: entering ? h : -h), 1)
+        case "slide-down":  return (CGAffineTransform(translationX: 0, y: entering ? -h : h), 1)
+        case "slide-left":  return (CGAffineTransform(translationX: entering ? w : -w, y: 0), 1)
+        case "slide-right": return (CGAffineTransform(translationX: entering ? -w : w, y: 0), 1)
+        case "zoom":        return (CGAffineTransform(scaleX: 0.6, y: 0.6), 0)
+        default:            return (.identity, 0)
+        }
+    }
+    /// Mounted views with an entering spec, once they have a frame: start from the
+    /// kind's state and settle into place.
+    func runPendingEnters() {
+        if pendingEnter.isEmpty { return }
+        let batch = pendingEnter; pendingEnter = [:]
+        for (id, text) in batch {
+            guard let v = views[id], let spec = TransitionSpec(text), v.bounds.width > 0 || v.bounds.height > 0 else { continue }
+            if mBindings[id] != nil { continue }   // a bound node's transform is the graph's
+            let start = transitionState(v, spec.kind, entering: true)
+            let endAlpha = v.alpha
+            v.transform = start.transform; v.alpha = start.alpha
+            spec.run({ v.transform = .identity; v.alpha = endAlpha })
+        }
+    }
+    /// A removed view with an exiting spec leaves on its own time: it stays where it
+    /// was, takes no touches, and is dropped when the animation ends. Its node is
+    /// already gone, so a new node at the same id is unaffected.
+    func runExit(_ v: UIView, _ text: String) -> Bool {
+        guard let spec = TransitionSpec(text), v.window != nil, v.bounds.width > 0 || v.bounds.height > 0 else { return false }
+        v.isUserInteractionEnabled = false
+        v.superview?.bringSubviewToFront(v)   // out of the live children's order, so their insert indices stay right
+        let end = transitionState(v, spec.kind, entering: false)
+        spec.run({ v.transform = end.transform; v.alpha = end.alpha }, completion: { _ in v.removeFromSuperview() })
+        return true
+    }
+    /// A node's frame in absolute terms: its Yoga frame summed up the owner chain, so
+    /// a child of a parent that moved has moved too. Scrolling does not change Yoga
+    /// frames, so a scroll never counts as a move.
+    func yogaAbsoluteFrame(_ id: String) -> CGRect? {
+        guard let n = ynodes[id] else { return nil }
+        var x = CGFloat(YGNodeLayoutGetLeft(n)), y = CGFloat(YGNodeLayoutGetTop(n))
+        let w = CGFloat(YGNodeLayoutGetWidth(n)), h = CGFloat(YGNodeLayoutGetHeight(n))
+        var o = YGNodeGetOwner(n)
+        while let p = o { x += CGFloat(YGNodeLayoutGetLeft(p)); y += CGFloat(YGNodeLayoutGetTop(p)); o = YGNodeGetOwner(p) }
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+    /// After a layout pass: every view with a layout spec whose absolute frame changed
+    /// is placed at the new frame and moves there from the old one (translate and
+    /// scale back to identity). A view mounted this pass enters instead.
+    func runLayoutTransitions() {
+        if layoutSpec.isEmpty { return }
+        for (id, text) in layoutSpec {
+            guard let v = views[id], let fr = yogaAbsoluteFrame(id) else { continue }
+            let old = layoutLast[id]
+            layoutLast[id] = fr
+            guard let o = old, !needsFrame.contains(id), mBindings[id] == nil, o != fr, let spec = TransitionSpec(text) else { continue }
+            guard o.width > 0, o.height > 0, fr.width > 0, fr.height > 0 else { continue }
+            let sx = o.width / fr.width, sy = o.height / fr.height
+            let dx = o.midX - fr.midX, dy = o.midY - fr.midY
+            v.transform = CGAffineTransform(translationX: dx, y: dy).scaledBy(x: sx, y: sy)
+            spec.run({ v.transform = .identity })
         }
     }
 }

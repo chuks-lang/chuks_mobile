@@ -66,3 +66,52 @@ chuks_ensure_sim() {
     open -a Simulator --args -CurrentDeviceUDID "$UDID" >/dev/null 2>&1 || true
     return 0
 }
+
+# Entitlements for a simulator build. A simulator app needs no identity or profile,
+# but a capability that is an entitlement on a device is one here too: Sign in with
+# Apple answers error 1000 on the simulator exactly as on a phone whose App ID lacks
+# it. The simulator does not read entitlements from the signature (an app signed
+# with any lands as "Launch failed"); it reads them from two sections the linker
+# writes into the binary, the plist in __TEXT,__entitlements and its DER form in
+# __TEXT,__ents_der, which is what Xcode does for every simulator build. Every
+# entitlement the app asks for is granted, there being no profile to filter against,
+# and Info.plist says so. Prints the swiftc flags that link the sections; empty when
+# the app declares nothing. Reads SDKROOT, PROJDIR, OUT, APP, BID from the caller.
+chuks_ios_sim_entitlement_flags() {
+    local want ent_key ent_val extra="" team
+    rm -f "$OUT/sim.xcent" "$OUT/sim.der"   # a build that dropped a kind must not keep last time's
+    want="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" ios-entitlements 2>/dev/null)"
+    [ -n "$want" ] || return 0
+    # The identifier prefix is the team when the Mac has a development identity, the
+    # way Xcode writes it; the simulator does not check it against an App ID.
+    team="$(security find-certificate -c "Apple Development" -p 2>/dev/null | openssl x509 -noout -subject 2>/dev/null | sed -n 's/.*OU *= *\([A-Z0-9]*\).*/\1/p' | head -1)"
+    team="${team:-SIMULATOR}"
+    while IFS="$(printf '\t')" read -r ent_key ent_val; do
+        [ -n "$ent_key" ] || continue
+        extra="$extra  <key>$ent_key</key>$ent_val
+"
+    done <<WANTENT
+$want
+WANTENT
+    cat > "$OUT/sim.xcent" <<ENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>application-identifier</key><string>$team.$BID</string>
+$extra</dict></plist>
+ENT
+    xcrun derq query -f xml -i "$OUT/sim.xcent" -o "$OUT/sim.der" --raw 2>/dev/null || return 0
+    printf -- '-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements -Xlinker %s ' "$OUT/sim.xcent"
+    printf -- '-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __ents_der -Xlinker %s' "$OUT/sim.der"
+}
+
+# Record in Info.plist which entitlements a simulator build carries (see above), so
+# the host can tell "not signed for it" from "unavailable" the way it does on device.
+chuks_ios_sim_note_entitlements() {
+    [ -f "$OUT/sim.xcent" ] || return 0
+    plutil -replace ChuksGrantedEntitlements -json '[]' "$APP/Info.plist" >/dev/null 2>&1
+    sed -n 's/^  <key>\(.*\)<\/key>.*/\1/p' "$OUT/sim.xcent" | grep -v '^application-identifier$' | while read -r granted; do
+        [ -n "$granted" ] && plutil -insert ChuksGrantedEntitlements -string "$granted" -append "$APP/Info.plist" >/dev/null 2>&1
+    done
+    echo "   entitlements: $(sed -n 's/^  <key>\(.*\)<\/key>.*/\1/p' "$OUT/sim.xcent" | grep -v '^application-identifier$' | tr '\n' ' ')"
+}

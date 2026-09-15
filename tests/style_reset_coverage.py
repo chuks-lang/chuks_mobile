@@ -112,6 +112,18 @@ MANIFEST = {
     "mvis": (PERSISTENT, "modal visible (driven every render)"), "mpos": (PERSISTENT, "modal position"),
     "panc": (PERSISTENT, "popover anchor (with the popover)"), "pplc": (PERSISTENT, "popover placement (with the popover)"),
     "pgap": (PERSISTENT, "popover gap (with the popover)"), "parw": (PERSISTENT, "popover arrow (with the popover)"),
+    "shsnap": (PERSISTENT, "sheet snap points (with the sheet)"), "shidx": (PERSISTENT, "sheet index (with the sheet)"),
+    "shbd": (PERSISTENT, "sheet backdrop (with the sheet)"), "shptc": (PERSISTENT, "sheet pan-to-close (with the sheet)"),
+    "shhdl": (PERSISTENT, "sheet handle (with the sheet)"), "shkb": (PERSISTENT, "sheet keyboard behaviour (with the sheet)"),
+    # Shared values: bindings and sources are dropped in the reset block, re-applied by `mo`.
+    "mo": (RESET, "shared-value bindings: iOS motion.unbind(id) / Android motion.unbind(id) in the reset block"),
+    "mpx": (RESET, "pan feeds value (x): dropped with the gesture source reset"),
+    "mpy": (RESET, "pan feeds value (y): dropped with the gesture source reset"),
+    "msc": (RESET, "scroll feeds value: dropped with the scroll source reset"),
+    # Transitions: the specs are per-node state the host reads at mount, removal and layout.
+    "en": (RESET, "entering transition spec: cleared in the reset block"),
+    "ex": (RESET, "exiting transition spec: cleared in the reset block"),
+    "lt": (RESET, "layout transition spec: cleared in the reset block"),
     "swtc": (PERSISTENT, "switch thumb color (with the switch)"), "paging": (PERSISTENT, "scroll paging (with the scroll)"),
     "stick": (PERSISTENT, "scroll stick-bottom (with the scroll)"), "horiz": (PERSISTENT, "horizontal list (with the scroll)"),
     "dp": (PERSISTENT, "date-picker mode"), "dpd": (PERSISTENT, "date-picker display"),

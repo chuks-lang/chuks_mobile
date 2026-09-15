@@ -51,6 +51,20 @@ bash chuks_packages/@chuks/mobile/android/build.sh   # Android device / emulator
 The streamlined path — `chuks new <name> --template mobile` to scaffold a project, then
 project `chuks.json` scripts to build — is being wired up in the CLI.
 
+## Testing the framework
+
+From a checkout of this repository (a consumer's install does not carry `tests/`):
+
+```
+bash tests/run.sh                  # every tests/*_test.chuks, headless, plus the style-reset guard
+HOST_PARITY=1 bash tests/run.sh    # also tools/host-parity.sh: needs a booted simulator and a running emulator
+```
+
+Host parity renders the fixture screens in `tests/host` on both hosts and diffs the view
+trees: a platform frame that differs from the layout the engine computed, or a frame that
+differs between iOS and Android, fails. It is how a host that measures a scroll's content for
+itself, or wraps a label a line early, is caught before a phone is.
+
 ## Engines
 
 Your Chuks code is identical across both hosts. iOS renders through a UIKit host

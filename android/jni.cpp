@@ -14,6 +14,7 @@ extern "C" {
 // ---- engine ----
 JNIEXPORT void  JNICALL J(setup)(JNIEnv* e, jobject, jint n) { chuks_set_count(n); }
 JNIEXPORT jint  JNICALL J(mount)(JNIEnv* e, jobject) { return chuks_mount(); }
+JNIEXPORT jint  JNICALL J(remount)(JNIEnv* e, jobject) { return chuks_remount(); }
 JNIEXPORT jint  JNICALL J(tick)(JNIEnv* e, jobject) { return chuks_tick(); }
 JNIEXPORT jint  JNICALL J(viewport)(JNIEnv* e, jobject, jint t, jint h, jint w) { return chuks_setViewport(t, h, w); }
 JNIEXPORT jstring JNICALL J(drain)(JNIEnv* e, jobject) {
@@ -73,6 +74,13 @@ JNIEXPORT jint JNICALL J(fail)(JNIEnv* e, jobject, jstring tok, jstring msg) {
     return m;
 }
 JNIEXPORT void JNICALL J(setColorScheme)(JNIEnv*, jobject, jint dark) { chuks_setColorScheme(dark); }
+// The engine's local time zone. Go believes every Android process is in UTC;
+// the Activity passes the device zone before the engine boots (and on change).
+JNIEXPORT void JNICALL J(setTimezone)(JNIEnv* e, jobject, jstring id, jint offsetSeconds) {
+    const char* ci = e->GetStringUTFChars(id, 0);
+    chuks_set_timezone((char*)ci, offsetSeconds);
+    e->ReleaseStringUTFChars(id, ci);
+}
 JNIEXPORT jint JNICALL J(colorSchemeFollows)(JNIEnv*, jobject) { return chuks_colorSchemeFollows(); }
 JNIEXPORT void JNICALL J(setInsets)(JNIEnv*, jobject, jint t, jint r, jint b, jint l) { chuks_setInsets(t, r, b, l); }
 JNIEXPORT void JNICALL J(setPlatform)(JNIEnv* e, jobject, jstring os, jstring ver, jstring model, jint isTablet) {

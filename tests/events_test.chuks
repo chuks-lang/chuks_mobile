@@ -1,0 +1,72 @@
+// Every event is its own tag.
+//
+// A press binds on the node id (T|), a value change on "<id>:change" (TC|), and the
+// rest on "<id>:<event>". They coexist: a node may carry a press and a change at once
+// (a Gesture that is also tapped, a slider that is also pressed). Before this, one slot
+// held either onPress or onChange, so a Gesture with onPress lost its gesture stream.
+//
+// Run:  chuks run tests/events_test.chuks   (exits non-zero on failure)
+
+import { Node, Column, Text, TextInput, Slider, Select, Toggle, Gesture, Reconciler } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function lines(stream: string, prefix: string): []string {
+    var out: []string = []
+    for (var l of stream.split("\n")) { if (l.startsWith(prefix)) { out.push(l) } }
+    return out
+}
+function has(s: string, sub: string): bool { return s.indexOf(sub) >= 0 }
+
+function main(): void {
+    println("events: a press and a change on one node")
+    var pressed: int = 0
+    var changed: string = ""
+    const r: Reconciler = new Reconciler(); r.drain()
+    const tree: function(withPress: bool): Node = function(withPress: bool): Node {
+        return Column({}, [
+            Slider({ min: 0, max: 10, value: 3, onChange: function(v: string): void { changed = v },
+                     onPress: withPress ? function(): void { pressed = pressed + 1 } : null }),
+        ])
+    }
+    r.renderRoot(tree(true))
+    const first: string = r.drain()
+    check(lines(first, "T|app.0|app.0").length == 1, "the press binds on the node id")
+    check(lines(first, "TC|app.0").length == 1, "the change binds as its own op")
+    r.fire("app.0"); r.fireValue("app.0:change", "7")
+    check(pressed == 1 && changed == "7", "both closures are reachable, each through its own tag (pressed " + string(pressed) + ", changed " + changed + ")")
+
+    println("events: bindings follow the props across renders")
+    r.renderRoot(tree(false))
+    const second: string = r.drain()
+    check(lines(second, "T|app.0|").length == 1, "losing the press re-emits the press tag as empty (" + lines(second, "T|app.0|").join(" ") + ")")
+    r.fire("app.0"); check(pressed == 1, "and the dropped press no longer fires")
+    r.fireValue("app.0:change", "9"); check(changed == "9", "while the change still does")
+    r.renderRoot(tree(true))
+    const third: string = r.drain()
+    check(has(third, "T|app.0|app.0") && lines(third, "TC|").length == 0, "regaining the press re-emits it; an unchanged change binding emits nothing")
+
+    println("events: the value controls bind a change, a Toggle a press")
+    const r2: Reconciler = new Reconciler(); r2.drain()
+    r2.renderRoot(Column({}, [
+        TextInput({ value: "", onChange: function(v: string): void { } }),
+        Select({ value: 0, onChange: function(v: string): void { } }, ["a", "b"]),
+        Toggle({ on: false, onPress: function(): void { } }),
+        Gesture({ onPress: function(): void { }, onGesture: function(g: string): void { } }, [ Text({}, "g") ]),
+    ]))
+    const w: string = r2.drain()
+    check(has(w, "TC|app.0") && !has(w, "T|app.0|"), "a TextInput binds a change and no press")
+    check(has(w, "TC|app.1") && !has(w, "T|app.1|"), "a Select binds a change and no press")
+    check(has(w, "T|app.2|app.2") && !has(w, "TC|app.2"), "a Toggle binds a press and no change")
+    check(has(w, "T|app.3|app.3") && !has(w, "TC|app.3"), "a Gesture's press is a press; its stream is its own event, not a binding")
+
+    println("")
+    println("events: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("events tests failed") }
+}
+
+main();

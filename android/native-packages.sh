@@ -17,6 +17,14 @@
 # Callers must have SDKROOT, PROJDIR, PKGDIR, AJAR and OUT set. Sets PKG_KT, KT_SRC and
 # KT_CP, and writes $OUT/ChuksPackageModules.kt and $OUT/ChuksBuild.kt.
 
+# The identity of a build's code: a hash over every Chuks source under the project (the
+# app and its installed packages), by path and content. Two builds of the same sources
+# share it; any edit changes it. Used to keep a previous build's saved state from being
+# restored into code it was not written for.
+chuks_build_id() {
+    (cd "$1" && find . -type f -name '*.chuks' -not -path '*/node_modules/*' -not -path './.chuks/cache/*' -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | cut -c1-16)
+}
+
 chuks_android_native_packages() {
 PKG_KT="$(chuks run "$SDKROOT/appconfig.chuks" "$PROJDIR" mobile-sources android 2>/dev/null | tr '\n' ' ')"
 {
@@ -72,8 +80,9 @@ chuks_capability_check() {
 #
 # `AJ` (app.json reader) must be defined by the caller, as both build scripts do.
 chuks_android_kotlin_sources() {
-    local restore_window
+    local restore_window build_id
     restore_window="$(AJ state-restore-window)"; [ -n "$restore_window" ] || restore_window=1800
+    build_id="$(chuks_build_id "$PROJDIR")"
     # Build-time constants from app.json. Generated rather than read at runtime because
     # the host needs them before anything is mounted.
     cat > "$OUT/ChuksBuild.kt" <<KTB
@@ -81,6 +90,9 @@ chuks_android_kotlin_sources() {
 package com.chuks.app
 object ChuksBuild {
     const val STATE_RESTORE_WINDOW = $restore_window
+    // A hash of every Chuks source this build compiled. Saved state is restored only by
+    // the build that wrote it (see restoreStateIfAppropriate).
+    const val BUILD_ID = "$build_id"
 }
 KTB
     KT_SRC="$OUT/ChuksBuild.kt $PKGDIR/MainActivity.kt $PKGDIR/ChuksEffects.kt $PKGDIR/ChuksModule.kt $PKGDIR/ChuksJobService.kt $PKGDIR/ChuksLocationService.kt $PKGDIR/ChuksNotifications.kt $PKGDIR/ChuksAudio.kt $PKGDIR/ChuksFiles.kt $PKGDIR/ChuksGeo.kt $PKGDIR/ChuksContacts.kt $PKGDIR/ChuksCalendar.kt $PKGDIR/ChuksFileProvider.kt $PKGDIR/ChuksClipboard.kt $PKGDIR/ChuksSpeech.kt $PKGDIR/ChuksRecorder.kt $PKGDIR/ChuksMedia.kt $PKGDIR/ChuksSecure.kt $PKGDIR/ChuksWire.kt $OUT/ChuksPackageModules.kt $PKG_KT"

@@ -112,10 +112,12 @@ source "$PKGDIR/native-packages.sh"
 chuks_ios_native_packages
 chuks_capability_check
 
+# A simulator build links its entitlements in (simulator.sh); a device build signs them.
+SIM_ENT_FLAGS=""; [ "$IOS_TARGET" = "device" ] || SIM_ENT_FLAGS="$(chuks_ios_sim_entitlement_flags)"
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" "$PKGDIR/ChuksModule.swift" "$OUT/ChuksPackageModules.swift" $PKG_SRC $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
     "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
-    -Xclang-linker -Wno-incompatible-sysroot \
+    -Xclang-linker -Wno-incompatible-sysroot $SIM_ENT_FLAGS \
     -framework UIKit -framework Foundation $PREVIEW_FW -parse-as-library $SWIFT_OPT $SAN_FLAG $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
     -o "$OUT/$APPNAME"
 
@@ -150,6 +152,9 @@ ICON_SRC="$APP_ICON"
 # refuses to run one at all without the matching UIBackgroundModes. Both come from the
 # app.json list, so an app declares its tasks once.
 RESTORE_WINDOW="$(AJ state-restore-window)"; [ -n "$RESTORE_WINDOW" ] || RESTORE_WINDOW=1800
+# The identity of this build's code (see android/native-packages.sh chuks_build_id): saved
+# state is restored only by the build that wrote it.
+BUILD_ID="$(cd "$PROJDIR" && find . -type f -name '*.chuks' -not -path '*/node_modules/*' -not -path './.chuks/cache/*' -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | cut -c1-16)"
 BGTASK_PLIST=""
 BG_IDS="$(AJ background-tasks)"
 if [ -n "$BG_IDS" ]; then
@@ -177,7 +182,7 @@ else
 fi
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
 FONT_PLIST=""
-for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do
+for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" \( -name "*.ttf" -o -name "*.otf" \) 2>/dev/null); do
     bn="$(basename "$f")"; cp "$f" "$APP/$bn"; FONT_PLIST="$FONT_PLIST<string>$bn</string>"
 done
 # Media assets keep their path relative to assets/ (organize in subfolders, reference
@@ -197,6 +202,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$APP_BUILD</string>
   <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
   <key>LSRequiresIPhoneOS</key><true/>
+  <key>CADisableMinimumFrameDurationOnPhone</key><true/>
   <key>MinimumOSVersion</key><string>15.0</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
   <key>NSLocalNetworkUsageDescription</key><string>Chuks dev-server hot reload.</string>
@@ -210,6 +216,7 @@ $IOS_PLIST_EXTRA
   </array>
   <key>UILaunchScreen</key><dict/>
   <key>ChuksStateRestoreWindow</key><integer>$RESTORE_WINDOW</integer>
+  <key>ChuksBuildId</key><string>$BUILD_ID</string>
 $BGTASK_PLIST
   $ICONNAME_PLIST
   <key>UIAppFonts</key><array>$FONT_PLIST</array>
@@ -306,6 +313,7 @@ if [ "$IOS_TARGET" = "device" ]; then
     chuks_ios_install_device
 else
     chuks_ensure_sim || exit 1
+    chuks_ios_sim_note_entitlements
     echo "5. Installing + launching"
     xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
     xcrun simctl install "$UDID" "$APP"

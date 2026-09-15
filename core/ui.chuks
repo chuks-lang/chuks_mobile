@@ -8,12 +8,13 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, hookPark, runEffects, serializeCells, restoreCells, isDirty, clearDirty, markDirty, useState, Cell } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, Cell } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
 import { Prop } from "./prop.chuks";
 import { tw } from "./tw.chuks";
+import { syncSystemTheme } from "./theme.chuks";   // the OS appearance drives the theme (see App.setColorScheme)
 import { json } from "std/json";   // route params ride the hot-reload snapshot
 import { Channel } from "std/channel";   // awaited capabilities park on one of these
 import { time } from "std/time";
@@ -149,6 +150,24 @@ export class Style {
     var pPlace: string      // "auto" | "top" | "bottom" | "left" | "right"
     var pGap: int           // points between the anchor and the content (-1 = default 8)
     var pArrow: int         // 1 = draw an arrow pointing at the anchor (-1 = none)
+    // Sheet: a host-driven bottom sheet with snap points. All re-sent while the node is a
+    // Sheet (they describe the sheet, not a frame), so the host always has the whole spec.
+    var shSnap: string      // snap points, comma-joined: "25p" (percent), "320" (points), "c" (content)
+    var shIdx: int          // current snap index; -1 = closed (-2 = not a Sheet)
+    var shBackdrop: int     // 1 = scrim behind, dismiss on tap; 0 = persistent, the app stays interactive
+    var shPanClose: int     // 1 = dragging below the lowest point closes
+    var shHandle: int       // 1 = draw the grab handle
+    var shKeyboard: string  // "" | "interactive" | "extend" | "fillParent"
+    // Shared values (core/motion.chuks): props the host drives from values it holds.
+    var mBind: string       // "prop:expr|prop:expr" bindings on this node ("" = none)
+    var mPanX: int          // a Gesture's pan feeds this value id with its x (-1 = none)
+    var mPanY: int          // ... and this one with its y
+    var mScroll: int        // a Scroll/List feeds this value id with its offset (-1 = none)
+    // Transitions (host-run): how a node arrives, leaves, and moves. Specs like
+    // "fade", "slide-up 300", "zoom 250 out", "spring"; "" = none.
+    var enter: string
+    var exit: string
+    var lay: string
     constructor() {
         this.dir = ""; this.just = ""; this.align = ""
         this.grow = -1; this.basis = -1; this.w = -1; this.h = -1; this.pad = -1; this.padX = -1; this.padY = -1; this.gap = -1
@@ -180,6 +199,9 @@ export class Style {
         this.selectable = -1; this.hitSlop = -1; this.spinner = -1
         this.a11yLabel = ""; this.a11yHint = ""; this.a11yRole = ""; this.a11yState = ""; this.a11yHidden = -1; this.a11yLive = ""
         this.pAnchor = ""; this.pPlace = ""; this.pGap = -1; this.pArrow = -1
+        this.shSnap = ""; this.shIdx = -2; this.shBackdrop = -1; this.shPanClose = -1; this.shHandle = -1; this.shKeyboard = ""
+        this.mBind = ""; this.mPanX = -1; this.mPanY = -1; this.mScroll = -1
+        this.enter = ""; this.exit = ""; this.lay = ""
     }
     // Serialize the set fields into the host's compact "k=v;" style string. Only
     // non-default fields are emitted, so unchanged styles diff to nothing.
@@ -309,6 +331,20 @@ export class Style {
         if (this.pPlace != "") { s = s + "pplc=" + this.pPlace + ";" }
         if (this.pGap >= 0) { s = s + "pgap=" + string(this.pGap) + ";" }
         if (this.pArrow >= 0) { s = s + "parw=" + string(this.pArrow) + ";" }
+        if (this.shIdx >= -1) {
+            s = s + "shsnap=" + this.shSnap + ";" + "shidx=" + string(this.shIdx) + ";"
+            if (this.shBackdrop >= 0) { s = s + "shbd=" + string(this.shBackdrop) + ";" }
+            if (this.shPanClose >= 0) { s = s + "shptc=" + string(this.shPanClose) + ";" }
+            if (this.shHandle >= 0) { s = s + "shhdl=" + string(this.shHandle) + ";" }
+            if (this.shKeyboard != "") { s = s + "shkb=" + this.shKeyboard + ";" }
+        }
+        if (this.mBind != "") { s = s + "mo=" + styleEsc(this.mBind) + ";" }
+        if (this.mPanX >= 0) { s = s + "mpx=" + string(this.mPanX) + ";" }
+        if (this.mPanY >= 0) { s = s + "mpy=" + string(this.mPanY) + ";" }
+        if (this.mScroll >= 0) { s = s + "msc=" + string(this.mScroll) + ";" }
+        if (this.enter != "") { s = s + "en=" + styleEsc(this.enter) + ";" }
+        if (this.exit != "") { s = s + "ex=" + styleEsc(this.exit) + ";" }
+        if (this.lay != "") { s = s + "lt=" + styleEsc(this.lay) + ";" }
         if (this.slval >= 0) {                       // a Slider: RANGE before value, so the host sets
             s = s + "slmin=" + string(this.slmin) + ";"   // min/max first — else UISlider clamps the
             s = s + "slmax=" + string(this.slmax) + ";"   // value to its default max (1.0) on first mount.
@@ -344,7 +380,11 @@ export class Node {
     var kids: []Node
     var comp: any        // kind=="Comp": the component render fn () -> Node (lazy)
     var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
+    var hookKeys: []string   // kind=="Comp": the cells and effects its last run touched (kept alive when it is skipped)
     var ckey: string     // explicit identity key (.key(...)); "" = identify by position
+    var ctxTop: int      // kind=="Comp": the inset context it was built in (consumed top,
+    var ctxOverlay: int  //   floating-bar bottom), restored around its render: a lazy
+                         //   component inside a tab sees the tab's insets, not the window's
     // Controlled TextInput: `hasVal` marks the field controlled, `val` is its text.
     // onSubmit/onFocus/onBlur are the extra input events (kept `any` like onPress).
     var hasVal: bool
@@ -385,7 +425,8 @@ export class Node {
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
-        this.comp = null; this.produced = null; this.ckey = ""
+        this.comp = null; this.produced = null; this.ckey = ""; var hk: []string = []; this.hookKeys = hk
+        this.ctxTop = 0; this.ctxOverlay = 0
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
         this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
@@ -480,6 +521,8 @@ function mkModal(style: Style, kids: []Node): Node { return new Node("Modal", st
 // Build a popover node: an overlay like a Modal, whose content the host places beside the
 // anchor node named in the style (measured at layout time), flipping to fit the screen.
 function mkPopover(style: Style, kids: []Node): Node { return new Node("Popover", style, "", kids) }
+// Build a sheet node: an overlay the host drives between snap points with the finger.
+function mkSheet(style: Style, kids: []Node): Node { return new Node("Sheet", style, "", kids) }
 // Build an alert node: the host presents a NATIVE alert when avis=1. Title / message /
 // button labels ride the text field (tab-joined). Renders nothing inline.
 function mkAlert(style: Style, joined: string): Node { return new Node("Alert", style, joined, []) }
@@ -530,6 +573,41 @@ var _consumedTop: int = 0
 // Framework-internal: nested navigators bracket a screen's render with this.
 export function setConsumedTop(v: int): void { _consumedTop = v }
 export function consumedTop(): int { return _consumedTop }
+
+// A bar floating over the BOTTOM of the screen (a glass tab bar), in points. The other
+// half of the same idea: chrome that overlaps a screen is the screen's business to clear,
+// and the screen should not have to know the chrome exists. Every vertical Scroll, List
+// and SectionList keeps its last item clear of this on its own, so a page that just fits
+// the window still scrolls the last card out from under the bar (the Goals screen of an
+// app forgot to pad and its "Personal bests" lived under the bar, on every phone, until
+// someone noticed). Only a floating bar sets it; a bar in flow leaves it at 0.
+var _overlayBottom: int = 0
+// Framework-internal: a navigator whose bar floats brackets a screen's render with this.
+export function setOverlayBottom(v: int): void { _overlayBottom = v }
+/**
+ * How far a floating bar reaches up from the bottom of this screen, in points; 0 when
+ * nothing floats there. Scroll and List clear it for their content on their own. A
+ * screen that pins something to its bottom edge in flow (a Column with a button at the
+ * end) pads by this itself, the way it pads by safeBottom() at the window's edge.
+ */
+export function overlayBottom(): int { return _overlayBottom }
+// Run a component under the insets it was placed under, whatever is current when it
+// happens to run: a lazy component runs after its navigator's bracket has closed, and
+// without this it would see the window's insets instead of its tab's. The one path
+// for a first mount and a re-run alike.
+function renderInContext(n: Node): Node {
+    const pt: int = _consumedTop; const po: int = _overlayBottom
+    _consumedTop = n.ctxTop; _overlayBottom = n.ctxOverlay
+    const produced: Node = n.render()
+    _consumedTop = pt; _overlayBottom = po
+    return produced
+}
+// A subtree's own bottom padding, as the props gave it: pb, else py, else pad, else 0.
+function ownPadB(st: Style): int {
+    if (st.padB >= 0) { return st.padB }
+    if (st.padY >= 0) { return st.padY }
+    return st.pad >= 0 ? st.pad : 0
+}
 
 /**
  * The top safe-area inset to start below: the notch or status bar, in points, minus
@@ -664,7 +742,123 @@ function applyMediaEvents(n: Node, p: map[string]Prop): void {
 // caller imports nothing but the component. Inside, a builder hands the props
 // (as `any`) to the shared applyLayoutV/applyEventsV, which read fields BY KEY (a
 // dataType is map-backed), so one pair of helpers serves every typed builder.
+// ---- shared values: motion the host drives ---------------------------------
+// A shared value is a number that lives on the host. The app declares once what feeds
+// it (a pan, a scroll, the keyboard, or the app through set/spring/timing/decay) and
+// which props read it (the `motion` prop, an expression per prop); the host then moves
+// the views every frame without the engine. The API an app uses is core/motion.chuks
+// (useSharedValue, interpolate, clamp, ...); the types live here because LayoutProps
+// names them. See docs/shared-values.md.
+
+/**
+ * An expression the host evaluates each frame: a shared value, a constant, or an
+ * operation over other expressions. Build them with the functions in
+ * core/motion.chuks (`interpolate`, `clamp`, `add`, ...); a SharedValue is one too.
+ */
+export class Expr {
+    var s: string           // the host's prefix text: "v3", "12.5", "i(v3,0,120,100,60,c)"
+    constructor(s: string) { this.s = s }
+    public str(): string { return this.s }
+}
+// Lines for the host that belong to no node (MV| create a value, MS| set one, MX|
+// drop one). Queued here and emitted ahead of the next frame's diff, so a value
+// exists before a style line names it.
+var _hostOps: []string = []
+/** Queue a host line for the next frame. Framework use. A host op is not app state:
+ * it goes out with the next batch (a render's, or on its own from a tick or a value
+ * event) without making the app re-render. */
+export function queueHostOp(line: string): void { _hostOps.push(line); host.wake() }
+// Handlers for events that belong to no node (a shared value's end/settle). Looked up
+// when a node handler is not found for the tag.
+var _hostHandlers: map[string]any = {}
+/** Bind a closure to a host event tag that is not a node's. Framework use. */
+export function registerHostHandler(tag: string, fn: any): void { _hostHandlers[tag] = fn }
+var _nextSharedId: int = 1
+/**
+ * A number the host holds and moves. Make one with `useSharedValue(initial)` from
+ * core/motion.chuks (it keeps its identity across renders); feed it from a
+ * `Gesture({ panX, panY })`, a `Scroll({ scrollValue })`, or from the app with
+ * `set` / `spring` / `timing` / `decay`; read it from a prop through `motion`.
+ *
+ * ```chuks
+ * const y: SharedValue = useSharedValue(0)
+ * Gesture({ panY: y, onPanEnd: function(): void { y.spring(0) } }, [
+ *     Row({ motion: { ty: y, opacity: interpolate(y, [0, 200], [100, 40]) } }, [ card ]),
+ * ])
+ * ```
+ */
+export class SharedValue extends Expr {
+    var id: int
+    var last: float          // the value the host last reported (a gesture's end, a settle)
+    constructor(initial: float) {
+        super("v" + string(_nextSharedId))
+        this.id = _nextSharedId; _nextSharedId = _nextSharedId + 1
+        this.last = initial
+        queueHostOp("MV|" + string(this.id) + "|" + string(initial))
+    }
+    /** The value the host last reported. Not a live read: bind a prop instead of rendering this. */
+    public latest(): float { return this.last }
+    /** Jump to `v` now. */
+    public set(v: float): void { this.last = v; queueHostOp("MS|" + string(this.id) + "|" + string(v) + "|") }
+    /** Spring to `to`. `velocity` is where it starts from (a gesture's, usually), units per second. */
+    public spring(to: float, velocity: float = 0.0, stiffness: float = 180.0, damping: float = 22.0): void {
+        queueHostOp("MS|" + string(this.id) + "|" + string(to) + "|sp:" + string(stiffness) + "," + string(damping) + "," + string(velocity))
+    }
+    /** Ease to `to` over `ms` milliseconds. `easing`: "ease" (default), "linear", "in", "out". */
+    public timing(to: float, ms: int, easing: string = "ease"): void {
+        queueHostOp("MS|" + string(this.id) + "|" + string(to) + "|tm:" + string(ms) + "," + easing)
+    }
+    /** Coast from `velocity` (units per second) to a stop, kept inside [lo, hi] with a rubber band. */
+    public decay(velocity: float, lo: float = -1000000.0, hi: float = 1000000.0): void {
+        queueHostOp("MS|" + string(this.id) + "|" + string(this.last) + "|dc:" + string(velocity) + "," + string(lo) + "," + string(hi))
+    }
+    /** Called when a gesture that fed this value lets go, with the value and its velocity (units per second). */
+    public onEnd(fn: function(value: float, velocity: float): void): void {
+        const sv: SharedValue = this
+        registerHostHandler("mv" + string(this.id) + ":end", function(v: string): void {
+            const parts: []string = v.split(",")
+            const value: float = float(parts[0]); const vel: float = parts.length > 1 ? float(parts[1]) : 0.0
+            sv.last = value; fn(value, vel)
+        })
+    }
+    /** Called when a host animation on this value (spring, timing, decay) comes to rest. */
+    public onSettle(fn: function(value: float): void): void {
+        const sv: SharedValue = this
+        registerHostHandler("mv" + string(this.id) + ":settle", function(v: string): void { sv.last = float(v); fn(sv.last) })
+    }
+    /** Tell the host to forget this value. Called for you when the Comp that made it unmounts. */
+    public drop(): void { queueHostOp("MX|" + string(this.id)) }
+}
+/**
+ * The props a node reads from shared values, one expression each. Paint props (tx,
+ * ty, scale, rotate, opacity) are set on the view directly; layout props (w, h, pt,
+ * pr, pb, pl, top, left) are set on the layout node and the tree is laid out again
+ * that frame. Units are the prop's own: points, percent for opacity and scale, degrees.
+ */
+export dataType MotionBindings {
+    tx: Expr?, ty: Expr?, scale: Expr?, rotate: Expr?, opacity: Expr?,
+    w: Expr?, h: Expr?, pt: Expr?, pr: Expr?, pb: Expr?, pl: Expr?, top: Expr?, left: Expr?,
+}
+var MOTION_PROPS: []string = ["tx", "ty", "scale", "rotate", "opacity", "w", "h", "pt", "pr", "pb", "pl", "top", "left"]
+// Encode a MotionBindings record as the host's "prop:expr|prop:expr" text.
+function encodeMotion(m: any): string {
+    var parts: []string = []
+    for (var k of MOTION_PROPS) {
+        const e: any = m[k]
+        if (e != null) { const ex: Expr = e; parts.push(k + ":" + ex.str()) }
+    }
+    return parts.join("|")
+}
+
 export dataType LayoutProps {
+    motion: MotionBindings?;
+    // Transitions the host runs: `entering` when the view mounts, `exiting` when it
+    // leaves (the view stays until the animation ends), `layout` when its frame moves
+    // or resizes (from where it was to where it is). A spec is a kind and, optionally,
+    // a duration in ms, an easing and a delay: "fade", "slide-up 300", "zoom 250 out",
+    // "slide-left 300 ease 100". Kinds: fade, slide-up, slide-down, slide-left,
+    // slide-right, zoom; for `layout`: ease (default), spring, linear.
+    entering: string?; exiting: string?; layout: string?;
     gap: int?; pad: int?; px: int?; py: int?; w: int?; h: int?; grow: int?; basis: int?; radius: int?;
     align: string?; justify: string?; bg: string?; color: string?; size: int?;
     weight: string?; ta: string?; abs: bool?; top: int?; left: int?; right: int?;
@@ -675,7 +869,9 @@ export dataType LayoutProps {
     scale: int?; anim: int?; easing: string?; tw: string?;
     // Per-side padding + margins (px/py are the axes; pt/pr/pb/pl are the sides).
     pt: int?; pr: int?; pb: int?; pl: int?; mt: int?; mr: int?; mb: int?; ml: int?;
-    // Min/max size, percentage size, bottom offset, z-index, aspect ratio.
+    // Min/max size, percentage size (wpct/hpct: 0..100 of the parent), bottom offset,
+    // z-index, and the aspect ratio as width over height times 100 (100 is square,
+    // 178 is 16:9; the `tw` classes aspect-square and aspect-video set these).
     minw: int?; maxw: int?; minh: int?; maxh: int?; wpct: int?; hpct: int?; bottom: int?; z: int?; aspect: int?;
     // Per-corner radius.
     rtl: int?; rtr: int?; rbr: int?; rbl: int?;
@@ -727,6 +923,8 @@ export function pvF(p: any, k: string, d: float): float { const v: any = p[k]; r
 // props override it), then every layout field by key. Serves all typed builders.
 function applyLayoutV(s: Style, p: any): void {
     const tws: any = p["tw"]; if (tws != null) { applyLayout(s, tw(string(tws))) }
+    const mo: any = p["motion"]; if (mo != null) { s.mBind = encodeMotion(mo) }
+    s.enter = pvS(p, "entering", s.enter); s.exit = pvS(p, "exiting", s.exit); s.lay = pvS(p, "layout", s.lay)
     s.gap = pvI(p, "gap", s.gap)
     s.pad = pvI(p, "pad", s.pad)
     s.padX = pvI(p, "px", s.padX)
@@ -1512,12 +1710,25 @@ export function Blur(p: BlurProps, kids: []Kid = []): Node {
 dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
     onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
+    scrollValue: SharedValue?;   // the host feeds this with the offset along the scroll axis, in points, every scroll frame
 }
 // Android's ScrollView holds exactly ONE direct child; a Chuks Scroll may take several
 // (iOS UIScrollView allows many). Wrap multiple children in a single content container
 // (like RN's contentContainer) so the host never gets >1 direct scroll child and can't
 // crash. A single child (the common Scroll([Column([...])]) pattern) passes through
 // unchanged, so existing screens and the List windowing path are untouched.
+// Clear a floating bar (overlayBottom): a vertical scroll's content ends above it. One
+// child keeps its own bottom padding when that already clears the bar, so an app that
+// padded by tabBarHeight() is not padded twice; several children share a wrapper, and
+// the wrapper pads. Nothing to do when nothing floats.
+function clearOverlay(content: []Node, kidCount: int, horizontal: bool): []Node {
+    const ob: int = _overlayBottom
+    if (horizontal || ob <= 0 || content.length != 1) { return content }
+    const c: Node = content[0]
+    if (kidCount > 1) { c.style.padB = ob }
+    else if (ownPadB(c.style) < ob) { c.style.padB = ob }
+    return content
+}
 function scrollContent(kids: []Node, horizontal: bool): []Node {
     if (kids.length <= 1) { return kids }
     const cs: Style = new Style(); cs.dir = horizontal ? "row" : "col"
@@ -1551,7 +1762,7 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     if (typeof(first) == "array") {
         const c: []Kid = first
         const s0: Style = new Style(); s0.dir = "col"; s0.grow = 1; s0.basis = 0
-        return new Node("Scroll", s0, "", scrollContent(flatKids(c), false))
+        return new Node("Scroll", s0, "", clearOverlay(scrollContent(flatKids(c), false), c.length, false))
     }
     const p: ScrollProps = first  // narrowed to the dataType arm: typed field access below
     // horizontal: a carousel of MIXED content (left-to-right). Renders the host's
@@ -1560,7 +1771,13 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     const horizontal: bool = p.horizontal ?? false
     const s: Style = new Style()
     if (horizontal) { s.dir = "row"; s.horiz = 1 } else { s.dir = "col" }
-    s.grow = 1; s.basis = 0
+    // A scroll fills the space it is given: grow 1 from a basis of 0. Unless it was given
+    // a size of its own: a basis of 0 makes the layout ignore an explicit height, so a
+    // carousel asked for `h: 160` in a column would fill the column instead. An
+    // explicit h (or w, for a carousel in a row) is the size; the fill default stands
+    // down, and a `grow` the caller passes still applies below.
+    const sized: bool = p.h != null || (horizontal && p.w != null)
+    if (!sized) { s.grow = 1; s.basis = 0 }
     // paging: snap one full screen per swipe (a carousel / onboarding pager). Works on both
     // axes; combine with `horizontal` for a left-to-right paged carousel.
     if (p.paging ?? false) { s.paging = 1 }
@@ -1574,7 +1791,8 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
     // scrolled up to read history.
     if (!horizontal && (p.stickBottom ?? false)) { s.stick = 1 }
-    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", scrollContent(flatKids(kids), horizontal))
+    const svs: any = p["scrollValue"]; if (svs != null) { const sv: SharedValue = svs; s.mScroll = sv.id }
+    const n: Node = new Node(horizontal ? "HScroll" : "Scroll", s, "", clearOverlay(scrollContent(flatKids(kids), horizontal), kids.length, horizontal))
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
@@ -1754,6 +1972,63 @@ export function Popover(p: PopoverProps, kids: []Kid): Node {
     if (od != null) { n.onPress = od }
     return n
 }
+dataType SheetProps {
+    ViewProps; snapPoints: []string; index: int; onChange: (function(i: int): void)?;
+    backdrop: bool?; panToClose: bool?; handle: bool?; keyboard: string?; ref: ViewRef?;
+}
+/**
+ * A bottom sheet with snap points, driven by the finger on the host. `snapPoints` are
+ * heights, lowest first: a percent of the screen ("25%", "90%"), points ("320"), or
+ * "content" (as tall as the children). `index` is the snap point the sheet sits at
+ * (-1 = closed) and is yours: the host reports every settle through `onChange`, the
+ * app stores it, and the sheet is where the app says. A drag settles on the nearest
+ * point by distance and velocity; below the lowest it closes when `panToClose` (the
+ * default). `backdrop` (default true) puts a scrim behind and a tap on it closes;
+ * `backdrop: false` is a persistent sheet, a map's panel, with the app under it live.
+ * A Scroll inside hands off: the sheet moves until it is at its highest point, then the
+ * list scrolls, and pulling the list past its top moves the sheet again.
+ *
+ * `keyboard`: "interactive" (default) lifts the sheet with the keyboard, "extend"
+ * raises it to its highest point, "fillParent" to the screen.
+ *
+ * Commands through `ref`: `snapTo({ index })`, `expand()`, `collapse()`, `close()`.
+ *
+ * ```chuks
+ * Sheet({ snapPoints: ["25%", "60%", "90%"], index: at.get(),
+ *         onChange: function(i: int): void { at.set(i) } }, [
+ *     Scroll({ grow: 1 }, [ ...rows ]),
+ * ])
+ * ```
+ */
+export function Sheet(p: SheetProps, kids: []Kid): Node {
+    const s: Style = new Style()
+    var enc: []string = []
+    for (var pt of p.snapPoints) {
+        if (pt == "content") { enc.push("c") }
+        else if (pt.endsWith("%")) { enc.push(pt.slice(0, pt.length - 1) + "p") }
+        else { enc.push(pt) }
+    }
+    s.shSnap = enc.join(",")
+    s.shIdx = p.index < -1 ? -1 : p.index
+    s.shBackdrop = pvB(p, "backdrop", true) ? 1 : 0
+    s.shPanClose = pvB(p, "panToClose", true) ? 1 : 0
+    s.shHandle = pvB(p, "handle", true) ? 1 : 0
+    s.shKeyboard = pvS(p, "keyboard", "interactive")
+    applyLayoutV(s, p)
+    const n: Node = mkSheet(s, flatKids(kids))
+    const oc: any = p["onChange"]
+    if (oc != null) { n.events["change"] = function(v: string): void { oc(int(v)) } }
+    const rf: any = p["ref"]; if (rf != null) { n.ref = rf }
+    return n
+}
+/** Ask a Sheet to settle at snap point `index`. */
+export function sheetSnapTo(r: ViewRef, index: int): void { r.command("snapTo", { index: index }) }
+/** Ask a Sheet to open to its highest point. */
+export function sheetExpand(r: ViewRef): void { r.command("expand") }
+/** Ask a Sheet to settle at its lowest point. */
+export function sheetCollapse(r: ViewRef): void { r.command("collapse") }
+/** Ask a Sheet to close. The settle is reported through `onChange(-1)`. */
+export function sheetClose(r: ViewRef): void { r.command("close") }
 dataType AlertProps {
     visible: bool?; title: string?; message: string?;
     confirmText: string?; cancelText: string?; destructive: bool?;
@@ -2174,6 +2449,10 @@ dataType GestureProps {
     ViewProps;
     onGesture: (function(v: string): void)?; onPan: (function(v: string): void)?;
     onPinch: (function(v: string): void)?; onRotate: (function(v: string): void)?;
+    // Shared values the host feeds with the pan directly, with no per-move event: each
+    // gets its value at the start of the gesture plus the finger's travel. Use
+    // `panX.onEnd` / `panY.onEnd` (value, velocity) to decide what happens on release.
+    panX: SharedValue?; panY: SharedValue?;
 }
 /**
  * Recognizes gestures beyond a tap on its children and reports them through one
@@ -2195,6 +2474,7 @@ export function Gesture(first: GestureProps | []Kid, kids: []Kid = []): Node {
     const s: Style = new Style()
     applyLayoutV(s, p)
     const n: Node = new Node("Gesture", s, "", flatKids(kids))
+    applyEventsV(n, p)   // onPress and the other view events: a Gesture is a view too
     const og: any = p["onGesture"]      // discrete: swipe/doubletap/longpress
     const onPan: any = p["onPan"]        // continuous, each a function(v: string): void
     const onPinch: any = p["onPinch"]
@@ -2203,15 +2483,20 @@ export function Gesture(first: GestureProps | []Kid, kids: []Kid = []): Node {
     // Attaching only the requested ones avoids fighting a Scroll and skips the discrete
     // swipe recognizer when pan is on (they both track drags).
     var cont: string = ""
-    if (onPan != null) { cont = cont == "" ? "pan" : cont + ",pan" }
+    const px: any = p["panX"]; const py: any = p["panY"]
+    if (px != null) { const sv: SharedValue = px; s.mPanX = sv.id }
+    if (py != null) { const sv: SharedValue = py; s.mPanY = sv.id }
+    if (onPan != null || px != null || py != null) { cont = cont == "" ? "pan" : cont + ",pan" }
     if (onPinch != null) { cont = cont == "" ? "pinch" : cont + ",pinch" }
     if (onRotate != null) { cont = cont == "" ? "rotate" : cont + ",rotate" }
     n.text = cont
     // One value-channel binding routes every gesture string by its prefix to the right
     // callback. Continuous streams ("pan:..."/"pinch:..."/"rotate:...") and discrete
     // ("swipe:left"/"doubletap"/"longpress") all arrive here.
+    // Its own event ("<id>:gesture", which the hosts dispatch by convention), so a
+    // Gesture may also take onPress like any view: the node's press binding stays a press.
     if (og != null || onPan != null || onPinch != null || onRotate != null) {
-        n.onChange = function(v: string): void {
+        n.events["gesture"] = function(v: string): void {
             if (_prefix(v, "pan:")) { _callStr(onPan, v) }
             else if (_prefix(v, "pinch:")) { _callStr(onPinch, v) }
             else if (_prefix(v, "rotate:")) { _callStr(onRotate, v) }
@@ -2367,6 +2652,7 @@ export function List(p: map[string]ListProp): Node {
     const s: Style = new Style(); s.grow = 1; s.basis = 0    // fills the remaining space
     const n: Node = new Node("List", s, "", [])
     n.data = p    // carries count, key, item, rowHeight, gap, pad
+    n.ctxOverlay = _overlayBottom   // a floating bar to keep the last row clear of (reconcileList)
     return n
 }
 /**
@@ -2396,6 +2682,7 @@ export function SectionList(p: map[string]ListProp): Node {
     const s: Style = new Style(); s.grow = 1; s.basis = 0
     const n: Node = new Node("SectionList", s, "", [])
     n.data = p
+    n.ctxOverlay = _overlayBottom   // as for List
     return n
 }
 
@@ -2411,7 +2698,7 @@ export function SectionList(p: map[string]ListProp): Node {
  */
 export function Comp(render: any): Node {
     const n: Node = new Node("Comp", new Style(), "", [])
-    n.comp = render
+    n.comp = render; n.ctxTop = _consumedTop; n.ctxOverlay = _overlayBottom
     return n
 }
 /**
@@ -2427,7 +2714,7 @@ export function Comp(render: any): Node {
  */
 export function KeyedComp(key: string, render: any): Node {
     const n: Node = new Node("Comp", new Style(), "", [])
-    n.comp = render; n.ckey = key
+    n.comp = render; n.ckey = key; n.ctxTop = _consumedTop; n.ctxOverlay = _overlayBottom
     return n
 }
 
@@ -2452,7 +2739,7 @@ export function KeyedComp(key: string, render: any): Node {
  * ```
  */
 export class Component extends Node {
-    constructor() { super("Comp", new Style(), "", []) }
+    constructor() { super("Comp", new Style(), "", []); this.ctxTop = _consumedTop; this.ctxOverlay = _overlayBottom }   // placed under these insets, like Comp()
     // Subclasses override this. The default is an empty view (so a Component that
     // forgets to override renders nothing rather than looping on itself).
     override public render(): Node { return mkView(new Style(), []) }
@@ -2549,6 +2836,7 @@ export class Reconciler {
     // list is the one the user is scrolling: without this, a list on a COVERED screen
     // would claim the viewport, and the host's scroll reports would move it.
     var topScope: string
+    var ranDepth: int               // > 0 while inside a component that ran this pass: its children run too
     var liveListId: string          // the list the host is currently reporting scroll for
     var lastListId: string
     var lastListParent: string
@@ -2582,7 +2870,7 @@ export class Reconciler {
         this.vpTop = 0; this.vpH = 0; this.vpW = 0; this.rootPrev = null
         this.lastList = null; this.lastListId = ""; this.lastListParent = ""; this.lastListIndex = 0
         this.lastStackId = ""; this.stackHostId = ""
-        this.topScope = ""; this.liveListId = ""
+        this.topScope = ""; this.liveListId = ""; this.ranDepth = 0
         this.lists = {}
         this.pending = {}; this.pendingErr = {}; this.streamTokens = {}; this.tokenSeq = 0
         this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
@@ -2639,11 +2927,16 @@ export class Reconciler {
     // Reconcile the whole app tree from the root; the app calls this after any
     // state change and the memoization makes everything unchanged bail.
     public renderRoot(next: Node): void {
+        // Value ops queued during the render (a new shared value, a set) go out ahead of
+        // the diff, so a style line that names a value never reaches the host first.
+        if (_hostOps.length > 0) { for (var l of _hostOps) { this.lines.push(l) }; _hostOps = [] }
+        const frameStart: int = this.lines.length   // a Comp renders lazily inside reconcile: its values are spliced in here
         // Both cleared: re-set by reconcileList if the screen on top has a List. Leaving
         // the id behind meant a screen with no list (or with a SectionList, which does not
         // claim the viewport) kept the PREVIOUS screen's list named as live -- so the host
         // went on sizing a list that was covered, or destroyed.
         this.lastList = null; this.lastListId = ""
+        this.ranDepth = 0
         // Cleared each pass: a nested stack that emptied (or a tab switched away from)
         // must stop claiming the gesture, or the host would drag a container that no
         // longer holds two screens.
@@ -2663,6 +2956,15 @@ export class Reconciler {
         if (this.lastStackId != this.stackHostId) {
             this.stackHostId = this.lastStackId
             this.emit("SK|" + this.stackHostId)
+        }
+        // Values made while a Comp rendered inside this pass: their creation goes out
+        // ahead of the diff lines that name them, never after.
+        if (_hostOps.length > 0) {
+            var merged: []string = []
+            for (var i: int = 0; i < frameStart; i = i + 1) { merged.push(this.lines[i]) }
+            for (var op of _hostOps) { merged.push(op) }
+            for (var j: int = frameStart; j < this.lines.length; j = j + 1) { merged.push(this.lines[j]) }
+            this.lines = merged; _hostOps = []
         }
     }
     // The navigator names the screen on top (its container's node id); "" means no
@@ -2711,10 +3013,20 @@ export class Reconciler {
     // node id) ever crosses the host boundary.
     public fire(tag: string): void {
         if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f() }
+        else if (_hostHandlers[tag] != null) { const f: any = _hostHandlers[tag]; f() }
     }
-    // Fire the onChange(value) closure bound to node `tag` (from an input).
-    public fireValue(tag: string, value: string): void {
-        if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value) }
+    // Fire the onChange(value) closure bound to node `tag` (from an input), or the
+    // handler of a host event that belongs to no node (a shared value's end/settle).
+    // Returns who took it: 1 a node's handler, 2 a host handler (a value's end/settle),
+    // 0 nobody. The app decides from that whether the event is worth a render.
+    public fireValue(tag: string, value: string): int {
+        if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value); return 1 }
+        else if (_hostHandlers[tag] != null) { const f: any = _hostHandlers[tag]; f(value); return 2 }
+        return 0
+    }
+    // Emit the queued host ops on their own, when no render is going to carry them.
+    public flushHostOps(): void {
+        if (_hostOps.length > 0) { for (var l of _hostOps) { this.lines.push(l) }; _hostOps = [] }
     }
     // ---- async host->engine bridge (F3) --------------------------------------
     // Request a native capability. If `cb` is non-null it is registered under a
@@ -2806,11 +3118,15 @@ export class Reconciler {
     // Host-initiated death (the user dismissed the picker / the native op ended with
     // no result): drop the token locally, no host command (the host already knows).
     public dropToken(token: string): void { this.forgetToken(token) }
-    // register a node's event closure (tag = the node id), and emit its T binding
+    // Register a node's event closures and emit their bindings. Every event is its own
+    // tag: a press is the node id (T|), a value change is "<id>:change" (TC|), and the
+    // rest are "<id>:<event>". They coexist, so any node may carry a press and a change
+    // (a Gesture that is also tapped, a field that is also pressed); a control that
+    // reports a value fires "<id>:change" on the host whatever else the node binds.
     bindEvents(n: Node, id: string): void {
         if (n.onPress != null) { this.handlers[id] = n.onPress; this.emit("T|" + id + "|" + id) }
-        else if (n.onChange != null) { this.handlers[id] = n.onChange; this.emit("T|" + id + "|" + id) }
         else if (n.action != "") { this.emit("T|" + id + "|" + n.action) }
+        if (n.onChange != null) { this.handlers[id + ":change"] = n.onChange; this.emit("TC|" + id) }
         // Extra TextInput events, each a separate binding keyed by "<id>:<event>".
         if (n.onSubmit != null) { this.handlers[id + ":submit"] = n.onSubmit; this.emit("TS|" + id) }
         if (n.onFocus != null) { this.handlers[id + ":focus"] = n.onFocus; this.emit("TF|" + id) }
@@ -2856,9 +3172,11 @@ export class Reconciler {
             // Component subclass runs its overridden render().
             const path: string = n.ckey != "" ? "key:" + n.ckey : id
             hookEnter(path)
-            const produced: Node = n.render()
-            n.produced = produced
+            const produced: Node = renderInContext(n)
+            n.produced = produced; n.hookKeys = hookTouched()
+            this.ranDepth = this.ranDepth + 1
             this.mountNode(produced, id, parent, index)
+            this.ranDepth = this.ranDepth - 1
             return
         }
         // A mount must DESTROY whatever holds this id. Node ids are structural paths
@@ -2900,17 +3218,23 @@ export class Reconciler {
         if (next.kind == "StackHost") { this.lastStackId = id }
         if (prev == null) { this.mountNode(next, id, parent, index); return }
         const p: Node = prev
-        if (p == next) { return }              // memoized + unchanged: whole subtree bails
+        if (p == next) { this.revisit(next, id, parent, index); return }   // the same subtree as last pass: only a changed component inside it has work
         // component at this position: run it (setting its identity) and diff what it
-        // produced against what it produced last render.
+        // produced against what it produced last render. Unless nothing of its own
+        // changed and no component above it ran this pass: then what it produced last
+        // time still stands, and only a changed component inside it has work. This is
+        // what makes a state change in one row cost that row, not the screen.
         if (next.kind == "Comp") {
             const path: string = next.ckey != "" ? "key:" + next.ckey : id
-            hookEnter(path)
-            const produced: Node = next.render()
-            next.produced = produced
-            var prevProduced: Node? = null
-            if (p.kind == "Comp") { prevProduced = p.produced } else { this.emit("R|" + id) }
-            this.reconcile(prevProduced, produced, id, parent, index)
+            if (p.kind == "Comp" && p.produced != null && this.ranDepth == 0 && !passRuns(path)) {
+                next.produced = p.produced; next.hookKeys = p.hookKeys
+                hookRetain(p.hookKeys)
+                const kept: Node = p.produced
+                this.revisit(kept, id, parent, index)
+                return
+            }
+            if (p.kind != "Comp") { this.emit("R|" + id) }
+            this.runComp(next, p.kind == "Comp" ? p.produced : null, path, id, parent, index)
             return
         }
         // prev was a component here, next is a plain node: drop the old subtree, mount fresh.
@@ -2935,9 +3259,10 @@ export class Reconciler {
         // lose one. bindEvents (which emits T|) runs ONLY on mountNode, so re-emit
         // the tag here whenever the binding target changes — otherwise the host keeps
         // a stale (or empty) action and the tap never fires on ANY host.
-        const prevTag: string = (p.onPress != null || p.onChange != null) ? id : p.action
-        const nextTag: string = (next.onPress != null || next.onChange != null) ? id : next.action
+        const prevTag: string = p.onPress != null ? id : p.action
+        const nextTag: string = next.onPress != null ? id : next.action
         if (prevTag != nextTag) { this.emit("T|" + id + "|" + nextTag) }
+        if (p.onChange == null && next.onChange != null) { this.emit("TC|" + id) }   // gained a value handler: the host must route the value
         // The closure is recreated each render: rebind it when present, and DROP the
         // entry when this node no longer has that handler. A reused slot (a tappable
         // card becomes an inert stat row at the same id) must NOT keep a prior role's
@@ -2945,8 +3270,8 @@ export class Reconciler {
         // action. React Native drops a view's handler mapping when it unmounts / is
         // recycled; we do the same per binding.
         if (next.onPress != null) { this.handlers[id] = next.onPress }
-        else if (next.onChange != null) { this.handlers[id] = next.onChange }
         else if (this.handlers.has(id)) { this.handlers.delete(id) }
+        this.rebindOrDrop(id + ":change", next.onChange)
         this.rebindOrDrop(id + ":submit", next.onSubmit)
         this.rebindOrDrop(id + ":focus", next.onFocus)
         this.rebindOrDrop(id + ":blur", next.onBlur)
@@ -3035,6 +3360,43 @@ export class Reconciler {
         }
     }
 
+    // Run a component at `path`, then diff what it produced against `prevProduced`.
+    // Everything under a component that ran runs too: it made its children fresh, with
+    // whatever it passed them, and a closure's inputs cannot be compared.
+    runComp(n: Node, prevProduced: Node?, path: string, id: string, parent: string, index: int): void {
+        hookEnter(path)
+        const produced: Node = renderInContext(n)
+        n.produced = produced; n.hookKeys = hookTouched()
+        this.ranDepth = this.ranDepth + 1
+        this.reconcile(prevProduced, produced, id, parent, index)
+        this.ranDepth = this.ranDepth - 1
+    }
+    // Walk a subtree kept from the last pass, looking for the components in it that
+    // changed. Nothing here is diffed: the nodes ARE last pass's nodes. A changed
+    // component runs and diffs what it made against what it had; a list re-windows
+    // (its rows are rebuilt by its own path, and a row component that did not change
+    // is kept the same way); everything else is walked through.
+    revisit(n: Node, id: string, parent: string, index: int): void {
+        if (n.kind == "StackHost") { this.lastStackId = id }
+        if (n.kind == "Comp") {
+            const path: string = n.ckey != "" ? "key:" + n.ckey : id
+            if (passRuns(path)) { this.runComp(n, n.produced, path, id, parent, index); return }
+            hookRetain(n.hookKeys)
+            const kept: Node? = n.produced
+            if (kept != null) { this.revisit(kept, id, parent, index) }
+            return
+        }
+        if (n.kind == "List") { this.reconcileList(n, n, id, parent, index); return }
+        if (n.kind == "SectionList") { this.reconcileSectionList(n, n, id, parent, index); return }
+        var live: int = 0
+        for (var i: int = 0; i < n.kids.length; i = i + 1) {
+            const k: Node = n.kids[i]
+            if (k.kind == "None") { continue }
+            this.revisit(k, id + "." + this.childSlot(k, i), id, live)
+            live = live + 1
+        }
+    }
+
     // Where a child sits among its siblings, for identity purposes.
     //
     // A keyed child is identified by its KEY, an unkeyed one by its POSITION. This one
@@ -3061,11 +3423,12 @@ export class Reconciler {
         const d0: map[string]ListProp = next.data
         if (lpBool(d0, "horizontal", false)) { this.reconcileHList(prev, next, id, parent, index); return }
         const d: map[string]ListProp = next.data
-        const count: int = lpInt(d, "count", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
         const gap: int = lpInt(d, "gap", 0)
         const pad: int = lpInt(d, "pad", 0)
-        const stride: int = rowH + gap
+        const sized: bool = listStrideOk(rowH + gap, id, "rowHeight", "List")
+        const stride: int = sized ? rowH + gap : 1
+        const count: int = sized ? lpInt(d, "count", 0) : 0
         const buffer: int = lpInt(d, "buffer", 3)
         const itemFn: any = d.get("item")
         const contentId: string = id + ".0"
@@ -3088,7 +3451,10 @@ export class Reconciler {
         const gridRows: int = (count + ncol - 1) / ncol   // rows of `ncol` cells; == count when ncol==1
         var colW: int = 0
         if (ncol > 1 && this.vpW > 0) { colW = (this.vpW - 2 * pad - (ncol - 1) * gap) / ncol }
-        const contentH: int = rowsTop + gridRows * stride + footerH + pad
+        // The end pad, or the floating bar's height when that is more: the last row
+        // scrolls out from under the bar (see overlayBottom).
+        const endPad: int = next.ctxOverlay > pad ? next.ctxOverlay : pad
+        const contentH: int = rowsTop + gridRows * stride + footerH + endPad
         const invBase: int = contentH - pad - footerH - rowH
 
         if (prev == null) {
@@ -3378,11 +3744,12 @@ export class Reconciler {
     // reconciler places each at its x (left) with a fixed `itemWidth`.
     reconcileHList(prev: Node?, next: Node, id: string, parent: string, index: int): void {
         const d: map[string]ListProp = next.data
-        const count: int = lpInt(d, "count", 0)
         const itemW: int = lpInt(d, "itemWidth", 0)
         const gap: int = lpInt(d, "gap", 0)
         const pad: int = lpInt(d, "pad", 0)
-        const stride: int = itemW + gap
+        const sized: bool = listStrideOk(itemW + gap, id, "itemWidth", "horizontal List")
+        const stride: int = sized ? itemW + gap : 1
+        const count: int = sized ? lpInt(d, "count", 0) : 0
         const buffer: int = lpInt(d, "buffer", 3)
         const itemFn: any = d.get("item")
         const contentId: string = id + ".0"
@@ -3501,12 +3868,13 @@ export class Reconciler {
             this.lastList = next; this.lastListId = id; this.lastListParent = parent; this.lastListIndex = index
         }
         const d: map[string]ListProp = next.data
-        const sectionCount: int = lpInt(d, "sectionCount", 0)
         const rowH: int = lpInt(d, "rowHeight", 0)
         const headerH: int = lpInt(d, "headerHeight", 0)
         const gap: int = lpInt(d, "gap", 0)
         const pad: int = lpInt(d, "pad", 0)
-        const stride: int = rowH + gap
+        const sized: bool = listStrideOk(rowH + gap, id, "rowHeight", "SectionList")
+        const stride: int = sized ? rowH + gap : 1
+        const sectionCount: int = sized ? lpInt(d, "sectionCount", 0) : 0
         const buffer: int = lpInt(d, "buffer", 3)
         const rowsFn: any = d.get("rows")
         const keyFn: any = d.get("key")
@@ -3523,7 +3891,7 @@ export class Reconciler {
             totalRows = totalRows + nr0
             total = total + headerH + nr0 * stride
         }
-        total = total + pad
+        total = total + (next.ctxOverlay > pad ? next.ctxOverlay : pad)   // the end pad, or the floating bar's height (see overlayBottom)
         // Nothing to show: give the empty state the viewport to fill, the way a plain
         // List does. Without this a sectioned list with no sections rendered LITERALLY
         // NOTHING -- a blank screen where the app had asked for an empty state, which is
@@ -3796,7 +4164,11 @@ export class App {
     // Host reports the OS color scheme / platform / safe-area insets. These update
     // module state (osIsDark(), platformOS(), safeTop()/… ) that the app can read on
     // the next render; the host triggers that render via mount/tick/setViewport.
-    public setColorScheme(dark: int): void { setOsColorScheme(dark) }
+    // The host reports the OS appearance. Both things that depend on it happen here: the
+    // osColorScheme() readout, and the theme following the system until the user picks.
+    // The release entry used to do the theme half and the dev runtime the readout half,
+    // so under hot reload every app opened in the engine's default (dark) theme.
+    public setColorScheme(dark: int): void { setOsColorScheme(dark); syncSystemTheme(dark == 1) }
     // Host reports the platform: OS name, version, device model, and tablet flag.
     public setPlatform(os: string, ver: string, model: string, tablet: int): void { setPlatformInfo(os, ver, model, tablet == 1) }
     // Host reports the safe-area insets (top, right, bottom, left) in points.
@@ -3813,7 +4185,7 @@ export class App {
         // and they would vanish without a trace.
         flushHostReady()
         this.flushAppearance()
-        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        this.paint()
         return this.recon.count()
     }
     // Full re-mount: re-emit the entire current tree (state preserved). The dev server
@@ -3828,7 +4200,9 @@ export class App {
     }
     // Report the visible scroll window (top, height) and re-render. Drives List virtualization.
     public setViewport(top: int, h: int, w: int): int {
-        runAsyncQueue()
+        const ran: bool = runAsyncQueue()
+        // The size is app-visible (viewportHeight()/viewportWidth()); the offset is not.
+        const resized: bool = (h > 0 && h != _vpH) || (w > 0 && w != _vpW)
         if (h > 0) { _vpH = h }   // expose the real viewport height (viewportHeight()) for full-screen feeds
         if (w > 0) { _vpW = w }   // expose the list width (viewportWidth()) for grid column sizing
         this.recon.begin()
@@ -3838,17 +4212,20 @@ export class App {
         // lifecycle is deliberately skipped on this path: nothing re-rendered, so there
         // is nothing to sweep (a sweep here would drop every cell). Effects still run,
         // because a row entering the window may have registered one. When the screen has
-        // no List there is nothing to re-window and we fall back to a full render.
+        // no List there is nothing to re-window, and nothing to render either unless the
+        // viewport's size changed or a continuation dirtied state: the host reports every
+        // scroll frame, and a full render per frame of a plain 200-row Scroll cost 29ms
+        // on a Galaxy S23, every frame of every fling janky.
         if (this.recon.rewindow()) {
             runEffects()
-        } else {
-            hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+        } else if (ran || resized || isDirty()) {
+            this.paint()
         }
         // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
         // then re-render (WITHOUT begin, so the windowing mutations above are kept) so the newly
         // visible cell's state change (e.g. Video playing) lands in the same frame.
         if (this.recon.flushVisible()) {
-            hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+            this.paint()
         }
         return this.recon.count()
     }
@@ -3878,9 +4255,12 @@ export class App {
         // `onTick` is the app's hook; a default (empty) one cannot dirty anything, so an
         // app that does not override it never pays for a render here.
         const ticks: bool = this.ticksOnBeat()
-        if (!ran && active == 0 && !flipped && !ticks && !isDirty()) { return this.recon.count() }
-        hookBegin(); this.onTick(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
-        clearDirty()
+        if (!ran && active == 0 && !flipped && !ticks && !isDirty()) { this.recon.flushHostOps(); return this.recon.count() }
+        // onTick before hookBegin: what it writes belongs to THIS pass's plan. hookBegin
+        // takes the pending writes as the plan and clears the flag, so a write during the
+        // pass (an effect setting state) is the next pass's, not lost.
+        this.onTick()
+        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
         return this.recon.count()
     }
     // Override alongside onTick to say "my onTick changes state every beat", so the
@@ -3896,14 +4276,21 @@ export class App {
         var handled: bool = runBackHandlers()
         if (!handled) { handled = this.popRoute() }
         if (!handled) { return 0 }
-        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
-        clearDirty()
+        this.paint()
         return 1
     }
     // A plain App has no route stack; NavStack overrides this to pop one.
     public popRoute(): bool { return false }
 
 
+    // One render of the app tree, with the hook lifecycle around it. Clears the dirty
+    // flag too: every entry point that renders goes through here, so the heartbeat
+    // never re-renders an app that the event before it already painted. It used to,
+    // and on a 200-row screen that second render cost 29ms on the main thread after
+    // every tap and every gesture end.
+    paint(): void {
+        hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep()
+    }
     // A native tap arrived for node `tag`: fire its onPress closure, then re-render.
     public dispatch(tag: string): int {
         // The host's way of saying "the OS is taking the time back". Not a node id, so it
@@ -3913,27 +4300,37 @@ export class App {
             if (h != null) { h() }
             return 0
         }
-        this.recon.begin(); runAsyncQueue(); this.recon.fire(tag); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.fire(tag); this.paint(); return this.recon.count()
     }
     // A native input change arrived for node `tag`: fire its onChange(value), then re-render.
     public dispatchInput(tag: string, value: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.fireValue(tag, value); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin()
+        const ran: bool = runAsyncQueue()
+        const took: int = this.recon.fireValue(tag, value)
+        // A node's own handler renders, as every event does. A value event's handler is a
+        // native callback (the value ended or settled): it renders only when it marked
+        // state dirty, because its usual outcome is a host op (a spring), which goes out
+        // on its own. An event nobody bound renders nothing. Before this, a swipe row's
+        // fling, end and settle each cost a 13-31ms render of a 20-row screen on a
+        // Galaxy S23, for a diff of one line.
+        if (took == 1 || ran || isDirty()) { this.paint() } else { this.recon.flushHostOps() }
+        return this.recon.count()
     }
     // A native async result arrived for `token` (F3): fire the registered callback
     // with `payload`, then re-render. Mirrors dispatch, but keyed by an async token
     // rather than a UI node id.
     public resolve(token: string, payload: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.fireToken(token, payload); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.fireToken(token, payload); this.paint(); return this.recon.count()
     }
     // The host reports that `token` is dead (user dismissed the picker, native op
     // ended with no result). Drop it and re-render. Mirrors resolve, without a fire.
     public cancelToken(token: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.dropToken(token); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.dropToken(token); this.paint(); return this.recon.count()
     }
     // The host reports a FAILURE for `token` (permission denied, hardware missing,
     // native error). Fire the request's error callback and re-render.
     public failToken(token: string, message: string): int {
-        this.recon.begin(); runAsyncQueue(); this.recon.failToken(token, message); hookBegin(); this.recon.renderRoot(this.render()); runEffects(); hookSweep(); return this.recon.count()
+        this.recon.begin(); runAsyncQueue(); this.recon.failToken(token, message); this.paint(); return this.recon.count()
     }
     // Return the pending mutation stream as text and hand it to the host.
     public drain(): string { return this.recon.drain() }
@@ -3987,6 +4384,14 @@ export function devWarn(key: string, message: string): void {
 
 /** Every distinct warning raised so far, in the order they first happened. */
 export function devWarnings(): []string { return WARN_LOG }
+// A windowed list positions rows by rank * stride, so a stride of zero (the size prop
+// missing, or zero) is not a layout: it was a division by zero deep in the windowing
+// math. Say which prop the list needs, once, and treat the list as empty until it has it.
+function listStrideOk(stride: int, id: string, prop: string, kind: string): bool {
+    if (stride > 0) { return true }
+    devWarn("liststride:" + id, kind + " " + id + " has no " + prop + ": the rows are positioned by it, so nothing is mounted until it is set")
+    return false
+}
 
 /** How many times a given warning key has fired, including the ones not printed. */
 export function devWarnCount(key: string): int { return WARNED.getOr(key, 0) }
@@ -4286,6 +4691,7 @@ var NESTED_PUSH: (function(name: string, params: (map[string]any)?, body: any?):
 var NESTED_POP: (function(result: any?): bool)? = null
 var NESTED_REPLACE: (function(name: string, params: (map[string]any)?, body: any?): bool)? = null
 var NESTED_TOP: (function(): Route?)? = null
+var NESTED_POP_TO: (function(name: string, result: any?): bool)? = null
 
 /**
  * Framework-internal: a nested navigator claims the navigation functions while it is
@@ -4299,11 +4705,13 @@ var NESTED_TOP: (function(): Route?)? = null
 export function setNestedNavigator(push: (function(name: string, params: (map[string]any)?, body: any?): bool)?,
                                    pop: (function(result: any?): bool)?,
                                    replace: (function(name: string, params: (map[string]any)?, body: any?): bool)?,
-                                   top: (function(): Route?)?): void {
+                                   top: (function(): Route?)?,
+                                   popTo: (function(name: string, result: any?): bool)? = null): void {
     NESTED_PUSH = push
     NESTED_POP = pop
     NESTED_REPLACE = replace
     NESTED_TOP = top
+    NESTED_POP_TO = popTo
 }
 
 /**
@@ -4370,6 +4778,30 @@ export class NavStack extends App {
             this.stack = s
             if (result != null) { this.stack[this.stack.length - 1].result = result }
         }
+    }
+    /**
+     * Pop every route above the nearest `name` below the top, so that screen is on
+     * screen again with `result` as its `r.result`. False when no such route is
+     * stacked (nothing changes). Prefer the `popTo()` free function.
+     */
+    public popTo(name: string, result: any?): bool {
+        var at: int = -1
+        for (var i: int = this.stack.length - 2; i >= 0; i = i - 1) { if (this.stack[i].name == name) { at = i; break } }
+        if (at < 0) { return false }
+        const s: []Route = []
+        for (var i: int = 0; i <= at; i = i + 1) { s.push(this.stack[i]) }
+        this.stack = s
+        if (result != null) { this.stack[at].result = result }
+        return true
+    }
+    /**
+     * Pop every route above the first one, so the app is back at the screen it opened
+     * with, with `result` as its `r.result`. Prefer the `popToRoot()` free function.
+     */
+    public popToRoot(result: any?): void {
+        if (this.stack.length <= 1) { return }
+        this.stack = [this.stack[0]]
+        if (result != null) { this.stack[0].result = result }
     }
     /**
      * The entry on top of the stack: the route on screen right now, with its params,
@@ -4446,9 +4878,23 @@ export class NavStack extends App {
         hookPark(parked)
         // Name the screen on top, so a list on a covered screen cannot claim the viewport.
         this.recon.setTopScope("app." + string(n - 1))
+        // The overlay rides above every route, after them in the tree so the routes keep
+        // their indices (the top scope above is named by index).
+        const ov: any = this.overlay
+        if (ov != null) {
+            const os: Style = new Style()
+            os.pos = "abs"; os.left = 0; os.right = 0; os.bottom = safeBottom(); os.z = 50
+            kids.push(new Node("View", os, "", [ KeyedComp("overlay", ov) ]))
+        }
         const rs: Style = new Style(); rs.grow = 1; rs.basis = 0
         return new Node("View", rs, "", kids)
     }
+    // Something drawn over every route, anchored to the bottom: a ToastHost, a global
+    // banner. A screen comes and goes; the overlay stays, so a toast raised on a page
+    // that is then replaced still shows. Set once at startup.
+    var overlay: any = null
+    /** Draw `render()` over every route (a ToastHost, say). Pass null to remove it. */
+    public setOverlay(render: any): void { this.overlay = render }
     override setup(_n: int): void { }
     // Hot reload also preserves the current screen: serialize the route stack ahead
     // of the useState cells so an edit keeps you on the page you were on, not route 0.
@@ -4512,6 +4958,10 @@ export class NavStack extends App {
         for (var j: int = 0; j < arr.length; j = j + 1) {
             const e: any = arr[j]
             if (e == null || e["n"] == null) { continue }
+            // A route this build does not register is not restored: the snapshot was
+            // written by other code. The host refuses a snapshot from another build
+            // outright; this is the check for anything that gets past it.
+            if (this.routes[string(e["n"])] == null) { continue }
             var pm: map[string]any = {}
             const raw: any = e["p"]
             if (raw != null) { pm = raw }
@@ -4654,6 +5104,44 @@ export function back(result: any?): void {
     if (nested != null && nested(result)) { return }
     const nv: NavStack? = NAV
     if (nv != null) { nv.popStack(result) }
+}
+/**
+ * Pop every page above the nearest `name` below the top, so that page is on screen
+ * again, with `result` as its `r.result`. This is how a flow of several pushed
+ * screens (pick, then confirm, then done) ends: it returns to the page that started
+ * it in one step, and the pages between are gone. Inside a tab that owns its history
+ * the tab's pages are searched first, then the app's. False, and nothing changes,
+ * when no page of that name is stacked.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { popTo("home", walk.id) } }, "Done")
+ * ```
+ */
+export function popTo(name: string, result: any?): bool {
+    const nested: any = NESTED_POP_TO
+    if (nested != null && nested(name, result)) { return true }
+    const nv: NavStack? = NAV
+    if (nv == null) { return false }
+    return nv.popTo(name, result)
+}
+/**
+ * Pop every page above the first one, with `result` as its `r.result`. Inside a tab
+ * that owns its history this returns to the tab's root page (which takes no Route, so
+ * a result is not delivered there); otherwise to the app's first page.
+ *
+ * ```chuks
+ * Button({ onPress: function(): void { popToRoot(null) } }, "Start over")
+ * ```
+ */
+export function popToRoot(result: any?): void {
+    const nested: any = NESTED_POP
+    if (nested != null) {
+        var popped: bool = false
+        while (nested(null)) { popped = true }             // unwind the tab's own history
+        if (popped) { return }
+    }
+    const nv: NavStack? = NAV
+    if (nv != null) { nv.popToRoot(result) }
 }
 
 /**

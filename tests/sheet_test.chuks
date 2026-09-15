@@ -1,0 +1,92 @@
+// Sheet on the wire.
+//
+// A Sheet is a host-driven overlay: the app sends the snap points, the index it wants
+// and the behaviours as style keys, the host drives the finger, and every settle comes
+// back as a "change" value event carrying the new index. The commands go out as VC|
+// lines through the ViewRef. This checks the encoding in both directions.
+//
+// Run:  chuks run tests/sheet_test.chuks   (exits non-zero on failure)
+
+import { Node, Column, Row, Text, Scroll, Sheet, ViewRef, Reconciler, sheetSnapTo, sheetExpand, sheetCollapse, sheetClose } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function lines(stream: string, prefix: string): []string {
+    var out: []string = []
+    for (var l of stream.split("\n")) { if (l.startsWith(prefix)) { out.push(l) } }
+    return out
+}
+function has(s: string, sub: string): bool { return s.indexOf(sub) >= 0 }
+
+function main(): void {
+    var settled: int = -99
+    const ref: ViewRef = new ViewRef()
+    const tree: function(index: int): Node = function(index: int): Node {
+        return Column({}, [
+            Text({}, "under"),
+            Sheet({ snapPoints: ["25%", "320", "content", "90%"], index: index, ref: ref,
+                    onChange: function(i: int): void { settled = i } }, [
+                Text({}, "inside"),
+                Scroll({ grow: 1 }, [ Row({}, [ Text({}, "row") ]) ]),
+            ]),
+        ])
+    }
+
+    println("sheet: mount")
+    const r: Reconciler = new Reconciler()
+    r.drain(); r.renderRoot(tree(-1))
+    const first: string = r.drain()
+    check(lines(first, "C|app.1|Sheet").length == 1, "a Sheet mounts as its own kind")
+    const s0: []string = lines(first, "S|app.1|")
+    check(s0.length == 1, "one style line for the sheet")
+    check(has(s0[0], "shsnap=25p,320,c,90p;"), "snap points cross as heights: percent -> Np, points as is, content -> c (" + s0[0] + ")")
+    check(has(s0[0], "shidx=-1;"), "closed is index -1")
+    check(has(s0[0], "shbd=1;") && has(s0[0], "shptc=1;") && has(s0[0], "shhdl=1;"), "backdrop, pan-to-close and handle default on")
+    check(has(s0[0], "shkb=interactive;"), "the keyboard behaviour defaults to interactive")
+    check(lines(first, "C|app.1.0|").length == 1 && lines(first, "C|app.1.1|").length == 1, "the children mount even while closed (a sheet keeps its content)")
+    check(ref.id == "app.1", "the ref is bound to the sheet node (got " + ref.id + ")")
+
+    println("sheet: index is the app's")
+    r.renderRoot(tree(1))
+    const second: string = r.drain()
+    const s1: []string = lines(second, "S|app.1|")
+    check(s1.length == 1 && has(s1[0], "shidx=1;"), "a new index goes out as a style change")
+    r.renderRoot(tree(1))
+    check(r.drain() == "", "an unchanged sheet emits nothing")
+
+    println("sheet: the host reports a settle")
+    r.fireValue("app.1:change", "2")
+    check(settled == 2, "a change event decodes its index into onChange (got " + string(settled) + ")")
+    r.fireValue("app.1:change", "-1")
+    check(settled == -1, "closed is reported as -1")
+
+    println("sheet: commands")
+    r.drain()
+    sheetSnapTo(ref, 2)
+    sheetExpand(ref)
+    sheetCollapse(ref)
+    sheetClose(ref)
+    const cmds: []string = lines(r.drain(), "VC|app.1|")
+    check(cmds.length == 4, "four commands, one line each (got " + string(cmds.length) + ")")
+    check(cmds.length == 4 && has(cmds[0], "|snapTo|") && has(cmds[0], "\"index\":2"), "snapTo carries the index as JSON (" + (cmds.length > 0 ? cmds[0] : "") + ")")
+    check(cmds.length == 4 && has(cmds[1], "|expand|") && has(cmds[2], "|collapse|") && has(cmds[3], "|close|"), "expand, collapse, close by name")
+
+    println("sheet: options")
+    const r2: Reconciler = new Reconciler()
+    r2.drain()
+    r2.renderRoot(Sheet({ snapPoints: ["120", "50%"], index: 0, backdrop: false, panToClose: false, handle: false, keyboard: "extend" }, [ Text({}, "panel") ]))
+    const s2: []string = lines(r2.drain(), "S|app|")
+    check(s2.length == 1 && has(s2[0], "shbd=0;") && has(s2[0], "shptc=0;") && has(s2[0], "shhdl=0;"), "a persistent sheet turns backdrop, pan-to-close and handle off (" + (s2.length > 0 ? s2[0] : "") + ")")
+    check(s2.length == 1 && has(s2[0], "shkb=extend;"), "the keyboard behaviour crosses by name")
+    check(s2.length == 1 && has(s2[0], "shidx=0;"), "open at the lowest point")
+
+    println("")
+    println("sheet: " + string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw new Error("sheet tests failed") }
+}
+
+main();

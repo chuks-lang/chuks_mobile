@@ -1797,6 +1797,16 @@ export class Debug {
      * app logic would be reading the host's mind.
      */
     public static viewTree(onResult: (string)=> void): void { emitNativeCommand("debug.viewTree", "", onResult) }
+    /**
+     * Measure the frames the app renders for `ms` milliseconds. The result is one line,
+     * "hz=R frames=N janky=J p50=A p95=B max=C": the display's rate, the frames drawn,
+     * how many finished after the deadline the system gave them (Android: the window's
+     * FrameMetrics, what `dumpsys gfxinfo` reads; iOS: a display-link tick that arrived
+     * after the previous frame's target time), and frame durations in milliseconds.
+     * Drive a gesture while it runs to see what the gesture costs. A benchmarking tool,
+     * not an API; the line's shape may change.
+     */
+    public static frames(ms: int, onResult: (string)=> void): void { emitNativeCommand("debug.frames", string(ms), onResult) }
     /** The same dump, awaited (see the rule on awaiting a capability). */
     public static async viewTreeAsync(): Task<string> { return await awaitCommand("debug.viewTree", "", false, CAP_QUICK_MS) }
     public static fail(onResult: (string)=> void, onError: (string)=> void): void { emitNativeCommandE("debug.fail", "", onResult, onError) }

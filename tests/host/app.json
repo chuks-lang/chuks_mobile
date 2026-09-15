@@ -1,0 +1,8 @@
+{
+  "name": "hostparity",
+  "displayName": "hostparity",
+  "version": "1.0.0",
+  "buildNumber": 1,
+  "ios": { "bundleId": "com.chuks.hostparity", "schemes": [] },
+  "android": { "schemes": [] }
+}

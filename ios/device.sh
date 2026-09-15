@@ -85,7 +85,9 @@ fi
 chuks_ios_install_device() {
 # First connected+available device; exclude "unavailable" (substring match trap) and
 # let IOS_DEVICE_ID override when more than one is attached.
-DEVID="${IOS_DEVICE_ID:-$(xcrun devicectl list devices 2>/dev/null | awk '!/unavailable/ && /available/{for(i=1;i<=NF;i++) if($i ~ /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-/){print $i; exit}}')}"
+# (macOS awk has no {n} interval regexes, so the UDID is picked by shape: 36 chars of
+# hex and dashes; that pattern never matched before and no device was ever found.)
+DEVID="${IOS_DEVICE_ID:-$(xcrun devicectl list devices 2>/dev/null | awk '!/unavailable/ && /available/{for(i=1;i<=NF;i++) if(length($i)==36 && $i ~ /^[0-9A-Fa-f-]+$/){print $i; exit}}')}"
 [ -n "$DEVID" ] || { echo "no available paired device (connect an iPhone, unlock it, and trust this Mac)"; exit 1; }
 xcrun devicectl device install app --device "$DEVID" "$APP" >/dev/null
 xcrun devicectl device process launch --device "$DEVID" "$BID" >/dev/null && echo "   launched on device"

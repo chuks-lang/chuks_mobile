@@ -1,0 +1,198 @@
+// What makes the app render, and what must not. The host reports the viewport on every scroll frame. On a screen with a List the report
+// re-windows the rows; on a screen with a plain Scroll there is nothing to window, and a
+// bare offset change must render NOTHING: a full render per fling frame of a 200-row
+// Scroll cost 29ms on a Galaxy S23. A size change still renders (viewportHeight() and
+// viewportWidth() are app-visible), and so does a continuation that dirtied state.
+import { Node, Column, Text, Scroll, List, Gesture, App, SharedValue, Comp, KeyedComp, viewportHeight, requestRender } from "../core/ui.chuks";
+import { useSharedValue } from "../core/motion.chuks";
+import { markDirty, useState, useEffect, Cell } from "../core/state.chuks";
+
+var passed: int = 0
+var failed: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { passed = passed + 1 } else { failed = failed + 1; print("FAIL: " + name) }
+}
+
+var RENDERS: int = 0
+class PlainScrollApp extends App {
+    override public render(): Node {
+        RENDERS = RENDERS + 1
+        var rows: []Node = []
+        for (var i: int = 0; i < 50; i = i + 1) { rows.push(Text({ h: 40 }, "Row " + string(i))) }
+        return Column({ grow: 1 }, [ Text({}, "vp " + string(viewportHeight())), Scroll({ grow: 1 }, [ Column({}, rows) ]) ])
+    }
+}
+class ListApp extends App {
+    override public render(): Node {
+        RENDERS = RENDERS + 1
+        return List({ count: 500, rowHeight: 40, gap: 0,
+                      item: function(i: int, top: int): Node { return Text({ abs: true, top: top, left: 0, right: 0, h: 40 }, "Row " + string(i)) } })
+    }
+}
+
+const a: PlainScrollApp = new PlainScrollApp()
+a.mount(); a.drain()
+a.setViewport(0, 780, 360); a.drain()          // the first report sizes the viewport: a render
+const before: int = RENDERS
+var emitted: int = 0
+for (var top: int = 10; top < 600; top = top + 37) { emitted = emitted + a.setViewport(top, 780, 360); a.drain() }
+check(RENDERS == before, "a scroll-offset report on a List-less screen renders nothing (rendered " + string(RENDERS - before) + " times)")
+check(emitted == 0, "and emits nothing (" + string(emitted) + " lines)")
+a.setViewport(600, 700, 360); a.drain()
+check(RENDERS == before + 1, "a viewport size change renders (the app reads viewportHeight())")
+markDirty()
+a.setViewport(610, 700, 360); a.drain()
+check(RENDERS == before + 2, "dirty state renders on the next report")
+a.setViewport(620, 700, 360); a.drain()
+check(RENDERS == before + 2, "and the dirty flag is cleared by that render")
+
+// An event's render leaves nothing for the heartbeat: a tap that set state paints once,
+// in dispatch, and the tick after it must not paint the whole app again.
+var TAPS: int = 0
+class TapApp extends App {
+    override public render(): Node {
+        RENDERS = RENDERS + 1
+        return Column({ grow: 1, onPress: function(): void { TAPS = TAPS + 1; markDirty() } }, [ Text({}, "taps " + string(TAPS)) ])
+    }
+}
+const ta: TapApp = new TapApp()
+ta.mount(); ta.drain()
+ta.tick(); ta.drain()
+const tb: int = RENDERS
+ta.dispatch("app"); ta.drain()
+check(TAPS == 1 && RENDERS == tb + 1, "a tap paints once")
+ta.tick(); ta.drain()
+check(RENDERS == tb + 1, "and the heartbeat after it does not paint again (painted " + string(RENDERS - tb) + " times)")
+
+RENDERS = 0
+const l: ListApp = new ListApp()
+l.mount(); l.drain(); l.setViewport(0, 780, 360); l.drain()
+const lb: int = RENDERS
+const n1: int = l.setViewport(4000, 780, 360)
+check(RENDERS == lb, "a List screen re-windows without rendering the app")
+check(n1 > 0, "and the re-window mounts rows for the new offset (" + string(n1) + " lines)")
+
+// A shared value's events are native callbacks. Its end handler springs it back: a host
+// op, no app state, so nothing renders and the op still goes out. A gesture the app did
+// not bind (the host reports every fling on a Gesture view) renders nothing at all. A
+// settle handler that sets a cell renders, as it should.
+var SV: SharedValue? = null
+var SETTLED: Cell<int>? = null
+class RowApp extends App {
+    override public render(): Node {
+        RENDERS = RENDERS + 1
+        return Comp(function(): Node {
+            const x: SharedValue = useSharedValue(0.0)
+            const settled: Cell<int> = useState(0)
+            SV = x; SETTLED = settled
+            x.onEnd(function(v: float, vel: float): void { x.spring(v < -80.0 ? -160.0 : 0.0, vel) })
+            x.onSettle(function(v: float): void { settled.set(settled.get() + 1) })
+            return Column({ grow: 1 }, [ Gesture({ panX: x, motion: { tx: x } }, [ Text({}, "row " + string(settled.get())) ]) ])
+        })
+    }
+}
+RENDERS = 0
+const ra: RowApp = new RowApp()
+ra.mount(); ra.drain(); ra.tick(); ra.drain()
+const rb: int = RENDERS
+check(SV != null, "the row made its value")
+const svId: int = SV != null ? SV.id : -1
+const endLines: int = ra.dispatchInput("mv" + string(svId) + ":end", "-120,-300")
+const endOut: string = ra.drain()
+check(RENDERS == rb, "a value's end handler that only springs it does not render (rendered " + string(RENDERS - rb) + " times)")
+check(endLines == 1 && endOut.slice(0, 3) == "MS|", "and its spring still reaches the host: " + endOut)
+const gLines: int = ra.dispatchInput("app.0:gesture", "swipe:left")
+check(RENDERS == rb && gLines == 0, "a gesture nobody bound renders nothing (" + string(gLines) + " lines)")
+ra.dispatchInput("mv" + string(svId) + ":settle", "-160"); ra.drain()
+check(RENDERS == rb + 1, "a settle handler that set a cell renders once")
+ra.tick(); ra.drain()
+check(RENDERS == rb + 1, "and the heartbeat after it stays quiet")
+check(SETTLED != null && SETTLED.get() == 1, "the settle reached the cell")
+
+// Only the component whose state changed re-runs. A screen of rows, each with its
+// own cell: a row's change runs that row, not its siblings and not the screen; the
+// screen's own change runs the screen and every row under it (they were made fresh,
+// with whatever the screen passed them); module state announced with requestRender
+// runs everything; a pass in which nothing was marked runs everything too.
+var RUNS: map[string]int = {}
+function ran(name: string): void { RUNS[name] = RUNS.getOr(name, 0) + 1 }
+function runsOf(name: string): int { return RUNS.getOr(name, 0) }
+var ROW_CELLS: map[string]Cell<int> = {}
+var SCREEN_CELL: Cell<int>? = null
+var EFFECT_CLEANUPS: int = 0
+var MODULE_TITLE: string = "rows"
+function row(n: int): Node {
+    return KeyedComp("r" + string(n), function(): Node {
+        ran("row" + string(n))
+        const hits: Cell<int> = useState(0)
+        ROW_CELLS["row" + string(n)] = hits
+        useEffect(function(): any { return function(): void { EFFECT_CLEANUPS = EFFECT_CLEANUPS + 1 } }, [])
+        return Text({ h: 40 }, "row " + string(n) + " x" + string(hits.get()))
+    })
+}
+class RowsApp extends App {
+    override public render(): Node {
+        // keyed: the earlier apps in this file also put a component at path "app", and the
+        // cell store is shared across App instances in one process
+        return KeyedComp("rows-screen", function(): Node {
+            ran("screen")
+            const title: Cell<int> = useState(0)
+            SCREEN_CELL = title
+            var rows: []Node = []
+            for (var i: int = 0; i < 5; i = i + 1) { rows.push(row(i)) }
+            return Column({ grow: 1 }, [ Text({}, MODULE_TITLE + " " + string(title.get())), Column({}, rows) ])
+        })
+    }
+}
+const ra2: RowsApp = new RowsApp()
+ra2.mount(); ra2.drain(); ra2.tick(); ra2.drain()   // the tick flushes the previous app's value drop (the hook store is shared)
+check(runsOf("screen") == 1 && runsOf("row0") == 1 && runsOf("row4") == 1, "mount runs everything once")
+var c2: Cell<int>? = ROW_CELLS.get("row2")
+if (c2 != null) { c2.set(7) }
+const n2: int = ra2.tick()
+const out2: string = ra2.drain()
+check(runsOf("row2") == 2, "a row's own state change runs that row")
+check(runsOf("screen") == 1 && runsOf("row0") == 1 && runsOf("row3") == 1, "and not the screen or its siblings (screen " + string(runsOf("screen")) + ", row0 " + string(runsOf("row0")) + ")")
+check(n2 == 1 && out2.indexOf("row 2 x7") >= 0, "the diff is that row's one line: " + out2)
+check(EFFECT_CLEANUPS == 0, "a skipped row keeps its effect (no cleanup ran)")
+ra2.tick(); ra2.drain()
+check(runsOf("row2") == 2, "the beat after it runs nothing")
+var c3: Cell<int>? = ROW_CELLS.get("row3")
+if (c3 != null) { c3.set(1) }
+ra2.tick(); ra2.drain()
+var c2b: Cell<int>? = ROW_CELLS.get("row2")
+check(c2b != null && c2b.get() == 7, "a skipped row's state survives the sweep")
+if (SCREEN_CELL != null) { SCREEN_CELL.set(1) }
+ra2.tick(); const out3: string = ra2.drain()
+check(runsOf("screen") == 2 && runsOf("row0") == 2 && runsOf("row4") == 2, "the screen's own change runs the screen and every row it made")
+check(out3.indexOf("rows 1") >= 0, "and its text updates: " + out3.split("\n").join(" / "))
+MODULE_TITLE = "places"
+requestRender()
+ra2.tick(); const out4: string = ra2.drain()
+check(runsOf("screen") == 3 && runsOf("row1") == 3, "requestRender runs everything")
+check(out4.indexOf("places 1") >= 0, "and module state shows")
+MODULE_TITLE = "spots"
+ra2.dispatch("app"); const out5: string = ra2.drain()
+check(runsOf("screen") == 4, "an event that marked nothing runs everything (the render every event had)")
+check(out5.indexOf("spots 1") >= 0, "so module state changed in its handler still shows")
+check(EFFECT_CLEANUPS == 0, "no row unmounted through any of it")
+
+// ---- a Scroll given a size keeps it --------------------------------------------
+// The scroll's fill default is grow 1 from a basis of 0, and a basis of 0 makes the
+// layout ignore an explicit height: a carousel asked for h: 160 in a column filled the
+// column (589 tall on both hosts, found by the host parity fixture). An explicit h or,
+// for a carousel, w stands on its own; a scroll without one still fills.
+const fill: Node = Scroll({ grow: 1 }, [ Column({}, []) ])
+check(fill.style.grow == 1 && fill.style.basis == 0, "a scroll without a size fills: grow 1, basis 0")
+const plain: Node = Scroll([ Column({}, []) ])
+check(plain.style.grow == 1 && plain.style.basis == 0, "so does the bare form")
+const carousel: Node = Scroll({ horizontal: true, h: 160 }, [ Column({}, []) ])
+check(carousel.style.h == 160 && carousel.style.grow != 1 && carousel.style.basis != 0, "a carousel with h keeps it: no fill")
+const tall: Node = Scroll({ h: 300, bg: "FFFFFF" }, [ Column({}, []) ])
+check(tall.style.h == 300 && tall.style.grow != 1 && tall.style.basis != 0, "a vertical scroll with h keeps it")
+const wide: Node = Scroll({ horizontal: true, w: 240 }, [ Column({}, []) ])
+check(wide.style.w == 240 && wide.style.grow != 1, "a carousel with w keeps it")
+const sizedGrow: Node = Scroll({ h: 200, grow: 1 }, [ Column({}, []) ])
+check(sizedGrow.style.h == 200 && sizedGrow.style.grow == 1 && sizedGrow.style.basis != 0, "a caller's grow still applies beside h")
+
+print("render: " + string(passed) + " passed, " + string(failed) + " failed")

@@ -10,7 +10,7 @@
 // it would bury the warnings worth reading. Once, with a count, is the honest form.
 //
 // Run:  chuks run tests/devwarn_test.chuks   (exits non-zero on failure)
-import { devWarn, devWarnings, devWarnCount, clearDevWarnings } from "../core/ui.chuks";
+import { devWarn, devWarnings, devWarnCount, clearDevWarnings, Node, Text, List, Reconciler } from "../core/ui.chuks";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -53,6 +53,17 @@ function main(): void {
     clearDevWarnings()
     check(devWarnings().length == 0, "clearing empties the log")
     check(devWarnCount("pedometer.query|unsupported") == 0, "and forgets the counts with it")
+
+    // A List without rowHeight used to die with a bare "division by zero" inside the
+    // windowing math. It is a warning that names the prop, and the list mounts no rows.
+    const rc: Reconciler = new Reconciler()
+    rc.setViewport(0, 600, 400)
+    rc.drain()
+    rc.renderRoot(List({ count: 50, item: function(i: int, top: int): Node { return Text({ abs: true, top: top, h: 40 }, "row " + string(i)) } }))
+    const lines: string = rc.drain()
+    check(devWarnCount("liststride:app") == 1, "a List without rowHeight warns once")
+    check(devWarnings().length == 1 && devWarnings()[0].indexOf("rowHeight") >= 0, "and the warning names the missing prop: " + (devWarnings().length > 0 ? devWarnings()[0] : "<none>"))
+    check(lines.indexOf("row 0") < 0, "and no row is mounted until it has one")
 
     println("")
     println(string(PASS) + " passed, " + string(FAIL) + " failed")
