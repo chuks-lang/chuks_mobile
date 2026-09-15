@@ -46,6 +46,11 @@ docs/
 # of the shippable package (the starter template lives under template/).
 examples/
 
+# The host-parity fixture (tests/host) is a project of its own; tools/host-parity.sh
+# links it to this checkout and copies the template entry before building it.
+tests/host/chuks_packages/
+tests/host/.chuks/
+
 # Staging for packages that will graduate to their own repos (e.g. @chuks/filters).
 # Kept local until ported out; not shipped as part of @chuks/mobile.
 packages/

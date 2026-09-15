@@ -135,6 +135,12 @@ else
         sed -i '' 's#android:icon="[^"]*"##' "$OUT/AndroidManifest.xml"
         sed -i '' "s#<application #<application android:icon=\"@mipmap/ic_launcher\" #" "$OUT/AndroidManifest.xml"
     fi
+    # DEBUGGABLE=1: mark the app debuggable so `adb shell run-as <package>` can read the
+    # files it writes (tools/host-parity.sh reads its view-tree dumps that way on a
+    # production emulator image, where adb cannot run as root). Never for a release.
+    if [ "${DEBUGGABLE:-0}" = "1" ]; then
+        sed -i '' "s#<application #<application android:debuggable=\"true\" #" "$OUT/AndroidManifest.xml"
+    fi
     if [ -n "$SPLASH_BG" ]; then
         mkdir -p "$OUT/res/values" "$OUT/res/drawable"
         # A layer-list rather than a bare colour so an optional logo sits centred on it,

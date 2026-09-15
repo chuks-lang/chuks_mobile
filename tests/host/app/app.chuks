@@ -1,0 +1,193 @@
+// Host parity fixtures.
+//
+// The engine lays a screen out once, in Yoga; each host then turns those frames into
+// platform views, and each platform has opinions of its own (a ScrollView measures its
+// content for itself, a label measures its text with its own font). The layout can be
+// right and the screen still wrong. This app renders a fixed set of screens, one after
+// another, inside a 360x640 box so the device does not matter, and after each one asks
+// the host for its view tree (frames as Yoga resolved them, plus the platform's frame
+// wherever it disagrees) and writes it to a file. tools/host-parity.sh runs it on the
+// simulator and the emulator and diffs the files: a host that drifts from the engine,
+// or two hosts that drift from each other, fails the check.
+//
+// Every screen is deterministic: fixed sizes, fixed text, no capability, no clock.
+import { Node, Column, Row, Text, Scroll, List, Pressable, App, Comp, dispatchAsync } from "pkg/@chuks/mobile/core/ui.chuks";
+import { useState, Cell } from "pkg/@chuks/mobile/core/state.chuks";
+import { TabView, Tab } from "pkg/@chuks/mobile/core/nav.chuks";
+import { Debug, FileSystem } from "pkg/@chuks/mobile/core/native.chuks";
+import { time } from "std/time";
+
+const BOX_W: int = 360
+const BOX_H: int = 640
+const LONG: string = "Steps count all day on their own. Record a route only when you want a map of where you went, and nothing else."
+
+// ---- screens ------------------------------------------------------------------
+
+/** A page whose children just fit the box, with a content column padded at the bottom. The
+ *  padding is the scroll range, and it is what Android's ScrollView used to drop. */
+function scrollPadded(): Node {
+    var rows: []Node = []
+    for (var i: int = 0; i < 6; i = i + 1) {
+        rows.push(Row({ h: 72, bg: "DDE8E2", radius: 12, align: "center", px: 12 }, [ Text({ size: 14 }, "row " + string(i)) ]))
+    }
+    return Scroll({ grow: 1, bg: "F4F6F5" }, [ Column({ px: 16, pt: 16, pb: 150, gap: 10, justify: "start" }, rows) ])
+}
+
+/** A page far taller than the box. */
+function scrollLong(): Node {
+    var rows: []Node = []
+    for (var i: int = 0; i < 30; i = i + 1) {
+        rows.push(Row({ h: 48, bg: "E4E9F2", radius: 8, align: "center", px: 12 }, [ Text({ size: 14 }, "line " + string(i)) ]))
+    }
+    return Scroll({ grow: 1 }, [ Column({ px: 12, py: 12, gap: 8, justify: "start" }, rows) ])
+}
+
+/** A windowed list. */
+function list(): Node {
+    return Column({ grow: 1, justify: "start" }, [
+        List({ count: 100,
+               key: function(r: int): string { return string(r) },
+               item: function(r: int, top: int): Node {
+                   return Row({ abs: true, top: top, left: 12, right: 12, h: 56, bg: "EEE6D8", radius: 10, align: "center", px: 12 },
+                              [ Text({ size: 14 }, "item " + string(r)) ])
+               },
+               rowHeight: 56, gap: 8, pad: 12 }),
+    ])
+}
+
+/** Text with a width to wrap to, text on one line, text inside a fixed-width column. */
+function textWrap(): Node {
+    return Column({ grow: 1, px: 16, pt: 16, gap: 12, justify: "start", align: "start" }, [
+        Text({ size: 14, w: 280 }, LONG),
+        Text({ size: 14 }, "one line"),
+        Column({ w: 200, bg: "EEEEEE", pad: 8 }, [ Text({ size: 12, w: 184 }, LONG) ]),
+        Text({ size: 22, weight: "bold" }, "Heading"),
+    ])
+}
+
+/** Flex: grow shares, a basis, gaps, padding and margins, nested rows in columns. */
+function flex(): Node {
+    return Column({ grow: 1, px: 12, pt: 12, gap: 8, justify: "start" }, [
+        Row({ h: 40, gap: 8 }, [
+            Column({ grow: 1, basis: 0, bg: "C8E6C9" }, []),
+            Column({ grow: 2, basis: 0, bg: "B3E5FC" }, []),
+            Column({ w: 60, bg: "FFE0B2" }, []),
+        ]),
+        Row({ h: 80, gap: 8, align: "center", justify: "between" }, [
+            Column({ w: 40, h: 40, bg: "F8BBD0", radius: 20 }, []),
+            Column({ w: 40, h: 60, bg: "D1C4E9", mt: 10 }, []),
+            Column({ w: 40, h: 20, bg: "FFF9C4", mb: 10 }, []),
+        ]),
+        Column({ pad: 12, bg: "ECEFF1", gap: 6 }, [
+            Row({ h: 24, bg: "CFD8DC" }, []),
+            Row({ h: 24, bg: "CFD8DC", ml: 24 }, []),
+            Row({ wpct: 50, h: 24, bg: "B0BEC5" }, []),
+            Row({ w: 100, aspect: 200, bg: "90A4AE" }, []),   // 2:1, so 100x50
+        ]),
+    ])
+}
+
+/** Absolute placement: corners by top/left and bottom/right, an overlay over content. */
+function absolute(): Node {
+    return Column({ grow: 1, bg: "FAFAFA" }, [
+        Column({ abs: true, top: 12, left: 12, w: 80, h: 40, bg: "A5D6A7" }, []),
+        Column({ abs: true, top: 12, right: 12, w: 80, h: 40, bg: "90CAF9" }, []),
+        Column({ abs: true, bottom: 12, left: 12, w: 80, h: 40, bg: "FFCC80" }, []),
+        Column({ abs: true, bottom: 12, right: 12, w: 80, h: 40, bg: "CE93D8" }, []),
+        Column({ abs: true, top: 100, left: 40, right: 40, h: 200, bg: "EEEEEE", pad: 16 }, [
+            Text({ size: 14 }, "overlay"),
+            Column({ abs: true, bottom: 0, left: 0, right: 0, h: 30, bg: "BDBDBD" }, []),
+        ]),
+    ])
+}
+
+/** A horizontal scroll (carousel). */
+function hscroll(): Node {
+    var cards: []Node = []
+    for (var i: int = 0; i < 8; i = i + 1) {
+        cards.push(Column({ w: 200, h: 140, bg: "E1F5FE", radius: 12 }, [ Text({ size: 14 }, "card " + string(i)) ]))
+    }
+    return Column({ grow: 1, justify: "start", pt: 20 }, [
+        Scroll({ horizontal: true, h: 160 }, [ Row({ gap: 12, px: 16 }, cards) ]),
+        Text({ size: 14, pl: 16, pt: 12 }, "below the carousel"),
+    ])
+}
+
+/** A hidden node takes no space; a zero-height node is reported as such. */
+function hiddenNodes(): Node {
+    return Column({ grow: 1, px: 12, pt: 12, gap: 8, justify: "start" }, [
+        Row({ h: 40, bg: "C5CAE9" }, []),
+        Row({ h: 40, bg: "FFCDD2", hidden: true }, []),
+        Row({ h: 40, bg: "C8E6C9" }, []),
+        Row({ h: 0, bg: "000000" }, []),
+        Row({ h: 40, bg: "FFE082" }, []),
+    ])
+}
+
+/** Tabs with a header and a floating bar over a scrolling page. */
+function tabsScreen(): Node {
+    return TabView({
+            active: 0,
+            onSelect: function(i: int): void {},
+            iconFor: function(n: string, c: string, s: int): Node { return Column({ w: s, h: s, bg: c, radius: 4 }, []) },
+            activeColor: "1B5E20",
+            bg: "FFFFFF",
+            glass: true,
+            header: Row({ h: 56, px: 16, align: "center", bg: "F0F0F0" }, [ Text({ size: 18, weight: "bold" }, "Header") ]),
+        }, [
+            Tab({ name: "a", icon: "home", label: "A", screen: scrollPadded }),
+            Tab({ name: "b", icon: "users", label: "B", screen: scrollLong }),
+    ])
+}
+
+// ---- runner ---------------------------------------------------------------------
+
+const NAMES: []string = ["scroll_padded", "scroll_long", "list", "text_wrap", "flex", "absolute", "hscroll", "hidden", "tabs"]
+
+function screenAt(i: int): Node {
+    if (i == 0) { return scrollPadded() }
+    if (i == 1) { return scrollLong() }
+    if (i == 2) { return list() }
+    if (i == 3) { return textWrap() }
+    if (i == 4) { return flex() }
+    if (i == 5) { return absolute() }
+    if (i == 6) { return hscroll() }
+    if (i == 7) { return hiddenNodes() }
+    return tabsScreen()
+}
+
+var STARTED: bool = false
+
+/** Switch to screen `i` on the render thread. A parameter, not the loop slot: a closure
+ *  in a loop body reads the slot's final value. */
+function show(idx: Cell<int>, i: int): void {
+    dispatchAsync(function(): void { idx.set(i) })
+}
+
+/** Give each screen a moment on screen, dump it, move to the next; DONE marks the end. */
+async function drive(idx: Cell<int>): Task<void> {
+    for (var i: int = 0; i < NAMES.length; i = i + 1) {
+        show(idx, i)
+        time.sleep(700)
+        const tree: string = await Debug.viewTreeAsync()
+        FileSystem.write("parity/" + NAMES[i] + ".txt", tree)
+        time.sleep(200)
+    }
+    FileSystem.write("parity/DONE", "ok\n")
+}
+
+function Root(): Node {
+    const idx = useState<int>(0)
+    if (!STARTED) { STARTED = true; spawn drive(idx) }
+    const i: int = idx.get()
+    return Column({ grow: 1, bg: "FFFFFF", justify: "start", align: "start" }, [
+        Column({ abs: true, top: 0, left: 0, w: BOX_W, h: BOX_H, bg: "FFFFFF" }, [ screenAt(i) ]),
+        Text({ abs: true, top: BOX_H + 8, left: 8, size: 12, color: "888888" }, "hostparity " + NAMES[i]),
+    ])
+}
+
+class ParityApp extends App {
+    public override render(): Node { return Comp(Root) }
+}
+
+export function createRoot(): App { return new ParityApp() }

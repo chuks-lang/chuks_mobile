@@ -177,4 +177,22 @@ check(runsOf("screen") == 4, "an event that marked nothing runs everything (the 
 check(out5.indexOf("spots 1") >= 0, "so module state changed in its handler still shows")
 check(EFFECT_CLEANUPS == 0, "no row unmounted through any of it")
 
+// ---- a Scroll given a size keeps it --------------------------------------------
+// The scroll's fill default is grow 1 from a basis of 0, and a basis of 0 makes the
+// layout ignore an explicit height: a carousel asked for h: 160 in a column filled the
+// column (589 tall on both hosts, found by the host parity fixture). An explicit h or,
+// for a carousel, w stands on its own; a scroll without one still fills.
+const fill: Node = Scroll({ grow: 1 }, [ Column({}, []) ])
+check(fill.style.grow == 1 && fill.style.basis == 0, "a scroll without a size fills: grow 1, basis 0")
+const plain: Node = Scroll([ Column({}, []) ])
+check(plain.style.grow == 1 && plain.style.basis == 0, "so does the bare form")
+const carousel: Node = Scroll({ horizontal: true, h: 160 }, [ Column({}, []) ])
+check(carousel.style.h == 160 && carousel.style.grow != 1 && carousel.style.basis != 0, "a carousel with h keeps it: no fill")
+const tall: Node = Scroll({ h: 300, bg: "FFFFFF" }, [ Column({}, []) ])
+check(tall.style.h == 300 && tall.style.grow != 1 && tall.style.basis != 0, "a vertical scroll with h keeps it")
+const wide: Node = Scroll({ horizontal: true, w: 240 }, [ Column({}, []) ])
+check(wide.style.w == 240 && wide.style.grow != 1, "a carousel with w keeps it")
+const sizedGrow: Node = Scroll({ h: 200, grow: 1 }, [ Column({}, []) ])
+check(sizedGrow.style.h == 200 && sizedGrow.style.grow == 1 && sizedGrow.style.basis != 0, "a caller's grow still applies beside h")
+
 print("render: " + string(passed) + " passed, " + string(failed) + " failed")

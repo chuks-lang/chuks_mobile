@@ -22,5 +22,13 @@ done
 echo "=== tests/style_reset_coverage.py ==="
 if ! python3 tests/style_reset_coverage.py; then fail=1; fi
 
+# Host parity (HOST_PARITY=1): the fixture app in tests/host on the booted simulator
+# and the running emulator, its view trees diffed against the engine's layout and
+# against each other. Opt-in because it needs both devices up; see tools/host-parity.sh.
+if [ "${HOST_PARITY:-0}" = "1" ]; then
+    echo "=== tools/host-parity.sh ==="
+    if ! bash tools/host-parity.sh; then fail=1; fi
+fi
+
 if [ "$fail" -ne 0 ]; then echo "TESTS FAILED"; exit 1; fi
 echo "ALL TESTS PASSED"

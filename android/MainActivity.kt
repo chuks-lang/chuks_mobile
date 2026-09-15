@@ -1312,6 +1312,24 @@ class MainActivity : Activity(), ChuksModuleHost {
             sb.append("$pad$id  ${v.javaClass.simpleName}  $x,$y ${w}x$h")
             if (v.visibility != View.VISIBLE) sb.append("  hidden")
             if (w == 0 || h == 0) sb.append("  ZERO-SIZED")
+            // Where the platform disagrees with the engine. Android applies Yoga's frame
+            // through LayoutParams and then measures for itself, and a parent may
+            // overrule the child's height (a ScrollView measures its content
+            // UNSPECIFIED, so the content's own padding fell out of the scroll range
+            // and a page that just fit would not scroll). Yoga is what the app asked
+            // for; the View is what the user gets; a gap between them is a host bug,
+            // so the dump names it. Hidden views are skipped (a GONE view has no size);
+            // a horizontal list's content has its height pinned on purpose, so only its
+            // width is held to Yoga's. The root is placed by the host itself (topY below
+            // the inset), so it is exempt.
+            if (id != "app" && v.visibility == View.VISIBLE && !placed) {
+                val px = (v.x / density).toInt(); val py = (v.y / density).toInt()
+                val pw = (v.width / density).toInt(); val ph = (v.height / density).toInt()
+                val pinnedH = listHoriz && id == contentId
+                if (Math.abs(px - x) > 1 || Math.abs(pw - w) > 1 || (!pinnedH && (Math.abs(py - y) > 1 || Math.abs(ph - h) > 1))) {
+                    sb.append("  host=$px,$py ${pw}x$ph DRIFT")
+                }
+            }
             (v as? TextView)?.text?.toString()?.let {
                 if (it.isNotEmpty()) sb.append("  \"" + (if (it.length > 30) it.take(30) + "…" else it) + "\"")
             }
@@ -1323,6 +1341,19 @@ class MainActivity : Activity(), ChuksModuleHost {
     // What TalkBack would get for this view, read back from the AccessibilityNodeInfo
     // the view builds (so the delegate has run) rather than from what the host thinks
     // it set. Same shape as the iOS dump, so a test can compare the two.
+    // Run `block` once the platform has laid the tree out. A frame just written to a
+    // LayoutParams is not on any View until the next traversal; a caller that wants
+    // to compare Yoga's frames with the platform's has to wait for that.
+    private fun afterLayout(block: () -> Unit) {
+        if (!root.isLayoutRequested) { block(); return }
+        root.viewTreeObserver.addOnGlobalLayoutListener(object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+            override fun onGlobalLayout() {
+                root.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                block()
+            }
+        })
+    }
+
     private fun a11yDump(id: String, v: View): String {
         val parts = ArrayList<String>()
         if (v.importantForAccessibility == View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS) parts.add("hidden")
@@ -1792,7 +1823,9 @@ class MainActivity : Activity(), ChuksModuleHost {
             }
             "biometrics.authenticate" -> authenticateBiometric(token, args)
             "debug.activeStreams" -> resolve(token, (activeStreams.size + streamTeardown.size).toString())
-            "debug.viewTree" -> resolve(token, viewTreeDump())
+            // Answered after the pending layout pass, so the platform frames the dump
+            // compares against Yoga's are the ones on screen, not the previous pass's.
+            "debug.viewTree" -> afterLayout { resolve(token, viewTreeDump()) }
             "debug.frames" -> frameStats(token, args.toDoubleOrNull() ?: 10000.0)
             "debug.fail" -> fail(token, "simulated native failure")
             "permission.status" -> {

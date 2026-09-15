@@ -3909,6 +3909,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             var line = "\(pad)\(id)  \(cls)  \(Int(f.origin.x)),\(Int(f.origin.y)) \(Int(f.size.width))x\(Int(f.size.height))"
             if v.isHidden { line += "  hidden" }
             if f.size.width == 0 || f.size.height == 0 { line += "  ZERO-SIZED" }
+            // The same drift field Android prints. Here a frame is assigned from the Yoga
+            // node directly, so the two agree by construction; a DRIFT on iOS means the
+            // host placed the view itself after layout (a popover) and reports as much.
+            if !v.isHidden, let yn = ynodes[id] {
+                let yx = Int(YGNodeLayoutGetLeft(yn)), yy = Int(YGNodeLayoutGetTop(yn))
+                let yw = Int(YGNodeLayoutGetWidth(yn)), yh = Int(YGNodeLayoutGetHeight(yn))
+                if abs(Int(f.origin.x) - yx) > 1 || abs(Int(f.origin.y) - yy) > 1 || abs(Int(f.size.width) - yw) > 1 || abs(Int(f.size.height) - yh) > 1 {
+                    line += "  yoga=\(yx),\(yy) \(yw)x\(yh) DRIFT"
+                }
+            }
             if let t = (v as? UILabel)?.text, !t.isEmpty {
                 line += "  \"" + (t.count > 30 ? String(t.prefix(30)) + "…" : t) + "\""
             }
