@@ -2998,7 +2998,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // in viewDidLayoutSubviews (ins == lastInsets) would skip re-sending them, so the new
         // VM would lay out edge-to-edge (content under the status bar, tab bar under the home
         // indicator). Force-resend the current insets to the fresh VM before mounting.
+        // Everything the host told the old VM at launch, again for the fresh one: the
+        // insets, the platform info and the OS appearance (without it the fresh VM opens
+        // in the engine's default theme, dark, on a phone in light mode after the first save).
         let ins = view.safeAreaInsets; lastInsets = ins; eInsets(ins)
+        ePlatform()
+        eColorScheme(traitCollection.userInterfaceStyle == .dark)
         if let s = eMount() { remount(s); _ = pushViewport(); relayout() }
     }
     var cmrPendingState = ""   // app state kept across a failed reload, restored on the fix

@@ -111,7 +111,7 @@ cp "$BIN/../sysroot/usr/lib/$CXXLIB/libc++_shared.so" "$OUT/lib/$ABI/"
 # Fonts are referenced by family name, so they flatten. Images keep their path
 # relative to assets/, so you can organize them in subfolders and reference them as
 # src:"sub/dir/name.png" (basenames no longer collide across folders).
-for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
+for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" \( -name "*.ttf" -o -name "*.otf" \) 2>/dev/null); do cp "$f" "$OUT/assets/"; done
 # The same media types the release build bundles: a Video or Audio asset must not work
 # in a release APK and be missing under hot reload.
 find -L "$PROJDIR/assets" \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" -o -name "*.png" -o -name "*.jpg" \) 2>/dev/null | { while IFS= read -r f; do
@@ -121,7 +121,7 @@ done; } || true   # a project with no assets/ dir is fine: find exits non-zero, 
     && zip -q base.apk "lib/$ABI/libapp.so" "lib/$ABI/libc++_shared.so" \
     && zip -q base.apk assets/cmr.bundle \
     && { [ -e assets/cmr-dev.txt ] && zip -q base.apk assets/cmr-dev.txt || true; } \
-    && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
+    && for tf in assets/*.ttf assets/*.otf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
     && for wf in assets/*.js assets/*.css; do [ -e "$wf" ] && zip -q base.apk "$wf" || true; done \
     && (find assets \( -name "*.png" -o -name "*.jpg" \) -type f | while IFS= read -r im; do zip -q base.apk "$im"; done) \
     && (find assets \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" \) -type f | while IFS= read -r mv; do zip -0 -q base.apk "$mv"; done) )   # -0: stored, so MediaPlayer.openFd gets a seekable descriptor (as the release build does)

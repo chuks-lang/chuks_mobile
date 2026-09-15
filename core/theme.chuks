@@ -116,10 +116,36 @@ export function syncSystemTheme(dark: bool): void {
 // it to the OS.
 export function followingSystem(): bool { return !userPicked }
 
+// The app's own colours for the roles, laid over the defaults: what setPalette set.
+var BRAND_LIGHT: map[string]string = {}
+var BRAND_DARK: map[string]string = {}
+
+/**
+ * Give the framework your palette. Every builtin, the kit, and every `tw` class such
+ * as `bg-primary` or `text-muted` resolve their colours through the theme's roles,
+ * and this is where an app says what those roles are: a map per mode, hex without
+ * the `#`, keyed by role (`primary`, `bg`, `surface`, `text`, `muted`, `border`, and
+ * the rest listed under tk). A role you leave out keeps its default, so a brand is
+ * usually a handful of entries. Call it once at startup, before the first render;
+ * calling it again re-skins on the next render.
+ *
+ * ```chuks
+ * setPalette({ "primary": "0D47CF", "primaryText": "FFFFFF", "bg": "F3F3F2" },
+ *            { "primary": "3D7AF2", "primaryText": "FFFFFF", "bg": "0D0D1A" })
+ * ```
+ */
+export function setPalette(light: map[string]string, dark: map[string]string): void {
+    BRAND_LIGHT = light; BRAND_DARK = dark
+}
+
 // Resolve a semantic color role to hex against the active theme. Returns "" when
 // `name` is not a role, so callers can fall back (raw hex, Tailwind palette).
 export function tk(name: string): string {
-    const pal: map[string]string = THEME_MODE == ThemeMode.Light ? LIGHT : DARK
+    const light: bool = THEME_MODE == ThemeMode.Light
+    const brand: map[string]string = light ? BRAND_LIGHT : BRAND_DARK
+    const own: string = brand.getOr(name, "")
+    if (own != "") { return own }
+    const pal: map[string]string = light ? LIGHT : DARK
     return pal.getOr(name, "")
 }
 

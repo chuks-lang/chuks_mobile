@@ -1047,7 +1047,13 @@ class MainActivity : Activity(), ChuksModuleHost {
         // A hot reload swaps in a FRESH VM whose insets are zero. reportInsets' change-guard
         // would skip re-sending them, so the new VM would lay out edge-to-edge (content under
         // the status bar, tab bar under the nav bar). Invalidate the cache so reportInsets resends.
+        // The same goes for everything else the host told the old VM at launch: the OS
+        // appearance (without it the fresh VM opens in the engine's default theme, dark,
+        // on a phone in light mode after the first save) and the platform info.
         lastInsets = intArrayOf(-1, -1, -1, -1)
+        val isTablet = if (resources.configuration.smallestScreenWidthDp >= 600) 1 else 0
+        N.setPlatform("android", android.os.Build.VERSION.RELEASE, android.os.Build.MODEL, isTablet)
+        N.setColorScheme(if (osDark()) 1 else 0)
         hostMount(); reportInsets(); relayout(); if (pushViewport()) relayout()
     }
     private var lastGoodState: String = ""   // app state kept across a failed reload, restored on the fix
@@ -2976,8 +2982,14 @@ class MainActivity : Activity(), ChuksModuleHost {
     private val textWidthPx = HashMap<String, Float>()   // id -> explicit Text width (px), so text WRAPS to it
     private val explicitHeight = HashSet<String>()       // ids with an explicit `h`; a Button then keeps it instead of self-measuring
     private val iconFonts = HashMap<String, android.graphics.Typeface>()   // custom fonts by name, cached
+    // A font by family name, from assets: `Name.ttf`, else `Name.otf` (Gill Sans and
+    // many licensed families ship as OpenType). iOS matches the same name as the
+    // PostScript name, so one `font:` value resolves on both.
     private fun iconFont(name: String): android.graphics.Typeface =
-        iconFonts.getOrPut(name) { android.graphics.Typeface.createFromAsset(assets, "$name.ttf") }
+        iconFonts.getOrPut(name) {
+            try { android.graphics.Typeface.createFromAsset(assets, "$name.ttf") }
+            catch (e: RuntimeException) { android.graphics.Typeface.createFromAsset(assets, "$name.otf") }
+        }
 
     // ── Accessibility ──────────────────────────────────────────────────────────
     // Six style keys say what TalkBack reads and how it treats a node. The role is the

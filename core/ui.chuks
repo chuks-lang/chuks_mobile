@@ -14,6 +14,7 @@ import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
 import { Prop } from "./prop.chuks";
 import { tw } from "./tw.chuks";
+import { syncSystemTheme } from "./theme.chuks";   // the OS appearance drives the theme (see App.setColorScheme)
 import { json } from "std/json";   // route params ride the hot-reload snapshot
 import { Channel } from "std/channel";   // awaited capabilities park on one of these
 import { time } from "std/time";
@@ -4163,7 +4164,11 @@ export class App {
     // Host reports the OS color scheme / platform / safe-area insets. These update
     // module state (osIsDark(), platformOS(), safeTop()/… ) that the app can read on
     // the next render; the host triggers that render via mount/tick/setViewport.
-    public setColorScheme(dark: int): void { setOsColorScheme(dark) }
+    // The host reports the OS appearance. Both things that depend on it happen here: the
+    // osColorScheme() readout, and the theme following the system until the user picks.
+    // The release entry used to do the theme half and the dev runtime the readout half,
+    // so under hot reload every app opened in the engine's default (dark) theme.
+    public setColorScheme(dark: int): void { setOsColorScheme(dark); syncSystemTheme(dark == 1) }
     // Host reports the platform: OS name, version, device model, and tablet flag.
     public setPlatform(os: string, ver: string, model: string, tablet: int): void { setPlatformInfo(os, ver, model, tablet == 1) }
     // Host reports the safe-area insets (top, right, bottom, left) in points.

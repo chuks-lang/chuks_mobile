@@ -2,7 +2,7 @@
 // app root (app/app.chuks) to the @chuks/mobile native host C-ABI. The engine glue
 // comes from the installed package; your root comes from ./app.
 import { createRoot } from "../app/app.chuks";
-import { syncSystemTheme, followingSystem } from "pkg/@chuks/mobile/core/theme.chuks";
+import { followingSystem } from "pkg/@chuks/mobile/core/theme.chuks";
 import { setSafeInsets } from "pkg/@chuks/mobile/core/ui.chuks";
 import { setPlatformInfo } from "pkg/@chuks/mobile/core/platform.chuks";
 
@@ -22,7 +22,7 @@ export function fail(token: string, message: string): int { return APP.failToken
 export function drain(): string { return APP.drain() }
 export function saveState(): string { return APP.saveState() }
 export function loadState(data: string): void { APP.loadState(data) }
-export function setColorScheme(dark: int): void { syncSystemTheme(dark == 1) }
+export function setColorScheme(dark: int): void { APP.setColorScheme(dark) }   // theme + osColorScheme(), in one place
 export function colorSchemeFollows(): int { return followingSystem() ? 1 : 0 }
 export function setInsets(top: int, right: int, bottom: int, left: int): void { setSafeInsets(top, right, bottom, left) }
 export function setPlatform(os: string, version: string, model: string, isTablet: int): void {

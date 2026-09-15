@@ -206,7 +206,7 @@ if [ "${DEV:-0}" = "1" ]; then
     echo "   hot reload: app will fetch from $DEV_HOST:7799"
 fi
 # -L: follow symlinks so fonts/media inside symlinked packages (local dev) are found.
-for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do cp "$f" "$OUT/assets/"; done
+for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" \( -name "*.ttf" -o -name "*.otf" \) 2>/dev/null); do cp "$f" "$OUT/assets/"; done
 # Framework web assets (Leaflet for the Map route WebView) -> file:///android_asset/.
 # The dev build had this from the day Leaflet was bundled; this build did not, so every
 # release APK's Map was its background colour and nothing else.
@@ -220,7 +220,7 @@ for wf in "$PKGDIR"/webassets/*; do [ -e "$wf" ] && cp "$wf" "$OUT/assets/"; don
 done || true
 ( cd "$OUT" && zip -qj base.apk classes.dex && zip -q base.apk lib/arm64-v8a/libapp.so lib/arm64-v8a/libc++_shared.so \
     && { [ -e assets/chuks-dev.txt ] && zip -q base.apk assets/chuks-dev.txt || true; } \
-    && for tf in assets/*.ttf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
+    && for tf in assets/*.ttf assets/*.otf; do [ -e "$tf" ] && zip -q base.apk "$tf" || true; done \
     && for wf in assets/*.js assets/*.css; do [ -e "$wf" ] && zip -q base.apk "$wf" || true; done \
     && (find assets \( -name "*.png" -o -name "*.jpg" \) -type f | while IFS= read -r im; do zip -q base.apk "$im"; done) \
     && (find assets \( -name "*.mp4" -o -name "*.wav" -o -name "*.mp3" -o -name "*.m4a" \) -type f | while IFS= read -r mv; do zip -0 -q base.apk "$mv"; done) )   # -0 (media): seekable for MediaPlayer.openFd; images stay compressed   # -0 (media): seekable for MediaPlayer.openFd; images stay compressed   # -0: store media uncompressed so MediaPlayer.openFd hands back a seekable descriptor; || true so a non-matching glob doesn't trip set -e

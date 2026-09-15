@@ -103,7 +103,7 @@ cp "$OUT/$APPNAME" "$APP/$APPNAME"   # the .app's executable (CFBundleExecutable
 echo "4. Assembling the app (+ assets)"
 IOS_PLIST_EXTRA="$(AJ ios-plist)"
 FONT_PLIST=""
-for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" -name "*.ttf" 2>/dev/null); do
+for f in $(find -L "$PROJDIR/assets" "$PROJDIR/chuks_packages" \( -name "*.ttf" -o -name "*.otf" \) 2>/dev/null); do
     bn="$(basename "$f")"; cp "$f" "$APP/$bn"; FONT_PLIST="$FONT_PLIST<string>$bn</string>"
 done
 # Media assets keep their path relative to assets/ (organize in subfolders, reference
