@@ -74,6 +74,7 @@ object N {
     init { System.loadLibrary("app") }
     external fun setup(n: Int)
     external fun mount(): Int
+    external fun remount(): Int   // the full tree again, for a new Activity over an engine that already mounted
     external fun tick(): Int
     external fun viewport(top: Int, h: Int, w: Int): Int
     external fun event(action: String): Int
@@ -430,16 +431,29 @@ class MainActivity : Activity(), ChuksModuleHost {
             } catch (_: Throwable) { /* no cmr.bundle, or cmrBoot native absent (AOT) */ }
         }
 
-        if (!devMode) {
+        // Android keeps a process after its Activity is finished (Back at the root) and
+        // creates a new Activity in it on the next launch. The engine lives in the process:
+        // it has already set up, mounted and holds the app's live state, so this Activity
+        // asks it for the whole tree again (a mount would diff against the tree the engine
+        // believes is on screen, emit nothing, and leave the new window black) and does
+        // not restore a snapshot over state the engine still has.
+        val warm = !devMode && engineMounted
+        if (!devMode && !warm) {
             N.setup(1000)
             val isTablet = if (resources.configuration.smallestScreenWidthDp >= 600) 1 else 0
             N.setPlatform("android", android.os.Build.VERSION.RELEASE, android.os.Build.MODEL, isTablet)   // platform + device info
             N.setColorScheme(if (osDark()) 1 else 0)   // open in the OS appearance
         }
-        // BEFORE the first mount: loadState replaces the route stack and the useState
-        // cells, so it has to land while there is still nothing on screen.
-        restoreStateIfAppropriate()
-        hostMount()
+        if (warm) {
+            try { runMarker.writeText("1") } catch (e: Exception) {}     // arm crash detection for this run too
+            applyStream(N.remount().let { N.drain() }); relayout()
+        } else {
+            // BEFORE the first mount: loadState replaces the route stack and the useState
+            // cells, so it has to land while there is still nothing on screen.
+            restoreStateIfAppropriate()
+            hostMount()
+        }
+        if (!devMode) engineMounted = true
 
         // first layout after the window is measured
         root.post { reportInsets(); relayout(); if (pushViewport()) relayout() }
@@ -6099,5 +6113,9 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun align(v: String) = when (v) {
         "center" -> 2f; "end" -> 3f; "stretch" -> 4f; else -> 1f }
 
-    companion object { const val TAG = 0x7f_00_00_01; const val GTAG = 0x7f_00_00_02; const val CTAG = 0x7f_00_00_03 }   // TAG: press; GTAG: a Gesture's stream; CTAG: a value change
+    companion object {
+        const val TAG = 0x7f_00_00_01; const val GTAG = 0x7f_00_00_02; const val CTAG = 0x7f_00_00_03   // TAG: press; GTAG: a Gesture's stream; CTAG: a value change
+        // Process-wide: the engine (libapp.so) mounted once already. See onCreate.
+        @JvmStatic var engineMounted = false
+    }
 }

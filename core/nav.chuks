@@ -410,6 +410,11 @@ export function tabBarHeight(): int { return 56 + 10 + floatingBarGap() }
 function floatingBarGap(): int {
     const inset: int = safeBottom()
     if (inset <= 0) { return 10 }
+    // A tall inset is a navigation BAR (Android's three-button bar is 48), an opaque
+    // system surface the capsule cannot share: it floats just above it. A slim one is
+    // an indicator or a gesture pill (an iPhone's 34, Android's 16 to 24), a transparent
+    // zone the capsule may overlap as long as it clears the mark itself.
+    if (inset >= 40) { return inset + 8 }
     const g: int = inset - 14
     return g < 8 ? 8 : g
 }
