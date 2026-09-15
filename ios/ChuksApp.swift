@@ -2362,7 +2362,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if DEV_MODE { return (devHTTP("/back", "") ?? "").isEmpty == false }
         let handled = chuks_back() > 0
         let s = drainStr()               // drainStr returns "" when there is nothing
-        if !s.isEmpty { apply(s); relayout() }
+        applyReply(s)
         return handled
     }
     func eViewport(_ top: Int32, _ h: Int32, _ w: Int32) -> String? {
@@ -2513,7 +2513,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // clock follows it and the screen is rebuilt with the new local times.
     @objc func systemTimeZoneDidChange() {
         eTimezone()
-        if let s = eTick() { apply(s); relayout() }
+        if let s = eTick() { applyReply(s) }
     }
 
     // The OS appearance changed (Settings, Control Center, or automatic day/night):
@@ -2523,7 +2523,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let now = traitCollection.userInterfaceStyle
         if now != previous?.userInterfaceStyle {
             eColorScheme(now == .dark)
-            if let s = eTick() { apply(s); relayout() }
+            if let s = eTick() { applyReply(s) }
         }
     }
 
@@ -2660,7 +2660,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             let pts = Int((horiz ? sv.contentOffset.x : sv.contentOffset.y).rounded())
             if scrollLastPos[sv] != pts {
                 scrollLastPos[sv] = pts
-                if let s = eInput(tag, String(pts)) { apply(s); relayout() } else { connected = false }
+                if let s = eInput(tag, String(pts)) { applyReply(s) } else { connected = false }
             }
         }
     }
@@ -2822,7 +2822,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         frame += 1
         guard let s = eTick() else { connected = false; headerText("dev server down — reloading…"); return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("frame \(frame): live")
     }
 
@@ -2832,7 +2832,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func pumpWake() {
         if DEV_MODE && !connected { return }   // let step() own the reconnect path
         guard let s = eTick() else { return }
-        if !s.isEmpty { apply(s); relayout() }
+        applyReply(s)
     }
 
     // Start/stop the per-frame animation driver (FA|1 / FA|0). While on, a CADisplayLink
@@ -3707,9 +3707,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func onCancel(_ token: String, _ teardown: @escaping () -> Void) { streamTeardown[token] = teardown }
 
     // Token "0" is a call without a callback: nothing is waiting, so nothing to render.
+    // Apply what the engine replied and lay the tree out, unless it replied nothing.
+    // An empty reply used to run a full Yoga pass over the whole tree and reset every
+    // scroll's contentSize anyway, on every capability result: each location fix, each
+    // pedometer event, each two-second Health poll. Under a finger on a scroll that was
+    // a hitch every time one landed. The Android host skips an empty reply the same way.
+    func applyReply(_ s: String) {
+        if s.isEmpty { return }
+        apply(s); relayout()
+    }
     func resolve(_ token: String, _ payload: String) {
         if token == "0" { return }
-        if let s = eResolve(token, payload) { apply(s); relayout() }
+        if let s = eResolve(token, payload) { applyReply(s) }
     }
     // Report a capability failure back to the engine (fires the request's onErr).
     // Token "0" means the caller passed no callback, so the engine allocated nothing and
@@ -3724,7 +3733,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                    "chuks warning: \(dispatchingCap.isEmpty ? "a capability" : dispatchingCap) failed and nothing is listening: \"\(message)\". It was called without a callback, so nothing could be told.")
             return
         }
-        if let s = eFail(token, message) { apply(s); relayout() }
+        if let s = eFail(token, message) { applyReply(s) }
     }
     // The capability currently being dispatched, so a failure can name itself.
     var dispatchingCap: String = ""
@@ -6621,7 +6630,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         let val = String(Int(sl.value.rounded()))
         guard let s = eInput(action, val) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
     }
 
     // A native value event from a DatePicker -> the engine, as an ISO string; the
@@ -6630,7 +6639,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let action = datePickerActions[dp] else { return }
         let val = Self.formatISO(dp.date, mode: datePickerModes[dp] ?? "date")
         guard let s = eInput(action, val) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("date \(action)=\(val)")
     }
 
@@ -6667,7 +6676,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func selectPick(_ id: String, _ i: Int) {
         guard let action = selectActions[id] else { return }
         guard let s = eInput(action, String(i)) else { connected = false; return }
-        apply(s); relayout(); headerText("select \(action)=\(i)")
+        applyReply(s); headerText("select \(action)=\(i)")
     }
 
     // (Re)build a Menu button: a fixed label + one-shot action items (no selection state).
@@ -6684,7 +6693,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func menuPick(_ id: String, _ i: Int) {
         guard let action = menuActions[id] else { return }
         guard let s = eInput(action, String(i)) else { connected = false; return }
-        apply(s); relayout(); headerText("menu \(action)=\(i)")
+        applyReply(s); headerText("menu \(action)=\(i)")
     }
 
     // Long-press context menu: build the UIMenu for the interaction's view on demand.
@@ -6702,7 +6711,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func contextMenuPick(_ id: String, _ i: Int) {
         guard let action = contextMenuActions[id] else { return }
         guard let s = eInput(action, String(i)) else { connected = false; return }
-        apply(s); relayout(); headerText("ctxmenu \(action)=\(i)")
+        applyReply(s); headerText("ctxmenu \(action)=\(i)")
     }
 
     // ---- Gesture ---------------------------------------------------------
@@ -6711,7 +6720,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         guard let id = gestureIdFor(view) else { return }
         let action = id + ":gesture"   // the Gesture's own event; its T| binding, if any, is an onPress
         guard let s = eInput(action, g) else { connected = false; return }
-        apply(s); relayout(); headerText("gesture \(action)=\(g)")
+        applyReply(s); headerText("gesture \(action)=\(g)")
     }
     @objc func handleSwipe(_ g: UISwipeGestureRecognizer) {
         let dir = g.direction == .left ? "left" : (g.direction == .right ? "right" : (g.direction == .up ? "up" : "down"))
@@ -6759,7 +6768,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         textAreaPlaceholders[tv]?.isHidden = !tv.text.isEmpty
         guard let action = textAreaActions[tv] else { return }
         guard let s = eInput(action, tv.text) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("textarea \(action)")
     }
 
@@ -6801,7 +6810,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func alertDispatch(_ id: String, _ v: String) {
         guard let action = alertActions[id] else { return }
         guard let s = eInput(action, v) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
         headerText("alert \(action)=\(v)")
     }
 
@@ -6927,7 +6936,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
     func fireValue(_ action: String, _ value: String) {
         guard let s = eInput(action, value) else { connected = false; return }
-        apply(s); relayout()
+        applyReply(s)
     }
     // Video seek: jump to `seconds` when it changes (a controlled prop). Tracked per id so a
     // style re-emit that didn't change the seek target doesn't re-seek.
