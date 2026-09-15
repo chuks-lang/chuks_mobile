@@ -4878,9 +4878,23 @@ export class NavStack extends App {
         hookPark(parked)
         // Name the screen on top, so a list on a covered screen cannot claim the viewport.
         this.recon.setTopScope("app." + string(n - 1))
+        // The overlay rides above every route, after them in the tree so the routes keep
+        // their indices (the top scope above is named by index).
+        const ov: any = this.overlay
+        if (ov != null) {
+            const os: Style = new Style()
+            os.pos = "abs"; os.left = 0; os.right = 0; os.bottom = safeBottom(); os.z = 50
+            kids.push(new Node("View", os, "", [ KeyedComp("overlay", ov) ]))
+        }
         const rs: Style = new Style(); rs.grow = 1; rs.basis = 0
         return new Node("View", rs, "", kids)
     }
+    // Something drawn over every route, anchored to the bottom: a ToastHost, a global
+    // banner. A screen comes and goes; the overlay stays, so a toast raised on a page
+    // that is then replaced still shows. Set once at startup.
+    var overlay: any = null
+    /** Draw `render()` over every route (a ToastHost, say). Pass null to remove it. */
+    public setOverlay(render: any): void { this.overlay = render }
     override setup(_n: int): void { }
     // Hot reload also preserves the current screen: serialize the route stack ahead
     // of the useState cells so an edit keeps you on the page you were on, not route 0.

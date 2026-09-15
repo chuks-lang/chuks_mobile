@@ -112,10 +112,12 @@ source "$PKGDIR/native-packages.sh"
 chuks_ios_native_packages
 chuks_capability_check
 
+# A simulator build links its entitlements in (simulator.sh); a device build signs them.
+SIM_ENT_FLAGS=""; [ "$IOS_TARGET" = "device" ] || SIM_ENT_FLAGS="$(chuks_ios_sim_entitlement_flags)"
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" "$PKGDIR/ChuksModule.swift" "$OUT/ChuksPackageModules.swift" $PKG_SRC $PREVIEW_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$YOGA_INC" \
     "$OUT/libapp.a" "$YOGA/libyoga.a" -lc++ \
-    -Xclang-linker -Wno-incompatible-sysroot \
+    -Xclang-linker -Wno-incompatible-sysroot $SIM_ENT_FLAGS \
     -framework UIKit -framework Foundation $PREVIEW_FW -parse-as-library $SWIFT_OPT $SAN_FLAG $DEV_FLAG $BENCH_FLAG $PREVIEW_FLAG \
     -o "$OUT/$APPNAME"
 
@@ -311,6 +313,7 @@ if [ "$IOS_TARGET" = "device" ]; then
     chuks_ios_install_device
 else
     chuks_ensure_sim || exit 1
+    chuks_ios_sim_note_entitlements
     echo "5. Installing + launching"
     xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
     xcrun simctl install "$UDID" "$APP"

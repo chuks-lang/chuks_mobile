@@ -3812,7 +3812,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var notifTokens = Set<String>()   // Notifications.onResponse subscribers
     var lastURL: String? = nil                // the deep link that opened the app (delivered to late subscribers)
     // A deep link arrived (launch or subsequent open): store it and emit to subscribers.
-    func receiveURL(_ u: String) { lastURL = u; for t in urlTokens { resolve(t, u) } }
+    func receiveURL(_ u: String) {
+        if packageModules.onUrl(u) { return }   // a package waiting on this URL (an OAuth redirect) takes it
+        lastURL = u; for t in urlTokens { resolve(t, u) }
+    }
     // Audio: one ChuksAudioPlayer per Chuks AudioPlayer, watch tokens per player, and
     // the interruption observers installed on the first create. Capped, because a
     // player holds a decoder and a screen that forgets release() would otherwise find

@@ -1,0 +1,71 @@
+// Something drawn over every route: a toast host, a global banner.
+//
+// A ToastHost mounted inside the signed-in shell has nowhere to render on the welcome
+// board, so a refused sign-in there raised a toast nobody saw (Cleset on Chuks,
+// welcome.chuks). NavStack.setOverlay puts one render over every route: it is in the
+// tree on the first page, still there after a replace, and last in the tree so the
+// routes keep their indices. Removing it takes it out again.
+//
+// Run:  chuks run tests/nav_overlay_test.chuks   (exits non-zero on failure)
+import { Node, Column, Text, Route, NavStack, Reconciler, setSafeInsets } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) } else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function lines(rc: Reconciler): []string { return rc.drain().split("\n") }
+function anyLineHas(ls: []string, s: string): bool {
+    for (var i: int = 0; i < ls.length; i = i + 1) { if (ls[i].contains(s)) { return true } }
+    return false
+}
+
+var TOASTS: int = 0
+function toastHost(): Node {
+    if (TOASTS == 0) { return Column({ h: 0 }, []) }
+    return Column({ pad: 8 }, [ Text({}, "toast-" + string(TOASTS)) ])
+}
+function first(_: Route): Node { return Column({ grow: 1 }, [ Text({}, "first page") ]) }
+function second(_: Route): Node { return Column({ grow: 1 }, [ Text({}, "second page") ]) }
+
+function main(): void {
+    setSafeInsets(0, 0, 34, 0)
+    var routes: map[string]function(r: Route): Node = {}
+    routes["first"] = first
+    routes["second"] = second
+    const nv: NavStack = new NavStack(routes, "first")
+    nv.setOverlay(toastHost)
+    const rc: Reconciler = new Reconciler()
+    rc.setViewport(0, 600, 400); rc.drain()
+
+    rc.renderRoot(nv.render())
+    var ls: []string = lines(rc)
+    check(anyLineHas(ls, "first page"), "the first route renders")
+    check(!anyLineHas(ls, "toast-"), "an empty overlay draws nothing")
+
+    TOASTS = 1
+    rc.renderRoot(nv.render())
+    ls = lines(rc)
+    check(anyLineHas(ls, "toast-1"), "a toast shows over the first route")
+
+    nv.replace("second", null, null)
+    rc.renderRoot(nv.render())
+    ls = lines(rc)
+    check(anyLineHas(ls, "second page"), "the route was replaced")
+    check(anyLineHas(ls, "R|app.0.kroute:0:first"), "and the first is gone")
+    check(!anyLineHas(ls, "koverlay"), "the toast is untouched by the replace: it belongs to the app, not the page")
+
+    TOASTS = 2
+    rc.renderRoot(nv.render())
+    ls = lines(rc)
+    check(anyLineHas(ls, "P|app.1.koverlay") && anyLineHas(ls, "toast-2") && !anyLineHas(ls, "C|app.1.koverlay|"), "a new toast updates the mounted overlay in place")
+
+    nv.setOverlay(null)
+    rc.renderRoot(nv.render())
+    ls = lines(rc)
+    check(anyLineHas(ls, "R|app.1"), "removing the overlay takes it out of the tree")
+
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "nav_overlay_test failed" }
+}
+main()

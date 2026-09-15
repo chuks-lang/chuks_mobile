@@ -91,11 +91,13 @@ printf '#include "libcmr.h"\n#include <yoga/Yoga.h>\n' > "$OUT/app_bridge.h"
 source "$PKGDIR/native-packages.sh"
 chuks_ios_native_packages
 chuks_capability_check
+# A simulator build links its entitlements in (simulator.sh); a device build signs them.
+SIM_ENT_FLAGS=""; [ "$IOS_TARGET" = "device" ] || SIM_ENT_FLAGS="$(chuks_ios_sim_entitlement_flags)"
 swiftc "$PKGDIR/ChuksApp.swift" "$PKGDIR/ChuksEffects.swift" "$PKGDIR/ChuksModule.swift" \
     "$OUT/ChuksPackageModules.swift" $PKG_SRC -sdk "$SDKPATH" -target "$TRIPLE" \
     -import-objc-header "$OUT/app_bridge.h" -I "$OUT" -I "$PKGDIR/cmr" -I "$YOGA_INC" \
     "$CMRLIB" "$YOGA/libyoga.a" -lc++ \
-    -Xclang-linker -Wno-incompatible-sysroot \
+    -Xclang-linker -Wno-incompatible-sysroot $SIM_ENT_FLAGS \
     -framework UIKit -framework Foundation -parse-as-library -Onone -D CMR $BENCH_FLAG \
     -o "$OUT/$APPNAME"
 cp "$OUT/$APPNAME" "$APP/$APPNAME"   # the .app's executable (CFBundleExecutable)
@@ -147,6 +149,7 @@ if [ "$IOS_TARGET" = "device" ]; then
 else
     echo "5. Installing + launching (CMR — the VM runs on the device)"
     chuks_ensure_sim || exit 1
+    chuks_ios_sim_note_entitlements
     xcrun simctl terminate "$UDID" "$BID" 2>/dev/null || true
     xcrun simctl install "$UDID" "$APP"
     xcrun simctl launch "$UDID" "$BID"

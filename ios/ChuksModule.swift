@@ -237,6 +237,14 @@ public protocol ChuksNativeModule: AnyObject {
     /// `args` is the single argument as a string, which is all a one-argument
     /// capability wants; `a` reads several of them by name, already parsed and typed.
     func handle(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) -> Bool
+    /// A URL opened this app (a redirect back from a browser, a link). Return true to
+    /// claim it: it then never reaches the app's own deep-link handling. Only a module
+    /// that is already live is asked, which a session in flight always is. The default
+    /// claims nothing.
+    func onUrl(_ url: String) -> Bool
+}
+public extension ChuksNativeModule {
+    func onUrl(_ url: String) -> Bool { false }
 }
 
 /// Routes a command to whichever installed package claims its namespace.
@@ -254,6 +262,11 @@ final class ChuksModuleRegistry {
         for t in chuksPackageModules() { types[t.namespace] = t }
     }
 
+    /// Offer an incoming URL to the live modules; true when one claimed it.
+    func onUrl(_ url: String) -> Bool {
+        for m in live.values { if m.onUrl(url) { return true } }
+        return false
+    }
     /// True when a package answered. False means no package claims this namespace and
     /// the caller should treat the command as unknown, exactly as before.
     func handle(_ token: String, _ cap: String, _ args: String, _ a: ChuksArgs) -> Bool {

@@ -985,7 +985,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             c.disconnect(); Pair(body, ver)
         } catch (e: Exception) { Pair(null, cmrVersion) }
     }
-    // GET /hmr?since=N -> new version (>since), or 0 on 204/timeout/error. Long-poll.
+    // GET /hmr?since=N -> new version (!= since), or 0 on 204/timeout/error. Long-poll.
     private fun cmrPollHmr(since: Int): Int {
         return try {
             val c = java.net.URL("$cmrDevBase/hmr?since=$since").openConnection() as java.net.HttpURLConnection
@@ -998,7 +998,9 @@ class MainActivity : Activity(), ChuksModuleHost {
         Thread {
             while (true) {
                 val v = cmrPollHmr(cmrVersion)
-                if (v > cmrVersion) {
+                // Any other version is a change: a restarted server counts from 1 again,
+                // and its lower number must resync the device rather than be waited out.
+                if (v != cmrVersion && v > 0) {
                     val (b, ver, isDelta) = cmrFetchDelta(cmrVersion)   // since = OLD version, so the delta covers the edit
                     cmrVersion = ver                                     // advance now so the next poll doesn't re-trigger
                     if (b != null) handler.post { cmrReloadInPlace(b, ver, isDelta) }
@@ -2245,7 +2247,12 @@ class MainActivity : Activity(), ChuksModuleHost {
     override fun onNewIntent(newIntent: Intent) {
         super.onNewIntent(newIntent)
         setIntent(newIntent)
-        newIntent.data?.toString()?.let { url -> lastUrl = url; runOnUiThread { urlTokens.forEach { resolve(it, url) } } }
+        newIntent.data?.toString()?.let { url ->
+            // A package waiting on this URL (an OAuth redirect) takes it; the app's own
+            // deep links are everything a package did not claim.
+            if (packageModules.onUrl(url)) return
+            lastUrl = url; runOnUiThread { urlTokens.forEach { resolve(it, url) } }
+        }
         ChuksNotif.deliverTap(newIntent)
     }
 

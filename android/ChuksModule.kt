@@ -216,6 +216,12 @@ interface ChuksNativeModule {
      *  `args` is the single argument as a string, which is all a one-argument
      *  capability wants; `a` reads several of them by name, already parsed and typed. */
     fun handle(token: String, cap: String, args: String, a: ChuksArgs): Boolean
+    /** A URL opened this app (a redirect back from a browser, a link). Return true to
+     *  claim it: it then never reaches the app's own deep-link handling. An OAuth
+     *  session waiting on its redirect scheme claims exactly that; everything else
+     *  stays the app's. Only a module that is already live is asked, which a session
+     *  in flight always is. */
+    fun onUrl(url: String): Boolean = false
 }
 
 /// Routes a command to whichever installed package claims its namespace.
@@ -233,5 +239,10 @@ class ChuksModuleRegistry(private val host: ChuksModuleHost) {
         if (ns.isEmpty()) return false
         val m = live[ns] ?: factories[ns]?.invoke(host)?.also { live[ns] = it } ?: return false
         return m.handle(token, cap, args, a)
+    }
+    /** Offer an incoming URL to the live modules; true when one claimed it. */
+    fun onUrl(url: String): Boolean {
+        for (m in live.values) { if (m.onUrl(url)) return true }
+        return false
     }
 }
