@@ -4545,9 +4545,10 @@ export function emitNativeCommandE(cap: string, args: any, cb: any, onErr: any):
 //         idCell.set(id)                                        // lands on the render thread
 //     } }, [...])
 //
-// An await on the render thread cannot be told apart from inside this async body
-// (it runs in its own task either way), so it is discovered as the timeout below,
-// whose message names this rule.
+// The compiler enforces the rule: `await` is only legal inside an async function (or
+// at module level, which runs at boot and is refused below because there is no host
+// yet). So a plain handler cannot block the render thread, and the timeout below
+// means what it says: the native side did not answer.
 //
 // This is not a limitation we invented. A synchronous FFI call blocks Flutter's UI
 // isolate and a synchronous native call blocks React Native's JS thread; the difference
@@ -4563,8 +4564,8 @@ const AWAIT_POLL_SLOW_MS: int = 25    // after that, back off so a long wait cos
  * Await a one-shot capability and return its payload, or throw.
  *
  * Await it inside an `async function` (an async handler, or an async function a
- * handler calls). Awaited on the render thread it can only time out: the answer
- * arrives through the host, and the host is the thread that would be blocked.
+ * handler calls); the compiler allows `await` nowhere else but module level, and a
+ * module-level await is refused at boot, since no host exists yet to answer it.
  *
  * `timeoutMs` bounds the wait. Pick it from what the capability waits ON: a device
  * reading answers in milliseconds, while a picker or a permission prompt waits on a
@@ -4573,7 +4574,10 @@ const AWAIT_POLL_SLOW_MS: int = 25    // after that, back off so a long wait cos
  */
 export async function awaitCommand(cap: string, args: any, failable: bool, timeoutMs: int): Task<string> {
     const h: App? = HOST
-    if (h == null) { throw "capability '" + cap + "' was called before the app mounted" }
+    // No host yet means module-level code: an await at the top of a file runs at boot,
+    // on the root coroutine, before there is a host to answer. Say so at once rather
+    // than let it wait for an answer that cannot come.
+    if (h == null) { throw "capability '" + cap + "' was awaited at module level, which runs at boot before the app is mounted and blocks the thread that would answer it. Await it inside an async function called from a handler or an effect." }
     // One channel carries both outcomes, tagged, so there is only one thing to poll.
     // The tag is a single character because the payload can be anything at all.
     const ch: Channel<string> = new Channel<string>(1)
@@ -4603,13 +4607,11 @@ export async function awaitCommand(cap: string, args: any, failable: bool, timeo
         time.sleep(step)
         waited = waited + step
     }
-    // Nothing came back. Tell the host to drop the native op so it does not leak, and
-    // name both causes: a capability that never answered, or the await-on-the-render-thread
-    // mistake, which looks exactly like this from in here.
+    // Nothing came back. Tell the host to drop the native op so it does not leak.
     ch.close()
     const t: any = toks.tryReceive()
     if (bool(t.ok)) { const tok: string = string(t.value); dispatchAsync(function(): void { h.recon.cancelStream(tok) }) }
-    throw "capability '" + cap + "' did not answer within " + string(timeoutMs) + "ms. Either the native side never resolved it, or it was awaited on the render thread: a handler that awaits is an async function (onPress: async function(): Task<void> { ... })."
+    throw "capability '" + cap + "' did not answer within " + string(timeoutMs) + "ms: the native side never resolved it."
 }
 
 /**
