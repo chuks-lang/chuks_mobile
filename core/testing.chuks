@@ -17,7 +17,7 @@
 // useEffect behave as they do on a device. What it does NOT do is talk to a host, so a
 // capability call goes out and never answers, exactly as it would with the phone in
 // aeroplane mode. Assert on what the screen shows, not on what a device would say back.
-import { Node, Column, Reconciler } from "./ui.chuks";
+import { Node, Column, Reconciler, runAsyncQueue } from "./ui.chuks";
 import { hookBegin, hookSweep, hookEnter, runEffects } from "./state.chuks";
 
 /** What a rendered screen lets you ask and do. */
@@ -43,6 +43,9 @@ export class Screen {
     // on a device.
     frame(): void {
         const b: function(): Node = this.build
+        // What a task handed to the render thread (a Cell.set after an await) lands
+        // here, before the render, exactly as at a host entry point.
+        runAsyncQueue()
         hookBegin()
         // The screen function is called here rather than placed as a component, so give
         // it the hook context the reconciler would have given it. Without this, `_slot`

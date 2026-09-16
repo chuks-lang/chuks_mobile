@@ -11,13 +11,13 @@
 // API convention (single props-map model): every component takes a SINGLE props
 // `dataType`, so callers set only what they need by name (no positional nulls).
 // Required content is a plain field; optional config is a nullable field (`T?`,
-// `function?(...)`) that defaults to null when omitted. Every component accepts an
+// `Handler?`) that defaults to null when omitted. Every component accepts an
 // optional `extra` tw-class string that is appended last, so it wins:
 //   Button({ variant: "primary", label: "Save", extra: "grow rounded-full" })
-import { Node, Row, Column, Text, TextInput, Toggle, List, Popover, ViewRef, viewportWidth, requestRender } from "./ui.chuks";
+import { Node, Row, Column, Text, TextInput, Toggle, List, Popover, ViewRef, viewportWidth, requestRender, Handler, StringHandler, IntHandler } from "./ui.chuks";
 import { time } from "std/time";
 import { tk } from "./theme.chuks";
-import { useEffect } from "./state.chuks";
+import { useEffect, onRender, onRenderThread } from "./state.chuks";
 import { Animated, AnimHandle, useAnimated, animLoop, animStep } from "./animated.chuks";
 
 // Button: a tappable action. variant = "primary" | "secondary" | "ghost" | "danger"
@@ -26,7 +26,7 @@ import { Animated, AnimHandle, useAnimated, animLoop, animStep } from "./animate
 export dataType ButtonProps {
     label: string,
     variant: string?,               // "primary" | "secondary" | "ghost" | "danger"
-    onPress: function?(): void,
+    onPress: Handler?,
     extra: string?,
 }
 export function Button(p: ButtonProps): Node {
@@ -54,7 +54,7 @@ export function Card(p: CardProps): Node {
 //   Input({ placeholder: "you@example.com", onChange: function(v: string): void { email.set(v) } })
 export dataType InputProps {
     placeholder: string?,
-    onChange: function?(v: string): void,
+    onChange: StringHandler?,
     secure: bool?,                  // password field: mask the entered text
     multiline: bool?,               // a taller multi-line text area
     extra: string?,
@@ -98,7 +98,7 @@ export function Badge(p: BadgeProps): Node {
 export dataType ChipProps {
     text: string,
     selected: bool?,
-    onPress: function?(): void,
+    onPress: Handler?,
 }
 export function Chip(p: ChipProps): Node {
     const selected: bool = p.selected ?? false
@@ -136,7 +136,7 @@ export dataType ListItemProps {
     title: string,
     subtitle: string?,
     trailing: string?,
-    onPress: function?(): void,
+    onPress: Handler?,
 }
 export function ListItem(p: ListItemProps): Node {
     var kids: []Node = [
@@ -158,7 +158,7 @@ export function ListItem(p: ListItemProps): Node {
 //   Switch({ on: enabled, onToggle: function(): void { enabled = !enabled } })
 export dataType SwitchProps {
     on: bool,
-    onToggle: function?(): void,
+    onToggle: Handler?,
 }
 export function Switch(p: SwitchProps): Node {
     // A real native switch (UISwitch / Android Switch), tinted with
@@ -185,7 +185,7 @@ export function Switch(p: SwitchProps): Node {
 export dataType SegmentedControlProps {
     options: []string,
     selected: int,
-    onSelect: function?(i: int): void,
+    onSelect: IntHandler?,
     extra: string?,
 }
 export function SegmentedControl(p: SegmentedControlProps): Node {
@@ -197,7 +197,7 @@ export function SegmentedControl(p: SegmentedControlProps): Node {
 }
 // One segment. Its own function so the tap closure binds THIS index: a closure built
 // inline in the loop would capture the loop binding's final value.
-function segment(label: string, on: bool, idx: int, cb: function?(i: int): void): Node {
+function segment(label: string, on: bool, idx: int, cb: IntHandler?): Node {
     const skin: string = on ? "bg-surface shadow-sm" : ""
     const txt: string = on ? "text-text font-bold" : "text-muted"
     return Row({ tw: "grow basis-0 items-center justify-center py-sm rounded-md " + skin,
@@ -214,10 +214,10 @@ function segment(label: string, on: bool, idx: int, cb: function?(i: int): void)
 //               onChange: function(v: string): void { q.set(v) } })
 export dataType SearchBarProps {
     value: string,
-    onChange: function?(v: string): void,
+    onChange: StringHandler?,
     placeholder: string?,
     icon: Node?,
-    onClear: function?(): void,
+    onClear: Handler?,
     extra: string?,
 }
 export function SearchBar(p: SearchBarProps): Node {
@@ -245,7 +245,7 @@ export dataType StepperProps {
     min: int?,
     max: int?,
     step: int?,
-    onChange: function?(v: int): void,
+    onChange: IntHandler?,
     extra: string?,
 }
 export function Stepper(p: StepperProps): Node {
@@ -259,7 +259,7 @@ export function Stepper(p: StepperProps): Node {
         stepBtn("+", "Increase", v + by <= hi, v + by, p.onChange),
     ])
 }
-function stepBtn(glyph: string, name: string, enabled: bool, next: int, cb: function?(v: int): void): Node {
+function stepBtn(glyph: string, name: string, enabled: bool, next: int, cb: IntHandler?): Node {
     // A glyph says nothing to a screen reader, so the button carries its own name.
     return Row({ tw: "w-8 h-8 items-center justify-center rounded-md bg-surface",
                  opacity: enabled ? 100 : 40,
@@ -302,7 +302,7 @@ export function EmptyState(p: EmptyStateProps): Node {
 export dataType AccordionProps {
     title: string,
     open: bool,
-    onToggle: function?(): void,
+    onToggle: Handler?,
     children: []Node,
     extra: string?,
 }
@@ -359,7 +359,7 @@ export dataType TooltipProps {
     anchor: ViewRef,
     visible: bool,
     placement: string?,             // "top" (default) | "bottom" | "left" | "right" | "auto"
-    onDismiss: function?(): void,
+    onDismiss: Handler?,
 }
 export function Tooltip(p: TooltipProps): Node {
     return Popover({ visible: p.visible, anchor: p.anchor, placement: p.placement ?? "top", arrow: true, offset: 6,
@@ -379,7 +379,7 @@ export function Tooltip(p: TooltipProps): Node {
 export dataType CarouselProps {
     children: []Node,
     page: int,
-    onPage: function?(i: int): void,
+    onPage: IntHandler?,
     h: int,
     itemWidth: int?,                // page width; defaults to the viewport width
     dots: bool?,                    // default true
@@ -440,11 +440,12 @@ export function Carousel(p: CarouselProps): Node {
 var TOASTS: []string = []
 var TOAST_MS: int = 2600
 
-/** Show a short message. Safe to call from any closure; messages queue. */
+/** Show a short message. Safe to call from any closure or task; messages queue. */
 export function toast(message: string): void {
+    if (!onRenderThread()) { onRender(function(): void { toast(message) }); return }
     TOASTS.push(message)
     requestRender()
-    spawn _expireToast()
+    _expireToast()
 }
 /** How long each message stays up, in milliseconds (default 2600). */
 export function setToastDuration(ms: int): void { TOAST_MS = ms }
@@ -453,12 +454,15 @@ export function setToastDuration(ms: int): void { TOAST_MS = ms }
 // ask for a render. Draining by index would race with a toast raised mid-sleep.
 async function _expireToast(): Task<void> {
     time.sleep(TOAST_MS)
-    if (TOASTS.length > 0) {
-        var rest: []string = []
-        for (var i: int = 1; i < TOASTS.length; i = i + 1) { rest.push(TOASTS[i]) }
-        TOASTS = rest
-        requestRender()
-    }
+    // The list is the render thread's (ToastHost reads it while rendering).
+    onRender(function(): void {
+        if (TOASTS.length > 0) {
+            var rest: []string = []
+            for (var i: int = 1; i < TOASTS.length; i = i + 1) { rest.push(TOASTS[i]) }
+            TOASTS = rest
+            requestRender()
+        }
+    })
 }
 
 /** The surface toasts appear on. Mount once in the app shell; renders nothing when

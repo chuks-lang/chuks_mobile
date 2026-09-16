@@ -13,14 +13,34 @@ import { json } from "std/json";
 var _path: string = ""              // identity of the component currently rendering
 var _slot: int = 0                  // index within a component (multiple useState per component)
 var _fxSlot: int = 0                // index within a component for useEffect calls
-var _cells: map[string]any = {}     // persistent state boxes, keyed by "path#slot" (or "key:...")
+// The persistent state boxes, keyed by "path#slot" (or "key:..."). Behind a lock:
+// the render thread reads and writes them every frame, and an async handler reads
+// them after an await, from its own thread (a write from there is queued, see
+// Cell.set). An unlocked map read against a concurrent write is fatal on both
+// backends. The lock is uncontended in practice and costs tens of nanoseconds.
+@threadSafe
+class CellStore {
+    var m: map[string]any
+    constructor() { this.m = {} }
+    public get(k: string): any { var v: any = null; lock (this) { v = this.m.getOr(k, null) }; return v }
+    public has(k: string): bool { var h: bool = false; lock (this) { h = this.m.has(k) }; return h }
+    public set(k: string, v: any): void { lock (this) { this.m[k] = v } }
+    // Write only when the key is present (a set on an unmounted cell is a no-op).
+    public setIfPresent(k: string, v: any): bool { var ok: bool = false; lock (this) { if (this.m.has(k)) { this.m[k] = v; ok = true } }; return ok }
+    // Seed a key that has no value yet (a cell's initial).
+    public seed(k: string, v: any): void { lock (this) { if (!this.m.has(k)) { this.m[k] = v } } }
+    public keys(): []string { var ks: []string = []; lock (this) { ks = this.m.keys() }; return ks }
+    public replace(next: map[string]any): void { lock (this) { this.m = next } }
+    public snapshot(): string { var out: string = ""; lock (this) { out = json.stringify(this.m) }; return out }
+}
+var _cells: CellStore = new CellStore()
 var _seen: map[string]bool = {}     // cell keys touched this render, for hookSweep()
 
 // ---- state serialization (hot-reload preservation) -------------------------
 // Serialize every useState/useKeyedState cell to JSON so the dev server can carry
 // state across a `chuks watch` restart. Cells keyed by structural identity, so as
 // long as the component tree keeps the same shape the values reconnect on reload.
-export function serializeCells(): string { return json.stringify(_cells) }
+export function serializeCells(): string { return _cells.snapshot() }
 
 // Restore cells from serializeCells() output BEFORE the first render, so useState
 // finds the preserved value instead of re-seeding its initial. Keys absent from the
@@ -29,7 +49,7 @@ export function restoreCells(data: string): void {
     if (data == "") { return }
     const parsed: map[string]any = json.parse(data)
     const ks: []string = parsed.keys()
-    for (var i: int = 0; i < ks.length; i = i + 1) { _cells[ks[i]] = parsed[ks[i]] }
+    for (var i: int = 0; i < ks.length; i = i + 1) { _cells.set(ks[i], parsed[ks[i]]) }
 }
 
 // Effect bookkeeping (see useEffect below). Declared up top so hookBegin/hookSweep
@@ -102,6 +122,50 @@ export function passRunsAll(): bool { return _passAll }
 /** Framework-internal: does the component at `path` run this pass? */
 export function passRuns(path: string): bool { return _passAll || _passPaths.getOr(path, false) }
 
+// ─── The render thread ───────────────────────────────────────────────────────
+//
+// State, the reconciler and navigation belong to one thread: the engine's main
+// coroutine, where the host's calls (mount, dispatch, tick) run. Chuks is
+// multithreaded, and an `async function` body or a spawned task runs on its own
+// coroutine. Code there must not write a cell or push a route directly; it hands
+// the write over, and the write runs on the render thread at the next host entry.
+//
+// The framework does the handing over itself: every entry point that mutates
+// (Cell.set, navigate and friends, toast, one-shot capabilities) asks
+// onRenderThread() and, when the answer is no, queues itself through onRender().
+// An app author never sees the boundary; an async handler reads as straight code.
+//
+// The test is the language's: the host enters the engine on its main coroutine,
+// where Task.current() is null, and every async body or spawned task runs inside
+// a task. Verified on the VM, AOT, and the on-device dev runtime on both hosts.
+
+/**
+ * Is this code running on the render thread (the engine's main coroutine, where
+ * the host's calls run)? False inside an `async function` body or a spawned task,
+ * and inside any helper or closure they call.
+ */
+export function onRenderThread(): bool { return Task.current() == null }
+
+// The queue that carries a closure to the render thread. ui.chuks installs its
+// AsyncQueue here at load (this module cannot import ui.chuks back).
+var RENDER_POST: any = null
+
+/** Framework-internal: install the render-thread queue (ui.chuks does this). */
+export function setRenderPost(post: function(fn: function(): void): void): void { RENDER_POST = post }
+
+/**
+ * Run `fn` on the render thread: right now when already there, otherwise queued to
+ * run at the next host entry point, in order with everything else queued. This is
+ * what the framework's own entry points use; app code rarely needs it, because
+ * `Cell.set`, `navigate`, `toast` and the capabilities already go through it.
+ */
+export function onRender(fn: function(): void): void {
+    if (Task.current() == null) { fn(); return }
+    const post: any = RENDER_POST
+    if (post != null) { post(fn); return }
+    fn()   // no framework loaded (a bare test): nothing else owns the thread
+}
+
 /**
  * A typed handle to one piece of component state, returned by `useState`.
  *
@@ -124,13 +188,27 @@ export function passRuns(path: string): bool { return _passAll || _passPaths.get
 export class Cell<T> {
     var k: string
     constructor(k: string) { this.k = k }
-    public get(): T { return _cells.getOr(this.k, null) }
+    // Safe from any thread: the store is locked. What comes back is the value as it is
+    // now; a collection is the same object the render thread holds, so an async body
+    // that will change one should copy it rather than mutate it in place.
+    public get(): T { return _cells.get(this.k) }
     // Only update a cell that still exists. While the component is mounted useState
     // seeds it, so set() works; after it unmounts hookSweep drops the cell, so set()
     // is a no-op instead of resurrecting a dead cell. This makes a late async/stream
     // callback firing into an unmounted component harmless (React's "setState on an
     // unmounted component is a no-op"): the fire-after-unmount race lands here.
-    public set(v: T): void { if (_cells.has(this.k)) { _cells[this.k] = v; markDirtyCell(this.k) } }
+    //
+    // From an async body or a spawned task the write is queued for the render thread
+    // (see onRender above): the cell store is not locked, and only that thread may
+    // touch it. The set lands at the next host entry, within a frame.
+    public set(v: T): void {
+        if (Task.current() != null) {
+            const cell: Cell<T> = this
+            onRender(function(): void { cell.set(v) })
+            return
+        }
+        if (_cells.setIfPresent(this.k, v)) { markDirtyCell(this.k) }
+    }
 }
 
 /**
@@ -148,7 +226,7 @@ export function useState<T>(initial: T): Cell<T> {
     var k: string = _path + "#" + string(_slot)
     _slot = _slot + 1
     _seen[k] = true; _touched.push("c:" + k)
-    if (!_cells.has(k)) { _cells[k] = initial }
+    _cells.seed(k, initial)
     return new Cell<T>(k)
 }
 
@@ -164,7 +242,7 @@ export function useState<T>(initial: T): Cell<T> {
 export function useKeyedState<T>(key: string, initial: T): Cell<T> {
     var k: string = "key:" + key
     _seen[k] = true; _touched.push("c:" + k)
-    if (!_cells.has(k)) { _cells[k] = initial }
+    _cells.seed(k, initial)
     return new Cell<T>(k)
 }
 
@@ -222,9 +300,9 @@ export function hookSweep(): void {
     var ks: []string = _cells.keys()
     for (var i: int = 0; i < ks.length; i = i + 1) {
         var key: string = ks[i]
-        if (_seen.getOr(key, false) || isParked(key)) { live[key] = _cells[key] }
+        if (_seen.getOr(key, false) || isParked(key)) { live[key] = _cells.get(key) }
     }
-    _cells = live
+    _cells.replace(live)
     // effects: run cleanup for identities not visited this render, then drop them.
     var liveFx: map[string]Effect = {}
     var fks: []string = _effects.keys()

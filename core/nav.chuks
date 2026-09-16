@@ -7,7 +7,7 @@
 // state). Bring @chuks/lucide, or any other icon set, from the app side.
 import { Node, Row, Column, Text, KeyedComp, safeBottom, Route, Style, NavStack,
          setNestedNavigator, activeNav, safeTop, setConsumedTop, consumedTop, setOverlayBottom, overlayBottom,
-         setNestedStateHandlers } from "./ui.chuks";
+         setNestedStateHandlers, Handler } from "./ui.chuks";
 import { json } from "std/json";
 import { hookPark } from "./state.chuks";
 import { tk } from "./theme.chuks";
@@ -21,7 +21,7 @@ import { tk } from "./theme.chuks";
 // callee is unreliable. The `!= null` checks therefore live at the call site in
 // NavBar (inline field reads, which are correct), and iconBtn only ever receives a
 // real icon plus a plain bool.
-function iconBtn(icon: Node, hasPress: bool, onPress: function?(): void): Node {
+function iconBtn(icon: Node, hasPress: bool, onPress: Handler?): Node {
     const cls: string = "w-10 h-10 rounded-full items-center justify-center"
     if (hasPress) { return Row({ tw: cls, onPress: onPress }, [ icon ]) }
     return Row({ tw: cls }, [ icon ])
@@ -37,9 +37,9 @@ function iconSpacer(): Node { return Row({ tw: "w-10 h-10" }, []) }
 export dataType NavBarProps {
     title: string,
     leading: Node?,                 // a prebuilt icon node (e.g. lucide(...))
-    onLeading: function?(): void,
+    onLeading: Handler?,
     trailing: Node?,
-    onTrailing: function?(): void,
+    onTrailing: Handler?,
 }
 export function NavBar(p: NavBarProps): Node {
     // Resolve each slot INLINE (see iconBtn's note): the `!= null` checks on the

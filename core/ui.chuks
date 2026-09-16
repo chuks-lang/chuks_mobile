@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, Cell } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, Cell, onRender, onRenderThread, setRenderPost } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
@@ -896,10 +896,35 @@ export dataType LayoutProps {
  * about it. `expanded` reads "expanded" / "collapsed" the same way.
  */
 export dataType A11yState { disabled: bool?; selected: bool?; checked: bool?; expanded: bool?; busy: bool? }
+/**
+ * What an event prop accepts: a plain function, or an `async function` when the
+ * handler awaits. An async handler runs on its own thread from its first await, and
+ * what it writes afterwards (a `Cell.set`, a `navigate`, a `toast`) carries itself to
+ * the render thread, so the body reads as straight code:
+ *
+ * ```chuks
+ * Pressable({ onPress: async function(): Task<void> {
+ *     busy.set(true)
+ *     const r: string = await load()
+ *     busy.set(false)
+ *     result.set(r)
+ * } }, [...])
+ * ```
+ *
+ * A failure in an async handler that nothing caught is reported the moment it
+ * happens: on the dev error card, and in the platform log.
+ */
+export unionType Handler = function(): void | function(): Task<void>
+/** A handler that receives a string: a field's value, a scroll offset, a gesture payload. */
+export unionType StringHandler = function(v: string): void | function(v: string): Task<void>
+/** A handler that receives an int: a page or snap index, a progress value. */
+export unionType IntHandler = function(v: int): void | function(v: int): Task<void>
+/** A handler that receives the frame the host measured (see `LayoutBox`). */
+export unionType LayoutHandler = function(e: LayoutBox): void | function(e: LayoutBox): Task<void>
 dataType EventProps {
-    onPress: (function(): void)?; onChange: (function(v: string): void)?;
-    onLongPress: (function(): void)?; onPressIn: (function(): void)?; onPressOut: (function(): void)?;
-    onLayout: (function(e: LayoutBox): void)?;
+    onPress: Handler?; onChange: StringHandler?;
+    onLongPress: Handler?; onPressIn: Handler?; onPressOut: Handler?;
+    onLayout: LayoutHandler?;
 }
 /**
  * The frame the host gave a node: `x`, `y` relative to its parent, `w`, `h`, in points.
@@ -1033,8 +1058,8 @@ function applyMediaEventsV(n: Node, p: any): void {
 }
 // Media event fields, embedded by media component prop types (Image/Video).
 dataType MediaEventProps {
-    onLoad: (function(): void)?; onError: (function(): void)?;
-    onEnd: (function(): void)?; onProgress: (function(v: int): void)?;
+    onLoad: Handler?; onError: Handler?;
+    onEnd: Handler?; onProgress: IntHandler?;
 }
 
 /**
@@ -1534,7 +1559,7 @@ dataType TextInputProps {
     placeholder: string?; value: string?; secure: bool?; multiline: bool?;
     keyboardType: string?; returnKeyType: string?; editable: bool?; autoFocus: bool?;
     autoCapitalize: string?; autoCorrect: bool?; maxLength: int?;
-    onSubmit: (function(): void)?; onFocus: (function(): void)?; onBlur: (function(): void)?;
+    onSubmit: Handler?; onFocus: Handler?; onBlur: Handler?;
 }
 /**
  * A single-line text field. Pass `onChange` as a (string) -> void closure that
@@ -1717,7 +1742,7 @@ export function Blur(p: BlurProps, kids: []Kid = []): Node {
 
 dataType ScrollProps {
     ViewProps; horizontal: bool?; paging: bool?; refreshing: bool?; stickBottom: bool?; scrollTo: int?;
-    onRefresh: (function(): void)?; onScroll: (function(v: string): void)?;
+    onRefresh: Handler?; onScroll: StringHandler?;
     scrollValue: SharedValue?;   // the host feeds this with the offset along the scroll axis, in points, every scroll frame
 }
 // Android's ScrollView holds exactly ONE direct child; a Chuks Scroll may take several
@@ -1793,7 +1818,7 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     // Pull-to-refresh: `onRefresh` fires when the user pulls down at the top; the
     // parent owns `refreshing` (set it false when the work is done to end the spinner).
     // Vertical only (a horizontal carousel has no pull-to-refresh).
-    const orf: (function(): void)? = horizontal ? null : p.onRefresh
+    const orf: Handler? = horizontal ? null : p.onRefresh
     if (orf != null) { s.rfsh = (p.refreshing ?? false) ? 1 : 0 }
     // stickBottom: a chat transcript stays pinned to the newest message. The host keeps the
     // scroll at the bottom when content grows or the keyboard opens, unless the user has
@@ -1804,7 +1829,7 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     if (orf != null) { n.onPress = orf }
     // onScroll(offset) streams the scroll position; scrollTo imperatively scrolls to
     // an offset (logical points) and re-fires whenever the value changes.
-    const osc: (function(v: string): void)? = p.onScroll
+    const osc: StringHandler? = p.onScroll
     if (osc != null) { n.onScroll = osc }
     n.scrollTo = p.scrollTo ?? -1
     return n
@@ -1908,7 +1933,7 @@ export function StatusBar(p: StatusBarProps): Node {
     s.w = 0; s.h = 0
     return mkStatusBar(s)
 }
-dataType ModalProps { ViewProps; visible: bool?; position: string?; onDismiss: (function(): void)? }
+dataType ModalProps { ViewProps; visible: bool?; position: string?; onDismiss: Handler? }
 /**
  * A modal overlay: `kids` render on top of everything, over a dimmed scrim, when
  * `visible`. Tapping the scrim fires `onDismiss`. `position` centers the content
@@ -1940,7 +1965,7 @@ export function Modal(first: ModalProps | []Kid, kids: []Kid = []): Node {
 }
 dataType PopoverProps {
     ViewProps; visible: bool?; anchor: ViewRef; placement: string?; offset: int?; arrow: bool?;
-    onDismiss: (function(): void)?
+    onDismiss: Handler?
 }
 /**
  * An anchored overlay: `kids` render on top of everything, beside the view that holds
@@ -1981,7 +2006,7 @@ export function Popover(p: PopoverProps, kids: []Kid): Node {
     return n
 }
 dataType SheetProps {
-    ViewProps; snapPoints: []string; index: int; onChange: (function(i: int): void)?;
+    ViewProps; snapPoints: []string; index: int; onChange: IntHandler?;
     backdrop: bool?; panToClose: bool?; handle: bool?; keyboard: string?; ref: ViewRef?;
 }
 /**
@@ -2041,8 +2066,8 @@ dataType AlertProps {
     visible: bool?; title: string?; message: string?;
     confirmText: string?; cancelText: string?; destructive: bool?;
     buttons: string?; prompt: bool?; placeholder: string?; promptValue: string?;
-    onConfirm: (function(): void)?; onCancel: (function(): void)?;
-    onButton: (function(v: string): void)?; onSubmit: (function(v: string): void)?;
+    onConfirm: Handler?; onCancel: Handler?;
+    onButton: StringHandler?; onSubmit: StringHandler?;
 }
 /**
  * A NATIVE alert / confirm dialog (UIAlertController / AlertDialog).
@@ -2154,7 +2179,7 @@ export function Toggle(p: ToggleProps): Node {
     applyEventsV(n, p)
     return n
 }
-dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?; onSlidingComplete: (function(v: string): void)? }
+dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?; onSlidingComplete: StringHandler? }
 /**
  * A native value slider (UISlider / Android SeekBar). Controlled,
  * like Switch: the parent owns `value` and passes it; `onChange` fires with the new
@@ -2455,8 +2480,8 @@ export function Canvas(first: ViewProps | []string, shapes: []string = []): Node
 }
 dataType GestureProps {
     ViewProps;
-    onGesture: (function(v: string): void)?; onPan: (function(v: string): void)?;
-    onPinch: (function(v: string): void)?; onRotate: (function(v: string): void)?;
+    onGesture: StringHandler?; onPan: StringHandler?;
+    onPinch: StringHandler?; onRotate: StringHandler?;
     // Shared values the host feeds with the pan directly, with no per-move event: each
     // gets its value at the start of the gesture plus the finger's travel. Use
     // `panX.onEnd` / `panY.onEnd` (value, velocity) to decide what happens on release.
@@ -4026,10 +4051,22 @@ class AsyncQueue {
 }
 
 var ASYNC: AsyncQueue = new AsyncQueue()
+// This queue is how state.chuks's onRender() reaches the render thread from a task.
+setRenderPost(function(fn: function(): void): void { ASYNC.post(fn) })
 
-// Hand a result back to the render thread from a spawned task. The closure runs on
-// the render thread at the next host entry point, so it may safely touch useState:
-//   c.onMessage(function(m: string): void { dispatchAsync(function(): void { msgs.set(...) }) })
+/**
+ * Queue a closure to run on the render thread at the next host entry point, and wake
+ * the host so that is within a frame.
+ *
+ * Ordinary app code does not need this: `Cell.set`, `navigate` and its relatives,
+ * `toast` and the capabilities already carry themselves to the render thread when
+ * called from an async body or a spawned task. Reach for it when several writes must
+ * land in the same frame, or when a closure touches the reconciler directly.
+ *
+ * ```chuks
+ * dispatchAsync(function(): void { items.set(list); count.set(list.length) })   // one frame
+ * ```
+ */
 export function dispatchAsync(fn: function(): void): void { ASYNC.post(fn) }
 
 // Queued-closure count (host heartbeat gating / diagnostics).
@@ -4084,7 +4121,8 @@ var ON_TASK_EXPIRE: (function(): void)? = null
 /** Framework-internal: core/native.chuks registers its handler here. */
 export function setTaskExpireHandler(f: function(): void): void { ON_TASK_EXPIRE = f }
 
-function runAsyncQueue(): bool {
+/** Framework-internal: run what tasks queued for the render thread (see onRender). */
+export function runAsyncQueue(): bool {
     var fns: []function(): void = ASYNC.take()
     if (fns.length == 0) { return false }
     var i: int = 0
@@ -4350,9 +4388,41 @@ export class App {
 // hookSweep tears it down on unmount (no leaked native listener).
 export class NativeSub {
     var token: string
-    constructor(token: string) { this.token = token }
+    var cancelled: bool
+    constructor(token: string) { this.token = token; this.cancelled = false }
     // Drop the callback and tell the host to tear down the native op/subscription.
-    public cancel(): void { const h: App? = HOST; if (h != null) { h.recon.cancelStream(this.token) } }
+    // Runs on the render thread (the reconciler's tables are only touched there). A
+    // subscription registered from a task has no token until the queued registration
+    // runs; cancelling before that marks it, and the registration cancels at once.
+    public cancel(): void {
+        const sub: NativeSub = this
+        onRender(function(): void {
+            sub.cancelled = true
+            if (sub.token == "") { return }
+            const h: App? = HOST
+            if (h != null) { h.recon.cancelStream(sub.token) }
+        })
+    }
+}
+
+// Register a capability request on the render thread, from wherever the call came.
+// On the render thread the token is known before this returns; from a task the
+// request is queued and the returned handle receives its token when it runs.
+function registerCommand(cap: string, args: any, cb: any, onErr: any, stream: bool): NativeSub {
+    const payload: string = json.stringify(args)
+    if (onRenderThread()) {
+        const h: App? = HOST
+        if (h != null) { return new NativeSub(h.recon.command(cap, payload, cb, onErr, stream)) }
+        return new NativeSub("0")
+    }
+    const sub: NativeSub = new NativeSub("")
+    onRender(function(): void {
+        const h: App? = HOST
+        if (h == null) { sub.token = "0"; return }
+        sub.token = h.recon.command(cap, payload, cb, onErr, stream)
+        if (sub.cancelled) { h.recon.cancelStream(sub.token) }
+    })
+    return sub
 }
 
 // ---- The dev warning channel -----------------------------------------------
@@ -4425,9 +4495,7 @@ function warnUnhandled(cap: string, message: string): void {
  * core/native.chuks call this; app code uses those (Clipboard, Share, ...).
  */
 export function emitNativeCommand(cap: string, args: any, cb: any): NativeSub {
-    const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, json.stringify(args), cb, null, false)) }
-    return new NativeSub("0")
+    return registerCommand(cap, args, cb, null, false)
 }
 
 /**
@@ -4436,9 +4504,7 @@ export function emitNativeCommand(cap: string, args: any, cb: any): NativeSub {
  * (permission denied, hardware missing), instead of `cb`.
  */
 export function emitNativeCommandE(cap: string, args: any, cb: any, onErr: any): NativeSub {
-    const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, json.stringify(args), cb, onErr, false)) }
-    return new NativeSub("0")
+    return registerCommand(cap, args, cb, onErr, false)
 }
 
 // ---- How a command's arguments cross ---------------------------------------
@@ -4467,17 +4533,21 @@ export function emitNativeCommandE(cap: string, args: any, cb: any, onErr: any):
 // turn. `awaitCommand` parks a lightweight thread on that answer instead, so a
 // sequence of device calls reads as a sequence rather than a staircase of closures.
 //
-// THE ONE RULE, and the reason this took a second attempt to get right: await it off
-// the host thread. An event handler runs INSIDE the host's call into the engine, so
-// blocking there blocks the very thread that would have delivered the answer, and the
-// app freezes. An `async function` body runs on its own lightweight thread, so awaiting
-// inside one is safe; call that function from a handler WITHOUT awaiting it.
+// THE ONE RULE: a handler that awaits is an `async function`. The host's call into
+// the engine runs on the render thread, and an await there would block the very
+// thread that delivers the answer. An `async function` body runs on its own
+// lightweight thread, so awaiting inside one is safe, and the handler returns to the
+// host at its first await. The writes after the await (a Cell.set, a navigate) carry
+// themselves back to the render thread, so the body reads as straight code:
 //
-//     async function load(): Task<void> {
-//         const id: string = await DeviceInfo.deviceIdAsync()   // safe: own thread
-//         dispatchAsync(function(): void { idCell.set(id) })    // back to the render thread
-//     }
-//     Pressable({ onPress: function(): void { load() } }, [...])   // no await here
+//     Pressable({ onPress: async function(): Task<void> {
+//         const id: string = await DeviceInfo.deviceIdAsync()   // own thread
+//         idCell.set(id)                                        // lands on the render thread
+//     } }, [...])
+//
+// An await on the render thread cannot be told apart from inside this async body
+// (it runs in its own task either way), so it is discovered as the timeout below,
+// whose message names this rule.
 //
 // This is not a limitation we invented. A synchronous FFI call blocks Flutter's UI
 // isolate and a synchronous native call blocks React Native's JS thread; the difference
@@ -4492,10 +4562,9 @@ const AWAIT_POLL_SLOW_MS: int = 25    // after that, back off so a long wait cos
 /**
  * Await a one-shot capability and return its payload, or throw.
  *
- * Await it OFF the host thread: an event handler runs inside the host's call into the
- * engine, so blocking there blocks the very thread that would deliver the answer. Put
- * the await in an `async` function and call that function from your handler WITHOUT
- * awaiting it.
+ * Await it inside an `async function` (an async handler, or an async function a
+ * handler calls). Awaited on the render thread it can only time out: the answer
+ * arrives through the host, and the host is the thread that would be blocked.
  *
  * `timeoutMs` bounds the wait. Pick it from what the capability waits ON: a device
  * reading answers in milliseconds, while a picker or a permission prompt waits on a
@@ -4535,12 +4604,12 @@ export async function awaitCommand(cap: string, args: any, failable: bool, timeo
         waited = waited + step
     }
     // Nothing came back. Tell the host to drop the native op so it does not leak, and
-    // name both causes: a capability that never answered, or the await-on-the-host-thread
+    // name both causes: a capability that never answered, or the await-on-the-render-thread
     // mistake, which looks exactly like this from in here.
     ch.close()
     const t: any = toks.tryReceive()
     if (bool(t.ok)) { const tok: string = string(t.value); dispatchAsync(function(): void { h.recon.cancelStream(tok) }) }
-    throw "capability '" + cap + "' did not answer within " + string(timeoutMs) + "ms. Either the native side never resolved it, or it was awaited on the host thread: await inside an async function, and call that function from your handler without awaiting it."
+    throw "capability '" + cap + "' did not answer within " + string(timeoutMs) + "ms. Either the native side never resolved it, or it was awaited on the render thread: a handler that awaits is an async function (onPress: async function(): Task<void> { ... })."
 }
 
 /**
@@ -4550,9 +4619,7 @@ export async function awaitCommand(cap: string, args: any, failable: bool, timeo
  * and cancel() in its cleanup so they tear down on unmount.
  */
 export function emitNativeStream(cap: string, args: any, cb: any, onErr: any): NativeSub {
-    const h: App? = HOST
-    if (h != null) { return new NativeSub(h.recon.command(cap, json.stringify(args), cb, onErr, true)) }
-    return new NativeSub("0")
+    return registerCommand(cap, args, cb, onErr, true)
 }
 
 // ---- NavStack: named routing ----------------------------------------------
@@ -5062,6 +5129,7 @@ function runBackHandlers(): bool {
  * ```
  */
 export function navigate(name: string, params: (map[string]any)?, body: any?): void {
+    if (!onRenderThread()) { onRender(function(): void { navigate(name, params, body) }); return }
     // A tab that owns its history takes the push, so the bar stays visible and the
     // screen joins that tab's stack rather than covering the whole shell.
     const nested: any = NESTED_PUSH
@@ -5082,6 +5150,7 @@ export function navigate(name: string, params: (map[string]any)?, body: any?): v
  * ```
  */
 export function navigateRoot(name: string, params: (map[string]any)?, body: any?): void {
+    if (!onRenderThread()) { onRender(function(): void { navigateRoot(name, params, body) }); return }
     const nv: NavStack? = NAV
     if (nv != null) { nv.push(name, params, body) }
 }
@@ -5098,6 +5167,7 @@ export function navigateRoot(name: string, params: (map[string]any)?, body: any?
  * ```
  */
 export function navReplace(name: string, params: (map[string]any)?, body: any?): void {
+    if (!onRenderThread()) { onRender(function(): void { navReplace(name, params, body) }); return }
     // Inside a tab that owns its history this replaces the TAB's top, not the whole
     // app: replacing the app stack there would tear the shell out from under the user,
     // bar and all.
@@ -5119,6 +5189,7 @@ export function navReplace(name: string, params: (map[string]any)?, body: any?):
  * ```
  */
 export function navSwap(name: string, params: (map[string]any)?, body: any?): void {
+    if (!onRenderThread()) { onRender(function(): void { navSwap(name, params, body) }); return }
     const nested: any = NESTED_REPLACE
     if (nested != null && nested(name, params, body)) { return }
     const nv: NavStack? = NAV
@@ -5142,6 +5213,7 @@ export function navSwap(name: string, params: (map[string]any)?, body: any?): vo
  * ```
  */
 export function back(result: any?): void {
+    if (!onRenderThread()) { onRender(function(): void { back(result) }); return }
     const nested: any = NESTED_POP
     if (nested != null && nested(result)) { return }
     const nv: NavStack? = NAV
@@ -5160,6 +5232,9 @@ export function back(result: any?): void {
  * ```
  */
 export function popTo(name: string, result: any?): bool {
+    // From a task the pop is queued; true then means queued, since the stack is only
+    // read on the render thread.
+    if (!onRenderThread()) { onRender(function(): void { popTo(name, result) }); return true }
     const nested: any = NESTED_POP_TO
     if (nested != null && nested(name, result)) { return true }
     const nv: NavStack? = NAV
@@ -5176,6 +5251,7 @@ export function popTo(name: string, result: any?): bool {
  * ```
  */
 export function popToRoot(result: any?): void {
+    if (!onRenderThread()) { onRender(function(): void { popToRoot(result) }); return }
     const nested: any = NESTED_POP
     if (nested != null) {
         var popped: bool = false

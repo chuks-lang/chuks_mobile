@@ -1,0 +1,85 @@
+// A handler that awaits is an async function, and what it writes afterwards lands on
+// the render thread by itself: Cell.set, navigation, toast and a capability request
+// carry themselves over the thread boundary (state.chuks onRender). This pins the
+// contract every app leans on once dispatchAsync leaves ordinary code.
+import { Node, Column, Text, Pressable, dispatchAsync, asyncPending, runAsyncQueue, emitNativeCommand, NativeSub } from "../core/ui.chuks";
+import { useState, Cell, onRenderThread, onRender } from "../core/state.chuks";
+import { render, Screen } from "../core/testing.chuks";
+import { time } from "std/time";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(c: bool, name: string): void {
+    if (c) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+// Wait until a task has queued its writes, bounded so a regression prints instead of hanging.
+function settle(): void {
+    var tries: int = 0
+    while (asyncPending() == 0 && tries < 400) { time.sleep(5); tries = tries + 1 }
+}
+
+var SEEN_IN_HANDLER: bool = true
+var SEEN_IN_BODY: bool = true
+
+async function slowValue(): Task<string> { time.sleep(10); return "loaded" }
+
+function screen(): Node {
+    const label: Cell<string> = useState("idle")
+    const count: Cell<int> = useState(0)
+    return Column({ dir: "col" }, [
+        Text({ size: 12 }, label.get()),
+        Text({ size: 12 }, "count " + string(count.get())),
+        Pressable({ onPress: async function(): Task<void> {
+            SEEN_IN_HANDLER = onRenderThread()      // an async body is a task from its first line
+            label.set("loading")                    // queued: lands at the next host entry, in order
+            const v: string = await slowValue()
+            SEEN_IN_BODY = onRenderThread()
+            label.set(v)                            // carried to the render thread
+            count.set(count.get() + 1)
+        } }, [ Text({ size: 12 }, "Load") ]),
+    ])
+}
+
+// Module-level code IS the render thread here, as a host entry point is on a device.
+println("render_thread_test")
+check(onRenderThread(), "module code runs on the render thread")
+
+const s: Screen = render(function(): Node { return screen() })
+check(s.has("idle"), "initial state renders")
+
+s.press("Load")
+settle()
+check(!SEEN_IN_HANDLER, "an async handler runs on its own task from its first line")
+check(s.has("idle"), "a write from the task is not applied until the render thread runs")
+s.frame()
+check(s.has("loading"), "the write before the await lands at the next frame")
+check(!s.has("loaded"), "and the writes after the await are not there yet")
+// The body sleeps 10ms in slowValue, then queues two more writes.
+var tries: int = 0
+while (asyncPending() < 2 && tries < 400) { time.sleep(5); tries = tries + 1 }
+check(!SEEN_IN_BODY, "after an await the body is still on its task")
+s.frame()
+check(s.has("loaded") && s.has("count 1"), "the writes after the await land at the next frame, in order")
+
+// onRender from the render thread runs immediately; from a task it queues.
+var ran: bool = false
+onRender(function(): void { ran = true })
+check(ran, "onRender on the render thread runs at once")
+
+// A capability request from a task is registered on the render thread, and a
+// cancel that arrives before the registration ran cancels it when it runs.
+var subFromTask: NativeSub? = null
+const t: Task<void> = spawn(function(): void {
+    subFromTask = emitNativeCommand("probe.cap", "", function(_v: string): void { })
+}())
+await t
+check(subFromTask != null && asyncPending() > 0, "a capability request from a task is queued for the render thread")
+if (subFromTask != null) { subFromTask.cancel() }
+runAsyncQueue()
+check(subFromTask != null && subFromTask.token != "", "the handle gets its token once the registration has run")
+
+println("")
+println(string(PASS) + " passed, " + string(FAIL) + " failed")
+if (FAIL > 0) { throw new Error("render_thread_test failed") }
