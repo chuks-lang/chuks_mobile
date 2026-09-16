@@ -151,6 +151,17 @@ function main(): void {
     check(nv2.top().str("id", "") == "c-7", "params survive the reload")
     check(nv2.top().body == null, "body does NOT survive the reload")
 
+    // 3b. swap replaces the top page and keeps the history under it: the step of a flow
+    //     that should not be returned to.
+    const sw: NavStack = nav()
+    sw.push("club", { "id": "step-1" }, null)
+    sw.swap("club", { "id": "step-2" }, null)
+    check(sw.depth() == 2 && sw.top().str("id", "") == "step-2", "swap replaces the top route in place")
+    sw.popStack(null)
+    check(sw.depth() == 1 && sw.top().name != "club", "back from a swapped page goes to what was under the replaced one")
+    sw.push("club", { "id": "x" }, null); sw.replace("club", { "id": "only" }, null)
+    check(sw.depth() == 1, "replace resets the whole stack")
+
     // 4. back(result) hands a value to the screen underneath.
     nv.popStack("chosen")
     check(nv.depth() == 1, "pop shrinks the stack")

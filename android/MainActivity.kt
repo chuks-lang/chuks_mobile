@@ -676,9 +676,13 @@ class MainActivity : Activity(), ChuksModuleHost {
     // ---- apply the mutation stream ----------------------------------------
     private fun applyDrain() { applyStream(N.drain()) }
 
+    // `adb shell setprop log.tag.ChuksStream VERBOSE` prints every mutation the host applies
+    // and every event it sends, for reading a feedback loop between a widget and the engine.
+    private val traceStream = android.util.Log.isLoggable("ChuksStream", android.util.Log.VERBOSE)
     private fun applyStream(stream: String) {
         if (stream.isEmpty()) return
         for (raw in stream.split("\n")) {
+            if (traceStream) android.util.Log.v("ChuksStream", "<- " + raw.take(160))
             val f = raw.split("|")
             when (f.getOrNull(0)) {
                 "C" -> if (f.size >= 3) make(f[1], f[2])
@@ -1088,7 +1092,10 @@ class MainActivity : Activity(), ChuksModuleHost {
     // returns the mutation stream (production folds the op and drain into one call).
     private fun engMount() = if (devMode) devBlocking("/mount", "") else { N.mount(); N.drain() }
     private fun engEvent(a: String) = if (devMode) devBlocking("/event", a) else { N.event(a); N.drain() }
-    private fun engInput(a: String, v: String) = if (devMode) devBlocking("/input", "$a\n$v") else { N.input(a, v); N.drain() }
+    private fun engInput(a: String, v: String): String {
+        if (traceStream) android.util.Log.v("ChuksStream", "-> input $a [$v]")
+        return if (devMode) devBlocking("/input", "$a\n$v") else { N.input(a, v); N.drain() }
+    }
     private fun engResolve(t: String, p: String) = if (devMode) devBlocking("/resolve", "$t\n$p") else { N.resolve(t, p); N.drain() }
     private fun engFail(t: String, m: String) = if (devMode) devBlocking("/fail", "$t\n$m") else { N.fail(t, m); N.drain() }
 
@@ -1158,7 +1165,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     }
     // An empty reply changed nothing: no apply, no layout. A value's end or settle whose
     // handler only queued a spring, or a gesture nobody bound, comes back empty.
-    private fun hostEvent(a: String) { val st = engEvent(a); if (st.isEmpty()) return; applyStream(st); relayout() }
+    private fun hostEvent(a: String) { if (traceStream) android.util.Log.v("ChuksStream", "-> event $a"); val st = engEvent(a); if (st.isEmpty()) return; applyStream(st); relayout() }
     private fun hostInput(a: String, v: String) { val st = engInput(a, v); if (st.isEmpty()) return; applyStream(st); relayout() }
 
     // Deliver a native capability result back to the engine and apply the re-render.
@@ -3090,7 +3097,19 @@ class MainActivity : Activity(), ChuksModuleHost {
         a11yFocusable.remove(id)?.let { v.isFocusable = it }
     }
 
+    // A text field's style is applied with its watcher muted: EditText re-sets its own
+    // text when the input type, the transformation or single-line mode changes, and
+    // the watcher would report that as an edit. The engine then re-rendered, re-styled,
+    // and heard the same "edit" again: four change events per keystroke, and with a
+    // controlled value that disagreed, an unbounded loop. Only a person's typing is a
+    // change; setFieldValue keeps its own mute for the mirrored value.
     private fun style(id: String, s: String) {
+        val quiet = views[id] is EditText
+        val was = fieldSelfSet
+        if (quiet) fieldSelfSet = true
+        try { styleApply(id, s) } finally { if (quiet) fieldSelfSet = was }
+    }
+    private fun styleApply(id: String, s: String) {
         val n = ynodes[id] ?: return
         val v = views[id] ?: return
         // style() always receives the FULL style, so drop any stale visual state for

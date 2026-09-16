@@ -5814,6 +5814,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             l.font = .systemFont(ofSize: 14)
             l.textColor = .label
         }
+        (v as? UITextField)?.textAlignment = .left
         v.layer.borderWidth = 0
         v.layer.borderColor = nil
         pillIds.remove(id); cornerRadii[id] = nil
@@ -6064,7 +6065,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                         if let sl = v as? UISlider { sl.minimumTrackTintColor = hexColor(val); sl.thumbTintColor = hexColor(val) }
             case "fs":  fs = CGFloat(f)
             case "fw":  fw = weightOf(val)
-            case "ta":  label?.textAlignment = (val == "right") ? .right : (val == "center" ? .center : (val == "justify" ? .justified : .left)); labelDirty = true
+            case "ta":
+                let ta: NSTextAlignment = (val == "right") ? .right : (val == "center" ? .center : (val == "justify" ? .justified : .left))
+                label?.textAlignment = ta; labelDirty = true
+                field?.textAlignment = ta                        // a centred code box, a right-aligned amount
             case "font": customFont = val
             case "fontfam": customFont = val                 // font-family (same mechanism)
             case "italic": italicFont = (val == "1"); labelDirty = true

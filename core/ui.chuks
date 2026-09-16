@@ -1539,7 +1539,9 @@ dataType TextInputProps {
  * ("email"|"number"|"decimal"|"phone"|"url"), `returnKeyType`
  * ("done"|"send"|"search"|"next"|"go"), `secure`, `multiline`, `editable` (default
  * true), `autoFocus`, `maxLength`, `autoCapitalize` ("none"|"sentences"|"words"|
- * "characters"), `autoCorrect`, `bg`, `color`, `h`.
+ * "characters"), `autoCorrect`, `bg`, `color`, `h`, and the text props `size`,
+ * `weight`, `font`, `ta` ("left"|"center"|"right"): a one-digit code box is
+ * `TextInput({ w: 64, h: 64, size: 30, weight: "semibold", ta: "center", maxLength: 1 })`.
  *
  * ```chuks
  * // Controlled: the field always shows `draft`; clear it by setting draft to "".
@@ -4767,6 +4769,14 @@ export class NavStack extends App {
         this.stack = [new Route(name, params, body)]
     }
     /**
+     * Replace only the top route, keeping what is below it, so Back returns to the
+     * screen before the one being replaced. Prefer the `navSwap()` free function.
+     */
+    public swap(name: string, params: (map[string]any)?, body: any?): void {
+        if (this.stack.length == 0) { this.stack = [new Route(name, params, body)]; return }
+        this.stack[this.stack.length - 1] = new Route(name, params, body)
+    }
+    /**
      * Pop the top route when one remains below it; a no-op at the root, so the host
      * can fall through to its platform default. `result` is handed to the screen
      * underneath, which reads it as `r.result`. Prefer the `back()` free function.
@@ -4877,17 +4887,25 @@ export class NavStack extends App {
         }
         hookPark(parked)
         // Name the screen on top, so a list on a covered screen cannot claim the viewport.
-        this.recon.setTopScope("app." + string(n - 1))
-        // The overlay rides above every route, after them in the tree so the routes keep
-        // their indices (the top scope above is named by index).
+        // The routes live in a container of their own (app.0), so a route's id is
+        // "app.0.<depth>" and the overlay below is always app.1: a push or a pop never
+        // moves it, so a toast raised just before a navigation stays on screen.
+        this.recon.setTopScope("app.0." + string(n - 1))
+        const routesStyle: Style = new Style()
+        routesStyle.pos = "abs"; routesStyle.top = 0; routesStyle.left = 0; routesStyle.right = 0; routesStyle.bottom = 0
+        // "StackHost": its last two children are the pair a back gesture drags (a tab's
+        // own stack, walked later, takes over while it has something pushed).
+        var top: []Node = [ new Node("StackHost", routesStyle, "", kids) ]
+        // The overlay rides above every route: last in the tree, so it draws and is hit
+        // above them on both hosts.
         const ov: any = this.overlay
         if (ov != null) {
             const os: Style = new Style()
             os.pos = "abs"; os.left = 0; os.right = 0; os.bottom = safeBottom(); os.z = 50
-            kids.push(new Node("View", os, "", [ KeyedComp("overlay", ov) ]))
+            top.push(new Node("View", os, "", [ KeyedComp("overlay", ov) ]))
         }
         const rs: Style = new Style(); rs.grow = 1; rs.basis = 0
-        return new Node("View", rs, "", kids)
+        return new Node("View", rs, "", top)
     }
     // Something drawn over every route, anchored to the bottom: a ToastHost, a global
     // banner. A screen comes and goes; the overlay stays, so a toast raised on a page
@@ -5081,6 +5099,24 @@ export function navReplace(name: string, params: (map[string]any)?, body: any?):
     if (nested != null && nested(name, params, body)) { return }
     const nv: NavStack? = NAV
     if (nv != null) { nv.replace(name, params, body) }
+}
+/**
+ * Replace the page on screen with another, keeping the history under it, so Back
+ * returns to what came BEFORE the replaced page rather than to the page itself. The
+ * steps of a flow are the case: entering an email, then the code it received, then a
+ * new password; going back from the code should not show the email form again.
+ *
+ * Inside a tab that owns its history this swaps the tab's top page.
+ *
+ * ```chuks
+ * navSwap("verify-code", { email: email }, null)   // the email step is gone from history
+ * ```
+ */
+export function navSwap(name: string, params: (map[string]any)?, body: any?): void {
+    const nested: any = NESTED_REPLACE
+    if (nested != null && nested(name, params, body)) { return }
+    const nv: NavStack? = NAV
+    if (nv != null) { nv.swap(name, params, body) }
 }
 /**
  * Pop the top page and return to the previous one. No-op at the root page.

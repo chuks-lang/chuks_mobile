@@ -41,6 +41,7 @@ function main(): void {
     rc.renderRoot(nv.render())
     var ls: []string = lines(rc)
     check(anyLineHas(ls, "first page"), "the first route renders")
+    check(anyLineHas(ls, "SK|app.0"), "the routes' container is the one a back gesture drags, not the overlay's parent")
     check(!anyLineHas(ls, "toast-"), "an empty overlay draws nothing")
 
     TOASTS = 1
@@ -52,8 +53,18 @@ function main(): void {
     rc.renderRoot(nv.render())
     ls = lines(rc)
     check(anyLineHas(ls, "second page"), "the route was replaced")
-    check(anyLineHas(ls, "R|app.0.kroute:0:first"), "and the first is gone")
-    check(!anyLineHas(ls, "koverlay"), "the toast is untouched by the replace: it belongs to the app, not the page")
+    check(anyLineHas(ls, "R|app.0.0.kroute:0:first"), "and the first is gone")
+    check(!anyLineHas(ls, "koverlay") && !anyLineHas(ls, "S|app.1|"), "the toast is untouched by the replace: it belongs to the app, not the page")
+
+    nv.push("first", null, null)
+    rc.renderRoot(nv.render())
+    ls = lines(rc)
+    check(anyLineHas(ls, "first page"), "a push mounts the new route")
+    check(!anyLineHas(ls, "koverlay") && !anyLineHas(ls, "S|app.1|") && !anyLineHas(ls, "R|app.1"), "and leaves the overlay where it is: a push does not move it")
+    nv.popStack(null)
+    rc.renderRoot(nv.render())
+    ls = lines(rc)
+    check(!anyLineHas(ls, "koverlay") && !anyLineHas(ls, "S|app.1|"), "nor does a pop")
 
     TOASTS = 2
     rc.renderRoot(nv.render())
