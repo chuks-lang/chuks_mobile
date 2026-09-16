@@ -290,13 +290,25 @@ class MainActivity : Activity(), ChuksModuleHost {
     // dp on Android). Re-render if they changed so inset-using components update.
     private var lastInsets = intArrayOf(-1, -1, -1, -1)
     @Suppress("DEPRECATION")
-    private fun reportInsets() {
+    // The insets last dispatched to the content view. reportInsets reads these rather
+    // than the decor view's rootWindowInsets: after another Activity has been on top
+    // (the photo picker, a Custom Tab) the decor view's copy can read as zero while
+    // the content view was handed the real values, and a hot reload that re-sent
+    // "zero" laid the app out under the status bar and the navigation bar.
+    private var dispatchedInsets: WindowInsets? = null
+    private fun reportInsets(given: WindowInsets? = null) {
         if (devMode) return   // dev server has no /insets endpoint; uses default insets
-        val wi = window.decorView.rootWindowInsets ?: return
-        val t = (wi.systemWindowInsetTop / density).toInt()
-        val r = (wi.systemWindowInsetRight / density).toInt()
-        val b = (wi.systemWindowInsetBottom / density).toInt()
-        val l = (wi.systemWindowInsetLeft / density).toInt()
+        if (given != null) dispatchedInsets = given
+        val wi = given ?: dispatchedInsets ?: window.decorView.rootWindowInsets ?: return
+        val t: Int; val r: Int; val b: Int; val l: Int
+        if (Build.VERSION.SDK_INT >= 30) {
+            val sb = wi.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            t = (sb.top / density).toInt(); r = (sb.right / density).toInt(); b = (sb.bottom / density).toInt(); l = (sb.left / density).toInt()
+        } else {
+            @Suppress("DEPRECATION")
+            run { t = (wi.systemWindowInsetTop / density).toInt(); r = (wi.systemWindowInsetRight / density).toInt(); b = (wi.systemWindowInsetBottom / density).toInt(); l = (wi.systemWindowInsetLeft / density).toInt() }
+        }
+        if (traceStream) android.util.Log.v("ChuksStream", "insets t=$t r=$r b=$b l=$l given=${given != null} kept=${dispatchedInsets != null}")
         if (t != lastInsets[0] || r != lastInsets[1] || b != lastInsets[2] || l != lastInsets[3]) {
             lastInsets = intArrayOf(t, r, b, l)
             N.setInsets(t, r, b, l); N.tick(); applyDrain(); relayout()
@@ -510,7 +522,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 })
         }
         root.setOnApplyWindowInsetsListener { _, insets ->                            // update on inset changes
-            reportInsets()
+            reportInsets(insets)
             if (Build.VERSION.SDK_INT >= 30) applyKeyboard(insets.getInsets(WindowInsets.Type.ime()).bottom)
             insets
         }
@@ -749,6 +761,9 @@ class MainActivity : Activity(), ChuksModuleHost {
                     }
                 }
                 "FA" -> if (f.size >= 2) setFrameDriver(f[1] == "1")   // per-frame physics on/off
+                // A runtime error the live app hit (errPayload JSON, which may contain '|'):
+                // a handler that threw, a task that failed with nobody awaiting it.
+                "E" -> if (f.size >= 2) showDevError(f.drop(1).joinToString("|"))
                 "MV", "MS", "MX" -> motionOp(f)                          // shared values (docs/shared-values.md)
                 "MK" -> if (f.size >= 2) f[1].toIntOrNull()?.let { mKeyboardValues.add(it) }
                 "X" -> if (f.size >= 3) {
@@ -789,7 +804,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             fun dp(v: Int) = (v * dm.density).toInt()
 
             // --- parse payload (json) ---
-            var cls = "Error"; var msg = message; var file = ""; var line = 0; var amber = false
+            var cls = "Error"; var msg = message; var file = ""; var line = 0; var amber = false; var live = false
             val frame = ArrayList<Triple<Int, String, Boolean>>()   // n, text, hot
             val stack = ArrayList<Pair<String, Int>>()              // file, line
             try {
@@ -797,6 +812,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 cls = o.optString("class", "Error"); msg = o.optString("message", "")
                 file = o.optString("file", ""); line = o.optInt("line", 0)
                 amber = cls.startsWith("Type", true)
+                live = o.optBoolean("live", false)   // the app is still running behind this card
                 o.optJSONArray("frame")?.let { a -> for (i in 0 until a.length()) { val f = a.getJSONObject(i); frame.add(Triple(f.optInt("n"), f.optString("t"), f.optBoolean("hot"))) } }
                 o.optJSONArray("stack")?.let { a -> for (i in 0 until a.length()) { val s = a.getJSONObject(i); stack.add(Pair(s.optString("file"), s.optInt("line"))) } }
             } catch (e: Throwable) { cls = "Error"; msg = message }
@@ -900,10 +916,14 @@ class MainActivity : Activity(), ChuksModuleHost {
                 }
             }
 
-            // footer hint
-            val hint = tv("Fix the error and save to reload. Hot reload keeps your state.", 12.5f, dim)
+            // footer hint. A live error (a handler that threw, a task that failed with
+            // nobody awaiting it) happened in an app that is still up: a tap dismisses the
+            // card and the app is there underneath. A failed boot or reload has nothing underneath.
+            val hint = tv(if (live) "The app is still running. Tap anywhere to dismiss; the next save reloads."
+                          else "Fix the error and save to reload. Hot reload keeps your state.", 12.5f, dim)
             hint.setPadding(0, dp(24), 0, 0)
             col.addView(hint)
+            if (live) { scrim.setOnClickListener { dismissDevError() }; col.setOnClickListener { dismissDevError() } }
 
             scroll.addView(col)
             scrim.addView(scroll, android.widget.FrameLayout.LayoutParams(

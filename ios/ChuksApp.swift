@@ -3024,7 +3024,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let b = self.view.bounds.isEmpty ? UIScreen.main.bounds : self.view.bounds
 
         // Parse the JSON payload; fall back to a bare message if it is not JSON.
-        var cls = "Error", msg = message, file = "", line = 0, amber = false
+        var cls = "Error", msg = message, file = "", line = 0, amber = false, live = false
         var frameRows: [(Int, String, Bool)] = []
         var stack: [(String, Int)] = []
         if let data = message.data(using: .utf8),
@@ -3034,6 +3034,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             file = o["file"] as? String ?? ""
             line = o["line"] as? Int ?? 0
             amber = cls.lowercased().hasPrefix("type")
+            live = o["live"] as? Bool ?? false   // the app is still running behind this card
             if let fr = o["frame"] as? [[String: Any]] {
                 frameRows = fr.map { (($0["n"] as? Int) ?? 0, ($0["t"] as? String) ?? "", ($0["hot"] as? Bool) ?? false) }
             }
@@ -3152,17 +3153,26 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
 
         // hint
         let hintFont = UIFont.systemFont(ofSize: 12.5)
-        let hintText = "Fix the error and save to reload. Hot reload keeps your state."
+        // A live error (a handler that threw, a task that failed with nobody awaiting
+        // it) happened in an app that is still up: the card is dismissed by a tap and
+        // the app is there underneath. A failed boot or reload has nothing underneath.
+        let hintText = live ? "The app is still running. Tap anywhere to dismiss; the next save reloads."
+                            : "Fix the error and save to reload. Hot reload keeps your state."
         let hintH2 = measure(hintText, hintFont, contentW)
         let hint = UILabel(frame: CGRect(x: padX, y: y + 24, width: contentW, height: hintH2))
         hint.numberOfLines = 0; hint.text = hintText; hint.font = hintFont; hint.textColor = dim
         scroll.addSubview(hint); y += 24 + hintH2 + 28
 
         scroll.contentSize = CGSize(width: b.width, height: max(y, b.height + 1))
+        if live {
+            let tap = UITapGestureRecognizer(target: self, action: #selector(dismissDevErrorTap))
+            scroll.addGestureRecognizer(tap)
+        }
         self.view.addSubview(scrim)
         self.view.bringSubviewToFront(scrim)
         self.devErrorView = scrim
     }
+    @objc func dismissDevErrorTap() { dismissDevError() }
     func dismissDevError() {
         devErrorView?.removeFromSuperview(); devErrorView = nil
     }
@@ -3657,6 +3667,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     listHoriz = horizScrollIds.contains(lid)
                 }
             case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
+            // A runtime error the live app hit (errPayload JSON, which may contain '|'):
+            // a handler that threw, a task that failed with nobody awaiting it.
+            case "E" where f.count >= 2: showDevError(f[1...].joined(separator: "|"))
             case "MV", "MS", "MX": motionOp(f)                           // shared values (docs/shared-values.md)
             case "MK" where f.count >= 2: if let vid = Int(f[1]) { mKeyboardValues.insert(vid) }
             case "X" where f.count >= 3:

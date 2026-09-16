@@ -558,6 +558,12 @@ var _safeBottom: int = 0
 var _safeLeft: int = 0
 // Called by the host (via the entry's setInsets) whenever the insets are known/change.
 export function setSafeInsets(t: int, r: int, b: int, l: int): void {
+    // A layout that read safeTop() is stale the moment the insets change, so the
+    // whole tree re-renders on the next tick. Without this the insets a host sent
+    // after a mount (a hot reload mounts first and reports after) reached the
+    // engine but no component ran again to use them, and the app sat under the
+    // status bar until something else happened to dirty the tree.
+    if (t != _safeTop || r != _safeRight || b != _safeBottom || l != _safeLeft) { markDirty() }
     _safeTop = t; _safeRight = r; _safeBottom = b; _safeLeft = l
 }
 // The last-reported top safe-area inset (notch / status bar), in points.
