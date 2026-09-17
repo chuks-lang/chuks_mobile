@@ -1,0 +1,168 @@
+// A List of variable-height rows (`estimatedHeight`). What this pins: rows mount at
+// the estimate and move to their measured heights; a measurement only re-lays out
+// (no render, only the cells whose top changed move); the content height follows;
+// a row measured above the viewport shifts the scroll offset by the same amount so
+// the visible rows stay put; a row that keeps its height is left alone; the keys
+// carry heights across a data change; scrolling windows against the real tops.
+//
+// Run:  chuks run tests/varlist_test.chuks   (exits non-zero on failure)
+import { Node, Column, Row, Text, List, Reconciler } from "../core/ui.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(c: bool, name: string): void {
+    if (c) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function starts(s: string, p: string): bool { return s.length >= p.length && s.slice(0, p.length) == p }
+function field(line: string, i: int): string { const f: []string = line.split("|"); return f.length > i ? f[i] : "" }
+function styleTop(style: string): int {
+    const parts: []string = style.split(";")
+    for (var i: int = 0; i < parts.length; i = i + 1) { if (starts(parts[i], "top=")) { return int(parts[i].slice(4, parts[i].length)) } }
+    return -1
+}
+function count(lines: []string, prefix: string): int {
+    var n: int = 0
+    for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], prefix)) { n = n + 1 } }
+    return n
+}
+// A cell id is "<content>.cell<n>" with nothing after: its children carry a further ".".
+function isCell(id: string, contentId: string): bool {
+    if (!starts(id, contentId + ".cell")) { return false }
+    return id.slice(contentId.length + 5, id.length).indexOf(".") < 0
+}
+// Where every cell is, across passes: a cell whose top did not change emits no S|.
+var CELL_TOP: map[string]int = {}
+function absorb(lines: []string, contentId: string): void {
+    for (var i: int = 0; i < lines.length; i = i + 1) {
+        if (starts(lines[i], "S|") && isCell(field(lines[i], 1), contentId)) { CELL_TOP[field(lines[i], 1)] = styleTop(field(lines[i], 2)) }
+    }
+}
+function cellCreates(lines: []string, contentId: string): int {
+    var n: int = 0
+    for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], "C|") && isCell(field(lines[i], 1), contentId)) { n = n + 1 } }
+    return n
+}
+
+var ITEMS: []string = []
+for (var i: int = 0; i < 40; i = i + 1) { ITEMS.push("p" + string(i)) }
+
+function screen(): Node {
+    return Column({ dir: "col", grow: 1 }, [
+        List({
+            count: ITEMS.length,
+            estimatedHeight: 100,
+            gap: 10,
+            pad: 20,
+            key: function(r: int): string { return ITEMS[r] },
+            item: function(r: int, top: int): Node {
+                return Row({ abs: true, top: top, left: 0, right: 0 }, [ Text({ size: 15 }, ITEMS[r]) ])
+            },
+        }),
+    ])
+}
+
+println("varlist_test")
+const r: Reconciler = new Reconciler()
+r.setViewport(0, 600, 400)
+r.drain(); r.renderRoot(screen())
+var lines: []string = r.drain().split("\n")
+// The list scaffold: "<list>.0" is the content node; cells are "<list>.0.cell<i>".
+var listId: string = ""
+var contentId: string = ""
+for (var i: int = 0; i < lines.length; i = i + 1) {
+    if (starts(lines[i], "C|") && field(lines[i], 2) == "Scroll") { listId = field(lines[i], 1); contentId = listId + ".0" }
+}
+check(listId != "", "the list mounted a scroll (" + listId + ")")
+absorb(lines, contentId)
+// Rows at the estimate: row r sits at pad + r * (100 + 10).
+var tops0: map[string]int = {}
+var contentH0: int = 0
+for (var i: int = 0; i < lines.length; i = i + 1) {
+    if (starts(lines[i], "S|" + contentId + "|")) { contentH0 = styleTop(field(lines[i], 2)) }
+    if (starts(lines[i], "S|" + contentId + ".cell")) { tops0[field(lines[i], 1)] = styleTop(field(lines[i], 2)) }
+}
+check(tops0.getOr(contentId + ".cell0", -1) == 20 && tops0.getOr(contentId + ".cell1", -1) == 130 && tops0.getOr(contentId + ".cell2", -1) == 240, "rows mount at the estimate (20, 130, 240)")
+const mounted0: int = cellCreates(lines, contentId)
+check(mounted0 >= 6 && mounted0 < 40, "only the window is mounted (" + string(mounted0) + " of 40)")
+check(count(lines, "LY|" + contentId + ".cell") == mounted0, "every cell asks the host for its layout")
+
+// Content height as emitted: h= on the content node's style.
+function styleH(style: string): int {
+    const parts: []string = style.split(";")
+    for (var i: int = 0; i < parts.length; i = i + 1) { if (starts(parts[i], "h=")) { return int(parts[i].slice(2, parts[i].length)) } }
+    return -1
+}
+var ch: int = -1
+for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], "S|" + contentId + "|")) { ch = styleH(field(lines[i], 2)) } }
+check(ch == 20 + 40 * 110 - 10 + 20, "content height is the estimate for every row (" + string(ch) + ")")
+
+// The host measures row 0 at 160 (60 taller). Delivered as the cell's onLayout value.
+r.drain()
+r.fireValue(contentId + ".cell0:layout", "0,20,400,160")
+lines = r.drain().split("\n")
+absorb(lines, contentId)
+var moved: map[string]int = {}
+for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], "S|" + contentId + ".cell")) { moved[field(lines[i], 1)] = styleTop(field(lines[i], 2)) } }
+check(!moved.has(contentId + ".cell0"), "the measured row itself does not move")
+check(moved.getOr(contentId + ".cell1", -1) == 190 && moved.getOr(contentId + ".cell2", -1) == 300, "the rows below move down by the difference (190, 300)")
+check(count(lines, "C|") == 0 && count(lines, "R|") == 0, "a measurement creates and removes nothing")
+check(count(lines, "LS|") == 0, "a row measured inside the viewport does not move the scroll")
+ch = -1
+for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], "S|" + contentId + "|")) { ch = styleH(field(lines[i], 2)) } }
+check(ch == 20 + 40 * 110 - 10 + 20 + 60, "content height grew by the difference (" + string(ch) + ")")
+
+// The same measurement again: nothing.
+r.drain()
+r.fireValue(contentId + ".cell0:layout", "0,20,400,160")
+check(r.count() == 0, "a repeated measurement emits nothing")
+
+// Scroll down past row 0 and row 1 (now 20..180 and 190..290): the viewport starts at 400.
+r.drain()
+r.setViewport(400, 600, 400)
+r.renderRoot(screen())
+lines = r.drain().split("\n")
+absorb(lines, contentId)
+var cellOfRow2: string = ""
+for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], "P|" + contentId + ".cell") && field(lines[i], 2) == "p2") { cellOfRow2 = cellOf(field(lines[i], 1), contentId) } }
+// Row 1 is entirely above the viewport (bottom 290 < 400). The host measures it at 50 (was 100).
+r.drain()
+r.fireValue(contentId + ".cell1:layout", "0,190,400,50")
+lines = r.drain().split("\n")
+absorb(lines, contentId)
+var ls: string = ""
+for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], "LS|")) { ls = lines[i] } }
+check(ls == "LS|" + listId + "|350|i", "a row shrinking above the viewport moves the scroll offset with it, instantly (" + ls + ")")
+var top2: int = -1
+for (var i: int = 0; i < lines.length; i = i + 1) { if (starts(lines[i], "S|" + contentId + ".cell")) { const t: int = styleTop(field(lines[i], 2)); if (field(lines[i], 1) != contentId + ".cell1" && (top2 == -1 || t < top2)) { top2 = t } } }
+check(top2 == 250, "row 2 now starts where the shorter row 1 ends (" + string(top2) + ")")
+
+// Prepend an item: heights follow keys, so p0 keeps its 160 at rank 1.
+ITEMS = ["new"].concat(ITEMS)
+r.drain()
+r.setViewport(0, 600, 400)
+r.renderRoot(screen())
+lines = r.drain().split("\n")
+var topsByText: map[string]int = {}
+var cellText: map[string]string = {}
+// A row's text lives on the cell's Text child ("<cell>.0"): map it back to the cell.
+function cellOf(id: string, contentId: string): string {
+    const rest: string = id.slice(contentId.length + 1, id.length)
+    const dot: int = rest.indexOf(".")
+    return dot < 0 ? id : contentId + "." + rest.slice(0, dot)
+}
+for (var i: int = 0; i < lines.length; i = i + 1) {
+    if (starts(lines[i], "P|" + contentId + ".cell")) { cellText[cellOf(field(lines[i], 1), contentId)] = field(lines[i], 2) }
+}
+absorb(lines, contentId)
+const ks: []string = cellText.keys()
+for (var i: int = 0; i < ks.length; i = i + 1) { topsByText[cellText.getOr(ks[i], "")] = CELL_TOP.getOr(ks[i], -1) }
+check(topsByText.getOr("new", -1) == 20 && topsByText.getOr("p0", -1) == 130 && topsByText.getOr("p1", -1) == 300, "after a prepend the measured heights follow their items (new 20, p0 130, p1 300), got " + string(topsByText.getOr("new", -1)) + " " + string(topsByText.getOr("p0", -1)) + " " + string(topsByText.getOr("p1", -1)))
+
+// An identical re-render emits nothing.
+r.drain(); r.renderRoot(screen())
+check(r.count() == 0, "an unchanged render emits nothing")
+
+println("")
+println(string(PASS) + " passed, " + string(FAIL) + " failed")
+if (FAIL > 0) { throw new Error("varlist_test failed") }

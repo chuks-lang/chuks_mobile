@@ -2020,6 +2020,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // Discovered from the Chuks tree (not hardcoded): the scroll region + its content.
     var listScroll: UIScrollView?
     var scrollContentIds: [String: String] = [:]      // scroll node id -> its content node id
+    var instantScrolls: [String: CGFloat] = [:]       // LS|id|y|i: offsets to set once this pass has sized the content
     var horizScrollIds = Set<String>()                // which of those scroll sideways
     var scrollId = ""
     var listHoriz = false            // the tracked list scrolls horizontally (report x, not y)
@@ -2562,7 +2563,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // viewportWidth()/viewportHeight() stay correct. The reconciler picks vpW vs vpH as the
         // windowing extent per the list's orientation.
         let top = Int32(max(0, listHoriz ? sc.contentOffset.x : sc.contentOffset.y))
-        let vh = Int32(sc.bounds.height); let vw = Int32(sc.bounds.width)
+        var vh = Int32(sc.bounds.height); var vw = Int32(sc.bounds.width)
+        // A list that has not been laid out yet (the push right after a remount) has no
+        // size of its own. Report the root's rather than nothing: the engine sizes text
+        // and columns from viewportWidth() on its first render, and a screen built at
+        // width 0 stayed built that way, since nothing re-reported the width until the
+        // user scrolled. The list's own report follows once it has a frame.
+        if vh <= 0 || vw <= 0 { vh = Int32(view.bounds.height); vw = Int32(view.bounds.width) }
         if vh <= 0 || vw <= 0 { return false }
         let _tc0 = BENCHMARK_MODE ? CACurrentMediaTime() : 0
         guard let s = eViewport(top, vh, vw) else { connected = false; return false }
@@ -3625,7 +3632,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "IF" where f.count >= 3:   // Image GPU op-chain (JSON may contain '|', so rejoin)
                 imageOpChain[f[1]] = f[2...].joined(separator: "|")
                 if let iv = views[f[1]] as? UIImageView { applyOps(iv, f[1]) }
-            case "LS" where f.count >= 3: scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0))   // scrollToIndex/scrollToEnd
+            case "LS" where f.count >= 3:                                   // scrollToIndex/scrollToEnd
+                // `i`: instant and in THIS pass. A variable-height list that re-measured a
+                // row above the viewport moves its rows and the offset together; deferred to
+                // the next runloop turn the rows would draw shifted for a frame first.
+                if f.count >= 4 && f[3] == "i" { instantScrolls[f[1]] = CGFloat(Int(f[2]) ?? 0) }
+                else { scrollListTo(f[1], y: CGFloat(Int(f[2]) ?? 0)) }
             case "VC" where f.count >= 3:
                 // VC|<id>|<name>|<json>: the app told ONE package view to do something.
                 // The arguments are JSON, so a pipe inside them is safe: everything after
@@ -7211,6 +7223,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             guard let sv = views[sid] as? UIScrollView, let cnode = ynodes[cid] else { continue }
             let w = yogaSize(YGNodeLayoutGetWidth(cnode)), h = yogaSize(YGNodeLayoutGetHeight(cnode))
             sv.contentSize = CGSize(width: w, height: horizScrollIds.contains(sid) ? sv.bounds.height : h)
+        }
+        // Instant offsets (LS ... i): the content is sized now, so the clamp is against the
+        // new height, and the offset lands in the same frame as the rows that moved.
+        if !instantScrolls.isEmpty {
+            for (sid, y) in instantScrolls {
+                guard let sv = views[sid] as? UIScrollView else { continue }
+                let maxY = max(0, sv.contentSize.height - sv.bounds.height)
+                sv.setContentOffset(CGPoint(x: 0, y: min(max(0, y), maxY)), animated: false)
+            }
+            instantScrolls.removeAll()
         }
         if let sc = listScroll, let cn = ynodes[contentId] {
             let cw = yogaSize(YGNodeLayoutGetWidth(cn)), chh = yogaSize(YGNodeLayoutGetHeight(cn))

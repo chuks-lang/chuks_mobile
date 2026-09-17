@@ -7,9 +7,10 @@
 // state). Bring @chuks/lucide, or any other icon set, from the app side.
 import { Node, Row, Column, Text, KeyedComp, safeBottom, Route, Style, NavStack,
          setNestedNavigator, activeNav, safeTop, setConsumedTop, consumedTop, setOverlayBottom, overlayBottom,
-         setNestedStateHandlers, Handler } from "./ui.chuks";
+         setNestedStateHandlers, Handler, SharedValue } from "./ui.chuks";
 import { json } from "std/json";
 import { hookPark } from "./state.chuks";
+import { useSharedValue } from "./motion.chuks";
 import { tk } from "./theme.chuks";
 
 // A round, tappable icon button around a NON-NULL icon node. `hasPress` says
@@ -303,6 +304,13 @@ function tabRootThunk(f: any, consume: int, overlay: int): function(): Node {
     }
 }
 
+// The bar's vertical offset, a value the host moves: 0 when the bar is in place, its
+// own height when it has slid off the bottom edge. Made in TabView (which runs inside
+// the shell component, so it keeps its identity across renders) and driven from
+// setTabBarHidden, which needs no render: the spring is a host op.
+var _barY: SharedValue? = null
+var _barHidden: bool = false
+
 export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
     const spec: TabSpec = tabs[p.active]
     // Claim navigate()/back() while a tab that owns its history is the visible one, and
@@ -368,6 +376,11 @@ export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
     // their last item clear of it through overlayBottom(), not by knowing about it.
     const floating: bool = p.glass ?? false
     kids.push(tabContent(spec, p.active, consumed, floating ? tabBarHeight() : 0))
+    // The bar's offset (setTabBarHidden). Created here, inside the shell's render, so it
+    // is one value for the life of the shell; a bar that was hidden when the shell
+    // last rendered stays where it is, since a re-render never resets a bound prop.
+    const barY: SharedValue = useSharedValue(0.0)
+    _barY = barY
     if (p.accessory != null) { kids.push(p.accessory) }                             // floating accessory
     var barNode: Node = defaultTabBar(tabs, p)
     if (p.bar != null) { const bf: any = p.bar; barNode = bf(tabs, p.active, p.onSelect) }   // custom bar
@@ -380,12 +393,36 @@ export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
         // The content keeps the full height and scrolls under the bar; its scrolls and
         // lists end above the bar on their own (overlayBottom). A screen that pins
         // something to its bottom edge in flow pads by tabBarHeight() itself.
-        kids.push(Column({ abs: true, bottom: 0, left: 0, right: 0, z: 20 }, [ barNode ]))
+        kids.push(Column({ abs: true, bottom: 0, left: 0, right: 0, z: 20, motion: { ty: barY } }, [ barNode ]))
     } else {
-        kids.push(barNode)
+        kids.push(Column({ motion: { ty: barY } }, [ barNode ]))
     }
     return Column({ grow: 1, tw: "bg-bg" }, kids)
 }
+
+/**
+ * Slide the tab bar off the bottom edge (`true`) or back into place (`false`), with a
+ * spring the host runs. A feed calls this from its list's `onScroll`: hidden while
+ * the reader scrolls down through the content, back the moment they scroll up. The
+ * state persists until it is set again, so a screen that hides the bar shows it
+ * again when it is done (the bar cannot be tapped while it is off-screen).
+ *
+ * ```chuks
+ * var lastY: int = 0
+ * List({ ..., onScroll: function(y: int): void {
+ *     setTabBarHidden(y > lastY && y > 50)   // down and past the top: hide; up: show
+ *     lastY = y
+ * } })
+ * ```
+ */
+export function setTabBarHidden(hidden: bool): void {
+    if (hidden == _barHidden) { return }
+    _barHidden = hidden
+    const v: SharedValue? = _barY
+    if (v != null) { v.spring(hidden ? float(tabBarHeight() + 8) : 0.0, 0.0, 180.0, 24.0) }
+}
+/** Whether the tab bar is currently slid off-screen (see `setTabBarHidden`). */
+export function tabBarHidden(): bool { return _barHidden }
 
 /**
  * How tall the default tab bar is, in points, including the bottom safe-area inset.

@@ -1,7 +1,7 @@
 // A tab that owns its history: navigate() pushes inside it, popTo unwinds inside it
 // when the page is there, and falls through to the app stack when it is not.
 import { Node, Column, Text, Route, NavStack, Reconciler, navigate, back, popTo, popToRoot, currentRoute } from "../core/ui.chuks";
-import { TabView, Tab, TabSpec, resetTabStack } from "../core/nav.chuks";
+import { TabView, Tab, TabSpec, resetTabStack, setTabBarHidden, tabBarHidden } from "../core/nav.chuks";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -49,6 +49,25 @@ function main(): void {
     check(popTo("shell", "back-home") == true && nv.depth() == 1, "popTo the shell pops the app stack")
     check(nv.top().result != null && string(nv.top().result) == "back-home", "with the result on the shell's route")
     resetTabStack("feed")
+
+    // The bar rides a shared value the host moves: the shell's render binds the bar's
+    // wrapper to it, and setTabBarHidden springs it off the bottom edge and back with a
+    // host op and no render. The same state twice queues nothing.
+    const rc2: Reconciler = new Reconciler()
+    rc2.setViewport(0, 600, 400); rc2.drain(); rc2.renderRoot(nv.render())
+    const mountLines: []string = rc2.drain().split("\n")
+    var bound: bool = false
+    for (var i: int = 0; i < mountLines.length; i = i + 1) { if (mountLines[i].indexOf("mo=ty") >= 0) { bound = true } }
+    check(bound, "the tab bar's wrapper binds its offset to a shared value")
+    setTabBarHidden(true); rc.drain(); rc.flushHostOps()
+    const hideLines: string = rc.drain()
+    check(hideLines.indexOf("MS|") >= 0 && hideLines.indexOf("|sp:") >= 0 && tabBarHidden(), "setTabBarHidden(true) springs the bar away without a render")
+    setTabBarHidden(true); rc.drain(); rc.flushHostOps()
+    check(rc.drain() == "", "hiding an already hidden bar queues nothing")
+    setTabBarHidden(false); rc.drain(); rc.flushHostOps()
+    const showLines: string = rc.drain()
+    check(showLines.indexOf("|0|sp:") >= 0 && !tabBarHidden(), "setTabBarHidden(false) springs it back to 0")
+
     println("tabnav: " + string(PASS) + " passed, " + string(FAIL) + " failed")
     if (FAIL > 0) { throw "tabnav_test failed" }
 }

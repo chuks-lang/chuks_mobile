@@ -252,6 +252,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     private var refreshSpinner: ProgressBar? = null                      // pull-to-refresh spinner (overlaid on root)
     private var pullStartY = 0f
     private var pulling = false
+    private var pullTracking = false   // the pull tracker has seen this gesture's start
     private var contentId = ""
     private var frame = 0
     private val handler = Handler(Looper.getMainLooper())
@@ -630,6 +631,23 @@ class MainActivity : Activity(), ChuksModuleHost {
         h.postDelayed(r, 250)
     }
 
+    // Set a vertical scroll's offset in the frame that draws this pass's layout: the
+    // pre-draw hook runs after the traversal has measured the new content height, so the
+    // clamp is right, and before anything is drawn, so the rows and the offset move as one.
+    private fun instantScrollTo(id: String, y: Int) {
+        val sc = views[id] as? ScrollView ?: return
+        val target = dp(y)
+        sc.viewTreeObserver.addOnPreDrawListener(object : android.view.ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                sc.viewTreeObserver.removeOnPreDrawListener(this)
+                val child = if (sc.childCount > 0) sc.getChildAt(0) else null
+                val maxY = if (child != null) (child.height - sc.height).coerceAtLeast(0) else Int.MAX_VALUE
+                sc.scrollTo(0, target.coerceIn(0, maxY))
+                return true
+            }
+        })
+    }
+
     private fun scrollListTo(id: String, y: Int) {
         val vv = views[id] ?: return
         if (vv is HorizontalScrollView) {   // horizontal list: y is really the x offset
@@ -677,8 +695,13 @@ class MainActivity : Activity(), ChuksModuleHost {
         // viewportWidth()/viewportHeight() stay correct. The reconciler picks vpW vs vpH as the
         // windowing extent per the list's orientation.
         val topDp = ((if (listHoriz) sc.scrollX else sc.scrollY) / density).toInt()
-        val hDp = (sc.height / density).toInt()
-        val wDp = (sc.width / density).toInt()
+        // A list that has not been laid out yet (the push right after a remount) has no
+        // size of its own. Report the root's rather than nothing: the engine sizes text
+        // and columns from viewportWidth() on its first render, and a screen built at
+        // width 0 stayed built that way, since nothing re-reported the width until the
+        // user scrolled. The list's own report follows once it has a frame.
+        val hDp = ((if (sc.height > 0) sc.height else root.height) / density).toInt()
+        val wDp = ((if (sc.width > 0) sc.width else root.width) / density).toInt()
         if (hDp <= 0 || wDp <= 0) return false
         if (devMode) { applyStream(devBlocking("/viewport", "$topDp $hDp $wDp")); return true }
         if (N.viewport(topDp, hDp, wDp) > 0) { applyDrain(); return true }
@@ -721,7 +744,14 @@ class MainActivity : Activity(), ChuksModuleHost {
                     imageOrigBmp[f[1]]?.let { b -> (views[f[1]] as? ImageView)?.setImageBitmap(runOps(f[1], b)) }
                 }
                 "MP" -> if (f.size >= 2) { mediaProgress[f[1]] = f[1] + ":progress"; startProgressPoll(f[1]) }   // Video onProgress
-                "LS" -> if (f.size >= 3) scrollListTo(f[1], f[2].toIntOrNull() ?: 0)   // scrollToIndex/scrollToEnd
+                "LS" -> if (f.size >= 3) {                                               // scrollToIndex/scrollToEnd
+                    // `i`: instant, once this pass's layout has landed. A variable-height list
+                    // that re-measured a row above the viewport moves its rows and the offset
+                    // together; a smooth scroll would glide, and a scrollTo before the layout
+                    // traversal would clamp against the old content height.
+                    if (f.size >= 4 && f[3] == "i") instantScrollTo(f[1], f[2].toIntOrNull() ?: 0)
+                    else scrollListTo(f[1], f[2].toIntOrNull() ?: 0)
+                }
                 // VC|<id>|<name>|<json>: the app told ONE package view to do something.
                 // The arguments are JSON, so a pipe inside them is safe: everything after
                 // the third field is joined back together, as a capability's args are.
@@ -4973,8 +5003,14 @@ class MainActivity : Activity(), ChuksModuleHost {
         sc.setOnTouchListener { _, ev ->
             val sp = refreshSpinner ?: return@setOnTouchListener false
             when (ev.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { pullStartY = ev.y; pulling = false; false }
+                MotionEvent.ACTION_DOWN -> { pullStartY = ev.y; pulling = false; pullTracking = true; false }
                 MotionEvent.ACTION_MOVE -> {
+                    // A gesture that began on a child (a pressable row took the DOWN) reaches
+                    // the scroll only once it intercepts the drag, so the first event seen here
+                    // is a MOVE. It is the start of what this listener measures; measured from
+                    // the previous gesture's DOWN it read as a pull, the content followed the
+                    // finger downward, and the list never scrolled at all.
+                    if (!pullTracking) { pullStartY = ev.y; pulling = false; pullTracking = true; return@setOnTouchListener false }
                     val dy = ev.y - pullStartY
                     if (sc.scrollY == 0 && dy > dp(12)) {
                         pulling = true
@@ -4990,6 +5026,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     } else false
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    pullTracking = false
                     if (pulling) {
                         pulling = false
                         val trigger = (ev.y - pullStartY) > dp(90) && refreshAction.isNotEmpty()

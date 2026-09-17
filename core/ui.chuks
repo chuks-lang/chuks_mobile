@@ -2657,6 +2657,13 @@ export function Screen(first: ViewProps | []Kid, kids: []Kid = []): Node {
  *                 them renders flush left and only as wide as its content.
  *   - `rowHeight` row height in px, matching the row's real height (rows sit at
  *                 rank * (rowHeight + gap), so a mismatch drifts)
+ *   - `estimatedHeight`  INSTEAD of rowHeight, for rows whose heights differ (a feed
+ *                 of posts): each row sizes itself (omit `h`), the host measures it,
+ *                 and the rows below move to fit. A row is assumed to be the estimate
+ *                 until it is measured, so the closer the estimate, the less the
+ *                 content grows and shrinks as rows come in. Heights follow the row's
+ *                 key across a prepend or a removal. One column, top-down (no
+ *                 `numColumns`, `inverted` or `paging`).
  *   - `gap`       vertical gap between rows
  *   - `pad`       top/bottom padding (optional). VERTICAL only: horizontal
  *                 padding belongs on the row, via its left/right insets.
@@ -2897,6 +2904,7 @@ export class Reconciler {
     var listScrollIdx: map[string]int // List id -> last scrollToIndex target emitted (fire on change)
     var listScrollEnd: map[string]int // List id -> last scrollToEnd nonce emitted (fire on change)
     var listScrollPos: map[string]int // List id -> last scroll offset reported to its onScroll
+    var measureTags: map[string]bool  // "<cell>:layout" tags that are a variable-height list's own measurement
     var scrollToPos: map[string]int  // Scroll id -> last scrollTo target emitted (fire on change)
     constructor() {
         this.lines = []; this.handlers = {}
@@ -2909,7 +2917,7 @@ export class Reconciler {
         this.listVisible = {}; this.pendingVisible = []; this.listEndFired = {}
         this.listRefreshing = {}; this.listEmpty = {}
         this.listHeaderShown = {}; this.listFooterShown = {}
-        this.listScrollIdx = {}; this.listScrollEnd = {}; this.listScrollPos = {}
+        this.listScrollIdx = {}; this.listScrollEnd = {}; this.listScrollPos = {}; this.measureTags = {}
         this.scrollToPos = {}
     }
     // Start a new mutation batch (clears the buffer). Call once per frame.
@@ -3052,6 +3060,9 @@ export class Reconciler {
     // handler of a host event that belongs to no node (a shared value's end/settle).
     // Returns who took it: 1 a node's handler, 2 a host handler (a value's end/settle),
     // 0 nobody. The app decides from that whether the event is worth a render.
+    // A tag whose handler is a variable-height list's cell measurement: it lays the
+    // list out itself and is not an app event, so it is not worth a render.
+    public isMeasure(tag: string): bool { return this.measureTags.getOr(tag, false) }
     public fireValue(tag: string, value: string): int {
         if (this.handlers[tag] != null) { const f: any = this.handlers[tag]; f(value); return 1 }
         else if (_hostHandlers[tag] != null) { const f: any = _hostHandlers[tag]; f(value); return 2 }
@@ -3459,8 +3470,14 @@ export class Reconciler {
         const rowH: int = lpInt(d, "rowHeight", 0)
         const gap: int = lpInt(d, "gap", 0)
         const pad: int = lpInt(d, "pad", 0)
-        const sized: bool = listStrideOk(rowH + gap, id, "rowHeight", "List")
-        const stride: int = sized ? rowH + gap : 1
+        // Variable-height rows: `estimatedHeight` instead of `rowHeight`. Each row sizes
+        // itself (no `h`), the host measures it, and the rows below move to fit. Until a
+        // row is measured it is assumed to be the estimate. See the variable-height notes
+        // further down.
+        const est: int = lpInt(d, "estimatedHeight", 0)
+        const variable: bool = rowH <= 0 && est > 0
+        const sized: bool = variable || listStrideOk(rowH + gap, id, "rowHeight", "List")
+        const stride: int = sized ? (variable ? est : rowH) + gap : 1
         const count: int = sized ? lpInt(d, "count", 0) : 0
         const buffer: int = lpInt(d, "buffer", 3)
         const itemFn: any = d.get("item")
@@ -3474,12 +3491,14 @@ export class Reconciler {
         // inverted (chat): row 0 sits at the BOTTOM and later rows stack upward, so a
         // freshly-appended row 0 (newest) shows at the bottom. `invBase` is row 0's top;
         // top(r) = invBase - r*stride. Default off, so a feed lays out exactly as before.
-        const inverted: bool = lpBool(d, "inverted", false)
+        const inverted: bool = variable ? false : lpBool(d, "inverted", false)
         // numColumns (grid): pack `ncol` cells per row across the list WIDTH (reported by the
         // host as vpW). The reconciler computes each cell's column width + x and overrides them
         // on the item node, so the app's item builder need not know the layout. ncol defaults
         // to 1 (a plain list); grids are non-inverted, so inverted forces ncol back to 1.
-        const ncol0: int = lpInt(d, "numColumns", 1)
+        // Variable-height rows are one column, top-down: a grid needs equal cells and an
+        // inverted list positions from the bottom.
+        const ncol0: int = variable ? 1 : lpInt(d, "numColumns", 1)
         const ncol: int = (inverted || ncol0 < 1) ? 1 : ncol0
         const gridRows: int = (count + ncol - 1) / ncol   // rows of `ncol` cells; == count when ncol==1
         var colW: int = 0
@@ -3487,7 +3506,40 @@ export class Reconciler {
         // The end pad, or the floating bar's height when that is more: the last row
         // scrolls out from under the bar (see overlayBottom).
         const endPad: int = next.ctxOverlay > pad ? next.ctxOverlay : pad
-        const contentH: int = rowsTop + gridRows * stride + footerH + endPad
+        // ---- VARIABLE-HEIGHT ROWS ------------------------------------------------
+        // Rows are still absolutely positioned by the framework, so the host's job is
+        // unchanged; what changes is where each top comes from. `keys` maps rank -> key
+        // (rebuilt when the data renders, so it follows inserts and removals) and
+        // `heights` maps key -> the height the host measured through the cell's onLayout
+        // (see cellMeasured), the estimate standing in until then. `tops` is the prefix
+        // sum, rebuilt only when a key or a height changed: a scroll frame reads it. A
+        // measurement re-lays out here without a render, moving only the cells whose top
+        // changed, and a row that grew or shrank ABOVE the viewport shifts the scroll
+        // offset by the same amount so what the user is looking at stays put.
+        const scrollPass: bool = prev != null && prev == next
+        var rowsMoved: bool = false
+        if (variable) {
+            st.node = next; st.id = id; st.parent = parent; st.index = index
+            const keyFn: any = d.get("key")
+            if (!scrollPass || st.keys.length != count) {
+                const ks: []string = []
+                for (var kr: int = 0; kr < count; kr = kr + 1) { ks.push(keyFn != null ? string(keyFn(kr)) : string(kr)) }
+                // Same keys as before: the tops still stand. Compare before replacing, so a
+                // render that changed nothing does not re-lay the list out.
+                var same: bool = ks.length == st.keys.length
+                if (same) { for (var kc: int = 0; kc < ks.length; kc = kc + 1) { if (ks[kc] != st.keys[kc]) { same = false; break } } }
+                if (!same) { st.keys = ks; st.layoutDirty = true }
+            }
+            if (st.layoutDirty || st.tops.length != count + 1) {
+                const ts: []int = []
+                var y: int = rowsTop
+                for (var tr: int = 0; tr < count; tr = tr + 1) { ts.push(y); y = y + st.heights.getOr(st.keys[tr], est) + gap }
+                ts.push(y)
+                st.tops = ts; st.layoutDirty = false; rowsMoved = true
+            }
+        }
+        const rowsEnd: int = variable ? (count > 0 ? st.tops[count] - gap : rowsTop) : rowsTop + gridRows * stride
+        const contentH: int = rowsEnd + footerH + endPad
         const invBase: int = contentH - pad - footerH - rowH
 
         if (prev == null) {
@@ -3544,7 +3596,10 @@ export class Reconciler {
         // actually is.
         var gr0: int = 0
         var gr1: int = 0
-        if (inverted) {
+        if (variable) {
+            gr0 = rankAtY(st.tops, count, st.top) - buffer
+            gr1 = rankAtY(st.tops, count, st.top + this.vpH) + buffer + 1
+        } else if (inverted) {
             gr0 = (invBase - (st.top + this.vpH)) / stride - buffer
             gr1 = (invBase - st.top) / stride + buffer + 1
         } else {
@@ -3589,7 +3644,18 @@ export class Reconciler {
             const cid: string = this.cellIdAt(st, contentId, i)
             const cr: int = st.cellRank.getOr(cid, -1)
             if (cr >= r0 && cr < r1) { rankCell[cr] = cid } else { freeCells.push(cid) }
+            // A row whose top moved (a measurement above it, a key change): move the cell
+            // in place. The node the cell shows is updated too, so the next diff against it
+            // starts from where the cell really is.
+            if (rowsMoved && cr >= 0 && cr < count) {
+                const mn: Node? = st.itemNodes.get(cid)
+                if (mn != null && mn.style.top != st.tops[cr]) {
+                    mn.style.top = st.tops[cr]
+                    this.emit("S|" + cid + "|" + mn.style.str())
+                }
+            }
         }
+        if (rowsMoved) { st.lastWinRange = -1 }   // the window must be recomputed against the new tops
 
         // A SCROLL cannot change a row's content: a row's node is a function of its rank
         // and its top, and both are unchanged for a row still in the window. Only a state
@@ -3600,7 +3666,19 @@ export class Reconciler {
         // whole window (~19 rows, each several nodes plus the app's own string work),
         // which measured 9-14ms per frame on an iPhone 12 Pro and produced the visible
         // stutter. Only rows ENTERING the window cost anything now.
-        const scrollOnly: bool = prev != null && prev == next
+        const scrollOnly: bool = scrollPass
+        // onScroll: report the scroll offset (points) whenever it changes, so an app can drive
+        // a parallax header, a scroll-to-top button, a bar that hides on the way down. Queued
+        // like onVisible (fired after this pass); opt-in, so a list without onScroll pays
+        // nothing. BEFORE the unchanged-window return below: the offset moves on every
+        // scroll frame while the window changes only at row boundaries, and a handler
+        // that read the direction from a report per row boundary missed the turn.
+        const osf: any = d.get("onScroll")
+        if (osf != null && st.top != this.listScrollPos.getOr(id, -1)) {
+            this.listScrollPos[id] = st.top
+            const off: int = st.top
+            this.pendingVisible.push(function(): void { osf(off) })
+        }
         // Same rows as last pass and nothing else changed: no rebuild, no diff, no
         // mutations. This is the common case between row boundaries at ordinary speeds.
         const range: int = r0 * 100000 + r1
@@ -3618,8 +3696,18 @@ export class Reconciler {
             else if (fi < freeCells.length) { cid = freeCells[fi]; fi = fi + 1 }   // recycle a leaving cell
             else { cid = this.cellIdAt(st, contentId, st.poolSize); st.poolSize = st.poolSize + 1 }  // grow the pool
             const gridRow: int = r / ncol
-            const top: int = inverted ? invBase - r * stride : rowsTop + gridRow * stride
+            const top: int = variable ? st.tops[r] : (inverted ? invBase - r * stride : rowsTop + gridRow * stride)
             const node: Node = itemFn(r, top)
+            if (variable) {
+                // The host measures the cell after layout and reports it here; a row's own
+                // onLayout, if it had one, is folded in so the app still hears it.
+                const own: any = node.onLayout
+                const recon: Reconciler = this
+                const cidM: string = cid
+                const contentM: string = contentId
+                node.onLayout = function(v: string): void { recon.cellMeasured(contentM, cidM, v); if (own != null) { own(v) } }
+                this.measureTags[cid + ":layout"] = true
+            }
             // Grid: the list owns each cell's column x + width; override them on the node so the
             // app's item builder stays layout-agnostic. `right` is cleared so width wins.
             if (ncol > 1 && colW > 0) {
@@ -3660,7 +3748,7 @@ export class Reconciler {
         // inline, so the closure's setState runs after this render (see flushVisible).
         const vf: any = d.get("onVisible")
         if (vf != null && count > 0 && stride > 0) {
-            var centered: int = inverted ? (invBase - (st.top + this.vpH / 2)) / stride : (st.top + this.vpH / 2 - rowsTop) / stride
+            var centered: int = variable ? rankAtY(st.tops, count, st.top + this.vpH / 2) : (inverted ? (invBase - (st.top + this.vpH / 2)) / stride : (st.top + this.vpH / 2 - rowsTop) / stride)
             if (centered < 0) { centered = 0 }
             if (centered >= count) { centered = count - 1 }
             if (centered != this.listVisible.getOr(id, -1)) {
@@ -3679,7 +3767,7 @@ export class Reconciler {
             // The "end" is the far edge of the data: the bottom row normally, or the TOP row
             // when inverted (a chat scrolling up to load older messages). In a grid the last
             // visible GRID ROW covers up to `ncol` ranks, so convert to the last visible rank.
-            const lastGridRow: int = inverted ? (invBase - st.top) / stride : (st.top + this.vpH - rowsTop) / stride
+            const lastGridRow: int = variable ? rankAtY(st.tops, count, st.top + this.vpH) : (inverted ? (invBase - st.top) / stride : (st.top + this.vpH - rowsTop) / stride)
             const lastVisible: int = ncol > 1 ? (lastGridRow + 1) * ncol - 1 : lastGridRow
             if (lastVisible >= count - 1 - threshold && this.listEndFired.getOr(id, -1) != count) {
                 this.listEndFired[id] = count
@@ -3726,7 +3814,7 @@ export class Reconciler {
         const footerFn: any = d.get("footer")
         const footerId: string = contentId + ".footer"
         if (footerFn != null) {
-            const fnode: Node = footerFn(rowsTop + count * stride)
+            const fnode: Node = footerFn(rowsEnd)
             this.reconcile(st.itemNodes.get(footerId), fnode, footerId, contentId, 0)
             st.itemNodes[footerId] = fnode; this.listFooterShown[id] = true
         } else if (this.listFooterShown.getOr(id, false)) {
@@ -3740,7 +3828,7 @@ export class Reconciler {
         const sti: int = lpInt(d, "scrollToIndex", -1)
         if (sti >= 0 && sti != this.listScrollIdx.getOr(id, -999)) {
             this.listScrollIdx[id] = sti
-            const stiY: int = inverted ? invBase - sti * stride : rowsTop + sti * stride
+            const stiY: int = variable ? (sti < count ? st.tops[sti] : rowsEnd) : (inverted ? invBase - sti * stride : rowsTop + sti * stride)
             this.emit("LS|" + id + "|" + string(stiY))
         }
         const ste: int = lpInt(d, "scrollToEnd", 0)
@@ -3759,15 +3847,41 @@ export class Reconciler {
             if (invY < 0) { invY = 0 }
             this.emit("LS|" + id + "|" + string(invY))
         }
-        // onScroll: report the scroll offset (points) whenever it changes, so an app can drive
-        // a parallax header, a scroll-to-top button, etc. Queued like onVisible (fired after
-        // render); opt-in, so a list without onScroll pays nothing.
-        const osf: any = d.get("onScroll")
-        if (osf != null && st.top != this.listScrollPos.getOr(id, -1)) {
-            this.listScrollPos[id] = st.top
-            const off: int = st.top
-            this.pendingVisible.push(function(): void { osf(off) })
+    }
+
+    // The host measured a variable-height list's cell (its onLayout report, "x,y,w,h").
+    // Record the height under the row's key; when it differs from what the rows were laid
+    // out with, re-lay the list out in place (no render): the rows below move, the content
+    // grows or shrinks, and a change above the viewport moves the scroll offset with it so
+    // the visible rows do not jump. Called for every report, so it must be cheap when
+    // nothing changed: one map read.
+    public cellMeasured(contentId: string, cid: string, v: string): void {
+        const st: ListState? = this.lists.get(contentId)
+        if (st == null) { return }
+        const r: int = st.cellRank.getOr(cid, -1)
+        if (r < 0 || r >= st.keys.length) { return }
+        const f: []string = v.split(",")
+        if (f.length < 4) { return }
+        const h: int = int(f[3])
+        const key: string = st.keys[r]
+        const ln: Node? = st.node
+        if (ln == null) { return }
+        const ld: map[string]ListProp = ln.data
+        const est: int = lpInt(ld, "estimatedHeight", 0)
+        const was: int = st.heights.getOr(key, est)
+        if (h <= 0 || h == was) { return }
+        st.heights[key] = h
+        st.layoutDirty = true
+        // Entirely above the first visible pixel: everything on screen shifts by the
+        // difference unless the offset follows. Instant, in the same host pass as the
+        // moved rows (LS with the `i` flag).
+        if (r + 1 < st.tops.length && st.tops[r] + was <= st.top) {
+            st.top = st.top + (h - was)
+            if (st.top < 0) { st.top = 0 }
+            if (st.id == this.lastListId) { this.vpTop = st.top }
+            this.emit("LS|" + st.id + "|" + string(st.top) + "|i")
         }
+        this.reconcileList(ln, ln, st.id, st.parent, st.index)
     }
 
     // A HORIZONTAL virtualized list (a carousel / story reel). Same windowed cell-recycling
@@ -4262,10 +4376,17 @@ export class App {
         // viewport's size changed or a continuation dirtied state: the host reports every
         // scroll frame, and a full render per frame of a plain 200-row Scroll cost 29ms
         // on a Galaxy S23, every frame of every fling janky.
-        if (this.recon.rewindow()) {
-            runEffects()
-        } else if (ran || resized || isDirty()) {
+        // A size change re-renders EVERY component, and renders even when a List is on
+        // screen: a screen that sized itself with viewportWidth() (a card's text width,
+        // a grid's columns) built against the old width, or none at all when it rendered
+        // before the host had reported one, and neither a re-window nor a render that
+        // keeps clean components rebuilds it. viewportWidth()/Height() are read, not
+        // subscribed, so the size is treated as state every component depends on.
+        if (resized) { markDirty() }
+        if (ran || resized || isDirty()) {
             this.paint()
+        } else if (this.recon.rewindow()) {
+            runEffects()
         }
         // A paging List may have queued onVisible callbacks (centered row changed). Fire them,
         // then re-render (WITHOUT begin, so the windowing mutations above are kept) so the newly
@@ -4358,8 +4479,9 @@ export class App {
         // state dirty, because its usual outcome is a host op (a spring), which goes out
         // on its own. An event nobody bound renders nothing. Before this, a swipe row's
         // fling, end and settle each cost a 13-31ms render of a 20-row screen on a
-        // Galaxy S23, for a diff of one line.
-        if (took == 1 || ran || isDirty()) { this.paint() } else { this.recon.flushHostOps() }
+        // Galaxy S23, for a diff of one line. A list cell's measurement (variable-height
+        // rows) re-lays its list out in place; the moved rows are already in the buffer.
+        if ((took == 1 && !this.recon.isMeasure(tag)) || ran || isDirty()) { this.paint() } else { this.recon.flushHostOps() }
         return this.recon.count()
     }
     // A native async result arrived for `token` (F3): fire the registered callback
@@ -4738,17 +4860,45 @@ class ListState {
     // scrolling and mount rows for a position it is not at. It also outlives the cells:
     // a screen released deeper in the stack comes back to the row you left it on.
     var top: int
+    // Variable-height rows (`estimatedHeight`): what the host measured each row to be,
+    // keyed by the row's key so a height follows its item when the data shifts; the
+    // rank -> key table and the rank -> top table derived from them; and the list node
+    // itself, so a measurement can re-lay the rows out without a render.
+    var heights: map[string]int
+    var keys: []string
+    var tops: []int                 // tops[r] is row r's top; tops[count] is where the next row would start
+    var layoutDirty: bool           // a key or a height changed since tops was built
+    var node: Node?
+    var id: string
+    var parent: string
+    var index: int
     constructor() {
         this.itemNodes = {}; this.mounted = []; this.count = -1; this.contentH = -1
         this.cellRank = {}; this.cellIds = []; this.lastWinRange = -1; this.poolSize = 0
         this.top = 0
+        this.heights = {}; this.keys = []; this.tops = []; this.layoutDirty = true
+        this.node = null; this.id = ""; this.parent = ""; this.index = 0
     }
     // Start over: a fresh mount, so no cell from the previous life is still live. `top`
-    // deliberately survives -- it is what puts a re-mounted screen back where it was.
+    // deliberately survives -- it is what puts a re-mounted screen back where it was --
+    // and so do the measured heights: the rows are the same rows.
     public reset(): void {
         this.itemNodes = {}; this.mounted = []; this.cellRank = {}; this.cellIds = []
-        this.poolSize = 0; this.lastWinRange = -1
+        this.poolSize = 0; this.lastWinRange = -1; this.layoutDirty = true
     }
+}
+
+// The last rank whose top is at or above `y` (0 when y is above the first row): a
+// binary search over the tops table of a variable-height list.
+function rankAtY(tops: []int, count: int, y: int): int {
+    if (count <= 0 || y <= tops[0]) { return 0 }
+    var lo: int = 0
+    var hi: int = count - 1
+    while (lo < hi) {
+        const mid: int = (lo + hi + 1) / 2
+        if (tops[mid] <= y) { lo = mid } else { hi = mid - 1 }
+    }
+    return lo
 }
 
 // Bind one screen function to one route entry. This has to be its own function: a
