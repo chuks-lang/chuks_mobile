@@ -111,6 +111,19 @@ check(dup.contains("already exists"), "a second store with the same name is refu
 
 check(OTHER_RENDERS >= 1, "a component that reads no store rendered")
 
+// The record handed to super() is copied: a reducer assigning into this.state leaves it as it was.
+dataType Counter { n: int }
+class CounterStore extends Store<Counter> {
+    private defaultCounter: Counter = { n: 0 }
+    constructor() { super("counter", this.defaultCounter, null) }
+    public bump(): void { this.mutate((): void => { this.state.n = this.state.n + 1 }) }
+    public dflt(): int { return this.defaultCounter.n }
+}
+const counter: CounterStore = new CounterStore()
+counter.bump()
+s.frame()
+check(counter.get().n == 1 && counter.dflt() == 0, "the initial record passed to super() is not aliased by the store")
+
 println("")
 println(string(PASS) + " passed, " + string(FAIL) + " failed")
 if (FAIL > 0) { throw new Error("store_test failed") }

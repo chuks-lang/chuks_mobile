@@ -93,7 +93,9 @@ export class Store<T> {
 
     constructor(name: string, initial: T, options: StoreOptions?) {
         this.name = name
-        this.state = initial
+        // Two copies, so the store never aliases the caller's record: a reducer
+        // assigning into this.state must not change a field the subclass passed in.
+        this.state = copyOf(initial)
         this.initial = copyOf(initial)
         this.persist = options != null ? (options.persist ?? Persist.None) : Persist.None
         this.version = options != null ? (options.version ?? 1) : 1
