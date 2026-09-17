@@ -19,6 +19,9 @@
 // aeroplane mode. Assert on what the screen shows, not on what a device would say back.
 import { Node, Column, Reconciler, runAsyncQueue } from "./ui.chuks";
 import { hookBegin, hookSweep, hookEnter, runEffects } from "./state.chuks";
+import { resetStores } from "./store.chuks";
+/** Every store back to its initial value with no subscribers: call it at the top of a test. */
+export { resetStores };
 
 /** What a rendered screen lets you ask and do. */
 export class Screen {

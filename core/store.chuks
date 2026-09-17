@@ -1,0 +1,330 @@
+// The app store.
+//
+// Component state (useState) is per screen and dies with it. What an app shares
+// between screens and keeps across launches, a session, a feed, a set of counts,
+// used to be module-level variables with a listener list, an onRender around every
+// write and a keychain read written by hand in each app. This is that, once.
+//
+// A store is a class you extend. It holds ONE typed record, `state`, and the
+// methods you add are the reducers: each changes the fields it wants with plain
+// typed assignment, inside `this.mutate(...)`:
+//
+//     dataType Session { user: User?, access: string, refresh: string }
+//
+//     class SessionStore extends Store<Session> {
+//         constructor() { super("session", { user: null, access: "", refresh: "" }, { persist: Persist.Secure }) }
+//         public begin(user: User, access: string, refresh: string): void {
+//             this.mutate((): void => { this.state.user = user; this.state.access = access; this.state.refresh = refresh })
+//         }
+//         public end(): void { this.reset() }
+//         public signedIn(): bool { return this.get().access != "" }
+//     }
+//     export const session: SessionStore = new SessionStore()
+//
+// `mutate` is what makes a method a reducer. Its body runs on the render thread (at
+// once when called there, queued in order when called from a task), under the
+// store's lock, and then the store re-renders every component that read it, tells
+// its listeners, writes the persisted copy and, in development, logs the change.
+// A reducer can be called from anywhere: a handler, an effect, an async function
+// after an await.
+//
+// Reading: `use()` inside a component subscribes it; `select(pick)` subscribes it
+// to one part; `get()` anywhere is a plain read. Outside components, `subscribe`.
+//
+// A store persists where its options say: the keychain for secrets, a file for
+// the rest, nowhere by default. Hydration is asynchronous; `ready()` waits for it,
+// which is what a request that needs a token awaits. Stores also ride the hot
+// reload and restoration snapshot beside the cells, so a save keeps a session.
+import { onRender, onRenderThread, markDirtyPath, renderingPath, setStoreSnapshot } from "./state.chuks";
+import { devWarn } from "./ui.chuks";
+import { SecureStore, FileSystem } from "./native.chuks";
+import { json } from "std/json";
+import { time } from "std/time";
+
+/** Where a store keeps its value between launches. */
+export enum Persist {
+    None = "none",       // memory only
+    Secure = "secure",   // the keychain / Keystore: tokens, anything a person would call a secret
+    File = "file"        // a JSON file in the app's sandbox: caches, drafts, preferences
+}
+
+/** Options a store is created with. Every field is optional. */
+export dataType StoreOptions {
+    persist: Persist?,   // default Persist.None
+    version: int?,       // bump to discard what an older app version persisted (default 1)
+    log: bool?           // development builds: log every change (default false)
+}
+
+// A component subscribed to one part of the state: what it picks, and the JSON of
+// what it last saw, so it re-renders only when that changes.
+class Selection {
+    var pick: any
+    var last: string
+    constructor(pick: any, last: string) { this.pick = pick; this.last = last }
+}
+
+// Every store, by name: the snapshot, resetStores(), and the duplicate-name check.
+var STORES: map[string]any = {}
+var STORE_ORDER: []string = []
+
+/** The value the store held, without the base class's own fields. */
+function copyOf<T>(v: T): T { const c: T = json.parse(json.stringify(v)); return c }
+
+/**
+ * A typed, shared, persisted piece of app state. Extend it; add methods that
+ * change `state` inside `mutate`. See the module comment for the shape.
+ */
+@threadSafe
+export class Store<T> {
+    /** The record. Reducers assign its fields inside `mutate`; nothing else writes it. */
+    var state: T
+    var name: string
+    var initial: T
+    var persist: Persist
+    var version: int
+    var logging: bool
+    var loadedFlag: bool
+    var readers: map[string]bool             // component paths that called use()
+    var selections: map[string][]Selection   // component path -> what it selected
+    var listeners: []any                     // subscribe() callbacks
+    var changes: int                         // how many mutations so far (dev logging)
+    var writePending: bool                   // a persisted write is queued (coalescing)
+    var pending: []any                       // reducers that arrived before hydration, applied after it in order
+
+    constructor(name: string, initial: T, options: StoreOptions?) {
+        this.name = name
+        this.state = initial
+        this.initial = copyOf(initial)
+        this.persist = options != null ? (options.persist ?? Persist.None) : Persist.None
+        this.version = options != null ? (options.version ?? 1) : 1
+        this.logging = options != null ? (options.log ?? false) : false
+        this.loadedFlag = this.persist == Persist.None
+        this.readers = {}
+        this.selections = {}
+        this.listeners = []
+        this.changes = 0
+        this.writePending = false
+        this.pending = []
+        if (STORES.has(name)) { throw "a store named '" + name + "' already exists; every store needs its own name" }
+        STORES[name] = this
+        STORE_ORDER.push(name)
+        if (this.persist != Persist.None) { this.hydrate() }
+    }
+
+    // ---- reading -----------------------------------------------------------------
+
+    /** The value now. From the render thread the record itself; from a task a copy, so a change landing later cannot alter it under you. */
+    public get(): T {
+        if (onRenderThread()) { return this.state }
+        var v: T = this.state
+        lock (this) { v = copyOf(this.state) }
+        return v
+    }
+
+    /** The value now, and the calling component re-renders whenever the store changes. Inside a component's render only. */
+    public use(): T {
+        const path: string = renderingPath()
+        if (path != "") { this.readers[path] = true }
+        return this.state
+    }
+
+    /**
+     * One part of the value, and the calling component re-renders only when that
+     * part changes (compared by value, so a header that shows a count does not
+     * re-render for a new page of posts). Inside a component's render only.
+     */
+    public select<R>(pick: function(v: T): R): R {
+        const v: R = pick(this.state)
+        const path: string = renderingPath()
+        if (path != "") {
+            const sel: Selection = new Selection(pick, json.stringify(v))
+            var list: []Selection = this.selections.getOr(path, [])
+            list.push(sel)
+            this.selections[path] = list
+        }
+        return v
+    }
+
+    // ---- writing -----------------------------------------------------------------
+
+    /**
+     * Run a reducer body: assign the fields of `this.state` you want changed. Runs
+     * on the render thread, under the store's lock; then readers re-render,
+     * listeners hear, the persisted copy is written. Call it from a method of your
+     * store, from anywhere.
+     */
+    protected mutate(fn: function(): void): void {
+        if (!onRenderThread()) {
+            const me: Store<T> = this
+            onRender((): void => { me.apply(fn) })
+            return
+        }
+        // A persisted store changes nothing until its persisted value is back: a
+        // reducer that runs before then waits and is applied after it, in order.
+        // Otherwise the read, landing a moment later, would overwrite what the
+        // reducer did, and the write that follows would persist the overwrite.
+        if (!this.loadedFlag) { this.pending.push(fn); return }
+        this.apply(fn)
+    }
+    // The reducer body, on the render thread.
+    apply(fn: function(): void): void {
+        const before: T = this.listeners.length > 0 ? copyOf(this.state) : this.state
+        lock (this) { fn(); this.changes = this.changes + 1 }
+        this.changed(before)
+    }
+
+    /** Replace the whole value. `mutate` for the case where every field changes. */
+    public set(v: T): void {
+        const me: Store<T> = this
+        this.mutate((): void => { me.state = v })
+    }
+
+    /** Back to the initial value; the persisted copy is removed. Sign-out. */
+    public reset(): void {
+        const me: Store<T> = this
+        this.mutate((): void => { me.state = copyOf(me.initial) })
+        this.forget()
+    }
+
+    // ---- listening outside components ------------------------------------------
+
+    /**
+     * Call `fn(next, prev)` after every change, on the render thread. Returns the
+     * function that stops it. For code that is not a component: an effect returns
+     * it as the cleanup so the listener ends with the screen.
+     */
+    public subscribe(fn: function(next: T, prev: T): void): function(): void {
+        this.listeners.push(fn)
+        const me: Store<T> = this
+        return (): void => {
+            var rest: []any = []
+            for (var i: int = 0; i < me.listeners.length; i = i + 1) { if (me.listeners[i] != fn) { rest.push(me.listeners[i]) } }
+            me.listeners = rest
+        }
+    }
+
+    // ---- persistence -------------------------------------------------------------
+
+    /**
+     * Has the persisted value been read back (or was there nothing to read)? Always
+     * true for a store that does not persist. Until it is, reads answer `initial`
+     * and reducers wait; listeners are told when it lands.
+     */
+    public loaded(): bool { return this.loadedFlag }
+
+    /** Wait for that: a request that needs a persisted token awaits this. Bounded, so a keychain that never answers cannot hang a task. */
+    public async ready(): Task<void> {
+        var waited: int = 0
+        while (!this.loadedFlag && waited < 5000) { time.sleep(10); waited = waited + 10 }
+    }
+
+    /** The name the store was created with. */
+    public storeName(): string { return this.name }
+
+    // ---- internals ---------------------------------------------------------------
+
+    // After a mutation: wake the readers, tell the listeners, persist, log.
+    changed(before: T): void {
+        const ks: []string = this.readers.keys()
+        for (var i: int = 0; i < ks.length; i = i + 1) { markDirtyPath(ks[i]) }
+        const sk: []string = this.selections.keys()
+        for (var i: int = 0; i < sk.length; i = i + 1) {
+            const list: []Selection = this.selections.getOr(sk[i], [])
+            var hit: bool = false
+            for (var j: int = 0; j < list.length; j = j + 1) {
+                const pick: any = list[j].pick
+                const now: string = json.stringify(pick(this.state))
+                if (now != list[j].last) { list[j].last = now; hit = true }
+            }
+            if (hit) { markDirtyPath(sk[i]) }
+        }
+        // A component's selections are rebuilt on its next render (select runs again);
+        // clear so a screen that changed what it picks does not keep the old pick.
+        const cleared: map[string][]Selection = {}
+        this.selections = cleared
+        for (var i: int = 0; i < this.listeners.length; i = i + 1) { const fn: any = this.listeners[i]; fn(this.state, before) }
+        if (this.logging) { devWarn("store:" + this.name + ":" + string(this.changes), "store " + this.name + " changed (" + string(this.changes) + ")") }
+        this.write()
+    }
+
+    // The persisted envelope: the version it was written under, and the value.
+    envelope(): string {
+        var doc: map[string]any = {}
+        doc["v"] = this.version
+        doc["s"] = this.state
+        return json.stringify(doc)
+    }
+    key(): string { return "chuks.store." + this.name }
+    path(): string { return "chuks-store-" + this.name + ".json" }
+
+    // Coalesced: a burst of mutations in one frame costs one write, off the render
+    // thread's frame (the capability itself runs natively).
+    write(): void {
+        if (this.persist == Persist.None || this.writePending) { return }
+        this.writePending = true
+        const me: Store<T> = this
+        onRender((): void => {
+            me.writePending = false
+            const data: string = me.envelope()
+            if (me.persist == Persist.Secure) { SecureStore.set(me.key(), data) }
+            else { FileSystem.write(me.path(), data) }
+        })
+    }
+    forget(): void {
+        if (this.persist == Persist.Secure) { SecureStore.delete(this.key()) }
+        else if (this.persist == Persist.File) { FileSystem.delete(this.path()) }
+    }
+    // Read the persisted copy back, once, at creation. What comes back lands as a
+    // change, so readers and listeners see it; an older version is discarded.
+    hydrate(): void {
+        const me: Store<T> = this
+        const got: function(data: string): void = (data: string): void => { me.hydrated(data) }
+        // A key that was never written answers as an error on some hosts and as ""
+        // on others; both mean "nothing persisted", and both must release the queue.
+        const missing: function(e: string): void = (_e: string): void => { me.hydrated("") }
+        if (this.persist == Persist.Secure) { SecureStore.get(this.key(), got, missing) }
+        else { FileSystem.read(this.path(), got, missing) }
+    }
+    hydrated(data: string): void {
+        var doc: any = null
+        if (data != "") { try { doc = json.parse(data) } catch (e: any) { doc = null } }
+        var usable: bool = doc != null && doc["v"] != null && int(doc["v"]) == this.version && doc["s"] != null
+        if (data != "" && !usable) { this.forget() }   // an older shape: start over rather than read it into a record it no longer fits
+        if (usable) { const v: T = doc["s"]; this.state = v }
+        this.loadedFlag = true
+        // The persisted value is the base; what happened meanwhile lands on top, in order.
+        const queued: []any = this.pending
+        this.pending = []
+        if (usable && queued.length == 0) { this.changed(this.state); return }   // readers and listeners see the read value
+        for (var i: int = 0; i < queued.length; i = i + 1) { const fn: any = queued[i]; this.apply(fn) }
+        if (queued.length == 0) { this.changed(this.state) }   // nothing persisted, nothing queued: listeners still learn it is loaded
+    }
+    // The snapshot half: what hot reload carries, and how it comes back.
+    snapshotValue(): any { return this.state }
+    restoreSnapshot(v: any): void { const t: T = v; this.state = t; this.loadedFlag = true }
+    resetForTest(): void { this.state = copyOf(this.initial); this.readers = {}; const c: map[string][]Selection = {}; this.selections = c; this.listeners = []; this.changes = 0 }
+}
+
+// ---- the registry ------------------------------------------------------------------
+
+setStoreSnapshot(
+    function(): map[string]any {
+        var out: map[string]any = {}
+        for (var i: int = 0; i < STORE_ORDER.length; i = i + 1) { const st: any = STORES[STORE_ORDER[i]]; out[STORE_ORDER[i]] = st.snapshotValue() }
+        return out
+    },
+    function(m: map[string]any): void {
+        const ks: []string = m.keys()
+        for (var i: int = 0; i < ks.length; i = i + 1) {
+            const st: any = STORES.getOr(ks[i], null)
+            if (st != null) { st.restoreSnapshot(m[ks[i]]) }
+        }
+    })
+
+/** Every store's name, in creation order. */
+export function storeNames(): []string { return STORE_ORDER }
+
+/** Framework-internal (core/testing.chuks): every store back to its initial value, subscribers forgotten. */
+export function resetStores(): void {
+    for (var i: int = 0; i < STORE_ORDER.length; i = i + 1) { const st: any = STORES[STORE_ORDER[i]]; st.resetForTest() }
+}

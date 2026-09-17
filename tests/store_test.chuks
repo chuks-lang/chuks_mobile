@@ -1,0 +1,116 @@
+// The app store: a class holding one typed record, whose methods are the reducers.
+// What this pins: a reducer re-renders the components that read the store and no
+// others; a reducer from a task lands at the next frame, in order; select() only
+// re-renders for the part it picks; listeners hear next and prev and can stop;
+// get() from a task is a copy; reset; the snapshot carries stores; names are unique.
+import { Node, Column, Text, KeyedComp } from "../core/ui.chuks";
+import { serializeCells, restoreCells } from "../core/state.chuks";
+import { Store, Persist } from "../core/store.chuks";
+import { render, Screen, resetStores } from "../core/testing.chuks";
+import { time } from "std/time";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(c: bool, name: string): void {
+    if (c) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+dataType Feed { posts: []string, cursor: string, loading: bool }
+
+class FeedStore extends Store<Feed> {
+    constructor(name: string) { super(name, { posts: [], cursor: "", loading: false }, null) }
+    public loadingNow(): void { this.mutate((): void => { this.state.loading = true }) }
+    public pageArrived(page: []string, next: string): void {
+        this.mutate((): void => { this.state.posts = this.state.posts.concat(page); this.state.cursor = next; this.state.loading = false })
+    }
+    public hasMore(): bool { return this.get().cursor != "end" }
+}
+const feed: FeedStore = new FeedStore("feed")
+
+var FEED_RENDERS: int = 0
+var COUNT_RENDERS: int = 0
+var OTHER_RENDERS: int = 0
+
+function feedView(): Node {
+    FEED_RENDERS = FEED_RENDERS + 1
+    const f: Feed = feed.use()
+    return Column({ dir: "col" }, [ Text({ size: 12 }, f.loading ? "loading" : "posts " + string(f.posts.length)) ])
+}
+function countView(): Node {
+    COUNT_RENDERS = COUNT_RENDERS + 1
+    const n: int = feed.select((f: Feed): int => { return f.posts.length })
+    return Text({ size: 12 }, "count " + string(n))
+}
+function otherView(): Node { OTHER_RENDERS = OTHER_RENDERS + 1; return Text({ size: 12 }, "other") }
+
+println("store_test")
+resetStores()
+// Three components, so each has its own identity and re-renders on its own.
+const s: Screen = render((): Node => { return Column({ dir: "col" }, [ KeyedComp("feed", feedView), KeyedComp("count", countView), KeyedComp("other", otherView) ]) })
+check(s.has("posts 0") && s.has("count 0"), "components read the initial value")
+
+// A reducer on the render thread: readers re-render at the next frame.
+feed.loadingNow()
+s.frame()
+check(s.has("loading"), "a reducer's change shows at the next frame")
+check(feed.get().loading, "get() sees it too")
+
+// A reducer from a task: queued, lands at the next frame, in order.
+const t: Task<void> = spawn((): void => { feed.pageArrived(["a", "b"], "c2"); feed.pageArrived(["c"], "end") }())
+await t
+time.sleep(20)
+check(!s.has("posts 3"), "a change from a task waits for the render thread")
+s.frame()
+check(s.has("posts 3") && s.has("count 3"), "both changes landed, in order")
+check(!feed.hasMore(), "a derived read on the store answers from the new value")
+
+// select(): the count view re-renders for a count change, not for a loading flip.
+const feedBefore: int = FEED_RENDERS
+const countBefore: int = COUNT_RENDERS
+const otherBefore: int = OTHER_RENDERS
+feed.loadingNow()
+s.frame()
+check(FEED_RENDERS == feedBefore + 1, "use() re-rendered the feed view")
+check(COUNT_RENDERS == countBefore, "select() did not re-render the count view for a field it does not pick")
+check(OTHER_RENDERS == otherBefore, "a component that reads no store did not re-render")
+
+// Listeners hear next and prev, on the render thread, and can stop.
+var heard: string = ""
+const stop: function(): void = feed.subscribe((next: Feed, prev: Feed): void => { heard = prev.cursor + "->" + next.cursor })
+feed.pageArrived(["d"], "c9")
+s.frame()
+check(heard == "end->c9", "a listener hears the previous and the new value")
+stop()
+feed.pageArrived([], "c10")
+s.frame()
+check(heard == "end->c9", "a stopped listener hears nothing more")
+
+// get() from a task is a copy: a later reducer does not change it under the task.
+var seen: int = -1
+const t2: Task<void> = spawn((): void => { const f: Feed = feed.get(); time.sleep(30); seen = f.posts.length }())
+time.sleep(10)                       // let the task take its copy first
+feed.pageArrived(["e", "f"], "c11")
+s.frame()
+await t2
+check(seen == 4 && feed.get().posts.length == 6, "a task's copy is not changed by a reducer that landed meanwhile")
+
+// The snapshot carries the store: a hot reload keeps it.
+const snap: string = serializeCells()
+feed.reset()
+s.frame()
+check(s.has("posts 0"), "reset returns to the initial value")
+restoreCells(snap)
+s.frame()
+check(s.has("posts 6") && feed.get().cursor == "c11", "restoring the snapshot brings the store back")
+
+// Names are unique.
+var dup: string = ""
+try { const again: FeedStore = new FeedStore("feed"); println(again.storeName()) } catch (e: any) { dup = string(e) }
+check(dup.contains("already exists"), "a second store with the same name is refused")
+
+check(OTHER_RENDERS >= 1, "a component that reads no store rendered")
+
+println("")
+println(string(PASS) + " passed, " + string(FAIL) + " failed")
+if (FAIL > 0) { throw new Error("store_test failed") }

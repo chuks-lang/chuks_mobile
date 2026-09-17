@@ -3385,7 +3385,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                         "clip" -> null; else -> android.text.TextUtils.TruncateAt.END } }
                 "dis" -> { v.alpha = if (vl == "1") 0.4f else 1f; v.isEnabled = (vl != "1")            // disabled: dim + block
                     if (vl == "1") disabledIds.add(id) else disabledIds.remove(id) }
-                "tint" -> (v as? ImageView)?.let { val c = Color.parseColor("#" + vl); imageTint[id] = c; it.setColorFilter(c) }   // Image tintColor
+                "tint" -> (v as? ImageView)?.let { val c = hexColor(vl); imageTint[id] = c; it.setColorFilter(c) }   // Image tintColor (the one site left on the raw parse; see hexColorStatic)
                 "filt" -> (v as? ImageView)?.let { val m = photoMatrix(vl); if (m != null) it.colorFilter = android.graphics.ColorMatrixColorFilter(m) else it.clearColorFilter() }   // Image photo filter
                 "seek" -> videoPlayers[id]?.let { mp ->                                                // Video seek (seconds)
                     val secs = f.toInt()
@@ -5059,6 +5059,18 @@ class MainActivity : Activity(), ChuksModuleHost {
     }
     // Two-pass decode: read bounds, pick an inSampleSize so neither side exceeds
     // maxDim, then decode at that sample. Avoids ever allocating the full-res bitmap.
+    // decodeScaled, from a file: the bounds pass and the sampled decode both stream from
+    // disk, so the file's bytes never sit in the heap.
+    private fun decodeScaledFile(f: java.io.File, maxDim: Int = MAX_DIM): android.graphics.Bitmap? {
+        val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(f.absolutePath, o)
+        if (o.outWidth <= 0 || o.outHeight <= 0) return null
+        var s = 1
+        while (o.outWidth / s > maxDim || o.outHeight / s > maxDim) s *= 2
+        val o2 = android.graphics.BitmapFactory.Options().apply { inSampleSize = s }
+        return android.graphics.BitmapFactory.decodeFile(f.absolutePath, o2)
+    }
+
     private fun decodeScaled(bytes: ByteArray, maxDim: Int = MAX_DIM): android.graphics.Bitmap? {
         val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
         android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
@@ -5091,6 +5103,12 @@ class MainActivity : Activity(), ChuksModuleHost {
         return if (j.isNullOrEmpty()) bmp else try { ChuksEffects.run(bmp, j) } catch (e: Exception) { bmp }
     }
 
+    // Remote images load on a small pool, not a thread each. A feed mounts twenty images
+    // at once; twenty threads each holding a whole downloaded file while it decoded was
+    // an OutOfMemoryError on a 192MB heap before the first card painted. Four in flight
+    // bounds the peak; the rest queue in order.
+    private val imageLoads: java.util.concurrent.ExecutorService = java.util.concurrent.Executors.newFixedThreadPool(4)
+
     private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {
         // Feed-grade: memory LRU -> disk cache -> network, decoded off the main thread, with
         // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
@@ -5099,22 +5117,28 @@ class MainActivity : Activity(), ChuksModuleHost {
         // RN parity: downsample to the view's display size (captured here on the main
         // thread), else screen width if the view is not laid out yet.
         val target = (if (iv.width > 0 || iv.height > 0) maxOf(iv.width, iv.height) else root.width).coerceIn(1, MAX_DIM)
-        Thread {
+        imageLoads.execute {
             try {
+                // A recycled cell may have moved on while this waited in the queue.
+                if (id.isNotEmpty() && iv.getTag(TAG) != url) return@execute
                 val key = Integer.toHexString(url.hashCode())
                 val f = java.io.File(imgDir, key)
-                var bmp = if (f.exists()) f.readBytes().let { decodeScaled(it, target) } else null
-                if (bmp == null) {
-                    val bytes = java.net.URL(url).openStream().use { it.readBytes() }
-                    bmp = decodeScaled(bytes, target)
-                    if (bmp != null) try { f.outputStream().use { os -> bmp!!.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os) }; trimImgDir() } catch (e: Exception) {}
+                if (!f.exists()) {
+                    // Straight to disk, never the whole file in memory: the decode below
+                    // reads the file with a sample size, so a 12MB photo costs its
+                    // downsampled bitmap and nothing else.
+                    val tmp = java.io.File(imgDir, "$key.part")
+                    java.net.URL(url).openStream().use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
+                    if (!tmp.renameTo(f)) { tmp.delete() }
+                    trimImgDir()
                 }
+                val bmp = decodeScaledFile(f, target)
                 if (bmp != null) {
                     imageMem.put(url, bmp)
-                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmpFor(bmp!!, id)); mediaLoad[id]?.let { a -> fire(a) } }
-                } else iv.post { mediaError[id]?.let { a -> fire(a) } }
+                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmpFor(bmp, id)); mediaLoad[id]?.let { a -> fire(a) } }
+                } else { f.delete(); iv.post { mediaError[id]?.let { a -> fire(a) } } }
             } catch (e: Exception) { iv.post { mediaError[id]?.let { a -> fire(a) } } }
-        }.start()
+        }
     }
 
     // ---- Yoga layout -> Android frames ------------------------------------

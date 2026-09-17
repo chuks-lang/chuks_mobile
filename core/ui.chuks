@@ -4408,20 +4408,26 @@ export class NativeSub {
 // Register a capability request on the render thread, from wherever the call came.
 // On the render thread the token is known before this returns; from a task the
 // request is queued and the returned handle receives its token when it runs.
+// A request made before the app is mounted (from createRoot, a module's setup) waits
+// for the host (onHostReady) and goes out on the first batch; it used to be dropped,
+// so a keychain read at launch never answered and the session it was loading never
+// arrived. Either way the handle receives its token once the registration has run.
 function registerCommand(cap: string, args: any, cb: any, onErr: any, stream: bool): NativeSub {
     const payload: string = json.stringify(args)
-    if (onRenderThread()) {
+    if (onRenderThread() && HOST != null) {
         const h: App? = HOST
         if (h != null) { return new NativeSub(h.recon.command(cap, payload, cb, onErr, stream)) }
-        return new NativeSub("0")
     }
     const sub: NativeSub = new NativeSub("")
-    onRender(function(): void {
-        const h: App? = HOST
-        if (h == null) { sub.token = "0"; return }
-        sub.token = h.recon.command(cap, payload, cb, onErr, stream)
-        if (sub.cancelled) { h.recon.cancelStream(sub.token) }
-    })
+    const register: function(): void = function(): void {
+        onHostReady(function(): void {
+            const h: App? = HOST
+            if (h == null) { sub.token = "0"; return }
+            sub.token = h.recon.command(cap, payload, cb, onErr, stream)
+            if (sub.cancelled) { h.recon.cancelStream(sub.token) }
+        })
+    }
+    if (onRenderThread()) { register() } else { onRender(register) }
     return sub
 }
 

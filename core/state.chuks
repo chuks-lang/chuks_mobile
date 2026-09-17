@@ -37,10 +37,27 @@ var _cells: CellStore = new CellStore()
 var _seen: map[string]bool = {}     // cell keys touched this render, for hookSweep()
 
 // ---- state serialization (hot-reload preservation) -------------------------
+// Stores ride the state snapshot (hot reload, restoration) beside the cells. The
+// store module registers how to save and restore them here, since this module
+// cannot import it.
+var STORE_SAVE: (function(): map[string]any)? = null
+var STORE_LOAD: (function(m: map[string]any): void)? = null
+/** Framework-internal: core/store.chuks registers its snapshot hooks. */
+export function setStoreSnapshot(save: function(): map[string]any, load: function(m: map[string]any): void): void { STORE_SAVE = save; STORE_LOAD = load }
+
 // Serialize every useState/useKeyedState cell to JSON so the dev server can carry
 // state across a `chuks watch` restart. Cells keyed by structural identity, so as
 // long as the component tree keeps the same shape the values reconnect on reload.
-export function serializeCells(): string { return _cells.snapshot() }
+export function serializeCells(): string {
+    const save: any = STORE_SAVE
+    if (save == null) { return _cells.snapshot() }
+    // One JSON object: the cells, plus each store under "store:<name>".
+    const m: map[string]any = json.parse(_cells.snapshot())
+    const stores: map[string]any = save()
+    const ks: []string = stores.keys()
+    for (var i: int = 0; i < ks.length; i = i + 1) { m["store:" + ks[i]] = stores[ks[i]] }
+    return json.stringify(m)
+}
 
 // Restore cells from serializeCells() output BEFORE the first render, so useState
 // finds the preserved value instead of re-seeding its initial. Keys absent from the
@@ -49,7 +66,13 @@ export function restoreCells(data: string): void {
     if (data == "") { return }
     const parsed: map[string]any = json.parse(data)
     const ks: []string = parsed.keys()
-    for (var i: int = 0; i < ks.length; i = i + 1) { _cells.set(ks[i], parsed[ks[i]]) }
+    var stores: map[string]any = {}
+    for (var i: int = 0; i < ks.length; i = i + 1) {
+        if (ks[i].startsWith("store:")) { stores[ks[i].slice(6, ks[i].length)] = parsed[ks[i]] }
+        else { _cells.set(ks[i], parsed[ks[i]]) }
+    }
+    const load: any = STORE_LOAD
+    if (load != null && stores.keys().length > 0) { load(stores) }
 }
 
 // Effect bookkeeping (see useEffect below). Declared up top so hookBegin/hookSweep
@@ -110,6 +133,11 @@ function markDirtyCell(k: string): void {
     if (hash < 0) { _dirtyAll = true; return }
     _dirtyPaths[k.slice(0, hash)] = true
 }
+/** Framework-internal: re-run one component (by its identity) on the next render. A store uses this for its readers. */
+export function markDirtyPath(path: string): void { _dirty = true; _dirtyPaths[path] = true }
+/** Framework-internal: the identity of the component rendering right now ("" outside a render). */
+export function renderingPath(): string { return _path }
+
 /**
  * Framework-internal: whether a state write has landed since the last render. The
  * host's idle beat asks this to skip rendering entirely when nothing changed.

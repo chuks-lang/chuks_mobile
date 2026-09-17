@@ -68,8 +68,9 @@ var ran: bool = false
 onRender(function(): void { ran = true })
 check(ran, "onRender on the render thread runs at once")
 
-// A capability request from a task is registered on the render thread, and a
-// cancel that arrives before the registration ran cancels it when it runs.
+// A capability request from a task is registered on the render thread. With no host
+// yet (this test has none) the registration waits for one rather than being dropped,
+// so the handle stays pending; a cancel meanwhile is remembered for when it runs.
 var subFromTask: NativeSub? = null
 const t: Task<void> = spawn(function(): void {
     subFromTask = emitNativeCommand("probe.cap", "", function(_v: string): void { })
@@ -78,7 +79,8 @@ await t
 check(subFromTask != null && asyncPending() > 0, "a capability request from a task is queued for the render thread")
 if (subFromTask != null) { subFromTask.cancel() }
 runAsyncQueue()
-check(subFromTask != null && subFromTask.token != "", "the handle gets its token once the registration has run")
+check(asyncPending() == 0, "the queued registration and the cancel both ran on the render thread")
+check(subFromTask != null && subFromTask.token == "" && subFromTask.cancelled, "with no host yet the request waits for one, and the cancel is remembered")
 
 println("")
 println(string(PASS) + " passed, " + string(FAIL) + " failed")
