@@ -7,7 +7,7 @@
 //
 // Run:  chuks run tests/events_test.chuks   (exits non-zero on failure)
 
-import { Node, Column, Text, TextInput, Slider, Select, Toggle, Gesture, Reconciler } from "../core/ui.chuks";
+import { Node, Column, Text, TextInput, Slider, Select, Toggle, Gesture, Image, Reconciler } from "../core/ui.chuks";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -63,6 +63,17 @@ function main(): void {
     check(has(w, "TC|app.1") && !has(w, "T|app.1|"), "a Select binds a change and no press")
     check(has(w, "T|app.2|app.2") && !has(w, "TC|app.2"), "a Toggle binds a press and no change")
     check(has(w, "T|app.3|app.3") && !has(w, "TC|app.3"), "a Gesture's press is a press; its stream is its own event, not a binding")
+
+    // An Image's onSize: bound as "<id>:size" (MZ|), and the host's "w,h" arrives as two ints.
+    var sizeW: int = 0
+    var sizeH: int = 0
+    const ri: Reconciler = new Reconciler()
+    ri.drain()
+    ri.renderRoot(Column({ dir: "col" }, [ Image({ src: "https://example.com/p.jpg", w: 100, h: 75, onSize: function(pw: int, ph: int): void { sizeW = pw; sizeH = ph } }) ]))
+    const wi: string = ri.drain()
+    check(has(wi, "MZ|app.0"), "an Image with onSize asks the host for the decoded size")
+    ri.fireValue("app.0:size", "1200,1600")
+    check(sizeW == 1200 && sizeH == 1600, "the size report arrives as width and height")
 
     println("")
     println("events: " + string(PASS) + " passed, " + string(FAIL) + " failed")

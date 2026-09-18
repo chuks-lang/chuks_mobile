@@ -733,6 +733,10 @@ class MainActivity : Activity(), ChuksModuleHost {
                 "TPI" -> if (f.size >= 2) pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
                 "TPO" -> if (f.size >= 2) pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
                 "ML" -> if (f.size >= 2) mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
+                "MZ" -> if (f.size >= 2) {                                                // Image onSize
+                    mediaSize[f[1]] = f[1] + ":size"
+                    ((views[f[1]] as? ImageView)?.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap?.let { reportImageSize(f[1], it) }   // already decoded: say so now
+                }
                 "ME" -> if (f.size >= 2) mediaError[f[1]] = f[1] + ":error"              // Image onError
                 "MN" -> if (f.size >= 2) mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
                 "SC" -> if (f.size >= 2) sliderDone[f[1]] = f[1] + ":slidedone"          // Slider onSlidingComplete
@@ -3006,6 +3010,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     private val a11yFocusable = HashMap<String, Boolean>()     // id -> the view's isFocusable before a11y made it focusable
     private val longDelayMs = HashMap<String, Long>()          // id -> onLongPress hold time (ms)
     private val mediaLoad = HashMap<String, String>()          // id -> onLoad action (Image)
+    private val mediaSize = HashMap<String, String>()          // id -> onSize action (Image): the decoded picture's pixel size
     private val mediaError = HashMap<String, String>()         // id -> onError action (Image)
     private val mediaEnd = HashMap<String, String>()           // id -> onEnd action (Video)
     private val mediaProgress = HashMap<String, String>()      // id -> onProgress action (Video)
@@ -5122,6 +5127,13 @@ class MainActivity : Activity(), ChuksModuleHost {
     // width on load, then refined from the real frame in relayout(). Re-reads from
     // the source each time (bundled assets/files are cheap); a power-of-two bucket
     // skips the common case where a relayout did not cross a resolution boundary.
+    // An Image's onSize: the decoded picture's size in pixels, after this pass like a load event.
+    private fun reportImageSize(id: String, bmp: android.graphics.Bitmap) {
+        val a = mediaSize[id] ?: return
+        if (bmp.width <= 0 || bmp.height <= 0) return
+        root.post { hostInput(a, "${bmp.width},${bmp.height}") }
+    }
+
     private fun ensureSizedImage(id: String, targetPx: Int) {
         val src = imageSrc[id] ?: return
         val iv = (views[id] as? ImageView) ?: bgImageViews[id] ?: return
@@ -5132,7 +5144,7 @@ class MainActivity : Activity(), ChuksModuleHost {
             if (src.startsWith("file://")) java.io.File(src.substring(7)).readBytes()
             else assets.open(src).use { it.readBytes() }
         } catch (e: Exception) { return }
-        decodeScaled(bytes, target)?.let { iv.setImageBitmap(bmpFor(it, id)); imageDecodedDim[id] = bucket }
+        decodeScaled(bytes, target)?.let { iv.setImageBitmap(bmpFor(it, id)); imageDecodedDim[id] = bucket; reportImageSize(id, it) }
     }
     // Run the Image GPU op-chain (effects.chain) on the GPU, if set (else the base bitmap).
     private fun runOps(id: String, bmp: android.graphics.Bitmap): android.graphics.Bitmap {
@@ -5149,7 +5161,7 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {
         // Feed-grade: memory LRU -> disk cache -> network, decoded off the main thread, with
         // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
-        imageMem.get(url)?.let { iv.setImageBitmap(bmpFor(it, id)); mediaLoad[id]?.let { a -> fire(a) }; return }
+        imageMem.get(url)?.let { iv.setImageBitmap(bmpFor(it, id)); reportImageSize(id, it); mediaLoad[id]?.let { a -> fire(a) }; return }
         iv.setTag(TAG, url)
         // RN parity: downsample to the view's display size (captured here on the main
         // thread), else screen width if the view is not laid out yet.
@@ -5172,7 +5184,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                 val bmp = decodeScaledFile(f, target)
                 if (bmp != null) {
                     imageMem.put(url, bmp)
-                    iv.post { if (iv.getTag(TAG) == url) iv.setImageBitmap(bmpFor(bmp, id)); mediaLoad[id]?.let { a -> fire(a) } }
+                    iv.post { if (iv.getTag(TAG) == url) { iv.setImageBitmap(bmpFor(bmp, id)); reportImageSize(id, bmp) }; mediaLoad[id]?.let { a -> fire(a) } }
                 } else { f.delete(); iv.post { mediaError[id]?.let { a -> fire(a) } } }
             } catch (e: Exception) { iv.post { mediaError[id]?.let { a -> fire(a) } } }
         }

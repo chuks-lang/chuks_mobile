@@ -2175,6 +2175,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var a11yIds = Set<String>()                                           // ids carrying any a11y key (reset on reuse)
     var a11yLive: [String: String] = [:]                                  // id -> "polite" | "assertive" (announce on text change)
     var mediaLoad: [String: String] = [:]                                 // id -> onLoad action (Image/Video)
+    var mediaSize: [String: String] = [:]                                 // id -> onSize action (Image): the decoded picture's pixel size
     var mediaError: [String: String] = [:]                                // id -> onError action (Image)
     var mediaEnd: [String: String] = [:]                                  // id -> onEnd action (Video)
     var mediaProgress: [String: String] = [:]                             // id -> onProgress action (Video)
@@ -3624,6 +3625,9 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             case "TPI" where f.count >= 2: pressInActions[f[1]] = f[1] + ":pressin"       // Pressable onPressIn
             case "TPO" where f.count >= 2: pressOutActions[f[1]] = f[1] + ":pressout"     // Pressable onPressOut
             case "ML" where f.count >= 2: mediaLoad[f[1]] = f[1] + ":load"                // Image/Video onLoad
+            case "MZ" where f.count >= 2:                                                  // Image onSize
+                mediaSize[f[1]] = f[1] + ":size"
+                if let iv = views[f[1]] as? UIImageView, let img = iv.image { reportImageSize(f[1], img) }   // already decoded: say so now
             case "ME" where f.count >= 2: mediaError[f[1]] = f[1] + ":error"              // Image onError
             case "MN" where f.count >= 2: mediaEnd[f[1]] = f[1] + ":end"                  // Video onEnd
             case "MP" where f.count >= 2: mediaProgress[f[1]] = f[1] + ":progress"; addVideoProgress(f[1])   // Video onProgress
@@ -5328,11 +5332,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if let iv = views[id] as? UIImageView, t.hasPrefix("file://") {   // picked/captured local file
             imageSrc[id] = t; imageDecodedDim[id] = nil
             ensureSizedImage(id, UIScreen.main.bounds.width * UIScreen.main.scale)   // provisional; relayout() refines to the frame
+            if let img = iv.image { reportImageSize(id, img) }
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if let iv = views[id] as? UIImageView, !t.isEmpty {   // bundled local asset (e.g. chuks-logo.png)
             imageSrc[id] = t; imageDecodedDim[id] = nil
             ensureSizedImage(id, UIScreen.main.bounds.width * UIScreen.main.scale)
+            if let img = iv.image { reportImageSize(id, img) }
             fireMedia(iv.image != nil ? mediaLoad[id] : mediaError[id]); return
         }
         if bgImageViews[id] != nil, !t.isEmpty {              // bundled ImageBackground asset
@@ -6904,13 +6910,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func loadRemoteImage(_ urlStr: String, into iv: UIImageView, id: String = "") {
         // Bounded LRU + disk + off-main decode (feed-grade), with tag cancellation so a
         // recycled cell never gets a late image for a URL it no longer shows.
-        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id); hideImageSpinner(id); fireMedia(mediaLoad[id]); return }
+        if let cached = ChuksImageLoader.shared.cached(urlStr) { iv.image = tinted(cached, id); imageOriginal[id] = nil; applyFilter(iv, id); applyBlur(iv, id); applyOps(iv, id); hideImageSpinner(id); reportImageSize(id, cached); fireMedia(mediaLoad[id]); return }
         let wanted = urlStr.hashValue
         iv.tag = wanted
         ChuksImageLoader.shared.load(urlStr) { [weak self] img in
             guard let self = self else { return }
             if iv.tag == wanted { iv.image = self.tinted(img, id); self.imageOriginal[id] = nil; self.applyFilter(iv, id); self.applyBlur(iv, id); self.applyOps(iv, id) }
             self.hideImageSpinner(id)
+            if iv.tag == wanted { self.reportImageSize(id, img) }
             self.fireMedia(self.mediaLoad[id])
         } fail: { [weak self] in self?.hideImageSpinner(id); self?.fireMedia(self?.mediaError[id]) }
     }
@@ -6970,6 +6977,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     let ciContext = CIContext()
     // Dispatch a media event action (onLoad/onError/onEnd) if one is registered for the node.
     func fireMedia(_ action: String?) { if let a = action { DispatchQueue.main.async { [weak self] in self?.fire(a) } } }
+    // An Image's onSize: the decoded picture's size in pixels, after this pass like a load event.
+    func reportImageSize(_ id: String, _ img: UIImage) {
+        guard let a = mediaSize[id] else { return }
+        let w = Int((img.size.width * img.scale).rounded()), h = Int((img.size.height * img.scale).rounded())
+        if w <= 0 || h <= 0 { return }
+        DispatchQueue.main.async { [weak self] in self?.fireValue(a, "\(w),\(h)") }
+    }
 
     // Pull-to-refresh fired: run onRefresh (synchronous — its state change re-renders),
     // then end the spinner. (A controlled `refreshing` flag can also drive it via rfsh.)

@@ -401,6 +401,7 @@ export class Node {
     var onError: any
     var onEnd: any
     var onProgress: any
+    var onSize: any        // Image: the decoded picture's pixel size, "w,h" from the host
     // Slider: fires once when the drag gesture ENDS (RN onSlidingComplete), with
     // the final value; distinct from onChange which streams during the drag.
     var onSlideDone: any
@@ -429,7 +430,7 @@ export class Node {
         this.ctxTop = 0; this.ctxOverlay = 0
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
-        this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null
+        this.onLoad = null; this.onError = null; this.onEnd = null; this.onProgress = null; this.onSize = null
         this.onSlideDone = null; this.onScroll = null; this.onLayout = null; this.scrollTo = -1; this.opsChain = ""
         this.events = {}
         this.ref = null
@@ -919,6 +920,8 @@ export unionType Handler = function(): void | function(): Task<void>
 export unionType StringHandler = function(v: string): void | function(v: string): Task<void>
 /** A handler that receives an int: a page or snap index, a progress value. */
 export unionType IntHandler = function(v: int): void | function(v: int): Task<void>
+/** A handler that receives a width and a height (an Image's `onSize`). */
+export unionType SizeHandler = function(w: int, h: int): void | function(w: int, h: int): Task<void>
 /** A handler that receives the frame the host measured (see `LayoutBox`). */
 export unionType LayoutHandler = function(e: LayoutBox): void | function(e: LayoutBox): Task<void>
 dataType EventProps {
@@ -1234,6 +1237,10 @@ dataType ImageProps {
     ViewProps; MediaEventProps;
     src: string?; resize: string?; tintColor: string?; blurRadius: int?;
     filter: string?; spinner: bool?; ops: string?;
+    // The picture's size in pixels once it has decoded (`onSize(w, h)`), so a card can
+    // take the picture's own aspect: set the Image's height from w and h, and a
+    // variable-height list moves the rows below to fit.
+    onSize: SizeHandler?;
 }
 /**
  * A remote (network) image loaded from a URL. The host fetches + caches the
@@ -1264,6 +1271,9 @@ export function Image(p: ImageProps): Node {
     const n: Node = new Node("Image", s, pvS(p, "src", ""), [])   // URL in the text channel
     n.opsChain = pvS(p, "ops", "")                        // GPU op-chain (from effects.chain); host runs it on the GPU
     applyMediaEventsV(n, p)                               // onLoad / onError
+    // onSize: the host reports "w,h"; the app gets two ints.
+    const os: any = p["onSize"]
+    if (os != null) { n.onSize = function(v: string): void { const f: []string = v.split(","); os(f.length > 0 ? int(f[0]) : 0, f.length > 1 ? int(f[1]) : 0) } }
     return n
 }
 dataType ImageBackgroundProps { ViewProps; src: string?; resize: string? }
@@ -3188,6 +3198,7 @@ export class Reconciler {
         if (n.onError != null) { this.handlers[id + ":error"] = n.onError; this.emit("ME|" + id) }
         if (n.onEnd != null) { this.handlers[id + ":end"] = n.onEnd; this.emit("MN|" + id) }
         if (n.onProgress != null) { this.handlers[id + ":progress"] = n.onProgress; this.emit("MP|" + id) }
+        if (n.onSize != null) { this.handlers[id + ":size"] = n.onSize; this.emit("MZ|" + id) }
         if (n.onSlideDone != null) { this.handlers[id + ":slidedone"] = n.onSlideDone; this.emit("SC|" + id) }
         if (n.onScroll != null) { this.handlers[id + ":scroll"] = n.onScroll; this.emit("SS|" + id) }
         if (n.onLayout != null) { this.handlers[id + ":layout"] = n.onLayout; this.emit("LY|" + id + "|1") }
@@ -3326,6 +3337,8 @@ export class Reconciler {
         this.rebindOrDrop(id + ":error", next.onError)
         this.rebindOrDrop(id + ":end", next.onEnd)
         this.rebindOrDrop(id + ":progress", next.onProgress)
+        this.rebindOrDrop(id + ":size", next.onSize)
+        if (p.onSize == null && next.onSize != null) { this.emit("MZ|" + id) }
         this.rebindOrDrop(id + ":slidedone", next.onSlideDone)
         this.rebindOrDrop(id + ":scroll", next.onScroll)
         // onLayout is bound on the host too, so gaining or losing it on an update must
