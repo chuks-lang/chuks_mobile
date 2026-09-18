@@ -1997,6 +1997,8 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // of the whole tree. `needsFrame` is a belt-and-suspenders set of just-created views that
     // must get their frame at least once even if Yoga's flag says unchanged.
     var needsFrame = Set<String>()
+    var zResort = Set<ObjectIdentifier>()                  // parents whose children's z changed this batch
+    var zResortViews: [ObjectIdentifier: UIView] = [:]
     /// Capabilities that installed packages provide, consulted for any command the
     /// framework's own switch does not claim. Built lazily, so an app with no native
     /// package never constructs it.
@@ -3703,8 +3705,25 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             default: break
             }
         }
+        resortZ()
         syncChrome()
         finishThemeFade()
+    }
+
+    // Put each parent's children in z order (stable: equal z keeps the array order the
+    // engine gave), decorations staying at the back. Runs only for parents a z touched.
+    func resortZ() {
+        if zResort.isEmpty { return }
+        for key in zResort {
+            guard let pv = zResortViews[key] else { continue }
+            let kids = pv.subviews.filter { $0.tag != CHUKS_DECOR_TAG }
+            let ordered = kids.enumerated().sorted { a, b in
+                let za = a.element.layer.zPosition, zb = b.element.layer.zPosition
+                return za == zb ? a.offset < b.offset : za < zb
+            }
+            for (_, v) in ordered { pv.bringSubviewToFront(v) }
+        }
+        zResort.removeAll(); zResortViews.removeAll()
     }
 
     /// Dissolve the frozen old-theme frame, once the new one is fully in place.
@@ -5861,7 +5880,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // lockstep with the setters in style(); the durable fix is to materialize these
         // defaults in the reconciler. (transform + alpha are reset in the post-loop block
         // where `anim` is known, so a reset never fights an in-flight animation.)
-        v.layer.zPosition = 0                                        // z
+        if v.layer.zPosition != 0 { v.layer.zPosition = 0; if let pv = v.superview { zResort.insert(ObjectIdentifier(pv)); zResortViews[ObjectIdentifier(pv)] = pv } }   // z (a reused node re-sorts its siblings)
         v.layer.shadowRadius = 0; v.layer.shadowOffset = .zero       // shadow (opacity already 0 above)
         if !modalIds.contains(id) { v.isHidden = false }             // hidden/mvis (modal drives its own)
         disabledIds.remove(id)                                       // dis: interaction gate + alpha
@@ -6107,7 +6126,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 YGNodeStyleSetDisplay(n, hid ? YGDisplay.none : YGDisplay.flex)
             case "overflow": if !hasShadow { v.clipsToBounds = (val == "hidden") }   // overflow-hidden clips
             case "self":  YGNodeStyleSetAlignSelf(n, align(val))                // align-self
-            case "z":     v.layer.zPosition = CGFloat(f)                        // z-index
+            case "z":                                                          // z-index
+                // zPosition orders DRAWING only: UIKit hit-tests subviews in array order,
+                // so a strip drawn over a list still handed its taps to the rows beneath.
+                // The parent's subviews are re-ordered by z after this batch (resortZ), so
+                // a higher z is on top for touches as it is for paint, as on Android.
+                if v.layer.zPosition != CGFloat(f) { v.layer.zPosition = CGFloat(f); if let pv = v.superview { zResort.insert(ObjectIdentifier(pv)); zResortViews[ObjectIdentifier(pv)] = pv } }
             case "rtl":   rc.tl = CGFloat(f)
             case "rtr":   rc.tr = CGFloat(f)
             case "rbr":   rc.br = CGFloat(f)
@@ -6434,6 +6458,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         let base = pv.subviews.prefix { $0.tag == CHUKS_DECOR_TAG }.count
         let i = min(index + base, pv.subviews.count)
         pv.insertSubview(child, at: i)
+        if child.layer.zPosition != 0 || pv.subviews.contains(where: { $0.layer.zPosition != 0 }) { zResort.insert(ObjectIdentifier(pv)); zResortViews[ObjectIdentifier(pv)] = pv }
         }
         // A node id can be reused across a kind change (e.g. a Text becomes a container via
         // conditional rendering / hot reload). Yoga aborts if you add a child to a node that
