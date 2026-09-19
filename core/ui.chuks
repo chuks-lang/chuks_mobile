@@ -2089,10 +2089,16 @@ dataType SheetProps {
  * `keyboard`: "interactive" (default) lifts the sheet with the keyboard, "extend"
  * raises it to its highest point, "fillParent" to the screen.
  *
+ * `bg` is the panel: the rounded surface behind the children, the handle strip above
+ * them and the safe-area strip below. Unset, the host paints it in the platform's
+ * sheet colour (a light grey on iOS), so content with its own `bg` sits on it like a
+ * card; pass the same colour as the content (`bg: tk("surface")`) for one surface.
+ * The scrim behind the sheet is `backdrop`, not `bg`.
+ *
  * Commands through `ref`: `snapTo({ index })`, `expand()`, `collapse()`, `close()`.
  *
  * ```chuks
- * Sheet({ snapPoints: ["25%", "60%", "90%"], index: at.get(),
+ * Sheet({ snapPoints: ["25%", "60%", "90%"], index: at.get(), bg: tk("surface"),
  *         onChange: function(i: int): void { at.set(i) } }, [
  *     Scroll({ grow: 1 }, [ ...rows ]),
  * ])
