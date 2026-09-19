@@ -535,7 +535,7 @@ function mkAlert(style: Style, joined: string): Node { return new Node("Alert", 
 // List-specific signatures, so they get their own union, distinct from Prop. The
 // last three signatures are for SectionList: rows(s)->int, key(s,r)->string,
 // item(s,r,top)->Node; its header(s,top)->Node reuses (int,int)->Node above.
-export unionType ListProp = int | bool | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void | function(): void | function(top: int): Node
+export unionType ListProp = int | bool | function(r: int): string | function(r: int, top: int): Node | function(s: int): int | function(s: int, r: int): string | function(s: int, r: int, top: int): Node | function(r: int): void | function(r: int): Task<void> | function(): void | function(): Task<void> | function(top: int): Node
 
 // ---- Named-prop component builders (the JSX-like API) ----------------------
 // Compose with named props + children + closures:
@@ -2750,8 +2750,8 @@ export function Screen(first: ViewProps | []Kid, kids: []Kid = []): Node {
  *
  * ```chuks
  * List({ count: this.filtered.length,
- *        key:  function(r: int): string { return string(self.filtered[r]) },
- *        item: function(r: int, top: int): Node { return self.rowAt(r, top) },
+ *        key:  r => string(self.filtered[r]),
+ *        item: (r, top) => self.rowAt(r, top),
  *        rowHeight: 72, gap: 10, pad: 8 })
  * // ...and the row builder places itself:
  * function rowAt(r: int, top: int): Node {
@@ -2759,12 +2759,79 @@ export function Screen(first: ViewProps | []Kid, kids: []Kid = []): Node {
  * }
  * ```
  */
-export function List(p: map[string]ListProp): Node {
+export function List(p: ListProps): Node {
     const s: Style = new Style(); s.grow = 1; s.basis = 0    // fills the remaining space
+    if (p.h != null) { s.h = p.h; s.grow = 0 }                // or exactly the height it was given
     const n: Node = new Node("List", s, "", [])
-    n.data = p    // carries count, key, item, rowHeight, gap, pad
+    n.data = listConfig(p)    // carries count, key, item, rowHeight, gap, pad
     n.ctxOverlay = _overlayBottom   // a floating bar to keep the last row clear of (reconcileList)
     return n
+}
+/**
+ * What a `List` takes. `count` and `item` are required; everything else is optional
+ * and read as absent when omitted. The callbacks are typed, so an arrow in any of them
+ * reads its parameters from here: `item: (r, top) => ...`, `onVisible: r => ...`.
+ */
+export dataType ListProps {
+    count: int;                                  // total number of rows
+    item: function(r: int, top: int): Node;      // the row at `r`, positioned by the caller at `top` (abs: true, top: top)
+    key: (function(r: int): string)?;            // stable identity for the row at `r` (default: the rank)
+    rowHeight: int?;                             // every row's height, for uniform rows
+    estimatedHeight: int?;                       // INSTEAD of rowHeight: rows size themselves, the host measures them
+    gap: int?;                                   // between rows
+    pad: int?;                                   // top and bottom padding (horizontal padding belongs on the row)
+    buffer: int?;                                // extra rows kept above and below the window (default 3)
+    h: int?;                                     // a fixed height; without it the list fills the remaining space
+    horizontal: bool?;                           // rows become items laid out left to right (`itemWidth` instead of `rowHeight`)
+    itemWidth: int?;                             // a horizontal list's item width
+    paging: bool?;                               // snap one full screen per swipe
+    inverted: bool?;                             // row 0 sits at the bottom, later rows stack upward (chat)
+    numColumns: int?;                            // a grid of this many cells per row
+    header: (function(top: int): Node)?;         // a node above the rows, positioned at `top`
+    headerHeight: int?;                          // its height (the rows start below it)
+    footer: (function(top: int): Node)?;         // a node below the rows, positioned at `top`
+    footerHeight: int?;                          // its height
+    empty: (function(height: int): Node)?;       // shown, filling the viewport, when count == 0
+    onVisible: IntHandler?;                      // the centered row changed (autoplay follows it)
+    onScroll: IntHandler?;                       // the scroll offset, in points, once per frame it changed
+    onEndReached: Handler?;                      // near the end (infinite scroll)
+    endThreshold: int?;                          // how many rows before the end `onEndReached` fires (default 0)
+    onRefresh: Handler?;                         // pull to refresh
+    refreshing: bool?;                           // the refresh spinner
+    scrollToIndex: int?;                         // scroll so this row is at the top; fires again when the value changes
+    scrollToEnd: int?;                           // scroll to the end; bump the value to fire again
+}
+// The reconciler reads a List's config by name (see lpInt/lpBool and the `.get`
+// reads in reconcileList), so the typed props become that map here, one entry
+// per prop that was given.
+function listConfig(p: ListProps): map[string]ListProp {
+    const m: map[string]ListProp = {}
+    m["count"] = p.count; m["item"] = p.item
+    if (p.key != null) { m["key"] = p.key }
+    if (p.rowHeight != null) { m["rowHeight"] = p.rowHeight }
+    if (p.estimatedHeight != null) { m["estimatedHeight"] = p.estimatedHeight }
+    if (p.gap != null) { m["gap"] = p.gap }
+    if (p.pad != null) { m["pad"] = p.pad }
+    if (p.buffer != null) { m["buffer"] = p.buffer }
+    if (p.horizontal != null) { m["horizontal"] = p.horizontal }
+    if (p.itemWidth != null) { m["itemWidth"] = p.itemWidth }
+    if (p.paging != null) { m["paging"] = p.paging }
+    if (p.inverted != null) { m["inverted"] = p.inverted }
+    if (p.numColumns != null) { m["numColumns"] = p.numColumns }
+    if (p.header != null) { m["header"] = p.header }
+    if (p.headerHeight != null) { m["headerHeight"] = p.headerHeight }
+    if (p.footer != null) { m["footer"] = p.footer }
+    if (p.footerHeight != null) { m["footerHeight"] = p.footerHeight }
+    if (p.empty != null) { m["empty"] = p.empty }
+    if (p.onVisible != null) { m["onVisible"] = p.onVisible }
+    if (p.onScroll != null) { m["onScroll"] = p.onScroll }
+    if (p.onEndReached != null) { m["onEndReached"] = p.onEndReached }
+    if (p.endThreshold != null) { m["endThreshold"] = p.endThreshold }
+    if (p.onRefresh != null) { m["onRefresh"] = p.onRefresh }
+    if (p.refreshing != null) { m["refreshing"] = p.refreshing }
+    if (p.scrollToIndex != null) { m["scrollToIndex"] = p.scrollToIndex }
+    if (p.scrollToEnd != null) { m["scrollToEnd"] = p.scrollToEnd }
+    return m
 }
 /**
  * A virtualized SECTIONED list: rows grouped under section headers, only the
@@ -2782,19 +2849,45 @@ export function List(p: map[string]ListProp): Node {
  *
  * ```chuks
  * SectionList({ sectionCount: groups.length,
- *   rows:   function(s: int): int { return groups[s].items.length },
- *   header: function(s: int, top: int): Node { return self.header(s, top) },
- *   item:   function(s: int, r: int, top: int): Node { return self.row(s, r, top) },
- *   key:    function(s: int, r: int): string { return string(s) + "-" + string(r) },
+ *   rows:   s => groups[s].items.length,
+ *   header: (s, top) => self.header(s, top),
+ *   item:   (s, r, top) => self.row(s, r, top),
+ *   key:    (s, r) => string(s) + "-" + string(r),
  *   rowHeight: 56, headerHeight: 34, gap: 8, pad: 8 })
  * ```
  */
-export function SectionList(p: map[string]ListProp): Node {
+export function SectionList(p: SectionListProps): Node {
     const s: Style = new Style(); s.grow = 1; s.basis = 0
     const n: Node = new Node("SectionList", s, "", [])
-    n.data = p
+    n.data = sectionListConfig(p)
     n.ctxOverlay = _overlayBottom   // as for List
     return n
+}
+/** What a `SectionList` takes: the section count and its four builders, then the optional sizes. */
+export dataType SectionListProps {
+    sectionCount: int;                                   // number of sections
+    rows: function(s: int): int;                         // rows in section `s`
+    header: function(s: int, top: int): Node;            // section `s`'s header, positioned at `top`
+    item: function(s: int, r: int, top: int): Node;      // row `r` of section `s`, positioned at `top`
+    key: (function(s: int, r: int): string)?;            // stable row identity (default: the position)
+    rowHeight: int?;                                     // every row's height
+    headerHeight: int?;                                  // every header's height
+    gap: int?;                                           // between rows
+    pad: int?;                                           // top and bottom padding
+    buffer: int?;                                        // extra rows kept above and below the window (default 3)
+    empty: (function(height: int): Node)?;               // shown, filling the viewport, when there are no rows
+}
+function sectionListConfig(p: SectionListProps): map[string]ListProp {
+    const m: map[string]ListProp = {}
+    m["sectionCount"] = p.sectionCount; m["rows"] = p.rows; m["header"] = p.header; m["item"] = p.item
+    if (p.key != null) { m["key"] = p.key }
+    if (p.rowHeight != null) { m["rowHeight"] = p.rowHeight }
+    if (p.headerHeight != null) { m["headerHeight"] = p.headerHeight }
+    if (p.gap != null) { m["gap"] = p.gap }
+    if (p.pad != null) { m["pad"] = p.pad }
+    if (p.buffer != null) { m["buffer"] = p.buffer }
+    if (p.empty != null) { m["empty"] = p.empty }
+    return m
 }
 
 /**
@@ -4187,7 +4280,8 @@ export class Reconciler {
                 if (r1 < r0) { r1 = r0 }
                 for (var r: int = r0; r < r1; r = r + 1) {
                     const rtop: int = rowsTop + r * stride
-                    const rid: string = contentId + ".c" + string(keyFn(s, r))
+                    // No key(): the position stands in, as it does for List.
+                    const rid: string = contentId + ".c" + (keyFn != null ? string(keyFn(s, r)) : string(s) + "-" + string(r))
                     desired.push(rid)
                     const rnode: Node = itemFn(s, r, rtop)
                     const rWas: bool = this.containsStr(st.mounted, rid)
