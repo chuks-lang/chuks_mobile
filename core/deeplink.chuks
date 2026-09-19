@@ -163,9 +163,9 @@ export function resolveLink(url: string, patterns: map[string]string): LinkTarge
  * var patterns: map[string]string = {}
  * patterns["/walk/:id"] = "walk"
  * patterns["/club/:id"] = "club"
- * useEffect(function(): any {
+ * useEffect(() => {
  *     const sub: NativeSub = bindLinks(patterns)
- *     return function(): void { sub.cancel() }
+ *     return () => sub.cancel()
  * }, [])
  * ```
  *

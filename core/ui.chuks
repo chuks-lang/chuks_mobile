@@ -789,7 +789,7 @@ var _nextSharedId: int = 1
  *
  * ```chuks
  * const y: SharedValue = useSharedValue(0)
- * Gesture({ panY: y, onPanEnd: function(): void { y.spring(0) } }, [
+ * Gesture({ panY: y, onPanEnd: () => y.spring(0) }, [
  *     Row({ motion: { ty: y, opacity: interpolate(y, [0, 200], [100, 40]) } }, [ card ]),
  * ])
  * ```
@@ -904,7 +904,7 @@ export dataType A11yState { disabled: bool?; selected: bool?; checked: bool?; ex
  * the render thread, so the body reads as straight code:
  *
  * ```chuks
- * Pressable({ onPress: async function(): Task<void> {
+ * Pressable({ onPress: async () => {
  *     busy.set(true)
  *     const r: string = await load()
  *     busy.set(false)
@@ -1424,7 +1424,7 @@ var _nextRefId: int = 0
  * var carousel: ViewRef = useViewRef()
  * ...
  * Carousel({ ref: carousel, w: 320, h: 180 })
- * Button({ onPress: function(): void { carousel.command("next") } }, "next")
+ * Button({ onPress: () => carousel.command("next") }, "next")
  * ```
  */
 export function useViewRef(): ViewRef {
@@ -1458,7 +1458,7 @@ export function useViewRef(): ViewRef {
  * back as an empty bag, so a mixed package can read both without a guard.
  *
  * ```chuks
- * { change: function(raw: string): void {
+ * { change: (raw: string) => {
  *       const d: any = eventData(raw)
  *       p.onChange({ star: pvI(d, "star", 0), previous: pvI(d, "previous", 0) })
  *   } }
@@ -1532,7 +1532,7 @@ export function eventData(raw: string): any {
  * // and in the app:
  * var c: ViewRef = useViewRef()
  * Carousel({ ref: c, ... })
- * Button({ onPress: function(): void { c.command("scrollTo", { index: 3 }) } }, "next")
+ * Button({ onPress: () => c.command("scrollTo", { index: 3 }) }, "next")
  * ```
  */
 export function nativeView(kind: string, props: any, layout: any, kids: []Kid, events: any = null, ref: any = null): Node {
@@ -1580,7 +1580,7 @@ dataType ButtonBaseProps { ViewProps; disabled: bool? }
  * Props: `onPress`, `bg`, `color`, `h`, `w`, `radius`, `size`, `weight`.
  *
  * ```chuks
- * Button({ onPress: function(): void { navReplace("home") },
+ * Button({ onPress: () => navReplace("home"),
  *          bg: ACCENT, color: "FFFFFF", h: 52, radius: 12 }, "Log in")
  * ```
  */
@@ -1597,7 +1597,7 @@ export function Button(first: ButtonBaseProps | string, t: string = ""): Node {
  * Props: `w`, `h`, `bg`, `color`, `onPress`.
  *
  * ```chuks
- * Pill({ onPress: function(): void { self.inc() } }, string(this.value))
+ * Pill({ onPress: () => self.inc() }, string(this.value))
  * ```
  */
 export function Pill(first: ViewProps | string, t: string = ""): Node {
@@ -1632,8 +1632,8 @@ dataType TextInputProps {
  * ```chuks
  * // Controlled: the field always shows `draft`; clear it by setting draft to "".
  * TextInput({ value: draft.get(), keyboardType: "email", returnKeyType: "send",
- *             onChange: function(v: string): void { draft.set(v) },
- *             onSubmit: function(): void { send() } })
+ *             onChange: v => draft.set(v),
+ *             onSubmit: () => send() })
  * ```
  *
  * A field takes two commands through a `useViewRef()` handle passed as `ref`: `focus`
@@ -1643,7 +1643,7 @@ dataType TextInputProps {
  * ```chuks
  * const input: ViewRef = useViewRef()
  * TextInput({ ref: input, placeholder: "Write a reply" })
- * Button({ onPress: function(): void { input.command("focus") } }, "Reply")
+ * Button({ onPress: () => input.command("focus") }, "Reply")
  * ```
  */
 export function TextInput(p: TextInputProps): Node {
@@ -2048,9 +2048,9 @@ dataType PopoverProps {
  *
  * ```chuks
  * const more: ViewRef = useViewRef()
- * Row({ ref: more, onPress: function(): void { open.set(true) } }, [ Text({}, "More") ])
+ * Row({ ref: more, onPress: () => open.set(true) }, [ Text({}, "More") ])
  * Popover({ visible: open.get(), anchor: more, placement: "bottom", arrow: true,
- *           onDismiss: function(): void { open.set(false) } }, [
+ *           onDismiss: () => open.set(false) }, [
  *     Card({ children: [ Text({}, "Rename"), Text({}, "Delete") ] }),
  * ])
  * ```
@@ -2099,7 +2099,7 @@ dataType SheetProps {
  *
  * ```chuks
  * Sheet({ snapPoints: ["25%", "60%", "90%"], index: at.get(), bg: tk("surface"),
- *         onChange: function(i: int): void { at.set(i) } }, [
+ *         onChange: i => at.set(i) }, [
  *     Scroll({ grow: 1 }, [ ...rows ]),
  * ])
  * ```
@@ -2164,8 +2164,8 @@ dataType AlertProps {
  * ```chuks
  * Alert({ visible: confirming.get(), title: "Delete?", message: "This can't be undone.",
  *         confirmText: "Delete", cancelText: "Cancel", destructive: true,
- *         onConfirm: function(): void { doDelete(); confirming.set(false) },
- *         onCancel:  function(): void { confirming.set(false) } })
+ *         onConfirm: () => { doDelete(); confirming.set(false) },
+ *         onCancel:  () => confirming.set(false) })
  * ```
  */
 export function Alert(p: AlertProps): Node {
@@ -2237,7 +2237,7 @@ dataType ToggleProps { ViewProps; on: bool?; thumbColor: string?; disabled: bool
  *        `thumbColor` (knob color hex), `disabled` (bool: dim + block taps).
  *
  * ```chuks
- * Toggle({ on: enabled, onPress: function(): void { enabled = !enabled }, bg: ACCENT })
+ * Toggle({ on: enabled, onPress: () => enabled = !enabled, bg: ACCENT })
  * ```
  */
 export function Toggle(p: ToggleProps): Node {
@@ -2264,7 +2264,7 @@ dataType SliderProps { ViewProps; min: int?; max: int?; value: int?; step: int?;
  *
  * ```chuks
  * Slider({ value: vol.get(), min: 0, max: 100,
- *          onChange: function(v: string): void { vol.set(int(v)) } })
+ *          onChange: v => vol.set(int(v)) })
  * ```
  */
 export function Slider(p: SliderProps): Node {
@@ -2294,7 +2294,7 @@ dataType SelectProps { ViewProps; value: int? }
  * `options` is a separate arg (the Prop union has no list type).
  *
  * ```chuks
- * Select({ value: sel.get(), onChange: function(v: string): void { sel.set(int(v)) } },
+ * Select({ value: sel.get(), onChange: v => sel.set(int(v)) },
  *        ["Low", "Medium", "High"])
  * ```
  */
@@ -2331,7 +2331,7 @@ dataType DatePickerProps { ViewProps; mode: string?; display: string?; value: st
  *
  * ```chuks
  * DatePicker({ value: born.get(), mode: "date",
- *              onChange: function(v: string): void { born.set(v) } })
+ *              onChange: v => born.set(v) })
  * ```
  */
 export function DatePicker(p: DatePickerProps): Node {
@@ -2361,7 +2361,7 @@ export function DatePicker(p: DatePickerProps): Node {
  * (`display: "" | "inline" | "wheels"`, `bg`, `color`, `radius`, layout props).
  *
  * ```chuks
- * TimePicker({ value: t.get(), onChange: function(v: string): void { t.set(v) } })
+ * TimePicker({ value: t.get(), onChange: v => t.set(v) })
  * ```
  */
 export function TimePicker(p: DatePickerProps): Node {
@@ -2390,7 +2390,7 @@ dataType MenuProps { ViewProps; label: string? }
  *
  * ```chuks
  * Menu({ label: "Options",
- *        onChange: function(v: string): void { self.run(int(v)) } },
+ *        onChange: v => self.run(int(v)) },
  *      ["Share", "Rename", "Delete"])
  * ```
  */
@@ -2413,7 +2413,7 @@ export function Menu(p: MenuProps, items: []string): Node {
  * arg before the children.
  *
  * ```chuks
- * ContextMenu({ onChange: function(v: string): void { self.act(int(v)) } },
+ * ContextMenu({ onChange: v => self.act(int(v)) },
  *             ["Copy", "Share", "Delete"],
  *             [ Card({ children: [ Text(tw("text-text"), "Long-press me") ] }) ])
  * ```
@@ -2566,7 +2566,7 @@ dataType GestureProps {
  * GestureDetector), so each fires once, with no per-frame round-trip.
  *
  * ```chuks
- * Gesture({ onGesture: function(g: string): void {
+ * Gesture({ onGesture: g => {
  *     if (g == "swipe:left") { next() }
  *     if (g == "doubletap") { like() }
  * } }, [ card ])
@@ -2637,7 +2637,7 @@ export class PanEvent {
  * fingers lift.
  *
  * ```chuks
- * Gesture({ onPinch: function(e: PinchEvent): void {
+ * Gesture({ onPinch: e => {
  *     if (e.phase == 2) { settle() } else { zoom.set(base * e.scale / 100) }
  * } }, [ ... ])
  * ```
@@ -2656,7 +2656,7 @@ export class PinchEvent {
  * per second, for letting the rotation coast.
  *
  * ```chuks
- * Gesture({ onRotate: function(e: RotateEvent): void { angle.set(e.deg) } }, [ ... ])
+ * Gesture({ onRotate: e => angle.set(e.deg) }, [ ... ])
  * ```
  */
 export class RotateEvent {
@@ -2897,7 +2897,7 @@ function sectionListConfig(p: SectionListProps): map[string]ListProp {
  * component that holds state; pure/controlled components may be called directly.
  *
  * ```chuks
- * Column({ gap: 10 }, [ Comp(Counter), Comp(function(): Node { return Card(id) }) ])
+ * Column({ gap: 10 }, [ Comp(Counter), Comp(() => Card(id)) ])
  * ```
  */
 export function Comp(render: any): Node {
@@ -2936,7 +2936,7 @@ export function KeyedComp(key: string, render: any): Node {
  *     override public render(): Node {
  *         var c = useState(this.start)
  *         var n: int = c.get()
- *         return Button({ onPress: function(): void { c.set(c.get() + 1) } }, string(n))
+ *         return Button({ onPress: () => c.set(c.get() + 1) }, string(n))
  *     }
  * }
  * // placed directly, no wrapper: Column({}, [ new Counter(0), new Counter(0).key("b") ])
@@ -4355,7 +4355,7 @@ setRenderPost(function(fn: function(): void): void { ASYNC.post(fn) })
  * land in the same frame, or when a closure touches the reconciler directly.
  *
  * ```chuks
- * dispatchAsync(function(): void { items.set(list); count.set(list.length) })   // one frame
+ * dispatchAsync(() => { items.set(list); count.set(list.length) })   // one frame
  * ```
  */
 export function dispatchAsync(fn: function(): void): void { ASYNC.post(fn) }
@@ -5411,7 +5411,7 @@ var BACK_HANDLERS: []function(): bool = []
  * Register a handler for the system back gesture/button. Return true to consume it.
  *
  * ```chuks
- * onBackPress(function(): bool {
+ * onBackPress(() => {
  *     if (detailWalk() != null) { closeDetail(); return true }   // close the sheet
  *     return false                                               // let back go on
  * })
@@ -5456,7 +5456,7 @@ function runBackHandlers(): bool {
  * navigate("club", { id: c.id })                        // identity only
  * navigate("club", { id: c.id }, c)                     // + a head start
  *
- * routes["club"] = function(r: Route): Node {           // and on the other side
+ * routes["club"] = r => {           // and on the other side
  *     const seed: Club? = r.body                        // null after a reload
  *     const club: Club? = seed != null ? seed : clubById(r.str("id", ""))
  *     ...
@@ -5481,7 +5481,7 @@ export function navigate(name: string, params: (map[string]any)?, body: any?): v
  * this is identical to navigate().
  *
  * ```chuks
- * Button({ onPress: function(): void { navigateRoot("checkout", { id: cartId }, null) } }, "Check out")
+ * Button({ onPress: () => navigateRoot("checkout", { id: cartId }, null) }, "Check out")
  * ```
  */
 export function navigateRoot(name: string, params: (map[string]any)?, body: any?): void {
@@ -5497,8 +5497,8 @@ export function navigateRoot(name: string, params: (map[string]any)?, body: any?
  * survive a reload, body is an in-memory head start for the first frame.
  *
  * ```chuks
- * Button({ onPress: function(): void { navReplace("home") } }, "Log in")
- * Button({ onPress: function(): void { navReplace("club", { id: c.id }, c) } }, "Open")
+ * Button({ onPress: () => navReplace("home") }, "Log in")
+ * Button({ onPress: () => navReplace("club", { id: c.id }, c) }, "Open")
  * ```
  */
 export function navReplace(name: string, params: (map[string]any)?, body: any?): void {
@@ -5538,10 +5538,10 @@ export function navSwap(name: string, params: (map[string]any)?, body: any?): vo
  * nothing was handed back, and cleared once that route is popped in turn).
  *
  * ```chuks
- * Button({ onPress: function(): void { back() } }, "< Back")
- * Button({ onPress: function(): void { back(club.id) } }, "Use this club")
+ * Button({ onPress: () => back() }, "< Back")
+ * Button({ onPress: () => back(club.id) }, "Use this club")
  *
- * routes["home"] = function(r: Route): Node {           // the screen that pushed it
+ * routes["home"] = r => {           // the screen that pushed it
  *     const picked: string = r.result != null ? string(r.result) : ""
  *     ...
  * }
@@ -5563,7 +5563,7 @@ export function back(result: any?): void {
  * when no page of that name is stacked.
  *
  * ```chuks
- * Button({ onPress: function(): void { popTo("home", walk.id) } }, "Done")
+ * Button({ onPress: () => popTo("home", walk.id) }, "Done")
  * ```
  */
 export function popTo(name: string, result: any?): bool {
@@ -5582,7 +5582,7 @@ export function popTo(name: string, result: any?): bool {
  * a result is not delivered there); otherwise to the app's first page.
  *
  * ```chuks
- * Button({ onPress: function(): void { popToRoot(null) } }, "Start over")
+ * Button({ onPress: () => popToRoot(null) }, "Start over")
  * ```
  */
 export function popToRoot(result: any?): void {

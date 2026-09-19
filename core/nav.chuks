@@ -154,7 +154,7 @@ function tabStack(name: string): []Route {
  * call this from `onSelect` when the tapped index is already active.
  *
  * ```chuks
- * onSelect: function(i: int): void {
+ * onSelect: i => {
  *     if (i == active) { resetTabStack(tabs[i].name) } else { setActive(i) }
  * }
  * ```
@@ -409,7 +409,7 @@ export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
  *
  * ```chuks
  * var lastY: int = 0
- * List({ ..., onScroll: function(y: int): void {
+ * List({ ..., onScroll: y => {
  *     setTabBarHidden(y > lastY && y > 50)   // down and past the top: hide; up: show
  *     lastY = y
  * } })

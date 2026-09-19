@@ -377,8 +377,8 @@ export class Location {
      * ```chuks
      * const sub: NativeSub = Location.watchBackground(
      *     { title: "Recording your walk", body: "Tap to return to the app" },
-     *     function(fix: string): void { addPoint(fix) },
-     *     function(e: string): void { println(e) })
+     *     fix => addPoint(fix),
+     *     e => println(e))
      * // later, when the walk ends
      * sub.cancel()
      * ```
@@ -1094,7 +1094,7 @@ export class Background {
      * killed and its future background budget cut.
      *
      * ```chuks
-     * Background.define("sync", async function(): Task<bool> {
+     * Background.define("sync", async () => {
      *     const pending: []Item = unsynced()
      *     if (pending.length == 0) { return true }
      *     await uploadAll(pending)      // spawn and await both work here
@@ -1790,7 +1790,7 @@ export class Debug {
      * are looking for. Print it, or write it to a file when there is no console:
      *
      * ```chuks
-     * Debug.viewTree(function(t: string): void { println(t) })
+     * Debug.viewTree(t => println(t))
      * ```
      *
      * A debugging tool, not an API: the shape of a line may change, and reading it in

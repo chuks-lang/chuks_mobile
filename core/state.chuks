@@ -247,7 +247,7 @@ export class Cell<T> {
  * ```chuks
  * var count = useState(0)          // Cell<int> by inference
  * var n: int = count.get()         // typed, no cast
- * Button({ onPress: function(): void { count.set(count.get() + 1) } }, string(n))
+ * Button({ onPress: () => count.set(count.get() + 1) }, string(n))
  * ```
  */
 export function useState<T>(initial: T): Cell<T> {
@@ -361,9 +361,9 @@ function depsKeyOf(deps: []any): string {
  * unmounts. Pass `[]` for run-once-on-mount.
  *
  * ```chuks
- * useEffect(function(): any {
+ * useEffect(() => {
  *     var id = startTimer()
- *     return function(): void { stopTimer(id) }   // cleanup on unmount
+ *     return () => stopTimer(id)   // cleanup on unmount
  * }, [])
  * ```
  */
