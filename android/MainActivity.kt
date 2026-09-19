@@ -772,6 +772,13 @@ class MainActivity : Activity(), ChuksModuleHost {
                             "collapse" -> sheetAnimate(f[1], sl, 0)
                             "close" -> sheetAnimate(f[1], sl, -1)
                         }
+                    } else (views[f[1]] as? EditText)?.let { et ->
+                        // A text field's two commands: the keyboard into it, or away.
+                        val imm = getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
+                        when (f[2]) {
+                            "focus" -> { et.requestFocus(); imm?.showSoftInput(et, 0) }
+                            "blur" -> { et.clearFocus(); imm?.hideSoftInputFromWindow(et.windowToken, 0) }
+                        }
                     }
                 }
                 "I" -> if (f.size >= 4) insert(f[1], f[2], f[3].toIntOrNull() ?: 0)
@@ -3213,7 +3220,10 @@ class MainActivity : Activity(), ChuksModuleHost {
         gradColors.remove(id); gradAngle.remove(id); gradStops.remove(id)   // linear gradient
         glassIds.remove(id)                                // glass frosted panel
         pressOpacity.remove(id); longDelayMs.remove(id)    // Pressable active-alpha / long-press
-        if (!modalIds.contains(id)) v.visibility = View.VISIBLE   // hidden/mvis (modal drives its own)
+        // hidden/mvis. A modal drives its own; so does a Sheet: shown here before its index
+        // arrived, a sheet mounted already open (a restore after a reload) skipped the
+        // "opening from closed" placement and animated from a view that had no size yet.
+        if (!modalIds.contains(id) && !sheetIds.contains(id)) v.visibility = View.VISIBLE
         (v as? ImageView)?.let { it.clearColorFilter(); it.scaleType = ImageView.ScaleType.CENTER_CROP }   // tint/filt/rmode
         imageTint.remove(id); imageBlur.remove(id)         // Image tint/blur (pixels re-driven on load/recycle)
         // Option A: close the Android-only reset gaps the coverage guard tracked

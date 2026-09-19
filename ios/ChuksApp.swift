@@ -3661,6 +3661,13 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     case "close": sheetAnimate(f[1], sv, to: -1)
                     default: break
                     }
+                } else if let tf = views[f[1]], tf is UITextField || tf is UITextView {
+                    // A text field's two commands: the keyboard into it, or away.
+                    switch f[2] {
+                    case "focus": tf.becomeFirstResponder()
+                    case "blur": tf.resignFirstResponder()
+                    default: break
+                    }
                 }
             case "I" where f.count >= 4: insert(f[1], parent: f[2], index: Int(f[3]) ?? 0)
             case "R" where f.count >= 2: remove(f[1])
@@ -5888,7 +5895,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         // where `anim` is known, so a reset never fights an in-flight animation.)
         if v.layer.zPosition != 0 { v.layer.zPosition = 0; if let pv = v.superview { zResort.insert(ObjectIdentifier(pv)); zResortViews[ObjectIdentifier(pv)] = pv } }   // z (a reused node re-sorts its siblings)
         v.layer.shadowRadius = 0; v.layer.shadowOffset = .zero       // shadow (opacity already 0 above)
-        if !modalIds.contains(id) { v.isHidden = false }             // hidden/mvis (modal drives its own)
+        if !modalIds.contains(id) && !sheetIds.contains(id) { v.isHidden = false }   // hidden/mvis (a modal and a sheet drive their own)
         disabledIds.remove(id)                                       // dis: interaction gate + alpha
         if a11yIds.contains(id) { resetA11y(id, v) }                 // al/ah/ar/as/ax/av
         pressOpacity[id] = nil; pressLongDelay[id] = nil             // Pressable active-alpha / long-press

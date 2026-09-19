@@ -11,8 +11,10 @@
 import { Node, Column, Row, Text, Scroll, Gesture, Comp, Reconciler, SharedValue } from "../core/ui.chuks";
 import { useSharedValue, interpolate, clamp, add, sub, mul, neg, minOf, maxOf, absOf, num } from "../core/motion.chuks";
 import { hookSweep, runEffects, hookBegin, serializeCells, restoreCells } from "../core/state.chuks";
+import { Animated, useAnimated } from "../core/animated.chuks";
 
 var PASS: int = 0
+var ANIM: Animated? = null
 var FAIL: int = 0
 function check(cond: bool, name: string): void {
     if (cond) { PASS = PASS + 1; println("  ok   " + name) }
@@ -143,6 +145,38 @@ function main(): void {
     check(RESTORED != null && RESTORED.id != firstId, "after a restore the component holds a fresh value (id " + string(RESTORED != null ? RESTORED.id : -1) + " vs " + string(firstId) + ")")
     check(lines(restoredOut, "MV|").length == 1, "and the new host is told to create it")
     check(restoredOut.indexOf("mo=") >= 0 || restoredOut.indexOf("tx") >= 0, "and the binding names it: " + restoredOut.split("\n").join(" / "))
+
+    // useAnimated holds its value the same way: the cell carries an id, the object lives
+    // in this process. An Animated restored from JSON was a map, and its first `.timing()`
+    // was a call on a non-function.
+    // The screen above leaves first: a component is its path, and a different one placed
+    // at the same path would inherit its cells and effects.
+    hookBegin(); r3.renderRoot(Column({}, [ Text({}, "gone") ])); runEffects(); hookSweep(); r3.drain()
+    const r4: Reconciler = new Reconciler()
+    const animScreen: Node = Column({}, [ Comp(function(): Node {
+        const a: Animated = useAnimated(5)
+        ANIM = a
+        return Row({ opacity: a.value() }, [ Text({}, "fade") ])
+    }) ])
+    hookBegin(); r4.renderRoot(animScreen); runEffects(); hookSweep(); r4.drain()
+    const firstAnim: Animated? = ANIM
+    if (firstAnim != null) { firstAnim.setValue(40) }
+    hookBegin(); r4.renderRoot(animScreen); runEffects(); hookSweep(); r4.drain()
+    check(ANIM != null && ANIM == firstAnim && (ANIM != null ? ANIM.value() : -1) == 40, "useAnimated returns the same object every render")
+    const animSaved: string = serializeCells()
+    check(animSaved.indexOf("\"cur\"") < 0 && animSaved.indexOf("\"ez\"") < 0, "and the snapshot holds its id, not the object")
+    hookBegin(); r4.renderRoot(Column({}, [ Text({}, "gone") ])); runEffects(); hookSweep(); r4.drain()
+    restoreCells(animSaved)
+    const r5: Reconciler = new Reconciler()
+    hookBegin(); r5.renderRoot(Column({}, [ Comp(function(): Node {
+        const a: Animated = useAnimated(5)
+        ANIM = a
+        return Row({ opacity: a.value() }, [ Text({}, "fade") ])
+    }) ])); runEffects(); hookSweep(); r5.drain()
+    const back: Animated? = ANIM
+    check(back != null && back != firstAnim && back.value() == 5, "after a restore the component holds a fresh value at its initial")
+    if (back != null) { back.timing(80, 100, "") }
+    check(back != null && back.dur() == 100, "and it answers as an Animated")
 
     println("")
     println("motion: " + string(PASS) + " passed, " + string(FAIL) + " failed")

@@ -25,7 +25,7 @@
 // rotate degrees). Color interpolation is not covered (the host tweens numbers, not
 // hex); cross-fade with opacity instead.
 
-import { useState, Cell } from "./state.chuks";
+import { useState, useEffect, Cell } from "./state.chuks";
 import { dispatchAsync, setFrameStepper } from "./ui.chuks";
 import { host } from "std/host";
 import { time } from "std/time";
@@ -300,6 +300,12 @@ export class AnimatedColor {
     }
 }
 
+// The values alive in this process, by id. The cell holds only the id, for the reason
+// useViewRef's does: a cell is serialised across a hot reload and a background stay,
+// and an object restored from that is a map, not an Animated (its first `.to()` was a
+// call on a non-function). A value from a previous process starts over at `initial`.
+var _liveAnims: map[int]Animated = {}
+var _nextAnimId: int = 0
 /**
  * Declare an animated value that persists across renders (like useRef(new
  * Animated.Value())). Identity comes from the component's position in the tree, so
@@ -308,8 +314,19 @@ export class AnimatedColor {
  *   const fade = useAnimated(0)
  */
 export function useAnimated(initial: int): Animated {
-    const c: Cell<Animated> = useState(new Animated(initial))
-    return c.get()
+    const cell: Cell<int> = useState(0)
+    var mine: int = cell.get()
+    const have: Animated? = mine > 0 ? _liveAnims.get(mine) : null
+    const held: Animated = have != null ? have : new Animated(initial)
+    if (have == null) {
+        _nextAnimId = _nextAnimId + 1
+        mine = _nextAnimId
+        _liveAnims[mine] = held
+        cell.set(mine)
+    }
+    // Every render, like the useState above: hooks are positional.
+    useEffect(function(): any { return function(): void { _liveAnims.delete(mine) } }, [])
+    return held
 }
 
 // ---- Composition: sequence / parallel / loop ------------------------------

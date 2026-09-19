@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, Cell, onRender, onRenderThread, setRenderPost } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, useEffect, Cell, onRender, onRenderThread, setRenderPost } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
@@ -1321,6 +1321,11 @@ dataType WebViewProps { ViewProps; url: string? }
 // The app owns the handle and hands it to the view; the reconciler writes that node's
 // id into it as it mounts. So a command reaches THAT instance and not the last one
 // rendered, for the same reason an event binding is per node.
+// Handles holding a command back until the render that is due has run (see
+// ViewRef.command). Drained at the end of renderRoot. Declared before the class, so
+// typed as any.
+var _refsWithCommands: []any = []
+var _inRender: bool = false
 export class ViewRef {
     var id: string
     // The reconciler that bound this handle, so a command goes out on the same stream as
@@ -1350,6 +1355,16 @@ export class ViewRef {
             if (this.queued.length < 8) { this.queued.push(name + "\t" + payload) }
             return
         }
+        // A render is due (the handler that issued this also wrote state). The view
+        // may not sit where it does now once that render has run: a row inserted
+        // above it gives it a new id, and a command sent now would reach a view the
+        // same frame then removes. It goes out after the render, on the id the view
+        // has then. `reply.set(rt); input.command("focus")` is the canonical case.
+        if (isDirty()) {
+            if (this.queued.length < 8) { this.queued.push(name + "\t" + payload) }
+            _refsWithCommands.push(this)
+            return
+        }
         const r: Reconciler = this.recon
         r.emit("VC|" + this.id + "|" + name + "|" + payload)
     }
@@ -1365,6 +1380,16 @@ export class ViewRef {
         this.id = nodeId
         this.recon = r
         if (this.queued.length == 0) { return }
+        // Bound in the middle of a render: the view's own create and insert lines are
+        // still being written, so the command waits for the end of the pass.
+        if (_inRender) { _refsWithCommands.push(this); return }
+        this.flushQueued()
+    }
+    // Whatever was queued goes out now, to the view the handle is bound to.
+    flushQueued(): void {
+        if (this.queued.length == 0 || this.id == "" || this.recon == null) { return }
+        const nodeId: string = this.id
+        const r: any = this.recon
         const q: []string = this.queued
         this.queued = []
         const rc: Reconciler = r
@@ -1381,6 +1406,15 @@ export class ViewRef {
     unbind(nodeId: string): void { if (this.id == nodeId) { this.id = ""; this.recon = null } }
 }
 
+// The handles alive in this process, by id. The cell holds only the id: cells are
+// serialised on a hot reload and when the app goes to the background, and a handle is
+// not data. Once bound it holds the reconciler, and writing that as JSON walks the
+// whole tree back into the handle, forever (the process died of it); and what came
+// back from the snapshot was a map, so the first command on it was a call on a
+// non-function. An id from a previous process names nothing here, so the component
+// gets a fresh handle, bound again by its view's next mount.
+var _liveRefs: map[int]ViewRef = {}
+var _nextRefId: int = 0
 /**
  * A `ViewRef` that survives re-renders, like `useState`. Declare it in the component
  * that renders the view, pass it as the view's `ref` prop, and call commands on it from
@@ -1394,8 +1428,19 @@ export class ViewRef {
  * ```
  */
 export function useViewRef(): ViewRef {
-    const c: Cell<ViewRef> = useState(new ViewRef())
-    return c.get()
+    const cell: Cell<int> = useState(0)
+    var mine: int = cell.get()
+    const have: ViewRef? = mine > 0 ? _liveRefs.get(mine) : null
+    const held: ViewRef = have != null ? have : new ViewRef()
+    if (have == null) {
+        _nextRefId = _nextRefId + 1
+        mine = _nextRefId
+        _liveRefs[mine] = held
+        cell.set(mine)
+    }
+    // Every render, like the useState above: hooks are positional.
+    useEffect(function(): any { return function(): void { _liveRefs.delete(mine) } }, [])
+    return held
 }
 
 /**
@@ -1589,6 +1634,16 @@ dataType TextInputProps {
  * TextInput({ value: draft.get(), keyboardType: "email", returnKeyType: "send",
  *             onChange: function(v: string): void { draft.set(v) },
  *             onSubmit: function(): void { send() } })
+ * ```
+ *
+ * A field takes two commands through a `useViewRef()` handle passed as `ref`: `focus`
+ * raises the keyboard into it, `blur` dismisses it. A "Reply" button that should put
+ * the cursor in the composer is `input.command("focus")`.
+ *
+ * ```chuks
+ * const input: ViewRef = useViewRef()
+ * TextInput({ ref: input, placeholder: "Write a reply" })
+ * Button({ onPress: function(): void { input.command("focus") } }, "Reply")
  * ```
  */
 export function TextInput(p: TextInputProps): Node {
@@ -2978,6 +3033,7 @@ export class Reconciler {
     // Reconcile the whole app tree from the root; the app calls this after any
     // state change and the memoization makes everything unchanged bail.
     public renderRoot(next: Node): void {
+        _inRender = true
         // Value ops queued during the render (a new shared value, a set) go out ahead of
         // the diff, so a style line that names a value never reaches the host first.
         if (_hostOps.length > 0) { for (var l of _hostOps) { this.lines.push(l) }; _hostOps = [] }
@@ -3016,6 +3072,14 @@ export class Reconciler {
             for (var op of _hostOps) { merged.push(op) }
             for (var j: int = frameStart; j < this.lines.length; j = j + 1) { merged.push(this.lines[j]) }
             this.lines = merged; _hostOps = []
+        }
+        _inRender = false
+        // Commands held back for this render (ViewRef.command while a render was due)
+        // go out now, after the diff, on the ids the views have after it.
+        if (_refsWithCommands.length > 0) {
+            const held: []any = _refsWithCommands
+            _refsWithCommands = []
+            for (var h of held) { const rf: ViewRef = h; rf.flushQueued() }
         }
     }
     // The navigator names the screen on top (its container's node id); "" means no

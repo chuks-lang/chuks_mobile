@@ -4,7 +4,10 @@
 // the wrong instance, or one issued before the view existed and silently dropped. Node
 // ids here are structural paths, which makes both easy to get wrong, so each is asserted
 // against the mutation stream rather than against a screenshot.
-import { Node, Column, Text, ViewRef, nativeView } from "../core/ui.chuks";
+import { Node, Column, Text, Pressable, ViewRef, nativeView, useViewRef, Comp, TextInput } from "../core/ui.chuks";
+import { useState, Cell } from "../core/state.chuks";
+import { serializeCells, restoreCells } from "../core/state.chuks";
+import { json } from "std/json";
 import { render, Screen } from "../core/testing.chuks";
 
 var PASS: int = 0
@@ -47,6 +50,12 @@ function screen(): Node {
         nativeView("test.thing", { n: 1 }, {}, [], null, WITH_REF ? A : null),
         nativeView("test.thing", { n: 2 }, {}, [], null, B),
     ])
+}
+
+var HELD: ViewRef = new ViewRef()
+function Held(): Node {
+    HELD = useViewRef()
+    return nativeView("test.thing", { n: 3 }, {}, [], null, HELD)
 }
 
 function main(): void {
@@ -95,6 +104,79 @@ function main(): void {
     A.command("late", {})
     s.frame()
     check(countWith(s, "VC|") == 0, "and a command on the released handle reaches nothing")
+
+    // A handle held by useViewRef lives across renders but is not data: the cell it sits
+    // in is serialised on a hot reload and a background stay. Once bound, the handle holds
+    // the reconciler, and writing THAT as JSON walked the whole tree back into the handle
+    // without end (the app died of it); what came back was a map, and the first command
+    // on it was a call on a non-function.
+    const held: Screen = render(function(): Node { return Comp(Held) })
+    held.frame()
+    var snap: string = ""
+    var threw: string = ""
+    try { snap = serializeCells() } catch (e: any) { threw = string(e) }
+    check(threw == "", "a bound handle in a cell serialises (" + threw + ")")
+    check(!has(snap, "recon") && !has(snap, "queued"), "and the cell holds an id, not the handle")
+    const before: int = countWith(held, "VC|")
+    held.frame()
+    HELD.command("still", {})
+    held.frame()
+    check(before == 0 && countWith(held, "VC|") == 1, "the same handle is returned every render")
+    // Restored into a process where that id names nothing (the next launch): the component
+    // gets a fresh handle, bound by its view's next mount, and commands work.
+    const cells: map[string]any = json.parse(snap)
+    const ks: []string = cells.keys()
+    var i2: int = 0
+    while (i2 < ks.length) { if (cells[ks[i2]] == 1 || cells[ks[i2]] == 2) { cells[ks[i2]] = 999 }; i2 = i2 + 1 }
+    restoreCells(json.stringify(cells))
+    const old: ViewRef = HELD
+    const again: Screen = render(function(): Node { return Comp(Held) })
+    again.frame()
+    check(HELD != old && HELD.attached(), "an id from another process yields a fresh, bound handle")
+    HELD.command("after", {})
+    again.frame()
+    check(countWith(again, "VC|") == 1, "and a command on it reaches the view")
+
+    // A framework view takes a ref too: a TextInput's `focus` goes out as a command on
+    // the field's own id, which is how a Reply button puts the cursor in the composer.
+    const field: ViewRef = new ViewRef()
+    const fs: Screen = render(function(): Node { return Column({}, [ Text({}, "top"), TextInput({ ref: field, placeholder: "Write a reply" }) ]) })
+    check(field.attached(), "a TextInput binds its ref")
+    field.command("focus")
+    fs.frame()
+    const fl: string = lineWith(fs, "VC|")
+    check(has(fl, "|focus|") && has(fl, field.id), "and focus is a command on the field's id (" + fl + ")")
+
+    // A handler that writes state AND commands the handle: the render it caused may move
+    // the view (a "Replying to" row appears above the composer, so the field's id
+    // changes). The command must reach the field where the render put it, after the
+    // insert, not the id it had before, which that same frame removes.
+    var REPLY_FIELD: ViewRef = new ViewRef()
+    const rs: Screen = render(function(): Node { return Comp(function(): Node {
+        const replying: Cell<bool> = useState(false)
+        const input: ViewRef = useViewRef()
+        REPLY_FIELD = input
+        var rows: []Node = [ Pressable({ onPress: function(): void { replying.set(true); input.command("focus") } }, [ Text({}, "Reply") ]) ]
+        if (replying.get()) { rows.push(Text({}, "Replying to Ada")) }
+        rows.push(TextInput({ ref: input, placeholder: "Write a reply" }))
+        return Column({}, rows)
+    }) })
+    const idBefore: string = REPLY_FIELD.id
+    check(rs.press("Reply"), "the reply button is pressable")
+    const idAfter: string = REPLY_FIELD.id
+    check(idAfter != idBefore && rs.has("Replying to Ada"), "the render moved the field (" + idBefore + " -> " + idAfter + ")")
+    const cmd: string = lineWith(rs, "VC|")
+    check(has(cmd, idAfter + "|focus|"), "and the command names the field's new id (" + cmd + ")")
+    const ls2: []string = rs.lines
+    var cmdAt: int = -1
+    var insertAt: int = -1
+    var k: int = 0
+    while (k < ls2.length) {
+        if (ls2[k].startsWith("VC|")) { cmdAt = k }
+        if (ls2[k].startsWith("I|" + idAfter + "|")) { insertAt = k }
+        k = k + 1
+    }
+    check(cmdAt > insertAt && insertAt >= 0, "and it goes out after the field is in place (insert " + string(insertAt) + ", command " + string(cmdAt) + ")")
 
     println("")
     println(string(PASS) + " passed, " + string(FAIL) + " failed")
