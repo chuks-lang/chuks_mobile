@@ -235,6 +235,7 @@ export class Cell<T> {
             onRender(function(): void { cell.set(v) })
             return
         }
+        cellHoldsData(this.k, v)
         if (_cells.setIfPresent(this.k, v)) { markDirtyCell(this.k) }
     }
 }
@@ -254,8 +255,23 @@ export function useState<T>(initial: T): Cell<T> {
     var k: string = _path + "#" + string(_slot)
     _slot = _slot + 1
     _seen[k] = true; _touched.push("c:" + k)
+    cellHoldsData(k, initial)
     _cells.seed(k, initial)
     return new Cell<T>(k)
+}
+
+// A cell is a JSON boundary: its value rides the hot-reload and restoration
+// snapshot as JSON, so a class instance comes back as a plain map with no
+// methods, and the app fails an hour later with "calling non-function" in a
+// place that did nothing wrong. Data (numbers, strings, records, lists, maps) is
+// fine. Said once per cell, the moment the instance goes in, through the dev
+// warning channel ui.chuks installs (state.chuks cannot import ui.chuks).
+var _warn: any = null
+export function setStateWarner(f: function(key: string, message: string): void): void { _warn = f }
+function cellHoldsData(k: string, v: any): void {
+    if (_warn == null || typeof(v) != "object") { return }
+    const w: any = _warn
+    w("cellobject:" + k, "useState at " + k + " holds a class instance. A cell is saved as JSON across a hot reload and a restore, so the instance comes back as a plain record with no methods. Keep an id or a record in the cell and the object in a module-level map, or make it a dataType.")
 }
 
 /**
@@ -303,6 +319,31 @@ function isParked(key: string): bool {
         if (key.length >= p.length && key.slice(0, p.length) == p) { return true }
     }
     return false
+}
+
+// Framework-internal: a component at `path` (hooks keyed `path#N` / `path!N`) is
+// being replaced by another one in the same position, whose children live under
+// `id.`. Its cells are dropped and its effects cleaned up now, the way the sweep
+// does for an unmounted component, so the replacement starts fresh instead of
+// reading the slots the old one filled.
+export function hookForget(path: string, id: string): void {
+    const owned: function(k: string): bool = k => {
+        if (k.length > path.length && k.slice(0, path.length + 1) == path + "#") { return true }
+        if (k.length > path.length && k.slice(0, path.length + 1) == path + "!") { return true }
+        return k.length > id.length && k.slice(0, id.length + 1) == id + "."
+    }
+    var live: map[string]any = {}
+    const ks: []string = _cells.keys()
+    for (var i: int = 0; i < ks.length; i = i + 1) { if (!owned(ks[i])) { live[ks[i]] = _cells.get(ks[i]) } }
+    _cells.replace(live)
+    var liveFx: map[string]Effect = {}
+    const fks: []string = _effects.keys()
+    for (var j: int = 0; j < fks.length; j = j + 1) {
+        const ev: Effect? = _effects.get(fks[j])
+        if (ev == null) { continue }
+        if (owned(fks[j])) { if (ev.cleanup != null) { const c: any = ev.cleanup; c() } } else { liveFx[fks[j]] = ev }
+    }
+    _effects = liveFx
 }
 
 // Framework-internal: begin a render pass (clear the visited sets + effect queue).

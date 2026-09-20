@@ -1,0 +1,104 @@
+// `Comp(fn, props)` is an element: the component and its props, and the framework
+// remembers which component sits at a position. Put a DIFFERENT component there
+// (`loading ? Comp(Skeleton, {}) : Comp(Card, { id })`) and the old one unmounts,
+// cells and effects included, and the new one starts fresh, instead of reading the
+// old one's cells because the hook slots line up. `Comp(() => ...)` is a thunk with
+// no identity, so it keeps the position's state, as before.
+//
+// Run:  chuks run tests/element_test.chuks   (exits non-zero on failure)
+import { Node, Column, Text, Pressable, Comp, devWarnings, devWarnCount } from "../core/ui.chuks";
+import { useState, useEffect, Cell } from "../core/state.chuks";
+import { render, Screen } from "../core/testing.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+
+dataType CardProps { id: string }
+var CLEANED: []string = []
+
+// A keeps a counter in its first cell; B keeps a label in ITS first cell. Same slot.
+function A(p: CardProps): Node {
+    const n: Cell<int> = useState(0)
+    useEffect(() => { return () => { CLEANED.push("A") } }, [])
+    return Pressable({ onPress: () => n.set(n.get() + 1) }, [ Text({ size: 12 }, "A" + p.id + "=" + string(n.get())) ])
+}
+function B(p: CardProps): Node {
+    const label: Cell<string> = useState("fresh")
+    return Text({ size: 12 }, "B" + p.id + "=" + label.get())
+}
+// The same two, as thunks.
+function At(): Node { const n: Cell<int> = useState(0); return Pressable({ onPress: () => n.set(n.get() + 1) }, [ Text({ size: 12 }, "At=" + string(n.get())) ]) }
+function Bt(): Node { const label: Cell<string> = useState("fresh"); return Text({ size: 12 }, "Bt=" + label.get()) }
+
+var WHICH: string = "A"
+
+class Ticket { var n: int; constructor() { this.n = 1 } }
+dataType Rec { n: int }
+function Holder(): Node {
+    const bad: Cell<any> = useState(new Ticket())
+    const rec: Cell<Rec> = useState({ n: 1 })
+    const list: Cell<[]int> = useState([1, 2])
+    const s: Cell<string> = useState("s")
+    bad.set(new Ticket())
+    return Text({}, string(rec.get().n) + string(list.get().length) + s.get())
+}
+
+function main(): void {
+    println("element_test")
+
+    // ---- elements: a swap starts fresh ----
+    WHICH = "A"
+    const s: Screen = render(() => Column({}, [ WHICH == "A" ? Comp(A, { id: "1" }) : Comp(B, { id: "1" }) ]))
+    check(s.has("A1=0"), "A renders with its own state")
+    s.press("A1=0"); s.frame()
+    check(s.has("A1=1"), "a press advances A's counter")
+    WHICH = "B"; s.frame()
+    check(s.has("B1=fresh"), "B in the same position starts with ITS initial value, not A's counter")
+    check(!s.has("A1=1"), "A is gone")
+    check(CLEANED.length == 1 && CLEANED[0] == "A", "A's effect cleanup ran when it was replaced")
+    WHICH = "A"; s.frame()
+    check(s.has("A1=0"), "A back in the position starts fresh too")
+
+    // ---- the same component with new props keeps its state ----
+    var ID: string = "1"
+    // Each screen below puts its component at a different position: the harness has one
+    // cell store, and two screens' components at the same path would share cells.
+    const t: Screen = render(() => Column({}, [ Text({}, "t"), Comp(A, { id: ID }) ]))
+    t.press("A1=0"); t.frame()
+    check(t.has("A1=1"), "A counts")
+    ID = "2"; t.frame()
+    check(t.has("A2=1"), "new props on the same component keep its state")
+
+    // ---- a thunk on one side, an element on the other: a swap ----
+    WHICH = "A"
+    const v: Screen = render(() => Column({}, [ Text({}, "v"), Text({}, "v"), WHICH == "A" ? Comp(At) : Comp(B, { id: "3" }) ]))
+    v.press("At=0"); v.frame()
+    check(v.has("At=1"), "the thunk counts")
+    WHICH = "B"; v.frame()
+    check(v.has("B3=fresh"), "an element replacing a thunk starts fresh")
+
+    // ---- thunks have no identity: documented, unchanged ----
+    WHICH = "A"
+    const u: Screen = render(() => Column({}, [ Text({}, "u"), Text({}, "u"), Text({}, "u"), WHICH == "A" ? Comp(At) : Comp(Bt) ]))
+    u.press("At=0"); u.frame()
+    check(u.has("At=1"), "the thunk form counts")
+    WHICH = "B"; u.frame()
+    check(!u.has("Bt=fresh"), "a thunk swap keeps the position's cell (the documented limit of the thunk form)")
+
+    // ---- a cell holds data, not a class instance ----
+    const before: int = devWarnings().length
+    const w: Screen = render(() => Column({}, [ Text({}, "w"), Text({}, "w"), Text({}, "w"), Text({}, "w"), Comp(Holder) ]))
+    w.frame(); w.frame()
+    const after: []string = devWarnings()
+    check(after.length == before + 1 && after[after.length - 1].contains("holds a class instance"), "a class instance in a cell is reported, once")
+    check(after.length == before + 1, "a record, a list and a string in cells are not")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "element_test failed" }
+}
+main()

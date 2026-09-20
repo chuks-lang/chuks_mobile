@@ -8,7 +8,7 @@
 // Reconciler instance the app owns, so nothing crosses the import boundary as
 // shared mutable state.
 
-import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, useEffect, Cell, onRender, onRenderThread, setRenderPost } from "./state.chuks";
+import { hookEnter, hookBegin, hookSweep, hookPark, hookTouched, hookRetain, hookForget, passRuns, runEffects, serializeCells, restoreCells, isDirty, markDirty, useState, useEffect, Cell, onRender, onRenderThread, setRenderPost, setStateWarner } from "./state.chuks";
 import { setPlatformInfo } from "./platform.chuks";   // the single Platform.OS store (isAndroid/select read it)
 import { takeAppearance } from "./appearance.chuks";
 import { host } from "std/host";
@@ -378,7 +378,9 @@ export class Node {
     var onChange: any    // signatures fit one field (see the Prop union below)
     var data: map[string]ListProp   // List config (count/key/item/rowHeight/gap)
     var kids: []Node
-    var comp: any        // kind=="Comp": the component render fn () -> Node (lazy)
+    var comp: any        // kind=="Comp": the component render fn () -> Node (lazy), or the component fn when compProps is set
+    var compProps: any   // kind=="Comp": the props `Comp(fn, props)` was given; null for the thunk form `Comp(() => ...)`
+    var isElement: bool  // kind=="Comp": built as `Comp(fn, props)`, so `comp` is a component with an identity to compare
     var produced: Node?  // kind=="Comp": last node the component produced (for diffing)
     var hookKeys: []string   // kind=="Comp": the cells and effects its last run touched (kept alive when it is skipped)
     var ckey: string     // explicit identity key (.key(...)); "" = identify by position
@@ -426,7 +428,7 @@ export class Node {
     constructor(kind: string, style: Style, text: string, kids: []Node) {
         this.kind = kind; this.style = style; this.text = text
         this.action = ""; this.onPress = null; this.onChange = null; this.data = {}; this.kids = kids
-        this.comp = null; this.produced = null; this.ckey = ""; var hk: []string = []; this.hookKeys = hk
+        this.comp = null; this.compProps = null; this.isElement = false; this.produced = null; this.ckey = ""; var hk: []string = []; this.hookKeys = hk
         this.ctxTop = 0; this.ctxOverlay = 0
         this.hasVal = false; this.val = ""; this.onSubmit = null; this.onFocus = null; this.onBlur = null
         this.onLongPress = null; this.onPressIn = null; this.onPressOut = null
@@ -441,7 +443,10 @@ export class Node {
     // Produce this node's rendered subtree. A host node is its own output; a
     // Comp(fn) node runs its closure; a class Component subclass overrides this.
     // The reconciler calls render() only for kind=="Comp" nodes.
-    public render(): Node { if (this.comp != null) { const f: any = this.comp; return f() } return this }
+    public render(): Node {
+        if (this.comp != null) { const f: any = this.comp; if (this.isElement) { return f(this.compProps) } return f() }
+        return this
+    }
 }
 
 // ---- Node constructors (INTERNAL primitives; the named-prop builders below
@@ -1088,7 +1093,9 @@ export function Row(first: ViewProps | []Kid, kids: []Kid = []): Node {
     applyLayoutV(s, p); const n: Node = mkView(s, flatKids(kids)); applyEventsV(n, p); return n
 }
 /**
- * A vertical column (flex-direction: col): lays its children top-to-bottom.
+ * A vertical column (flex-direction: col): lays its children top-to-bottom,
+ * starting at the top. `justify: "center"` centers them in the column's height,
+ * `justify: "end"` packs them at the bottom, `justify: "between"` spreads them.
  *
  * Props: `gap`, `pad`, `align`, `justify`, `bg`, `radius`, `grow`, `onPress`.
  *
@@ -1100,7 +1107,7 @@ export function Row(first: ViewProps | []Kid, kids: []Kid = []): Node {
  * ```
  */
 export function Column(first: ViewProps | []Kid, kids: []Kid = []): Node {
-    const s: Style = new Style(); s.dir = "col"; s.just = "center"
+    const s: Style = new Style(); s.dir = "col"   // children start at the top, as in a Row they start at the left
     // props-or-content (see Row): `Column([...])` or `Column({...}, [...])`.
     if (typeof(first) == "array") { const c: []Kid = first; return mkView(s, flatKids(c)) }
     const p: ViewProps = first  // narrowed to the dataType arm
@@ -2891,18 +2898,27 @@ function sectionListConfig(p: SectionListProps): map[string]ListProp {
 }
 
 /**
- * Place a component LAZILY. `render` is a () -> Node closure the framework calls
- * top-down, at the component's position, so the component knows its identity when
- * it runs -- which is what makes `useState()` work with no key. Use `Comp` for any
- * component that holds state; pure/controlled components may be called directly.
+ * Place a component LAZILY: the framework calls it top-down, at the component's
+ * position, so the component knows its identity when it runs, which is what makes
+ * `useState()` work with no key. Use `Comp` for any component that holds state;
+ * pure/controlled components may be called directly.
+ *
+ * Two forms. `Comp(Card, { id: 1 })` is an element: the component and its props,
+ * the way a JSX element is a type and its props. The framework remembers which
+ * component sits at the position, so when a render puts a DIFFERENT component
+ * there (`loading ? Comp(Skeleton, {}) : Comp(Card, { id })`) the old one
+ * unmounts and the new one starts with fresh state, instead of reading the old
+ * one's cells. `Comp(() => Card(id))` is a thunk: it works, but a closure has no
+ * identity, so a swap at the same position keeps the position's state.
  *
  * ```chuks
- * Column({ gap: 10 }, [ Comp(Counter), Comp(() => Card(id)) ])
+ * Column({ gap: 10 }, [ Comp(Counter), Comp(Card, { id: 1 }) ])
  * ```
  */
-export function Comp(render: any): Node {
+export function Comp<P>(render: function(p: P): Node | function(): Node, props: P? = null): Node {
     const n: Node = new Node("Comp", new Style(), "", [])
     n.comp = render; n.ctxTop = _consumedTop; n.ctxOverlay = _overlayBottom
+    if (props != null) { n.compProps = props; n.isElement = true }
     return n
 }
 /**
@@ -2910,15 +2926,19 @@ export function Comp(render: any): Node {
  * stateful children (prefer `List` for dynamic collections -- its rows are already
  * keyed). The key makes a child's state follow the item, not the slot.
  *
+ * Takes the same two forms as `Comp`: `KeyedComp(key, ItemRow, { item: items[i] })`
+ * is an element with an identity, `KeyedComp(key, () => rowFor(items[i]))` a thunk.
+ *
  * ```chuks
  * for (var i = 0; i < items.length; i = i + 1) {
- *     kids.push(KeyedComp("item:" + string(items[i].id), rowFor(items[i])))
+ *     kids.push(KeyedComp("item:" + string(items[i].id), ItemRow, { item: items[i] }))
  * }
  * ```
  */
-export function KeyedComp(key: string, render: any): Node {
+export function KeyedComp<P>(key: string, render: function(p: P): Node | function(): Node, props: P? = null): Node {
     const n: Node = new Node("Comp", new Style(), "", [])
     n.comp = render; n.ckey = key; n.ctxTop = _consumedTop; n.ctxOverlay = _overlayBottom
+    if (props != null) { n.compProps = props; n.isElement = true }
     return n
 }
 
@@ -3452,6 +3472,19 @@ export class Reconciler {
                 return
             }
             if (p.kind != "Comp") { this.emit("R|" + id) }
+            // Another component in this position (`loading ? Comp(Skeleton) :
+            // Comp(Card, { id })`): the old one unmounts, cells and effects included,
+            // and the new one mounts fresh instead of reading the old one's state.
+            // An element carries its component's identity; a thunk is a new closure
+            // every render, so two thunks are taken for the same component (the
+            // documented limit of that form), while a thunk on one side and an
+            // element on the other are different by construction.
+            if (p.kind == "Comp" && (p.isElement || next.isElement) && (!(p.isElement && next.isElement) || p.comp != next.comp)) {
+                hookForget(path, id)
+                this.emit("R|" + id)
+                this.runComp(next, null, path, id, parent, index)
+                return
+            }
             this.runComp(next, p.kind == "Comp" ? p.produced : null, path, id, parent, index)
             return
         }
@@ -4344,6 +4377,7 @@ class AsyncQueue {
 var ASYNC: AsyncQueue = new AsyncQueue()
 // This queue is how state.chuks's onRender() reaches the render thread from a task.
 setRenderPost(function(fn: function(): void): void { ASYNC.post(fn) })
+setStateWarner((key, message) => devWarn(key, message))
 
 /**
  * Queue a closure to run on the render thread at the next host entry point, and wake
