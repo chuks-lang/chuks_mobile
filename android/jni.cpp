@@ -159,6 +159,13 @@ JNIEXPORT jstring JNICALL J(cmrLastError)(JNIEnv* e, jobject) {
     if (s) chuks_free_str(s);
     return r;
 }
+// The id of the compiler this engine embeds; the engine owns the buffer. Sent to
+// the dev server, which refuses source to an engine built with another compiler.
+extern "C" char* chuks_cmr_compiler_id();
+JNIEXPORT jstring JNICALL J(cmrCompilerId)(JNIEnv* e, jobject) {
+    const char* s = chuks_cmr_compiler_id();
+    return e->NewStringUTF(s ? s : "");
+}
 // Hot-reload state preservation: save before a reboot, restore into the fresh VM.
 extern "C" char* chuks_cmr_save_state();
 extern "C" void chuks_cmr_load_state(char* state);

@@ -3,3 +3,5 @@
 .chuks/android-out/
 # Installed Chuks packages (fetched via chuks install)
 chuks_packages/
+# chuks pack writes its glue beside the entry while it runs and removes it after
+app/__cmr_entry.chuks

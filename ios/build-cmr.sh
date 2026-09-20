@@ -13,6 +13,18 @@ PROJDIR="$(pwd)"
 APP_ENTRY="${CMR_APP_ENTRY:-$PROJDIR/app/app.chuks}"
 [ -f "$APP_ENTRY" ] || { echo "no app entry at $APP_ENTRY (needs to export createRoot)"; exit 1; }
 export CHUKS_NO_WARNINGS=1
+# The prebuilt engine names the compiler it embeds (cmr/COMPILER_ID, written by
+# tools/build-libcmr.sh). When the installed chuks is another compiler, the app
+# would typecheck here and fail on the device, or the two would disagree quietly;
+# say so now. Not fatal: a release of @chuks/mobile carries the engine its
+# compiler shipped with, and a mismatch there is an upgrade, not a bug.
+ENGINE_ID="$(cat "$PKGDIR/cmr/COMPILER_ID" 2>/dev/null || echo unknown)"
+CLI_ID="$(chuks --compiler-id 2>/dev/null || echo dev)"
+if [ "$ENGINE_ID" != "$CLI_ID" ]; then
+    echo "warning: the prebuilt engine was built with compiler $ENGINE_ID and the installed chuks is $CLI_ID." >&2
+    echo "         Hot reload will refuse to send source until they agree: upgrade @chuks/mobile to the" >&2
+    echo "         release matching this chuks, or on a framework checkout run tools/build-libcmr.sh." >&2
+fi
 
 # ---- app identity (same as build.sh) ----
 pj() { sed -n "s/.*\"$1\"[^\"]*\"\([^\"]*\)\".*/\1/p" "$PROJDIR/chuks.json" | head -1; }

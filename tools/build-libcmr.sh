@@ -15,6 +15,14 @@ PKGDIR="$(cd "$(dirname "$0")/.." && pwd)"
 CHUKS_REPO="${CHUKS_REPO:?set CHUKS_REPO to your chuks source checkout}"
 [ -d "$CHUKS_REPO/cmd/cmr" ] || { echo "CHUKS_REPO=$CHUKS_REPO has no cmd/cmr"; exit 1; }
 STRIP='-ldflags=-s -w'
+# The engine is stamped with the id of the compiler it embeds (the hash of the
+# language sources in the checkout, see chuks/pkg/buildinfo), and the id is kept
+# beside the prebuilts in cmr/COMPILER_ID. The dev server compares it with its own
+# on every request, and build-cmr.sh compares it with the installed chuks, so a
+# stale engine is named instead of producing type errors nobody wrote.
+COMPILER_ID="$(bash "$CHUKS_REPO/scripts/compiler_id.sh")"
+LDFLAGS="-s -w -X chuks/pkg/buildinfo.CompilerID=$COMPILER_ID"
+echo "== compiler id $COMPILER_ID =="
 
 echo "== iOS: libcmr.a (pure VM c-archive) =="
 SIM_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"; SIM_CLANG="$(xcrun --sdk iphonesimulator --find clang)"
@@ -23,12 +31,12 @@ mkdir -p "$PKGDIR/ios/cmr/sim" "$PKGDIR/ios/cmr/device"
 ( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
     CC="$SIM_CLANG -isysroot $SIM_SDK -target arm64-apple-ios15.0-simulator" \
     CGO_CFLAGS="-isysroot $SIM_SDK -target arm64-apple-ios15.0-simulator" \
-    go build -buildmode=c-archive -tags ios -ldflags="-s -w" -o "$PKGDIR/ios/cmr/sim/libcmr.a" ./cmd/cmr )
+    go build -buildmode=c-archive -tags ios -ldflags="$LDFLAGS" -o "$PKGDIR/ios/cmr/sim/libcmr.a" ./cmd/cmr )
 cp "$PKGDIR/ios/cmr/sim/libcmr.h" "$PKGDIR/ios/cmr/libcmr.h"; rm -f "$PKGDIR/ios/cmr/sim/libcmr.h"
 ( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
     CC="$DEV_CLANG -isysroot $DEV_SDK -target arm64-apple-ios15.0" \
     CGO_CFLAGS="-isysroot $DEV_SDK -target arm64-apple-ios15.0" \
-    go build -buildmode=c-archive -tags ios -ldflags="-s -w" -o "$PKGDIR/ios/cmr/device/libcmr.a" ./cmd/cmr )
+    go build -buildmode=c-archive -tags ios -ldflags="$LDFLAGS" -o "$PKGDIR/ios/cmr/device/libcmr.a" ./cmd/cmr )
 rm -f "$PKGDIR/ios/cmr/device/libcmr.h"
 echo "   sim $(du -h "$PKGDIR/ios/cmr/sim/libcmr.a" | cut -f1), device $(du -h "$PKGDIR/ios/cmr/device/libcmr.a" | cut -f1)"
 
@@ -46,9 +54,11 @@ android_abi() {
     mkdir -p "$PKGDIR/android/cmr/$ABI"
     ( cd "$CHUKS_REPO" && CGO_ENABLED=1 GOOS=android GOARCH="$GOARCH" \
         CC="$BIN/${PREFIX}-clang" CXX="$BIN/${PREFIX}-clang++" CGO_CXXFLAGS="-DCMR_BUILD" \
-        go build -buildmode=c-shared -ldflags="-s -w" -o "$PKGDIR/android/cmr/$ABI/libapp.so" ./cmd/cmr )
+        go build -buildmode=c-shared -ldflags="$LDFLAGS" -o "$PKGDIR/android/cmr/$ABI/libapp.so" ./cmd/cmr )
     echo "   $ABI $(du -h "$PKGDIR/android/cmr/$ABI/libapp.so" | cut -f1)"
 }
 android_abi arm64-v8a arm64 aarch64-linux-android24 android/yoga
 android_abi x86_64     amd64 x86_64-linux-android24  android/yoga-x86_64
+printf '%s\n' "$COMPILER_ID" > "$PKGDIR/ios/cmr/COMPILER_ID"
+printf '%s\n' "$COMPILER_ID" > "$PKGDIR/android/cmr/COMPILER_ID"
 echo "done. Commit the updated cmr/ prebuilts."

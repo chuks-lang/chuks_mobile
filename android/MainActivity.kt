@@ -93,6 +93,7 @@ object N {
     external fun cmrBoot(bundle: ByteArray, tmpdir: String): Int   // CMR: load a chukspack bundle (libcmr only)
     external fun cmrApplyDelta(delta: ByteArray): Int              // CMR: merge only the changed modules + re-init
     external fun cmrLastError(): String                            // CMR: why the last boot/delta failed (dev error overlay)
+    external fun cmrCompilerId(): String                           // CMR: the compiler this engine embeds (sent to the dev server)
     external fun cmrSaveState(): String                            // CMR: serialize app state (cells + nav) before a reload
     external fun cmrLoadState(state: String)                       // CMR: restore it into the fresh VM after a reload
     external fun yNew(): Long
@@ -460,8 +461,8 @@ class MainActivity : Activity(), ChuksModuleHost {
             cmrDevBase = "http://$cmrDevHost"
             var b: ByteArray? = null; var v = 0
             val t = Thread { val r = cmrFetchBundle(); b = r.first; v = r.second }; t.start(); t.join(8000)
-            if (b == null) try { b = assets.open("cmr.bundle").readBytes() } catch (e: Exception) {}   // fallback if server down
-            if (b != null) { val rc = N.cmrBoot(b!!, cacheDir.absolutePath); cmrVersion = v; android.util.Log.i("CMR", "dev boot rc=$rc v=$v (${b!!.size} bytes) from $cmrDevBase"); if (rc != 0) showDevError(N.cmrLastError()) else dismissDevError() }
+            if (b == null) try { b = assets.open("cmr.bundle").readBytes() } catch (e: Exception) {}   // fallback if server down, or it refused this engine
+            if (b != null) { val rc = N.cmrBoot(b!!, cacheDir.absolutePath); cmrVersion = v; android.util.Log.i("CMR", "dev boot rc=$rc v=$v (${b!!.size} bytes) from $cmrDevBase"); if (rc != 0) showDevError(N.cmrLastError()) else if (cmrDevRefusal.isNotEmpty()) showDevError(cmrDevRefusal) else dismissDevError() }
             startCmrHmr()
         } else {
             try {
@@ -1036,12 +1037,26 @@ class MainActivity : Activity(), ChuksModuleHost {
     // new bundle and re-boots. The VM runs on the device; only the SOURCE crosses HTTP.
     private var cmrDevBase = ""         // "http://10.0.2.2:7799"; empty => baked bundle
     private var cmrVersion = 0
+    // The server compares the compiler this engine embeds with its own on every
+    // bundle or delta request and answers 409 with the reason when they differ:
+    // source the two would compile differently is never sent. Kept for the overlay.
+    @Volatile private var cmrDevRefusal = ""
+    private fun cmrDevConnection(path: String, readTimeout: Int): java.net.HttpURLConnection {
+        val c = java.net.URL("$cmrDevBase$path").openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 3000; c.readTimeout = readTimeout
+        c.setRequestProperty("X-CMR-Compiler", try { N.cmrCompilerId() } catch (e: Throwable) { "" })
+        return c
+    }
+    private fun cmrNoteRefusal(c: java.net.HttpURLConnection, code: Int) {
+        if (code == 409) cmrDevRefusal = try { c.errorStream?.use { it.readBytes() }?.toString(Charsets.UTF_8) ?: "" } catch (e: Exception) { "" }
+        else if (code == 200) cmrDevRefusal = ""
+    }
     // GET /bundle -> (bytes, X-CMR-Version). Blocking; call off the main thread.
     private fun cmrFetchBundle(): Pair<ByteArray?, Int> {
         return try {
-            val c = java.net.URL("$cmrDevBase/bundle").openConnection() as java.net.HttpURLConnection
-            c.connectTimeout = 3000; c.readTimeout = 8000
+            val c = cmrDevConnection("/bundle", 8000)
             val code = c.responseCode
+            cmrNoteRefusal(c, code)
             // Read the version header BEFORE consuming the body (Go canonicalizes it to
             // "X-Cmr-Version"; match case-insensitively).
             val ver = c.headerFields?.entries?.firstOrNull { it.key?.equals("X-CMR-Version", true) == true }
@@ -1069,6 +1084,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                     val (b, ver, isDelta) = cmrFetchDelta(cmrVersion)   // since = OLD version, so the delta covers the edit
                     cmrVersion = ver                                     // advance now so the next poll doesn't re-trigger
                     if (b != null) handler.post { cmrReloadInPlace(b, ver, isDelta) }
+                    else if (cmrDevRefusal.isNotEmpty()) { val why = cmrDevRefusal; handler.post { showDevError(why) } }
                 } else {
                     try { Thread.sleep(150) } catch (e: InterruptedException) { return@Thread }
                 }
@@ -1079,9 +1095,9 @@ class MainActivity : Activity(), ChuksModuleHost {
     // bundle (X-CMR-Delta:0) on first load / after a server restart. Off the main thread.
     private fun cmrFetchDelta(since: Int): Triple<ByteArray?, Int, Boolean> {
         return try {
-            val c = java.net.URL("$cmrDevBase/delta?since=$since").openConnection() as java.net.HttpURLConnection
-            c.connectTimeout = 3000; c.readTimeout = 8000
+            val c = cmrDevConnection("/delta?since=$since", 8000)
             val code = c.responseCode
+            cmrNoteRefusal(c, code)
             fun hdr(name: String) = c.headerFields?.entries?.firstOrNull { it.key?.equals(name, true) == true }?.value?.firstOrNull()?.trim()
             val ver = hdr("X-CMR-Version")?.toIntOrNull() ?: cmrVersion
             val isDelta = hdr("X-CMR-Delta") == "1"
@@ -4156,8 +4172,10 @@ class MainActivity : Activity(), ChuksModuleHost {
 
     private fun insert(id: String, parent: String, index: Int) {
         val child = views[id] ?: return
-        if (parent == "root") { root.addView(child); return }
-        if (modalIds.contains(id) || sheetIds.contains(id)) { root.addView(child); return }   // overlays mount on root, above the app
+        // A dev overlay raised before the first mount (the server refused this engine at
+        // boot) stays above whatever mounts on root after it.
+        if (parent == "root") { root.addView(child); devErrorOverlay?.bringToFront(); return }
+        if (modalIds.contains(id) || sheetIds.contains(id)) { root.addView(child); devErrorOverlay?.bringToFront(); return }   // overlays mount on root, above the app
         if (parent == scrollId) contentId = id
         val pn = ynodes[parent] ?: return
         // A package view may own where its children go: its root can be a decoration layer,

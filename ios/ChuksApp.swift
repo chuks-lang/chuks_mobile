@@ -959,6 +959,10 @@ func cmrLastErrorText() -> String {
     let s = String(cString: c); chuks_free_str(c); return s
 }
 var cmrBootErrorPending = ""   // set at initial boot, consumed once the view exists
+// A notice to show over a LIVE app once it is mounted (the dev server refused this
+// engine, so the baked bundle is running): unlike a boot error, the VM is fine and
+// the app mounts as usual; the overlay goes on top and the next good reload clears it.
+var cmrBootNoticePending = ""
 #endif
 // The perf/jank harness (auto-scroll sweep + fps header) is a benchmark tool, not
 // app behavior — off unless built with -D BENCHMARK. Without this it grabs whatever
@@ -2261,7 +2265,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     func eSetup() {
         eTimezone()   // before anything runs in the engine: module-level code may read the date
         #if CMR
-        if !cmrDevBoot() { cmrBootBundle() }   // dev: fetch bundle over HTTP + hot reload; else the baked bundle
+        if !cmrDevBoot() { cmrBootBundle() }   // dev: the server's bundle, or the baked one until the server answers; release: the baked bundle
         #endif
         if !DEV_MODE { chuks_set_count(N) }
     }   // chuks_* bridge auto-runs chuks_init; dev server self-inits on boot
@@ -2492,6 +2496,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if !cmrBootErrorPending.isEmpty {
             showDevError(cmrBootErrorPending)
         } else if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
+        if !cmrBootNoticePending.isEmpty { showDevError(cmrBootNoticePending); cmrBootNoticePending = "" }
         #else
         if let s = eMount(), !s.isEmpty { apply(s); connected = true }   // build the app tree
         #endif
@@ -2893,7 +2898,17 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         if host.isEmpty { return false }
         cmrDevBase = "http://\(host)"
         let (data, ver) = cmrFetchBundle()
-        guard let data = data else { NSLog("CMR dev: %@ unreachable, using baked bundle", cmrDevBase); return false }
+        guard let data = data else {
+            // No source from the server: boot the baked bundle so there is a screen,
+            // and keep polling, so the server coming up (or coming back with the
+            // right compiler) reloads the app without a relaunch. A refusal (the
+            // engine's compiler differs) is said over the screen; unreachable is quiet.
+            cmrBootBundle()
+            if !cmrDevRefusal.isEmpty { cmrBootNoticePending = cmrDevRefusal }
+            else { NSLog("CMR dev: %@ unreachable, using baked bundle", cmrDevBase) }
+            startCmrHmr()
+            return true
+        }
         cmrBootData(data); cmrVersion = ver
         NSLog("CMR dev boot v=%d (%d bytes) from %@", ver, data.count, cmrDevBase)
         startCmrHmr()
@@ -2905,16 +2920,31 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         cmrBootErrorPending = rc != 0 ? cmrLastErrorText() : ""
     }
+    // The server compares the compiler this engine embeds with its own on every
+    // bundle or delta request, and answers 409 with the reason when they differ
+    // (source the two would compile differently is never sent). The reason is
+    // kept here for the overlay.
+    var cmrDevRefusal = ""
+    func cmrDevRequest(_ url: URL, timeout: TimeInterval) -> URLRequest {
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        req.setValue(String(cString: chuks_cmr_compiler_id()), forHTTPHeaderField: "X-CMR-Compiler")
+        return req
+    }
+    func cmrNoteRefusal(_ h: HTTPURLResponse, _ d: Data?) {
+        if h.statusCode == 409, let d = d, let text = String(data: d, encoding: .utf8) { cmrDevRefusal = text }
+        else if h.statusCode == 200 { cmrDevRefusal = "" }
+    }
     // GET /bundle -> (data, X-CMR-Version). Synchronous (semaphore).
     func cmrFetchBundle() -> (Data?, Int) {
         guard let url = URL(string: "\(cmrDevBase)/bundle") else { return (nil, cmrVersion) }
-        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 8)
-        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let req = cmrDevRequest(url, timeout: 8)
         let sem = DispatchSemaphore(value: 0)
         var out: Data? = nil; var ver = cmrVersion; var code = -1
         URLSession.shared.dataTask(with: req) { d, resp, _ in
             if let h = resp as? HTTPURLResponse {
                 code = h.statusCode
+                self.cmrNoteRefusal(h, d)
                 if h.statusCode == 200, let d = d { out = d }
                 if let v = h.value(forHTTPHeaderField: "X-CMR-Version").flatMap({ Int($0) }) { ver = v }
             }
@@ -2952,6 +2982,10 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     let (data, ver, isDelta) = self.cmrFetchDelta(self.cmrVersion)
                     self.cmrVersion = ver
                     if let data = data { DispatchQueue.main.async { self.cmrReloadInPlace(data, ver, isDelta) } }
+                    else if !self.cmrDevRefusal.isEmpty {
+                        let why = self.cmrDevRefusal
+                        DispatchQueue.main.async { self.showDevError(why) }
+                    }
                 } else {
                     Thread.sleep(forTimeInterval: 0.15)
                 }
@@ -2963,15 +2997,18 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     // sent when the device is fresh or the server restarted. Synchronous (semaphore).
     func cmrFetchDelta(_ since: Int) -> (Data?, Int, Bool) {
         guard let url = URL(string: "\(cmrDevBase)/delta?since=\(since)") else { return (nil, cmrVersion, false) }
-        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
-        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let req = cmrDevRequest(url, timeout: 10)
         let sem = DispatchSemaphore(value: 0)
         var out: Data? = nil; var ver = cmrVersion; var isDelta = false
         URLSession.shared.dataTask(with: req) { d, resp, _ in
-            if let h = resp as? HTTPURLResponse, h.statusCode == 200, let d = d {
-                out = d
+            if let h = resp as? HTTPURLResponse {
+                self.cmrNoteRefusal(h, d)
+                // The version comes with a refusal too, so the poll settles on it.
                 if let v = h.value(forHTTPHeaderField: "X-CMR-Version").flatMap({ Int($0) }) { ver = v }
-                isDelta = (h.value(forHTTPHeaderField: "X-CMR-Delta") ?? "0") == "1"
+                if h.statusCode == 200, let d = d {
+                    out = d
+                    isDelta = (h.value(forHTTPHeaderField: "X-CMR-Delta") ?? "0") == "1"
+                }
             }
             sem.signal()
         }.resume()
