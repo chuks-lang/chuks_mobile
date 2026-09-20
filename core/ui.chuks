@@ -1465,7 +1465,7 @@ export function useViewRef(): ViewRef {
  * back as an empty bag, so a mixed package can read both without a guard.
  *
  * ```chuks
- * { change: (raw: string) => {
+ * { change: raw => {
  *       const d: any = eventData(raw)
  *       p.onChange({ star: pvI(d, "star", 0), previous: pvI(d, "previous", 0) })
  *   } }
@@ -1542,7 +1542,7 @@ export function eventData(raw: string): any {
  * Button({ onPress: () => c.command("scrollTo", { index: 3 }) }, "next")
  * ```
  */
-export function nativeView(kind: string, props: any, layout: any, kids: []Kid, events: any = null, ref: any = null): Node {
+export function nativeView(kind: string, props: any, layout: any, kids: []Kid, events: (map[string]StringHandler)? = null, ref: any = null): Node {
     const s: Style = new Style()
     applyLayoutV(s, layout)
     const n: Node = new Node(kind, s, json.stringify(props), flatKids(kids))

@@ -21,9 +21,17 @@ export CHUKS_NO_WARNINGS=1
 ENGINE_ID="$(cat "$PKGDIR/cmr/COMPILER_ID" 2>/dev/null || echo unknown)"
 CLI_ID="$(chuks --compiler-id 2>/dev/null || echo dev)"
 if [ "$ENGINE_ID" != "$CLI_ID" ]; then
-    echo "warning: the prebuilt engine was built with compiler $ENGINE_ID and the installed chuks is $CLI_ID." >&2
-    echo "         Hot reload will refuse to send source until they agree: upgrade @chuks/mobile to the" >&2
-    echo "         release matching this chuks, or on a framework checkout run tools/build-libcmr.sh." >&2
+    # A framework checkout with the compiler's source at hand rebuilds the engine
+    # itself, so a compiler change costs one build here and no manual step.
+    if [ -n "${CHUKS_REPO:-}" ] && [ -f "$SDKROOT/tools/build-libcmr.sh" ] && [ -d "$CHUKS_REPO/cmd/cmr" ]; then
+        echo "engine: prebuilt was $ENGINE_ID, chuks is $CLI_ID; rebuilding the engine from $CHUKS_REPO"
+        CHUKS_REPO="$CHUKS_REPO" bash "$SDKROOT/tools/build-libcmr.sh"
+    else
+        echo "warning: the prebuilt engine was built with compiler $ENGINE_ID and the installed chuks is $CLI_ID." >&2
+        echo "         Hot reload will refuse to send source until they agree: upgrade @chuks/mobile to the" >&2
+        echo "         release matching this chuks, or on a framework checkout run tools/build-libcmr.sh" >&2
+        echo "         (set CHUKS_REPO=/path/to/chuks and this script does it for you)." >&2
+    fi
 fi
 
 # ---- app identity (same as build.sh) ----

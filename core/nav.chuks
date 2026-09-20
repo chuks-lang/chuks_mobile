@@ -150,14 +150,9 @@ function tabStack(name: string): []Route {
 /**
  * Clear one tab's history, back to its root screen.
  *
- * The common use is the platform convention of tapping the active tab to go home:
- * call this from `onSelect` when the tapped index is already active.
- *
- * ```chuks
- * onSelect: i => {
- *     if (i == active) { resetTabStack(tabs[i].name) } else { setActive(i) }
- * }
- * ```
+ * `TabView` does this itself when the active tab is tapped again (the platform
+ * convention; `reselectResets: false` turns it off). Call it directly to send a tab
+ * home for another reason, such as a sign-out.
  */
 export function resetTabStack(name: string): void { var empty: []Route = []; TAB_STACKS[name] = empty }
 
@@ -206,6 +201,10 @@ setNestedStateHandlers(
 export dataType TabViewProps {
     active: int,
     onSelect: function(i: int): void,
+    // Tapping the tab that is already active clears that tab's history back to its root
+    // screen (the platform convention on both iOS and Android) before `onSelect` runs.
+    // Pass false to keep a tab's history on a re-tap.
+    reselectResets: bool?,
     iconFor: function(name: string, color: string, size: int): Node,
     // Default-path colors (used only for tabs WITHOUT a `render` fn, like Expo's
     // tabBarActiveTintColor). For anything beyond color, use a tab's `render`.
@@ -382,8 +381,14 @@ export function TabView(p: TabViewProps, tabs: []TabSpec): Node {
     const barY: SharedValue = useSharedValue(0.0)
     _barY = barY
     if (p.accessory != null) { kids.push(p.accessory) }                             // floating accessory
-    var barNode: Node = defaultTabBar(tabs, p)
-    if (p.bar != null) { const bf: any = p.bar; barNode = bf(tabs, p.active, p.onSelect) }   // custom bar
+    // A tap on the active tab goes home (its stack cleared) unless the app opted out;
+    // the app's onSelect runs either way. The same wrapper reaches a custom bar.
+    const select: function(i: int): void = i => {
+        if (i == p.active && (p.reselectResets ?? true) && i >= 0 && i < tabs.length) { resetTabStack(tabs[i].name) }
+        p.onSelect(i)
+    }
+    var barNode: Node = defaultTabBar(tabs, p, select)
+    if (p.bar != null) { const bf: any = p.bar; barNode = bf(tabs, p.active, select) }   // custom bar
     if (p.glass ?? false) {
         // A glass bar has to FLOAT, or the material has nothing to work with. In flow it
         // sits on the app background, and a material over one flat colour is just a
@@ -474,7 +479,7 @@ function tabBadge(text: string): Node {
 // The default bottom bar, built from the tab specs: icon (+ a selected variant), an
 // optional label, an optional badge, a raised `fab` center tab, and dimmed `disabled`
 // tabs. Hidden tabs are skipped. Pass `bar` to TabView to replace this entirely.
-function defaultTabBar(tabs: []TabSpec, p: TabViewProps): Node {
+function defaultTabBar(tabs: []TabSpec, p: TabViewProps, select: function(i: int): void): Node {
     const activeC: string = p.activeColor ?? tk("primary")
     const inactiveC: string = p.inactiveColor ?? tk("subtle")
     const bg: string = p.bg ?? tk("surface")
@@ -487,7 +492,7 @@ function defaultTabBar(tabs: []TabSpec, p: TabViewProps): Node {
         if (!(spec.hidden ?? false)) {
             const sel: bool = i == p.active
             const disabled: bool = spec.disabled ?? false
-            const onP: any = disabled ? null : tabPress(p.onSelect, i)
+            const onP: any = disabled ? null : tabPress(select, i)
             const rf: any = spec.render
             if (rf != null) {
                 // Full control (Expo model): the app draws the tab's inner content from

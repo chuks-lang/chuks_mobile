@@ -1,0 +1,52 @@
+// Tapping the tab that is already active goes home: the tab's history is cleared back
+// to its root screen, the platform convention on both iOS and Android, without the app
+// having to wire it. `reselectResets: false` keeps the history.
+//
+// Run:  chuks run tests/tabreselect_test.chuks   (exits non-zero on failure)
+import { Node, Text, Route, NavStack, navigate } from "../core/ui.chuks";
+import { TabView, Tab } from "../core/nav.chuks";
+import { render, Screen } from "../core/testing.chuks";
+
+var PASS: int = 0
+var FAIL: int = 0
+function check(cond: bool, name: string): void {
+    if (cond) { PASS = PASS + 1; println("  ok   " + name) }
+    else { FAIL = FAIL + 1; println("  FAIL " + name) }
+}
+function icon(name: string, color: string, size: int): Node { return Text({ size: size, color: color }, name) }
+var KEEP: bool = false
+var SELECTED: []int = []
+function shell(_: Route): Node {
+    return TabView({ active: 0, onSelect: i => { SELECTED.push(i) }, iconFor: icon, reselectResets: KEEP ? false : true },
+                   [ Tab({ name: "feed", label: "Feed", screen: () => Text({}, "feed root"), stack: true }) ])
+}
+function detail(r: Route): Node { return Text({}, "detail page") }
+
+function main(): void {
+    println("tabreselect_test")
+    var routes: map[string]function(r: Route): Node = {}
+    routes["shell"] = shell
+    routes["detail"] = detail
+    const nv: NavStack = new NavStack(routes, "shell")
+
+    KEEP = false
+    const s: Screen = render(() => nv.render())
+    check(s.has("feed root"), "the tab shows its root")
+    navigate("detail", null, null); s.frame()
+    check(s.has("detail page"), "a push inside the tab shows the page")
+    check(s.press("Feed"), "the active tab's item is pressable")
+    s.frame()
+    check(s.has("feed root") && !s.has("detail page"), "tapping the active tab again goes back to the tab's root")
+    check(SELECTED.length == 1 && SELECTED[0] == 0, "and the app's onSelect still ran")
+
+    KEEP = true
+    navigate("detail", null, null); s.frame()
+    check(s.has("detail page"), "pushed again")
+    s.press("Feed"); s.frame()
+    check(s.has("detail page"), "with reselectResets: false the history stays")
+
+    println("")
+    println(string(PASS) + " passed, " + string(FAIL) + " failed")
+    if (FAIL > 0) { throw "tabreselect_test failed" }
+}
+main()
