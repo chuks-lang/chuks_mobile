@@ -16,6 +16,14 @@ for t in tests/*_test.chuks; do
     if ! "$CHUKS" run "$t"; then fail=1; fi
 done
 
+# Both iOS host builds must typecheck: the CMR dev build every simulator session runs,
+# and the release build (`chuks ios`, ios:device, ios:release) that nothing else runs
+# until a device build. Seven seconds, needs Xcode; skipped where there is none.
+if [ "$(uname -s)" = "Darwin" ] && xcrun --sdk iphonesimulator --show-sdk-path >/dev/null 2>&1; then
+    echo "=== tools/host-typecheck.sh ==="
+    if ! bash tools/host-typecheck.sh; then fail=1; fi
+fi
+
 # Static guard: every wire style key must have a documented reset story, so a new
 # prop can't reintroduce the reused-node stale-state bug class (Stage 0). See
 # tests/style_reset_coverage.py and docs/ui-update-model-vs-rn.md.

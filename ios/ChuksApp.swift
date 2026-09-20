@@ -3730,8 +3730,14 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 }
             case "FA" where f.count >= 2: setFrameDriver(f[1] == "1")   // per-frame physics on/off
             // A runtime error the live app hit (errPayload JSON, which may contain '|'):
-            // a handler that threw, a task that failed with nobody awaiting it.
-            case "E" where f.count >= 2: showDevError(f[1...].joined(separator: "|"))
+            // a handler that threw, a task that failed with nobody awaiting it. The dev
+            // card exists in a CMR build only; a release build says it in the log.
+            case "E" where f.count >= 2:
+                #if CMR
+                showDevError(f[1...].joined(separator: "|"))
+                #else
+                NSLog("Chuks runtime error: %@", f[1...].joined(separator: "|"))
+                #endif
             case "MV", "MS", "MX": motionOp(f)                           // shared values (docs/shared-values.md)
             case "MK" where f.count >= 2: if let vid = Int(f[1]) { mKeyboardValues.insert(vid) }
             case "X" where f.count >= 3:
