@@ -1066,12 +1066,29 @@ class MainActivity : Activity(), ChuksModuleHost {
         } catch (e: Exception) { Pair(null, cmrVersion) }
     }
     // GET /hmr?since=N -> new version (!= since), or 0 on 204/timeout/error. Long-poll.
+    // The dev build reaches the server at localhost through an `adb reverse` tunnel,
+    // which adb drops when it restarts or the device reconnects; the app then sat
+    // silent, every poll refused, while the developer saved and saw nothing. On an
+    // emulator the host's loopback is also reachable as 10.0.2.2, so after a few
+    // refused connections in a row the base moves there and reloads carry on (the
+    // NAT can stall a long-poll, so the tunnel stays the first choice at build time).
+    private var cmrRefused = 0
+    private fun cmrDevFallback() {
+        if (!cmrDevBase.startsWith("http://localhost")) return
+        if (!(android.os.Build.FINGERPRINT.contains("generic") || android.os.Build.FINGERPRINT.contains("emulator") || android.os.Build.HARDWARE.contains("ranchu") || android.os.Build.HARDWARE.contains("goldfish"))) return
+        cmrDevBase = cmrDevBase.replace("http://localhost", "http://10.0.2.2")
+        android.util.Log.w("CMR", "dev server unreachable at localhost (the adb reverse tunnel is gone?); using $cmrDevBase")
+    }
     private fun cmrPollHmr(since: Int): Int {
         return try {
             val c = java.net.URL("$cmrDevBase/hmr?since=$since").openConnection() as java.net.HttpURLConnection
             c.connectTimeout = 3000; c.readTimeout = 35000
             val v = if (c.responseCode == 200) c.inputStream.use { it.readBytes() }.toString(Charsets.UTF_8).trim().toIntOrNull() ?: 0 else 0
-            c.disconnect(); v
+            c.disconnect(); cmrRefused = 0; v
+        } catch (e: java.net.ConnectException) {
+            cmrRefused += 1
+            if (cmrRefused >= 3) { cmrRefused = 0; cmrDevFallback() }
+            0
         } catch (e: Exception) { 0 }
     }
     private fun startCmrHmr() {
