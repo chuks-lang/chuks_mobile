@@ -7227,6 +7227,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                     sv.contentHeight = total; sv.resolveHeights()
                     YGNodeStyleSetPadding(sn, YGEdge.top, Float(sv.layoutTop + sv.handleStrip))
                     YGNodeCalculateLayout(sn, fw, fh, YGDirection.LTR)
+                    // The first open of a content-sized sheet starts before its children
+                    // are measured, so it was heading for the handle strip alone and
+                    // stayed there, a sliver at the bottom, until something else moved it.
+                    // Now that the height is known, an open sheet goes to it (the animation
+                    // retargets from where it is; a finger on it keeps its drag).
+                    if sv.index >= 0 && sheetDrag?.id != sid { sheetAnimate(sid, sv, to: sv.index, report: false) }
                 }
             }
         }

@@ -1858,7 +1858,7 @@ function scrollContent(kids: []Node, horizontal: bool): []Node {
  * vertical, a Row for horizontal); the host scroll view hosts exactly one child.
  *
  *     Scroll({}, [ Column({ gap: 12 }, [ Text(...), Card(...), Button(...) ]) ])
- *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])
+ *     Scroll({ horizontal: true }, [ Row({ gap: 12 }, [ Card(...), Card(...) ]) ])   // as tall as its cards
  *     Scroll({ horizontal: true, paging: true }, [ Row([ page0, page1, page2 ]) ])
  */
 export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
@@ -1876,12 +1876,14 @@ export function Scroll(first: ScrollProps | []Kid, kids: []Kid = []): Node {
     const horizontal: bool = p.horizontal ?? false
     const s: Style = new Style()
     if (horizontal) { s.dir = "row"; s.horiz = 1 } else { s.dir = "col" }
-    // A scroll fills the space it is given: grow 1 from a basis of 0. Unless it was given
-    // a size of its own: a basis of 0 makes the layout ignore an explicit height, so a
-    // carousel asked for `h: 160` in a column would fill the column instead. An
-    // explicit h (or w, for a carousel in a row) is the size; the fill default stands
-    // down, and a `grow` the caller passes still applies below.
-    const sized: bool = p.h != null || (horizontal && p.w != null)
+    // A vertical scroll fills the space it is given: grow 1 from a basis of 0. Unless it
+    // was given a size of its own: a basis of 0 makes the layout ignore an explicit
+    // height, so a scroll asked for `h: 160` in a column would fill the column instead.
+    // A HORIZONTAL scroll is sized by its content instead: as tall as its row, as wide as
+    // its parent (a column stretches it; in a row give it `w` or `grow`). With the fill
+    // default it was zero-high inside anything that sizes to its content (a sheet, a
+    // card), since a basis of 0 in a parent with no height to hand out is nothing.
+    const sized: bool = p.h != null || horizontal
     if (!sized) { s.grow = 1; s.basis = 0 }
     // paging: snap one full screen per swipe (a carousel / onboarding pager). Works on both
     // axes; combine with `horizontal` for a left-to-right paged carousel.
