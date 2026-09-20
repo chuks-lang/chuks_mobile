@@ -36,6 +36,12 @@ function Bt(): Node { const label: Cell<string> = useState("fresh"); return Text
 
 var WHICH: string = "A"
 
+var ASYNC_RAN: int = 0
+async function tick(): Task<void> { ASYNC_RAN = ASYNC_RAN + 1 }
+function Loader(p: CardProps): Node {
+    useEffect(async () => { await tick() }, [])
+    return Text({}, "loading")
+}
 class Ticket { var n: int; constructor() { this.n = 1 } }
 dataType Rec { n: int }
 function Holder(): Node {
@@ -88,6 +94,14 @@ function main(): void {
     check(u.has("At=1"), "the thunk form counts")
     WHICH = "B"; u.frame()
     check(!u.has("Bt=fresh"), "a thunk swap keeps the position's cell (the documented limit of the thunk form)")
+
+    // ---- an async effect runs as a task and has no cleanup ----
+    ASYNC_RAN = 0; WHICH = "A"
+    const x: Screen = render(() => Column({}, [ Text({}, "x"), Text({}, "x"), Text({}, "x"), Text({}, "x"), Text({}, "x"), WHICH == "A" ? Comp(Loader, { id: "9" }) : Comp(B, { id: "9" }) ]))
+    x.frame()
+    check(ASYNC_RAN == 1, "an async effect ran once on mount")
+    WHICH = "B"; x.frame()
+    check(x.has("B9=fresh"), "unmounting a component whose effect was async does not call its Task as a cleanup")
 
     // ---- a cell holds data, not a class instance ----
     const before: int = devWarnings().length

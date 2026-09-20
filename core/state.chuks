@@ -401,11 +401,20 @@ function depsKeyOf(deps: []any): string {
  * function, or null) that runs before the next re-run and when the component
  * unmounts. Pass `[]` for run-once-on-mount.
  *
+ * An effect may be `async`: it runs as a task, and it has no cleanup (what an
+ * async function returns is its Task, not a function). Load data that way,
+ * with the cells carrying the answer back to the screen.
+ *
  * ```chuks
  * useEffect(() => {
  *     var id = startTimer()
  *     return () => stopTimer(id)   // cleanup on unmount
  * }, [])
+ *
+ * useEffect(async () => {
+ *     const p: Post? = await fetchPost(id)
+ *     if (p != null) { post.set(p) }
+ * }, [id])
  * ```
  */
 export function useEffect(fn: any, deps: []any): void {
@@ -431,7 +440,11 @@ export function runEffects(): void {
         var p: PendingFx = _pendingFx[i]
         if (p.old != null) { var c: any = p.old; c() }
         var f: any = p.fn
-        var cleanup: any = f()
+        var ret: any = f()
+        // Only a function is a cleanup. An async effect returns its Task, which is
+        // not something to call on unmount; storing it as the cleanup made the
+        // component's unmount "calling non-function".
+        var cleanup: any = typeof(ret) == "function" ? ret : null
         var e: Effect? = _effects.get(p.key)
         if (e != null) { e.cleanup = cleanup }
     }
