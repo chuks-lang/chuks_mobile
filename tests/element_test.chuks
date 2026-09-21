@@ -33,7 +33,10 @@ function B(p: CardProps): Node {
 }
 // The same two, as thunks.
 function At(): Node { const n: Cell<int> = useState(0); return Pressable({ onPress: () => n.set(n.get() + 1) }, [ Text({ size: 12 }, "At=" + string(n.get())) ]) }
-function Bt(): Node { const label: Cell<string> = useState("fresh"); return Text({ size: 12 }, "Bt=" + label.get()) }
+// Bt's cell is an int like At's: the swap below hands Bt the cell At left at the
+// position (the documented limit), and a cell is read as its declared type, so a
+// Cell<string> there would be a type error natively rather than a stale string.
+function Bt(): Node { const label: Cell<int> = useState(7); return Text({ size: 12 }, "Bt=" + string(label.get())) }
 
 var WHICH: string = "A"
 
@@ -98,7 +101,7 @@ function main(): void {
     u.press("At=0"); u.frame()
     check(u.has("At=1"), "the thunk form counts")
     WHICH = "B"; u.frame()
-    check(!u.has("Bt=fresh"), "a thunk swap keeps the position's cell (the documented limit of the thunk form)")
+    check(!u.has("Bt=7") && u.has("Bt=1"), "a thunk swap keeps the position's cell (the documented limit of the thunk form)")
 
     // ---- an async effect runs as a task and has no cleanup ----
     ASYNC_RAN = 0; WHICH = "A"
