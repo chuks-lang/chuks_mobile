@@ -9,6 +9,7 @@
 import { Node, Column, Text, Pressable, Comp, devWarnings, devWarnCount } from "../core/ui.chuks";
 import { useState, useEffect, Cell } from "../core/state.chuks";
 import { render, Screen } from "../core/testing.chuks";
+import { Channel } from "std/channel";
 
 var PASS: int = 0
 var FAIL: int = 0
@@ -36,10 +37,14 @@ function Bt(): Node { const label: Cell<string> = useState("fresh"); return Text
 
 var WHICH: string = "A"
 
+// The effect's task signals when it has run: a task started in one frame has run by
+// the next on the VM's cooperative scheduler, but a native task runs alongside the
+// frame, so the test waits on the signal rather than on the frame.
 var ASYNC_RAN: int = 0
+const ASYNC_DONE: Channel<int> = new Channel<int>(4)
 async function tick(): Task<void> { ASYNC_RAN = ASYNC_RAN + 1 }
 function Loader(p: CardProps): Node {
-    useEffect(async () => { await tick() }, [])
+    useEffect(async () => { await tick(); ASYNC_DONE.send(1) }, [])
     return Text({}, "loading")
 }
 class Ticket { var n: int; constructor() { this.n = 1 } }
@@ -99,6 +104,7 @@ function main(): void {
     ASYNC_RAN = 0; WHICH = "A"
     const x: Screen = render(() => Column({}, [ Text({}, "x"), Text({}, "x"), Text({}, "x"), Text({}, "x"), Text({}, "x"), WHICH == "A" ? Comp(Loader, { id: "9" }) : Comp(B, { id: "9" }) ]))
     x.frame()
+    ASYNC_DONE.receive()
     check(ASYNC_RAN == 1, "an async effect ran once on mount")
     WHICH = "B"; x.frame()
     check(x.has("B9=fresh"), "unmounting a component whose effect was async does not call its Task as a cleanup")

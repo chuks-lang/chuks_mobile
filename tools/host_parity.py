@@ -2,7 +2,7 @@
 """
 Host parity: compare the view-tree dumps tests/host writes on iOS and Android.
 
-Two checks, in the order the bugs happen:
+Three checks, in the order the bugs happen:
 
   1. DRIFT (per host). A line carries `host=... DRIFT` (Android) or `yoga=... DRIFT`
      (iOS) when the platform's frame for a view differs from the frame the engine laid
@@ -16,6 +16,13 @@ Two checks, in the order the bugs happen:
      fails. Text nodes get a wider tolerance, since the two platforms measure the same
      string with different fonts (a few points either way is the fonts, more is a wrap
      that happened on one side only).
+
+  3. SCROLL RANGE (per host). A scroll's line carries `scroll=WxH` (or `hscroll=WxH`
+     for a sideways one): what the host lets it scroll over. It must cover the content
+     node's frame (the scroll's first child) along the scroll axis. A range cut short is
+     a page that will not scroll: the live list's content height got pinned to its own
+     height when a horizontal Scroll elsewhere on the screen flipped a host-wide flag,
+     after the screen was rebuilt. Both hosts must also agree on the range.
 
 Usage:
   python3 tools/host_parity.py <dir-with-ios-and-android-subdirs>
@@ -36,6 +43,7 @@ TEXT_CLASSES = ("TextView", "UILabel", "SelectableLabel", "EditText", "UITextFie
 INSET_DEPENDENT = {"tabs": ("app.0.0.2",)}
 
 LINE = re.compile(r'^(\s*)(\S+)\s+(\S+)\s+(-?\d+),(-?\d+)\s+(-?\d+)x(-?\d+)(.*)$')
+SCROLL = re.compile(r'\b(h?scroll)=(\d+)x(\d+)')
 
 def parse(path):
     """id -> dict(cls, x, y, w, h, hidden, zero, drift, text). Stops at the detached marker."""
@@ -49,10 +57,33 @@ def parse(path):
             if not m:
                 continue
             _, nid, cls, x, y, w, h, rest = m.groups()
+            sm = SCROLL.search(rest)
             nodes[nid] = dict(cls=cls, x=int(x), y=int(y), w=int(w), h=int(h),
                               hidden="  hidden" in rest, zero="ZERO-SIZED" in rest,
-                              drift="DRIFT" in rest, rest=rest.strip())
+                              drift="DRIFT" in rest, rest=rest.strip(),
+                              scroll=(sm.group(1), int(sm.group(2)), int(sm.group(3))) if sm else None)
+    # A hidden node hides its subtree: nothing under a closed sheet is drawn, and where
+    # the host parks it is the host's business.
+    for nid in sorted(nodes):
+        parent = nid.rsplit(".", 1)[0] if "." in nid else None
+        if parent in nodes and nodes[parent]["hidden"]:
+            nodes[nid]["hidden"] = True
     return nodes
+
+def scroll_range_problems(host, nodes):
+    """A visible scroll's range must cover its content node along its axis."""
+    out = []
+    for nid, n in nodes.items():
+        if not n["scroll"] or n["hidden"] or not in_box(nid):
+            continue
+        kind, sw, sh = n["scroll"]
+        c = nodes.get(nid + ".0")
+        if not c or c["hidden"]:
+            continue
+        short = sw < c["w"] - TOL_BOX or (kind == "scroll" and sh < c["h"] - TOL_BOX)
+        if short:
+            out.append(f"{host}: {nid} {n['cls']} scroll range {sw}x{sh} is short of its content {c['w']}x{c['h']}: it will not scroll over all of it")
+    return out
 
 def in_box(nid):
     """Only what the fixture drew inside its box: the root and the caption differ by device."""
@@ -67,6 +98,7 @@ def compare(name, ios, android):
         for nid, n in nodes.items():
             if n["drift"] and in_box(nid):
                 problems.append(f"{host}: {nid} {n['cls']} platform frame differs from the engine's: {n['rest']}")
+        problems += scroll_range_problems(host, nodes)
     ids_i = {k for k in ios if in_box(k)}
     ids_a = {k for k in android if in_box(k)}
     for nid in sorted(ids_i - ids_a):
@@ -96,6 +128,14 @@ def compare(name, ios, android):
         if dx > tol_pos or dy > tol_y or dw > tol_w or dh > tol_h:
             problems.append(f"parity: {nid} iOS {a['x']},{a['y']} {a['w']}x{a['h']}  Android {b['x']},{b['y']} {b['w']}x{b['h']}"
                             + (f"  ({a['cls']} / {b['cls']})" if text else ""))
+        # The scroll range along the scroll axis; the cross axis is each platform's own
+        # (iOS pins a sideways scroll's content height, Android measures the child).
+        if a["scroll"] and b["scroll"]:
+            (ka, aw, ah), (kb, bw, bh) = a["scroll"], b["scroll"]
+            if ka != kb:
+                problems.append(f"parity: {nid} scrolls sideways on {'iOS' if ka == 'hscroll' else 'Android'} only")
+            elif abs(aw - bw) > TOL_BOX or (ka == "scroll" and abs(ah - bh) > TOL_BOX):
+                problems.append(f"parity: {nid} scroll range iOS {aw}x{ah}  Android {bw}x{bh}")
     return problems
 
 def main():

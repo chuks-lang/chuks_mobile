@@ -11,8 +11,8 @@
 // or two hosts that drift from each other, fails the check.
 //
 // Every screen is deterministic: fixed sizes, fixed text, no capability, no clock.
-import { Node, Column, Row, Text, Scroll, List, Pressable, App, Comp, dispatchAsync } from "pkg/@chuks/mobile/core/ui.chuks";
-import { useState, Cell } from "pkg/@chuks/mobile/core/state.chuks";
+import { Node, Column, Row, Text, Scroll, List, Sheet, Pressable, App, Comp, dispatchAsync } from "pkg/@chuks/mobile/core/ui.chuks";
+import { useState, useEffect, Cell } from "pkg/@chuks/mobile/core/state.chuks";
 import { TabView, Tab } from "pkg/@chuks/mobile/core/nav.chuks";
 import { Debug, FileSystem } from "pkg/@chuks/mobile/core/native.chuks";
 import { time } from "std/time";
@@ -54,6 +54,32 @@ function list(): Node {
                rowHeight: 56, gap: 8, pad: 12 }),
     ])
 }
+
+/** A windowed list with a closed Sheet beside it whose panel holds a horizontal Scroll.
+ *  The panel's content arrives one render AFTER the list took the live slot (an app
+ *  fills a share sheet from state once it knows the post), so the sideways scroll is
+ *  styled after LV. The list's scroll range must still be its whole content, not its
+ *  own height: a host-wide "horizontal" flag once made a feed unscrollable this way. */
+function ListBesideSheet(): Node {
+    const filled = useState<bool>(false)
+    useEffect(() => { filled.set(true) }, [])
+    var cards: []Node = []
+    const n: int = filled.get() ? 6 : 0
+    for (var i: int = 0; i < n; i = i + 1) {
+        cards.push(Column({ w: 120, h: 80, bg: "FFE0B2", radius: 10 }, [ Text({ size: 14 }, "card " + string(i)) ]))
+    }
+    return Column({ grow: 1, justify: "start" }, [
+        List({ count: 100,
+               key: r => string(r),
+               item: (r, top) => Row({ abs: true, top: top, left: 12, right: 12, h: 56, bg: "E0F2F1", radius: 10, align: "center", px: 12 },
+                                     [ Text({ size: 14 }, "item " + string(r)) ]),
+               rowHeight: 56, gap: 8, pad: 12 }),
+        Sheet({ snapPoints: ["content"], index: -1 }, filled.get() ? [
+            Scroll({ horizontal: true }, [ Row({ gap: 12, px: 16, py: 16 }, cards) ]),
+        ] : []),
+    ])
+}
+function listBesideSheetScreen(): Node { return Comp(ListBesideSheet) }
 
 /** Text with a width to wrap to, text on one line, text inside a fixed-width column. */
 function textWrap(): Node {
@@ -142,7 +168,7 @@ function tabsScreen(): Node {
 
 // ---- runner ---------------------------------------------------------------------
 
-const NAMES: []string = ["scroll_padded", "scroll_long", "list", "text_wrap", "flex", "absolute", "hscroll", "hidden", "tabs"]
+const NAMES: []string = ["scroll_padded", "scroll_long", "list", "text_wrap", "flex", "absolute", "hscroll", "hidden", "tabs", "list_beside_sheet"]
 
 function screenAt(i: int): Node {
     if (i == 0) { return scrollPadded() }
@@ -153,7 +179,8 @@ function screenAt(i: int): Node {
     if (i == 5) { return absolute() }
     if (i == 6) { return hscroll() }
     if (i == 7) { return hiddenNodes() }
-    return tabsScreen()
+    if (i == 8) { return tabsScreen() }
+    return listBesideSheetScreen()
 }
 
 var STARTED: bool = false

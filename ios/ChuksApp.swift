@@ -2030,7 +2030,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
     var horizScrollIds = Set<String>()                // which of those scroll sideways
     var scrollId = ""
     var listHoriz = false            // the tracked list scrolls horizontally (report x, not y)
-    var stickBottomOn = false        // Scroll stickBottom: keep pinned to newest (chat)
+    var stickIds = Set<String>()     // Scroll stickBottom: keep pinned to newest (chat), by id
     var stickPrevH: CGFloat = 0      // previous content height, to tell if the user was at the bottom
     var contentId = ""
 
@@ -4041,6 +4041,12 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 if abs(Int(f.origin.x) - yx) > 1 || abs(Int(f.origin.y) - yy) > 1 || abs(Int(f.size.width) - yw) > 1 || abs(Int(f.size.height) - yh) > 1 {
                     line += "  yoga=\(yx),\(yy) \(yw)x\(yh) DRIFT"
                 }
+            }
+            // What a scroll can actually scroll over: its content size, which the host sets
+            // from the content node's frame. Yoga's content frame is what the app asked for;
+            // a range cut short is a page that will not scroll.
+            if let sv = v as? UIScrollView, !(v is UITextView) {
+                line += (horizScrollIds.contains(id) ? "  hscroll=" : "  scroll=") + "\(Int(sv.contentSize.width))x\(Int(sv.contentSize.height))"
             }
             if let t = (v as? UILabel)?.text, !t.isEmpty {
                 line += "  \"" + (t.count > 30 ? String(t.prefix(30)) + "…" : t) + "\""
@@ -6259,9 +6265,15 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
                 videoCtrlVCs[id]?.videoGravity = (val == "contain") ? .resizeAspect : .resizeAspectFill
             case "paging":   // List/Scroll snap-per-screen (video feeds)
                 (v as? UIScrollView)?.isPagingEnabled = (val == "1")
-            case "stick": if v is UIScrollView { stickBottomOn = (val == "1") }
+            // Both are facts about THIS scroll, recorded by id. They used to set the live
+            // list's flag directly, so a horizontal Scroll styled after the list took the
+            // slot (a share sheet's row of avatars, mounted on the same screen) turned the
+            // feed "horizontal": its content height got pinned to its own height and it
+            // could not scroll at all after the screen was rebuilt.
+            case "stick": if v is UIScrollView { if val == "1" { stickIds.insert(id) } else { stickIds.remove(id) } }
             case "horiz": if let sc = v as? UIScrollView {   // horizontal list (carousel): report x + scroll sideways
-                listHoriz = (val == "1")
+                if val == "1" { horizScrollIds.insert(id) } else { horizScrollIds.remove(id) }
+                if id == scrollId { listHoriz = (val == "1") }
                 sc.showsHorizontalScrollIndicator = false
                 sc.showsVerticalScrollIndicator = false
             }
@@ -6558,12 +6570,16 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
         }
         let prefix = id + "."
         for k in views.keys.filter({ $0 == id || $0.hasPrefix(prefix) }) {
+            // A Sheet, Modal or Popover mounts on the ROOT view, not under its parent, so
+            // removing the ancestor's view leaves the overlay in the hierarchy. Take it out
+            // here, by id: three of them stayed behind for every screen rebuilt.
+            if k != id && (sheetIds.contains(k) || modalIds.contains(k) || popoverIds.contains(k)), let ov = views[k], ov.superview === view { ov.removeFromSuperview() }
             if let b = views[k] as? UIButton { buttonActions[b] = nil }
             if let tf = views[k] as? UITextField { fieldActions[tf] = nil; fieldSubmit[tf] = nil; fieldFocus[tf] = nil; fieldBlur[tf] = nil; fieldMaxLen[tf] = nil }
             if let sw = views[k] as? UISwitch { switchActions[sw] = nil }
             if let sl = views[k] as? UISlider { sliderActions[sl] = nil; sliderStep[sl] = nil; sliderDoneAction[sl] = nil }
             if let sc = views[k] as? UIScrollView { scrollOnScroll[sc] = nil; scrollLastPos[sc] = nil }
-            scrollContentIds.removeValue(forKey: k); horizScrollIds.remove(k)   // per-scroll content sizing
+            scrollContentIds.removeValue(forKey: k); horizScrollIds.remove(k); stickIds.remove(k)   // per-scroll content sizing
             if let dp = views[k] as? UIDatePicker { datePickerActions[dp] = nil; datePickerModes[dp] = nil }
             if let tv = views[k] as? UITextView { textAreaActions[tv] = nil; textAreaPlaceholders[tv] = nil }
             if selectIds.contains(k) { selectIds.remove(k); selectOptions[k] = nil; selectSel[k] = nil; selectActions[k] = nil }
@@ -7334,7 +7350,7 @@ final class CardsVC: UIViewController, UIScrollViewDelegate, UITextFieldDelegate
             sc.contentSize = CGSize(width: cw, height: listHoriz ? sc.bounds.height : chh)
             // stickBottom (chat): if the user was at the bottom before this layout, stay pinned
             // to the new bottom (a new message, or the keyboard opening and shrinking the view).
-            if stickBottomOn {
+            if stickIds.contains(scrollId) {
                 let newH = sc.contentSize.height
                 let wasAtBottom = sc.contentOffset.y + sc.bounds.height >= stickPrevH - 40
                 if wasAtBottom && newH > sc.bounds.height {

@@ -191,7 +191,7 @@ class MainActivity : Activity(), ChuksModuleHost {
                                                      // by inference: LV can hand the live slot to any of them
     private var listHoriz = false                 // the tracked list scrolls horizontally (report x, not y)
     private var scrollId = ""
-    private var stickBottomOn = false   // Scroll stickBottom: keep pinned to newest (chat)
+    private val stickIds = HashSet<String>()   // Scroll stickBottom: keep pinned to newest (chat), by id
     private var stickPrevH = 0          // previous content height, to tell if the user was at the bottom
     private val modalIds = HashSet<String>()             // Modal node ids (full-screen overlays)
     private var activeModal: String? = null              // the currently-visible Modal
@@ -247,6 +247,12 @@ class MainActivity : Activity(), ChuksModuleHost {
         (Runtime.getRuntime().maxMemory() / 1024 / 8).toInt()) {
         override fun sizeOf(key: String, b: android.graphics.Bitmap): Int = b.byteCount / 1024
     }
+    // The bucket (power of two of the pixel size) each cached bitmap was decoded for, or
+    // FULL when it is the source at its own size. A request for a bigger bucket decodes
+    // the disk copy again rather than stretch the small one: an avatar asked for before
+    // anything had a frame was decoded at 1x1 and every later avatar got that pixel.
+    private val imageMemBucket = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val IMAGE_FULL = Int.MAX_VALUE
     private val imgDir by lazy { java.io.File(cacheDir, "imgcache").apply { mkdirs() } }  // disk cache (survives relaunch)
     private val bgImageViews = HashMap<String, ImageView>()              // ImageBackground id -> its backing image view
     private var refreshAction = ""                                       // Scroll onRefresh action
@@ -1431,13 +1437,23 @@ class MainActivity : Activity(), ChuksModuleHost {
             // a horizontal list's content has its height pinned on purpose, so only its
             // width is held to Yoga's. The root is placed by the host itself (topY below
             // the inset), so it is exempt.
-            if (id != "app" && v.visibility == View.VISIBLE && !placed) {
+            // (isShown, not visibility: a view under a hidden ancestor, a closed sheet's
+            // panel, is never measured either.)
+            if (id != "app" && v.isShown && !placed) {
                 val px = (v.x / density).toInt(); val py = (v.y / density).toInt()
                 val pw = (v.width / density).toInt(); val ph = (v.height / density).toInt()
                 val pinnedH = listHoriz && id == contentId
                 if (Math.abs(px - x) > 1 || Math.abs(pw - w) > 1 || (!pinnedH && (Math.abs(py - y) > 1 || Math.abs(ph - h) > 1))) {
                     sb.append("  host=$px,$py ${pw}x$ph DRIFT")
                 }
+            }
+            // What a scroll can actually scroll over: the size of its content view as the
+            // platform laid it out, which is its scroll range. Yoga's content frame is what
+            // the app asked for; a range cut short is a page that will not scroll.
+            if (v is ScrollView || v is HorizontalScrollView) {
+                val c = if ((v as ViewGroup).childCount > 0) v.getChildAt(0) else null
+                val cw = ((c?.width ?: 0) / density).toInt(); val ch = ((c?.height ?: 0) / density).toInt()
+                sb.append(if (v is HorizontalScrollView) "  hscroll=${cw}x$ch" else "  scroll=${cw}x$ch")
             }
             (v as? TextView)?.text?.toString()?.let {
                 if (it.isNotEmpty()) sb.append("  \"" + (if (it.length > 30) it.take(30) + "…" else it) + "\"")
@@ -3450,7 +3466,9 @@ class MainActivity : Activity(), ChuksModuleHost {
                     (v as? SnapScrollView)?.pageSnap = (vl == "1")
                     (v as? SnapHScrollView)?.pageSnap = (vl == "1")
                 }
-                "stick" -> if (v is ScrollView) stickBottomOn = (vl == "1")   // Scroll stickBottom (chat)
+                // A fact about THIS scroll, by id: a global flag let a chat Scroll elsewhere
+                // on the screen pin the live list to its bottom.
+                "stick" -> if (v is ScrollView) { if (vl == "1") stickIds.add(id) else stickIds.remove(id) }   // Scroll stickBottom (chat)
                 "press" -> pressOpacity[id] = f / 100f   // Pressable active alpha
                 "nlines" -> (v as? TextView)?.let {   // Text: cap lines; default to a tail ellipsis (as UIKit does), an explicit `ellip` overrides
                     val n = f.toInt()                 // nlines=-1 means "no cap" -> unlimited, and no forced ellipsis
@@ -4789,8 +4807,11 @@ class MainActivity : Activity(), ChuksModuleHost {
         videoPlayers.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { k -> poolVideo(k) }
         videoWanted.keys.filter { it == id || it.startsWith(prefix) }.toList().forEach { videoWanted.remove(it); videoPlayPref.remove(it); videoMutePref.remove(it); videoLoopPref.remove(it) }
         if (cameraIds.any { it == id || it.startsWith(prefix) }) { cameraController?.close(); cameraController = null }
+        // A Sheet, Modal or Popover mounts on the root, not under its parent, so removing
+        // the ancestor's view leaves the overlay in the hierarchy. Take it out by id.
+        views.keys.filter { it != id && it.startsWith(prefix) && (sheetIds.contains(it) || modalIds.contains(it) || popoverIds.contains(it)) }.forEach { k -> views[k]?.let { ov -> if (ov.parent === root) root.removeView(ov) } }
         views.keys.filter { it == id || it.startsWith(prefix) }.forEach { sheetIds.remove(it); popoverIds.remove(it); popoverAnchor.remove(it); popoverPlace.remove(it); popoverGap.remove(it); popoverArrow.remove(it); popoverArrowViews.remove(it); layoutIds.remove(it); lastLayoutReport.remove(it) }
-        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); motionForget(it); enterSpec.remove(it); exitSpec.remove(it); layoutSpec.remove(it); pendingEnter.remove(it); layoutLast.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
+        views.keys.filter { it == id || it.startsWith(prefix) }.forEach { views.remove(it); explicitFg.remove(it); cameraIds.remove(it); bgColor.remove(it); bgRadius.remove(it); borderW.remove(it); borderC.remove(it); pressOpacity.remove(it); sliderMin.remove(it); sliderStep.remove(it); sliderDone.remove(it); switchThumb.remove(it); explicitHeight.remove(it); scrollOnScroll.remove(it); horizScrollIds.remove(it); stickIds.remove(it); scrollLastPos.remove(it); selectIds.remove(it); selectOptions.remove(it); selectSel.remove(it); datePickerIds.remove(it); datePickerModes.remove(it); datePickerVals.remove(it); menuIds.remove(it); menuData.remove(it); contextMenuIds.remove(it); contextMenuData.remove(it); mapIds.remove(it); gestureIds.remove(it); gestureCont.remove(it); motionForget(it); enterSpec.remove(it); exitSpec.remove(it); layoutSpec.remove(it); pendingEnter.remove(it); layoutLast.remove(it); alertIds.remove(it); alertData.remove(it); alertActions.remove(it); bgImageViews.remove(it); imageSrc.remove(it); imageDecodedDim.remove(it); lastFrame.remove(it); needsFrame.remove(it) }
         ynodes.keys.filter { it == id || it.startsWith(prefix) }.forEach { ynodes.remove(it) }
     }
 
@@ -5148,6 +5169,12 @@ class MainActivity : Activity(), ChuksModuleHost {
     // maxDim, then decode at that sample. Avoids ever allocating the full-res bitmap.
     // decodeScaled, from a file: the bounds pass and the sampled decode both stream from
     // disk, so the file's bytes never sit in the heap.
+    // The longer side of the picture in a file, in pixels, without decoding it.
+    private fun imageSourceMax(f: java.io.File): Int {
+        val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(f.absolutePath, o)
+        return maxOf(o.outWidth, o.outHeight)
+    }
     private fun decodeScaledFile(f: java.io.File, maxDim: Int = MAX_DIM): android.graphics.Bitmap? {
         val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
         android.graphics.BitmapFactory.decodeFile(f.absolutePath, o)
@@ -5206,11 +5233,19 @@ class MainActivity : Activity(), ChuksModuleHost {
     private fun loadRemoteImage(url: String, iv: ImageView, id: String = "") {
         // Feed-grade: memory LRU -> disk cache -> network, decoded off the main thread, with
         // tag cancellation so a recycled cell never gets a late image for a URL it dropped.
-        imageMem.get(url)?.let { iv.setImageBitmap(bmpFor(it, id)); reportImageSize(id, it); mediaLoad[id]?.let { a -> fire(a) }; return }
+        // Downsample to the view's display size (captured here on the main thread), else
+        // the screen width when the view is not laid out yet. The root has no width either
+        // before its first layout (a feed's first images at a cold start), and the
+        // display's is the honest fallback there, never 1.
+        val screenW = if (root.width > 0) root.width else resources.displayMetrics.widthPixels
+        val target = (if (iv.width > 0 || iv.height > 0) maxOf(iv.width, iv.height) else screenW).coerceIn(1, MAX_DIM)
+        val bucket = Integer.highestOneBit(target)
+        imageMem.get(url)?.let {
+            if ((imageMemBucket[url] ?: IMAGE_FULL) >= bucket) {
+                iv.setImageBitmap(bmpFor(it, id)); reportImageSize(id, it); mediaLoad[id]?.let { a -> fire(a) }; return
+            }
+        }
         iv.setTag(TAG, url)
-        // RN parity: downsample to the view's display size (captured here on the main
-        // thread), else screen width if the view is not laid out yet.
-        val target = (if (iv.width > 0 || iv.height > 0) maxOf(iv.width, iv.height) else root.width).coerceIn(1, MAX_DIM)
         imageLoads.execute {
             try {
                 // A recycled cell may have moved on while this waited in the queue.
@@ -5228,10 +5263,18 @@ class MainActivity : Activity(), ChuksModuleHost {
                 }
                 val bmp = decodeScaledFile(f, target)
                 if (bmp != null) {
+                    // Decoded at its own size (no sampling): nothing bigger exists to ask for.
+                    imageMemBucket[url] = if (imageSourceMax(f) <= target) IMAGE_FULL else bucket
                     imageMem.put(url, bmp)
                     iv.post { if (iv.getTag(TAG) == url) { iv.setImageBitmap(bmpFor(bmp, id)); reportImageSize(id, bmp) }; mediaLoad[id]?.let { a -> fire(a) } }
-                } else { f.delete(); iv.post { mediaError[id]?.let { a -> fire(a) } } }
-            } catch (e: Exception) { iv.post { mediaError[id]?.let { a -> fire(a) } } }
+                } else { f.delete(); android.util.Log.w("ChuksImage", "could not decode $url"); iv.post { mediaError[id]?.let { a -> fire(a) } } }
+            } catch (e: Exception) {
+                // Named in the log as well as reported to the app: an image that never
+                // shows up is otherwise silent, and the reason (a host the device cannot
+                // reach, a refused request) is only here.
+                android.util.Log.w("ChuksImage", "could not load $url: $e")
+                iv.post { mediaError[id]?.let { a -> fire(a) } }
+            }
         }
     }
 
@@ -5424,7 +5467,7 @@ class MainActivity : Activity(), ChuksModuleHost {
         if (moved) root.requestLayout()
         // stickBottom (chat): after layout settles, keep the transcript pinned to the newest
         // message if the user was already at the bottom (new message, or the keyboard shrinking).
-        if (stickBottomOn) (listScroll as? ScrollView)?.let { sc -> sc.post {
+        if (stickIds.contains(scrollId)) (listScroll as? ScrollView)?.let { sc -> sc.post {
             val child = if (sc.childCount > 0) sc.getChildAt(0) else null
             val newH = child?.height ?: 0
             val wasAtBottom = sc.scrollY + sc.height >= stickPrevH - dp(20)
