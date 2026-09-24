@@ -118,6 +118,21 @@ export class Screen {
         return true
     }
 
+    /**
+     * What the field found by `find` currently shows. A field is found by its value or
+     * its placeholder, as `type` finds it, and its value is returned; "" when there is
+     * no such field. `has` only sees labels, so without this a test could type into a
+     * field but never assert what it holds.
+     *
+     * ```chuks
+     * s.type("Search", "ada")
+     * check(s.fieldValue("Search") == "ada", "the field keeps what was typed")
+     * ```
+     */
+    public fieldValue(find: string): string {
+        return findFieldValue(this.tree, find)
+    }
+
     /** The mutations the last frame emitted, for a test that cares about the wire. */
     public mutations(): []string { return this.lines }
 
@@ -192,6 +207,20 @@ function findChange(n: Node, text: string): any {
         i = i + 1
     }
     return null
+}
+
+// The value of the first field whose value or placeholder contains `find`, matching
+// how findChange locates one; "" when no field matches.
+function findFieldValue(n: Node, find: string): string {
+    if (n.onChange != null && (contains(n.text, find) || contains(n.val, find))) { return n.val }
+    const kids: []Node = kidsOf(n)
+    var i: int = 0
+    while (i < kids.length) {
+        const hit: string = findFieldValue(kids[i], find)
+        if (hit != "") { return hit }
+        i = i + 1
+    }
+    return ""
 }
 
 function dumpNodeStr(n: Node, depth: int): string {

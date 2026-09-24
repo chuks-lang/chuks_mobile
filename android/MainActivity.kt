@@ -177,6 +177,9 @@ fun chuksUnescapeText(s: String): String {
 
 class MainActivity : Activity(), ChuksModuleHost {
     private val views = HashMap<String, View>()
+    // What each view was made as. The per-frame reset restores a role's own defaults
+    // (a multiline field is multiline again), which a blanket reset cannot do.
+    private val viewKind = HashMap<String, String>()
     private val ynodes = HashMap<String, Long>()
     // Incremental apply: relayout() reassigns a view's LayoutParams (which triggers a child
     // requestLayout) only when its computed frame actually changed vs the last applied one,
@@ -2717,6 +2720,7 @@ class MainActivity : Activity(), ChuksModuleHost {
 
     private fun make(id: String, kind: String) {
         if (views.containsKey(id)) return
+        viewKind[id] = kind
         val n = N.yNew()
         val v: View = when (kind) {
             "Text" -> TextView(this).also { it.gravity = Gravity.CENTER_VERTICAL }
@@ -3252,7 +3256,17 @@ class MainActivity : Activity(), ChuksModuleHost {
         // relies on defaults (e.g. a reused label staying centered). Reset to make()'s
         // defaults; the loop re-applies whatever this role sets. (size/weight are always
         // re-applied from locals, so they need no reset.)
-        (v as? TextView)?.let { it.gravity = Gravity.CENTER_VERTICAL; it.maxLines = Integer.MAX_VALUE; it.ellipsize = null }
+        (v as? TextView)?.let {
+            // A multiline field starts its text at the top, as iOS's UITextView does and
+            // as make() set it: the blanket CENTER_VERTICAL below is right for a label
+            // and for a single-line field, and used to take the TextArea's own gravity
+            // with it on the first style pass, so a composer's placeholder sat halfway
+            // down the screen.
+            val multiline = (it.inputType and android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0
+            it.gravity = if (multiline) (Gravity.TOP or Gravity.START) else Gravity.CENTER_VERTICAL
+            it.maxLines = Integer.MAX_VALUE
+            it.ellipsize = null
+        }
         // Reused-node completeness: props style() applies only-when-present must be reset
         // here or a reused node inherits the previous role's value (stale-state bug class,
         // docs/ui-update-model-vs-rn.md). Text size/weight/decoration/tracking are already
@@ -3287,12 +3301,23 @@ class MainActivity : Activity(), ChuksModuleHost {
         if (v is SeekBar) { v.progressTintList = null; v.thumbTintList = null }              // fg on a Slider
         else if (v is ProgressBar) { v.progressTintList = null; v.indeterminateTintList = null }   // fg on Progress
         (v as? EditText)?.let {                            // input config: kbt/ret/edit/acap/acor/maxlen/sec
-            it.inputType = android.text.InputType.TYPE_CLASS_TEXT
+            // A multiline field is reset to ITS defaults, not to a single-line field's:
+            // this reset used to strip the TYPE_TEXT_FLAG_MULTI_LINE the TextArea was
+            // made with and call setSingleLine(), so a composer became one line and its
+            // text sat centred (the vertical gravity follows the flag).
+            val multiline = viewKind[id] == "TextArea"
+            if (multiline) {
+                it.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                it.isSingleLine = false
+                it.setHorizontallyScrolling(false)
+            } else {
+                it.inputType = android.text.InputType.TYPE_CLASS_TEXT
+            }
             it.transformationMethod = null
             it.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
             it.filters = arrayOf()
             it.isEnabled = true; it.isFocusable = true; it.isFocusableInTouchMode = true
-            it.setSingleLine()
+            if (!multiline) { it.setSingleLine() }
         }
         var fsPx = dpf(14f)
         var bold = false
@@ -3445,8 +3470,16 @@ class MainActivity : Activity(), ChuksModuleHost {
                     (v as? EditText)?.setHintTextColor(Color.argb(115, Color.red(c), Color.green(c), Color.blue(c)))
                     if (v is SeekBar) { v.progressTintList = ColorStateList.valueOf(c); v.thumbTintList = ColorStateList.valueOf(c) }
                     else if (v is ProgressBar) { if (v.isIndeterminate) v.indeterminateTintList = ColorStateList.valueOf(c) else v.progressTintList = ColorStateList.valueOf(c) } }
-                "ta" -> (v as? TextView)?.gravity =
-                    (if (vl == "right") Gravity.END else if (vl == "center") Gravity.CENTER else Gravity.START) or Gravity.CENTER_VERTICAL
+                // `ta` is horizontal alignment; the vertical half stays what the role
+                // wants: a multiline field keeps its text at the top (as iOS does),
+                // everything else centres. Pairing it with CENTER_VERTICAL for every
+                // TextView pushed a composer's text to the middle of the screen the
+                // moment it asked for ta: "left".
+                "ta" -> (v as? TextView)?.let { tv ->
+                    val h = if (vl == "right") Gravity.END else if (vl == "center") Gravity.CENTER_HORIZONTAL else Gravity.START
+                    val multiline = (tv.inputType and android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0
+                    tv.gravity = h or (if (multiline) Gravity.TOP else Gravity.CENTER_VERTICAL)
+                }
                 "font" -> customFont = vl
                 "vid" -> videoWanted[id] = vl   // a Video node wants this clip; a player is attached only while it's on screen (see updateVideoVisibility)
                 "vplay" -> {                    // controllable playback: vplay=0 pauses (feed cells drive this)

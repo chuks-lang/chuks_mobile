@@ -11,7 +11,7 @@
 // or two hosts that drift from each other, fails the check.
 //
 // Every screen is deterministic: fixed sizes, fixed text, no capability, no clock.
-import { Node, Column, Row, Text, Scroll, List, Sheet, Pressable, App, Comp, dispatchAsync } from "pkg/@chuks/mobile/core/ui.chuks";
+import { Node, Column, Row, Text, Scroll, List, Sheet, Pressable, App, Comp, dispatchAsync, TextInput} from "pkg/@chuks/mobile/core/ui.chuks";
 import { useState, useEffect, Cell } from "pkg/@chuks/mobile/core/state.chuks";
 import { TabView, Tab } from "pkg/@chuks/mobile/core/nav.chuks";
 import { Debug, FileSystem } from "pkg/@chuks/mobile/core/native.chuks";
@@ -88,6 +88,19 @@ function textWrap(): Node {
         Text({ size: 14 }, "one line"),
         Column({ w: 200, bg: "EEEEEE", pad: 8 }, [ Text({ size: 12, w: 184 }, LONG) ]),
         Text({ size: 22, weight: "bold" }, "Heading"),
+    ])
+}
+
+/** Fields: a single-line field beside a multiline one. A multiline field's text starts
+ *  at the TOP of its box on both hosts (iOS's UITextView does; Android's EditText is
+ *  centred by default, and the per-frame style reset used to take the multiline role's
+ *  own configuration with it, so a composer became one centred line). Both carry text,
+ *  so the frames compare with content rather than with a placeholder. */
+function fields(): Node {
+    return Column({ grow: 1, px: 16, pt: 16, gap: 12, justify: "start", align: "stretch" }, [
+        TextInput({ h: 44, w: 280, value: "single line", bg: "EEEEEE" }),
+        TextInput({ multiline: true, h: 120, w: 280, value: LONG, bg: "EEEEEE", ta: "left" }),
+        Text({ size: 12 }, "after the fields"),
     ])
 }
 
@@ -168,7 +181,7 @@ function tabsScreen(): Node {
 
 // ---- runner ---------------------------------------------------------------------
 
-const NAMES: []string = ["scroll_padded", "scroll_long", "list", "text_wrap", "flex", "absolute", "hscroll", "hidden", "tabs", "list_beside_sheet"]
+const NAMES: []string = ["scroll_padded", "scroll_long", "list", "text_wrap", "flex", "absolute", "hscroll", "hidden", "tabs", "list_beside_sheet", "fields"]
 
 function screenAt(i: int): Node {
     if (i == 0) { return scrollPadded() }
@@ -180,7 +193,8 @@ function screenAt(i: int): Node {
     if (i == 6) { return hscroll() }
     if (i == 7) { return hiddenNodes() }
     if (i == 8) { return tabsScreen() }
-    return listBesideSheetScreen()
+    if (i == 9) { return listBesideSheetScreen() }
+    return fields()
 }
 
 var STARTED: bool = false
